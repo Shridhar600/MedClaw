@@ -53,6 +53,7 @@ const DEFAULTS: AppConfig = {
   heartbeat: {
     enabled: true,
     timezone: 'Asia/Kolkata',
+    storePath: path.join(os.homedir(), '.redacted', 'heartbeats', 'jobs.json'),
   },
   agent: {
     maxIterations: 15,
@@ -100,6 +101,7 @@ export async function loadConfig(configPath?: string): Promise<AppConfig> {
 
   // Resolve ~ in paths
   merged.memory.workspace = resolvePath(merged.memory.workspace);
+  merged.heartbeat.storePath = resolvePath(merged.heartbeat.storePath);
 
   return merged;
 }

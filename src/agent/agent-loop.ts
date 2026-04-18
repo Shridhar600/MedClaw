@@ -9,6 +9,10 @@ interface AgentConfig {
   disclaimerEnabled: boolean;
 }
 
+interface AgentRunContext {
+  chatId?: string;
+}
+
 export class AgentLoop {
   constructor(
     private readonly provider: LLMProvider,
@@ -17,7 +21,11 @@ export class AgentLoop {
     private readonly config: AgentConfig,
   ) {}
 
-  async run(userMessage: string, conversationHistory: Message[] = []): Promise<AgentRunResult> {
+  async run(
+    userMessage: string,
+    conversationHistory: Message[] = [],
+    runContext?: AgentRunContext,
+  ): Promise<AgentRunResult> {
     const messages: Message[] = [
       ...this.systemMessages,
       ...conversationHistory,
@@ -68,7 +76,7 @@ export class AgentLoop {
       trace.push(toolRequestMessage);
 
       // Execute tool
-      const toolResult = await this.registry.execute(name, args);
+      const toolResult = await this.registry.execute(name, args, runContext);
       const resultText = toolResult.content.map(c => c.text).join('\n');
 
       // Append tool result

@@ -14,12 +14,16 @@ export interface ToolParameters {
   required?: string[];
 }
 
+export interface ToolExecutionContext {
+  chatId?: string;
+}
+
 export interface Tool {
   name: string;
   group: string;
   description: string;
   parameters: ToolParameters;
-  execute(params: Record<string, unknown>): Promise<ToolResult>;
+  execute(params: Record<string, unknown>, context?: ToolExecutionContext): Promise<ToolResult>;
 }
 
 export interface ToolCall {

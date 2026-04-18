@@ -41,6 +41,7 @@ export interface SessionsConfig {
 export interface HeartbeatConfig {
   enabled: boolean;
   timezone: string;
+  storePath: string;
 }
 
 export interface AgentConfig {

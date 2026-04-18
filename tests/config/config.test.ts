@@ -46,4 +46,20 @@ describe('loadConfig', () => {
     expect(config.memory.workspace).toContain(os.homedir());
     expect(config.memory.workspace).not.toContain('~');
   });
+
+  it('provides a default heartbeat store path', async () => {
+    const config = await loadConfig(path.join(tmpDir, 'nonexistent.json'));
+    expect(config.heartbeat.storePath).toContain(path.join('.redacted', 'heartbeats', 'jobs.json'));
+  });
+
+  it('resolves ~ in heartbeat store path', async () => {
+    const cfgPath = path.join(tmpDir, 'config.json');
+    fs.writeFileSync(
+      cfgPath,
+      JSON.stringify({ heartbeat: { storePath: '~/.redacted/custom-heartbeats.json' } }),
+    );
+    const config = await loadConfig(cfgPath);
+    expect(config.heartbeat.storePath.startsWith(os.homedir())).toBe(true);
+    expect(config.heartbeat.storePath).not.toContain('~');
+  });
 });

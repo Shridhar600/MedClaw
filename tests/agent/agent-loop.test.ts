@@ -100,4 +100,20 @@ describe('AgentLoop', () => {
     const result = await loop.run('Loop forever');
     expect(result.text).toContain('maximum');
   });
+
+  it('forwards run-context chatId to tool execution', async () => {
+    const provider = makeProvider([
+      { type: 'tool_call', toolCall: { id: 'c1', name: 'ping', arguments: {} } },
+      { type: 'text', text: 'done' },
+    ]);
+    const registry = new ToolRegistry({ allow: ['*'], deny: [] });
+    registry.register(pingTool);
+    const executeSpy = jest.spyOn(registry, 'execute');
+    const loop = new AgentLoop(provider, registry, [], { maxIterations: 15, disclaimerEnabled: false });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (loop as any).run('Ping with context', [], { chatId: 'chat-context-1' });
+
+    expect(executeSpy).toHaveBeenCalledWith('ping', {}, { chatId: 'chat-context-1' });
+  });
 });

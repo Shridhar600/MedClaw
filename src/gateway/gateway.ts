@@ -9,16 +9,22 @@ import { MemoryEngine } from '../memory/memory-engine';
 import { ToolRegistry } from '../tools/registry';
 import { createMemoryTools } from '../tools/memory-tools';
 import { createMedicalTools } from '../tools/medical-tools';
+import { createCronManageTool } from '../tools/cron-manage';
 import { SqliteStore } from '../memory/sqlite-store';
 import { MemorySearch } from '../memory/search';
 import { createProvider } from '../providers/factory';
 import { SessionManager } from './session';
+import { HeartbeatStore } from '../scheduler/store';
+import { HeartbeatScheduler } from '../scheduler/runtime';
+import { syncHeartbeatMarkdown } from '../scheduler/heartbeat-markdown';
+import type { HeartbeatJob } from '../scheduler/types';
 
 export class Gateway {
   private config: AppConfig;
   private channel?: Channel;
   private agentLoop?: AgentLoop;
   private sessions?: SessionManager;
+  private scheduler?: HeartbeatScheduler;
 
   constructor(config: AppConfig) {
     this.config = config;
@@ -88,12 +94,17 @@ export class Gateway {
       await this.channel.connect();
     }
 
+    await this.initializeScheduler();
+    if (this.scheduler) {
+      registry.register(createCronManageTool(this.scheduler, config.memory.workspace));
+    }
+
     console.log('[gateway] Redacted is running.');
   }
 
   async handleTestMessage(chatId: string, text: string): Promise<string> {
     const history = await this.sessions!.prepareHistory(chatId);
-    const result = await this.agentLoop!.run(text, history);
+    const result = await this.agentLoop!.run(text, history, { chatId });
     await this.sessions!.recordTurn(chatId, [
       { role: 'user', content: text },
       ...result.trace,
@@ -138,7 +149,7 @@ export class Gateway {
     const history = await this.sessions!.prepareHistory(chatId);
 
     try {
-      const result = await this.agentLoop!.run(agentInput, history);
+      const result = await this.agentLoop!.run(agentInput, history, { chatId });
       await this.channel!.send(chatId, { text: result.text });
 
       await this.sessions!.recordTurn(
@@ -155,8 +166,44 @@ export class Gateway {
   }
 
   async stop(): Promise<void> {
+    await this.scheduler?.stop();
     await this.channel?.disconnect();
     console.log('[gateway] Stopped.');
+  }
+
+  private async initializeScheduler(): Promise<void> {
+    if (!this.config.heartbeat.enabled) {
+      return;
+    }
+    if (!this.channel || !this.agentLoop || !this.sessions) {
+      return;
+    }
+
+    const store = new HeartbeatStore(this.config.heartbeat.storePath);
+    this.scheduler = new HeartbeatScheduler(
+      store,
+      async (job) => this.handleScheduledJob(job),
+      this.config.heartbeat.timezone,
+    );
+    await this.scheduler.start();
+    await syncHeartbeatMarkdown(this.config.memory.workspace, await this.scheduler.listJobs());
+  }
+
+  private async handleScheduledJob(job: HeartbeatJob): Promise<void> {
+    const history = await this.sessions!.prepareHistory(job.chatId);
+    const input = [
+      '[Heartbeat Trigger]',
+      `Job id: ${job.id}`,
+      `Job title: ${job.title}`,
+      `Prompt: ${job.prompt}`,
+    ].join('\n');
+
+    const result = await this.agentLoop!.run(input, history, { chatId: job.chatId });
+    await this.channel!.send(job.chatId, { text: result.text });
+    await this.sessions!.recordTurn(job.chatId, [
+      { role: 'user', content: input },
+      ...result.trace,
+    ]);
   }
 
   private buildAgentInput(incoming: IncomingMessage): string {

@@ -29,6 +29,7 @@ describe('Gateway media flow', () => {
       heartbeat: {
         enabled: false,
         timezone: 'Asia/Kolkata',
+        storePath: '/tmp/redacted-test/heartbeats/jobs.json',
       },
       agent: {
         maxIterations: 15,

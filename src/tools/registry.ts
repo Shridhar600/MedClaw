@@ -1,4 +1,4 @@
-import type { Tool, ToolResult } from './types';
+import type { Tool, ToolExecutionContext, ToolResult } from './types';
 import type { ToolsConfig } from '../config/types';
 
 export class ToolRegistry {
@@ -17,12 +17,16 @@ export class ToolRegistry {
     return [...this.tools.values()].filter(t => this.isAllowed(t));
   }
 
-  async execute(name: string, params: Record<string, unknown>): Promise<ToolResult> {
+  async execute(
+    name: string,
+    params: Record<string, unknown>,
+    context?: ToolExecutionContext,
+  ): Promise<ToolResult> {
     const tool = this.tools.get(name);
     if (!tool) throw new Error(`Tool not found: ${name}`);
     if (!this.isAllowed(tool)) throw new Error(`Tool not allowed: ${name}`);
     try {
-      return await tool.execute(params);
+      return await tool.execute(params, context);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[tool:${name}] Error:`, msg);
