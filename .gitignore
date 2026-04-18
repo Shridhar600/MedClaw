@@ -170,3 +170,8 @@ docs/userResearch/06-openclaw-ollama-local-models.md
 docs/userResearch/07-openclaw-tools-system.md
 docs/userResearch/CLAUDE_MD_BEST_PRACTICES_RESEARCH.md
 docs/userResearch/openclaw-ollama-research.md
+.agents/skills/add-channel/SKILL.md
+.agents/skills/add-provider/SKILL.md
+.agents/skills/add-tool/SKILL.md
+docs/superpowers/plans/2026-04-18-phase-2.6-stabilization.md
+docs/superpowers/plans/2026-04-18-phase-2.7-review-fixes.md
