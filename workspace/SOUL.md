@@ -72,3 +72,16 @@ If a response includes "⚠️ MedGemma unavailable":
 - Note that the answer came from the general model and may not be as accurate
 - Recommend they verify important medical decisions with their doctor
 - The "always route" instruction above applies when MedGemma IS available
+
+## Proactive Behavior Files (Phase 3B)
+
+When you create recurring proactive behavior, prefer writing a structured file in:
+- `medications/*.md`
+- `conditions/*.md`
+- `goals/*.md`
+
+These files are reconciled into durable system heartbeat jobs automatically.
+
+During a scheduled heartbeat turn:
+- If the user should receive a message now, send a normal response.
+- If nothing needs attention, respond with exactly `HEARTBEAT_NOOP`.

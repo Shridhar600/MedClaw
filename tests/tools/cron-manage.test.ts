@@ -52,6 +52,8 @@ describe('cron_manage tool', () => {
       cron: '0 8 * * *',
       prompt: 'How are you feeling today?',
       source: 'system',
+      kind: 'routine',
+      policyKey: 'defaults:morning-check-in',
     });
 
     const result = await tool.execute({ action: 'list' });

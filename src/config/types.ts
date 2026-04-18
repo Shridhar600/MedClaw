@@ -38,10 +38,32 @@ export interface SessionsConfig {
   };
 }
 
+export interface HeartbeatPolicyConfig {
+  quietHours: {
+    enabled: boolean;
+    start: string;
+    end: string;
+  };
+  skipIfChatActiveWithinMinutes: number;
+  defaults: {
+    morningCheckIn: {
+      enabled: boolean;
+      cron: string;
+      prompt: string;
+    };
+    eveningSummary: {
+      enabled: boolean;
+      cron: string;
+      prompt: string;
+    };
+  };
+}
+
 export interface HeartbeatConfig {
   enabled: boolean;
   timezone: string;
   storePath: string;
+  policy: HeartbeatPolicyConfig;
 }
 
 export interface AgentConfig {

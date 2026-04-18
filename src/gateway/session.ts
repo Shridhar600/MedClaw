@@ -81,6 +81,20 @@ export class SessionManager {
     return this.sessions.get(chatId)?.history ?? [];
   }
 
+  getLastActiveAt(chatId: string): Date | undefined {
+    return this.sessions.get(chatId)?.lastActiveAt;
+  }
+
+  getMostRecentChatId(): string | undefined {
+    let latest: Session | undefined;
+    for (const session of this.sessions.values()) {
+      if (!latest || session.lastActiveAt.getTime() > latest.lastActiveAt.getTime()) {
+        latest = session;
+      }
+    }
+    return latest?.chatId;
+  }
+
   async prepareHistory(chatId: string): Promise<Message[]> {
     return this.enqueue(chatId, async () => {
       const session = this.sessions.get(chatId);

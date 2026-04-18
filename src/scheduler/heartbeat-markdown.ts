@@ -3,7 +3,17 @@ import * as path from 'path';
 import type { HeartbeatJob } from './types';
 
 function formatJob(job: HeartbeatJob): string {
-  return `- ${job.title} | ${job.cron} | ${job.timezone} | ${job.enabled ? 'enabled' : 'paused'} | ${job.prompt}`;
+  return [
+    `- ${job.title}`,
+    `  kind: ${job.kind}`,
+    `  source: ${job.source}`,
+    `  cron: ${job.cron}`,
+    `  timezone: ${job.timezone}`,
+    `  status: ${job.enabled ? 'enabled' : 'paused'}`,
+    `  policyKey: ${job.policyKey ?? '(manual)'}`,
+    `  lastOutcome: ${job.lastOutcome ?? '(never-run)'}`,
+    `  prompt: ${job.prompt}`,
+  ].join('\n');
 }
 
 export async function syncHeartbeatMarkdown(

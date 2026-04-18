@@ -30,6 +30,14 @@ describe('Gateway media flow', () => {
         enabled: false,
         timezone: 'Asia/Kolkata',
         storePath: '/tmp/redacted-test/heartbeats/jobs.json',
+        policy: {
+          quietHours: { enabled: true, start: '22:00', end: '07:00' },
+          skipIfChatActiveWithinMinutes: 60,
+          defaults: {
+            morningCheckIn: { enabled: true, cron: '0 8 * * *', prompt: 'Morning check-in prompt.' },
+            eveningSummary: { enabled: true, cron: '0 21 * * *', prompt: 'Evening summary prompt.' },
+          },
+        },
       },
       agent: {
         maxIterations: 15,

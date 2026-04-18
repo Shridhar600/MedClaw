@@ -54,6 +54,28 @@ const DEFAULTS: AppConfig = {
     enabled: true,
     timezone: 'Asia/Kolkata',
     storePath: path.join(os.homedir(), '.redacted', 'heartbeats', 'jobs.json'),
+    policy: {
+      quietHours: {
+        enabled: true,
+        start: '22:00',
+        end: '07:00',
+      },
+      skipIfChatActiveWithinMinutes: 60,
+      defaults: {
+        morningCheckIn: {
+          enabled: true,
+          cron: '0 8 * * *',
+          prompt:
+            'Ask how the user is feeling this morning and whether there is anything health-related to address today.',
+        },
+        eveningSummary: {
+          enabled: true,
+          cron: '0 21 * * *',
+          prompt:
+            'Ask for a short end-of-day health summary, medication adherence, and anything to remember for tomorrow.',
+        },
+      },
+    },
   },
   agent: {
     maxIterations: 15,

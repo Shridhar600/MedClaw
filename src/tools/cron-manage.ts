@@ -66,6 +66,7 @@ export function createCronManageTool(
             timezone,
             prompt,
             source: 'agent',
+            kind: 'routine',
           });
           await syncHeartbeatMarkdown(workspacePath, await scheduler.listJobs());
           return {

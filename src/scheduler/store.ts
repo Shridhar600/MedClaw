@@ -1,7 +1,12 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
-import type { CreateHeartbeatJobInput, HeartbeatJob, UpdateHeartbeatJobInput } from './types';
+import type {
+  CreateHeartbeatJobInput,
+  HeartbeatJob,
+  HeartbeatLastOutcome,
+  UpdateHeartbeatJobInput,
+} from './types';
 
 export class HeartbeatStore {
   constructor(private readonly filePath: string) {}
@@ -14,8 +19,18 @@ export class HeartbeatStore {
     return this.readJobs().find((job) => job.id === id);
   }
 
+  async findByPolicyKey(policyKey: string): Promise<HeartbeatJob | undefined> {
+    return this.readJobs().find((job) => job.policyKey === policyKey);
+  }
+
   async create(input: CreateHeartbeatJobInput): Promise<HeartbeatJob> {
     const jobs = this.readJobs();
+    if (input.policyKey) {
+      const duplicate = jobs.find((job) => job.policyKey === input.policyKey);
+      if (duplicate) {
+        throw new Error(`Duplicate heartbeat policy key: ${input.policyKey}`);
+      }
+    }
     const now = new Date().toISOString();
     const job: HeartbeatJob = {
       id: randomUUID(),
@@ -26,6 +41,8 @@ export class HeartbeatStore {
       prompt: input.prompt,
       enabled: true,
       source: input.source,
+      kind: input.kind,
+      policyKey: input.policyKey,
       createdAt: now,
       updatedAt: now,
     };
@@ -88,6 +105,24 @@ export class HeartbeatStore {
     jobs[index] = {
       ...jobs[index],
       lastError: message,
+      lastOutcome: 'error',
+      lastOutcomeAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    this.writeJobs(jobs);
+  }
+
+  async markOutcome(id: string, outcome: HeartbeatLastOutcome): Promise<void> {
+    const jobs = this.readJobs();
+    const index = jobs.findIndex((job) => job.id === id);
+    if (index < 0) {
+      throw new Error(`Heartbeat job not found: ${id}`);
+    }
+
+    jobs[index] = {
+      ...jobs[index],
+      lastOutcome: outcome,
+      lastOutcomeAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
     this.writeJobs(jobs);

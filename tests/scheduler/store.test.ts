@@ -24,6 +24,8 @@ describe('HeartbeatStore', () => {
       cron: '0 8 * * *',
       prompt: 'Ask how the user is feeling today.',
       source: 'system',
+      kind: 'routine',
+      policyKey: 'defaults:morning-check-in',
     });
 
     const store2 = new HeartbeatStore(storePath);
@@ -41,6 +43,8 @@ describe('HeartbeatStore', () => {
       cron: '0 21 * * *',
       prompt: 'Ask for end-of-day summary.',
       source: 'system',
+      kind: 'routine',
+      policyKey: 'defaults:evening-summary',
     });
 
     const runTime = '2026-04-18T11:00:00.000Z';
@@ -51,6 +55,56 @@ describe('HeartbeatStore', () => {
     expect(refreshed).toBeDefined();
     expect(refreshed!.lastRunAt).toBe(runTime);
     expect(refreshed!.lastError).toBe('channel unavailable');
+  });
+
+  it('round-trips policy and outcome metadata through disk persistence', async () => {
+    const store = new HeartbeatStore(storePath);
+    const created = await store.create({
+      title: 'Metformin reminder',
+      chatId: 'chat-1',
+      cron: '0 8,20 * * *',
+      prompt: 'Take Metformin.',
+      source: 'system',
+      kind: 'medication',
+      policyKey: 'medications:medications/metformin.md',
+    });
+    await store.update(created.id, {
+      lastOutcome: 'sent',
+      lastOutcomeAt: '2026-04-18T06:30:00.000Z',
+    });
+
+    const reloaded = new HeartbeatStore(storePath);
+    const saved = await reloaded.get(created.id);
+    expect(saved).toBeDefined();
+    expect(saved!.kind).toBe('medication');
+    expect(saved!.policyKey).toBe('medications:medications/metformin.md');
+    expect(saved!.lastOutcome).toBe('sent');
+    expect(saved!.lastOutcomeAt).toBe('2026-04-18T06:30:00.000Z');
+  });
+
+  it('rejects duplicate policy keys', async () => {
+    const store = new HeartbeatStore(storePath);
+    await store.create({
+      title: 'Morning check-in',
+      chatId: 'chat-1',
+      cron: '0 8 * * *',
+      prompt: 'First.',
+      source: 'system',
+      kind: 'routine',
+      policyKey: 'defaults:morning-check-in',
+    });
+
+    await expect(
+      store.create({
+        title: 'Duplicate morning check-in',
+        chatId: 'chat-1',
+        cron: '0 9 * * *',
+        prompt: 'Second.',
+        source: 'system',
+        kind: 'routine',
+        policyKey: 'defaults:morning-check-in',
+      }),
+    ).rejects.toThrow('Duplicate heartbeat policy key');
   });
 
   it('quarantines malformed jobs file and degrades to empty store', async () => {

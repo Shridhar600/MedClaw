@@ -1,5 +1,10 @@
 import * as cron from 'node-cron';
-import type { CreateHeartbeatJobInput, HeartbeatJob } from './types';
+import type {
+  CreateHeartbeatJobInput,
+  HeartbeatJob,
+  HeartbeatLastOutcome,
+  UpdateHeartbeatJobInput,
+} from './types';
 import { HeartbeatStore } from './store';
 
 type HeartbeatTrigger = (job: HeartbeatJob) => Promise<void>;
@@ -13,15 +18,6 @@ export class HeartbeatScheduler {
     private readonly defaultTimezone: string = 'Asia/Kolkata',
   ) {}
 
-  async start(): Promise<void> {
-    const jobs = await this.store.list();
-    for (const job of jobs) {
-      if (job.enabled) {
-        this.register(job);
-      }
-    }
-  }
-
   async stop(): Promise<void> {
     for (const task of this.tasks.values()) {
       task.stop();
@@ -31,6 +27,10 @@ export class HeartbeatScheduler {
 
   async listJobs(): Promise<HeartbeatJob[]> {
     return this.store.list();
+  }
+
+  getStore(): HeartbeatStore {
+    return this.store;
   }
 
   async createJob(input: CreateHeartbeatJobInput): Promise<HeartbeatJob> {
@@ -43,6 +43,26 @@ export class HeartbeatScheduler {
       this.register(created);
     }
     return created;
+  }
+
+  async updateJob(id: string, patch: UpdateHeartbeatJobInput): Promise<HeartbeatJob> {
+    const current = await this.store.get(id);
+    if (!current) {
+      throw new Error(`Heartbeat job not found: ${id}`);
+    }
+
+    const nextCron = patch.cron ?? current.cron;
+    if ((patch.enabled ?? current.enabled) !== false) {
+      this.validateCron(nextCron);
+    }
+
+    const updated = await this.store.update(id, patch);
+    if (updated.enabled) {
+      this.register(updated);
+    } else {
+      this.unregister(updated.id);
+    }
+    return updated;
   }
 
   async deleteJob(id: string): Promise<boolean> {
@@ -76,6 +96,10 @@ export class HeartbeatScheduler {
       return;
     }
     await this.executeJob(job);
+  }
+
+  async recordOutcome(id: string, outcome: HeartbeatLastOutcome): Promise<void> {
+    await this.store.markOutcome(id, outcome);
   }
 
   private register(job: HeartbeatJob): void {
@@ -116,6 +140,31 @@ export class HeartbeatScheduler {
       const message = error instanceof Error ? error.message : String(error);
       await this.store.markError(job.id, message);
       console.error(`[scheduler] Heartbeat job failed (${job.id}):`, message);
+    }
+  }
+
+  private async disableInvalidJob(job: HeartbeatJob, message: string): Promise<void> {
+    try {
+      await this.store.update(job.id, { enabled: false });
+      await this.store.markError(job.id, message);
+    } catch (updateError) {
+      console.error(`[scheduler] Failed to disable invalid heartbeat job (${job.id}):`, updateError);
+    }
+  }
+
+  async start(): Promise<void> {
+    const jobs = await this.store.list();
+    for (const job of jobs) {
+      if (!job.enabled) {
+        continue;
+      }
+      try {
+        this.register(job);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await this.disableInvalidJob(job, message);
+        console.error(`[scheduler] Failed to register heartbeat job (${job.id}):`, message);
+      }
     }
   }
 }

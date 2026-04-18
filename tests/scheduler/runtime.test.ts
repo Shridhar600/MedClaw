@@ -25,6 +25,8 @@ describe('HeartbeatScheduler', () => {
       cron: '* * * * *',
       prompt: 'Ask how the user is feeling.',
       source: 'system',
+      kind: 'routine',
+      policyKey: 'defaults:morning-check-in',
     });
     const trigger = jest.fn().mockResolvedValue(undefined);
     const scheduler = new HeartbeatScheduler(store, trigger);
@@ -44,6 +46,8 @@ describe('HeartbeatScheduler', () => {
       cron: '* * * * *',
       prompt: 'Ask for end-of-day summary.',
       source: 'system',
+      kind: 'routine',
+      policyKey: 'defaults:evening-summary',
     });
     const trigger = jest.fn().mockResolvedValue(undefined);
     const scheduler = new HeartbeatScheduler(store, trigger);
@@ -68,7 +72,34 @@ describe('HeartbeatScheduler', () => {
         cron: 'not-a-cron',
         prompt: 'Should fail.',
         source: 'user',
+        kind: 'routine',
       }),
     ).rejects.toThrow('Invalid cron');
+  });
+
+  it('disables invalid persisted jobs instead of crashing startup', async () => {
+    const store = new HeartbeatStore(storePath);
+    await store.create({
+      title: 'Invalid persisted job',
+      chatId: 'chat-1',
+      cron: '0 8 * * *',
+      prompt: 'Should be disabled on startup.',
+      source: 'system',
+      kind: 'routine',
+      policyKey: 'defaults:invalid',
+    });
+    const persisted = await store.findByPolicyKey('defaults:invalid');
+    expect(persisted).toBeDefined();
+    await store.update(persisted!.id, { cron: 'not-a-cron' });
+
+    const trigger = jest.fn().mockResolvedValue(undefined);
+    const scheduler = new HeartbeatScheduler(store, trigger);
+
+    await expect(scheduler.start()).resolves.toBeUndefined();
+
+    const refreshed = await store.get(persisted!.id);
+    expect(refreshed?.enabled).toBe(false);
+    expect(refreshed?.lastOutcome).toBe('error');
+    await scheduler.stop();
   });
 });

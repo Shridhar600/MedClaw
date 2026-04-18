@@ -18,6 +18,9 @@ import { HeartbeatStore } from '../scheduler/store';
 import { HeartbeatScheduler } from '../scheduler/runtime';
 import { syncHeartbeatMarkdown } from '../scheduler/heartbeat-markdown';
 import type { HeartbeatJob } from '../scheduler/types';
+import { decideHeartbeatDelivery, HEARTBEAT_NOOP } from '../scheduler/delivery-policy';
+import { buildDesiredHeartbeatJobs } from '../scheduler/policy-engine';
+import { reconcilePolicyJobs } from '../scheduler/reconciler';
 
 export class Gateway {
   private config: AppConfig;
@@ -109,6 +112,7 @@ export class Gateway {
       { role: 'user', content: text },
       ...result.trace,
     ]);
+    await this.reconcileHeartbeatPolicies(chatId);
     return result.text;
   }
 
@@ -159,6 +163,7 @@ export class Gateway {
           ...result.trace,
         ],
       );
+      await this.reconcileHeartbeatPolicies(chatId);
     } catch (e) {
       console.error('[gateway] Agent error:', e);
       await this.channel!.send(chatId, { text: "I'm having trouble right now. Please try again in a moment." });
@@ -186,10 +191,25 @@ export class Gateway {
       this.config.heartbeat.timezone,
     );
     await this.scheduler.start();
+    const startupChatId = await this.resolveStartupPolicyChatId();
+    if (startupChatId) {
+      await this.reconcileHeartbeatPolicies(startupChatId);
+    }
     await syncHeartbeatMarkdown(this.config.memory.workspace, await this.scheduler.listJobs());
   }
 
   private async handleScheduledJob(job: HeartbeatJob): Promise<void> {
+    const decision = decideHeartbeatDelivery(job, {
+      now: new Date(Date.now()),
+      quietHours: this.config.heartbeat.policy.quietHours,
+      lastChatActivityAt: this.sessions!.getLastActiveAt(job.chatId),
+      skipIfChatActiveWithinMinutes: this.config.heartbeat.policy.skipIfChatActiveWithinMinutes,
+    });
+    if (decision.action === 'skip') {
+      await this.scheduler?.recordOutcome(job.id, decision.reason);
+      return;
+    }
+
     const history = await this.sessions!.prepareHistory(job.chatId);
     const input = [
       '[Heartbeat Trigger]',
@@ -198,12 +218,55 @@ export class Gateway {
       `Prompt: ${job.prompt}`,
     ].join('\n');
 
-    const result = await this.agentLoop!.run(input, history, { chatId: job.chatId });
-    await this.channel!.send(job.chatId, { text: result.text });
-    await this.sessions!.recordTurn(job.chatId, [
-      { role: 'user', content: input },
-      ...result.trace,
-    ]);
+    try {
+      const result = await this.agentLoop!.run(input, history, { chatId: job.chatId });
+      if (result.text === HEARTBEAT_NOOP) {
+        await this.sessions!.recordTurn(job.chatId, [
+          { role: 'user', content: input },
+          ...result.trace,
+        ]);
+        await this.scheduler?.recordOutcome(job.id, 'noop');
+        await this.reconcileHeartbeatPolicies(job.chatId);
+        return;
+      }
+
+      await this.channel!.send(job.chatId, { text: result.text });
+      await this.sessions!.recordTurn(job.chatId, [
+        { role: 'user', content: input },
+        ...result.trace,
+      ]);
+      await this.scheduler?.recordOutcome(job.id, 'sent');
+      await this.reconcileHeartbeatPolicies(job.chatId);
+    } catch (error) {
+      await this.scheduler?.recordOutcome(job.id, 'error');
+      throw error;
+    }
+  }
+
+  private async reconcileHeartbeatPolicies(chatId: string): Promise<void> {
+    if (!this.scheduler) {
+      return;
+    }
+
+    const desired = await buildDesiredHeartbeatJobs({
+      workspacePath: this.config.memory.workspace,
+      chatId,
+      timezone: this.config.heartbeat.timezone,
+      policy: this.config.heartbeat.policy,
+    });
+    await reconcilePolicyJobs(this.scheduler, desired);
+    await syncHeartbeatMarkdown(this.config.memory.workspace, await this.scheduler.listJobs());
+  }
+
+  private async resolveStartupPolicyChatId(): Promise<string | undefined> {
+    const sessionChatId = this.sessions?.getMostRecentChatId();
+    if (sessionChatId) {
+      return sessionChatId;
+    }
+
+    const jobs = await this.scheduler!.listJobs();
+    const persistedChatId = jobs.find((job) => job.chatId !== '__startup__')?.chatId;
+    return persistedChatId;
   }
 
   private buildAgentInput(incoming: IncomingMessage): string {
