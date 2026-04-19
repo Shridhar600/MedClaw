@@ -10,6 +10,7 @@ import { ToolRegistry } from '../tools/registry';
 import { createMemoryTools } from '../tools/memory-tools';
 import { createMedicalTools } from '../tools/medical-tools';
 import { createCronManageTool } from '../tools/cron-manage';
+import { createHeartbeatManageTool } from '../tools/heartbeat-manage';
 import { SqliteStore } from '../memory/sqlite-store';
 import { MemorySearch } from '../memory/search';
 import { createProvider } from '../providers/factory';
@@ -100,6 +101,7 @@ export class Gateway {
     await this.initializeScheduler();
     if (this.scheduler) {
       registry.register(createCronManageTool(this.scheduler, config.memory.workspace));
+      registry.register(createHeartbeatManageTool(this.scheduler, config.memory.workspace));
     }
 
     console.log('[gateway] Redacted is running.');
@@ -187,8 +189,17 @@ export class Gateway {
     const store = new HeartbeatStore(this.config.heartbeat.storePath);
     this.scheduler = new HeartbeatScheduler(
       store,
-      async (job) => this.handleScheduledJob(job),
+      async (job) => this.handleScheduledJob(job, true),
       this.config.heartbeat.timezone,
+      {
+        auditLogPath: this.config.heartbeat.audit.path,
+        defaultMaxRetries: this.config.heartbeat.retry.maxRetries,
+        maxGlobalTriggersPerMinute: this.config.heartbeat.rateLimit.maxGlobalTriggersPerMinute,
+        maxPerChatTriggersPerMinute: this.config.heartbeat.rateLimit.maxPerChatTriggersPerMinute,
+        recoveryEnabled: this.config.heartbeat.recovery.enabled,
+        recoveryWindowMinutes: this.config.heartbeat.recovery.windowMinutes,
+        retryBackoffMinutes: this.config.heartbeat.retry.backoffMinutes,
+      },
     );
     await this.scheduler.start();
     const startupChatId = await this.resolveStartupPolicyChatId();
@@ -198,7 +209,7 @@ export class Gateway {
     await syncHeartbeatMarkdown(this.config.memory.workspace, await this.scheduler.listJobs());
   }
 
-  private async handleScheduledJob(job: HeartbeatJob): Promise<void> {
+  private async handleScheduledJob(job: HeartbeatJob, invokedByScheduler: boolean = false): Promise<void> {
     const decision = decideHeartbeatDelivery(job, {
       now: new Date(Date.now()),
       quietHours: this.config.heartbeat.policy.quietHours,
@@ -238,7 +249,10 @@ export class Gateway {
       await this.scheduler?.recordOutcome(job.id, 'sent');
       await this.reconcileHeartbeatPolicies(job.chatId);
     } catch (error) {
-      await this.scheduler?.recordOutcome(job.id, 'error');
+      if (!invokedByScheduler) {
+        const message = error instanceof Error ? error.message : String(error);
+        await this.scheduler?.recordFailure(job.id, message);
+      }
       throw error;
     }
   }

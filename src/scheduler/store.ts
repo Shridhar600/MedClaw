@@ -42,6 +42,9 @@ export class HeartbeatStore {
       enabled: true,
       source: input.source,
       kind: input.kind,
+      deliveryState: 'ready',
+      retryCount: 0,
+      maxRetries: input.maxRetries ?? 0,
       policyKey: input.policyKey,
       createdAt: now,
       updatedAt: now,
@@ -143,7 +146,7 @@ export class HeartbeatStore {
       if (!Array.isArray(parsed)) {
         throw new Error('Heartbeat store payload must be an array.');
       }
-      return parsed as HeartbeatJob[];
+      return parsed.map((job) => this.normalizeJob(job));
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       try {
@@ -173,5 +176,14 @@ export class HeartbeatStore {
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
     fs.renameSync(this.filePath, quarantinedPath);
     return quarantinedPath;
+  }
+
+  private normalizeJob(job: HeartbeatJob): HeartbeatJob {
+    return {
+      ...job,
+      deliveryState: job.deliveryState ?? 'ready',
+      retryCount: job.retryCount ?? 0,
+      maxRetries: job.maxRetries ?? 0,
+    };
   }
 }

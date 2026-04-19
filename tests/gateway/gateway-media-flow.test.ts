@@ -30,6 +30,10 @@ describe('Gateway media flow', () => {
         enabled: false,
         timezone: 'Asia/Kolkata',
         storePath: '/tmp/redacted-test/heartbeats/jobs.json',
+        recovery: { enabled: false, windowMinutes: 60 },
+        retry: { maxRetries: 3, backoffMinutes: 5 },
+        rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
+        audit: { path: '/tmp/redacted-test/heartbeats/audit.jsonl' },
         policy: {
           quietHours: { enabled: true, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,

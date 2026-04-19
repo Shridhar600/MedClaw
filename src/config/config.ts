@@ -76,6 +76,21 @@ const DEFAULTS: AppConfig = {
         },
       },
     },
+    recovery: {
+      enabled: false,
+      windowMinutes: 60,
+    },
+    retry: {
+      maxRetries: 3,
+      backoffMinutes: 5,
+    },
+    rateLimit: {
+      maxGlobalTriggersPerMinute: 10,
+      maxPerChatTriggersPerMinute: 3,
+    },
+    audit: {
+      path: path.join(os.homedir(), '.redacted', 'heartbeats', 'audit.jsonl'),
+    },
   },
   agent: {
     maxIterations: 15,
@@ -124,6 +139,7 @@ export async function loadConfig(configPath?: string): Promise<AppConfig> {
   // Resolve ~ in paths
   merged.memory.workspace = resolvePath(merged.memory.workspace);
   merged.heartbeat.storePath = resolvePath(merged.heartbeat.storePath);
+  merged.heartbeat.audit!.path = resolvePath(merged.heartbeat.audit!.path);
 
   return merged;
 }
