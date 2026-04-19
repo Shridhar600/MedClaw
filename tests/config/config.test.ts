@@ -71,6 +71,17 @@ describe('loadConfig', () => {
     expect(config.heartbeat.policy.defaults.eveningSummary.enabled).toBe(true);
   });
 
+  it('provides heartbeat hardening defaults', async () => {
+    const config = await loadConfig(path.join(tmpDir, 'nonexistent.json'));
+    expect(config.heartbeat.recovery?.enabled).toBe(false);
+    expect(config.heartbeat.recovery?.windowMinutes).toBe(60);
+    expect(config.heartbeat.retry?.maxRetries).toBe(3);
+    expect(config.heartbeat.retry?.backoffMinutes).toBe(5);
+    expect(config.heartbeat.rateLimit?.maxGlobalTriggersPerMinute).toBe(10);
+    expect(config.heartbeat.rateLimit?.maxPerChatTriggersPerMinute).toBe(3);
+    expect(config.heartbeat.audit?.path).toContain(path.join('.redacted', 'heartbeats', 'audit.jsonl'));
+  });
+
   it('allows overriding quiet hours and default routines', async () => {
     const cfgPath = path.join(tmpDir, 'config.json');
     fs.writeFileSync(
@@ -95,5 +106,30 @@ describe('loadConfig', () => {
     expect(config.heartbeat.policy.skipIfChatActiveWithinMinutes).toBe(15);
     expect(config.heartbeat.policy.defaults.morningCheckIn.enabled).toBe(false);
     expect(config.heartbeat.policy.defaults.eveningSummary.prompt).toBe('Summarize the day.');
+  });
+
+  it('allows overriding heartbeat hardening defaults', async () => {
+    const cfgPath = path.join(tmpDir, 'config.json');
+    fs.writeFileSync(
+      cfgPath,
+      JSON.stringify({
+        heartbeat: {
+          recovery: { enabled: true, windowMinutes: 180 },
+          retry: { maxRetries: 7, backoffMinutes: 12 },
+          rateLimit: { maxGlobalTriggersPerMinute: 4, maxPerChatTriggersPerMinute: 2 },
+          audit: { path: '~/.redacted/custom-audit.jsonl' },
+        },
+      }),
+    );
+
+    const config = await loadConfig(cfgPath);
+    expect(config.heartbeat.recovery?.enabled).toBe(true);
+    expect(config.heartbeat.recovery?.windowMinutes).toBe(180);
+    expect(config.heartbeat.retry?.maxRetries).toBe(7);
+    expect(config.heartbeat.retry?.backoffMinutes).toBe(12);
+    expect(config.heartbeat.rateLimit?.maxGlobalTriggersPerMinute).toBe(4);
+    expect(config.heartbeat.rateLimit?.maxPerChatTriggersPerMinute).toBe(2);
+    expect(config.heartbeat.audit?.path.startsWith(os.homedir())).toBe(true);
+    expect(config.heartbeat.audit?.path).not.toContain('~');
   });
 });

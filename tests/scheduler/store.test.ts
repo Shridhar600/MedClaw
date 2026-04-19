@@ -82,6 +82,75 @@ describe('HeartbeatStore', () => {
     expect(saved!.lastOutcomeAt).toBe('2026-04-18T06:30:00.000Z');
   });
 
+  it('round-trips durable runtime state through disk persistence', async () => {
+    const store = new HeartbeatStore(storePath);
+    const created = await store.create({
+      title: 'Recovery reminder',
+      chatId: 'chat-1',
+      cron: '0 8 * * *',
+      prompt: 'Recover and check in.',
+      source: 'system',
+      kind: 'recovery',
+      maxRetries: 4,
+    });
+
+    await store.update(created.id, {
+      deliveryState: 'retry-wait',
+      acknowledgedAt: '2026-04-19T12:00:00.000Z',
+      retryCount: 2,
+      maxRetries: 4,
+      nextRetryAt: '2026-04-19T12:30:00.000Z',
+      snoozedUntil: '2026-04-19T13:00:00.000Z',
+      lastAttemptAt: '2026-04-19T11:45:00.000Z',
+      lastDeliveredAt: '2026-04-19T11:15:00.000Z',
+      deadLetterReason: 'max retries exhausted',
+    });
+
+    const reloaded = new HeartbeatStore(storePath);
+    const saved = await reloaded.get(created.id);
+    expect(saved).toBeDefined();
+    expect(saved!.deliveryState).toBe('retry-wait');
+    expect(saved!.acknowledgedAt).toBe('2026-04-19T12:00:00.000Z');
+    expect(saved!.retryCount).toBe(2);
+    expect(saved!.maxRetries).toBe(4);
+    expect(saved!.nextRetryAt).toBe('2026-04-19T12:30:00.000Z');
+    expect(saved!.snoozedUntil).toBe('2026-04-19T13:00:00.000Z');
+    expect(saved!.lastAttemptAt).toBe('2026-04-19T11:45:00.000Z');
+    expect(saved!.lastDeliveredAt).toBe('2026-04-19T11:15:00.000Z');
+    expect(saved!.deadLetterReason).toBe('max retries exhausted');
+  });
+
+  it('normalizes legacy jobs that predate the phase 3c durable fields', async () => {
+    fs.mkdirSync(path.dirname(storePath), { recursive: true });
+    fs.writeFileSync(
+      storePath,
+      JSON.stringify([
+        {
+          id: 'job-legacy',
+          title: 'Legacy reminder',
+          chatId: 'chat-1',
+          cron: '0 8 * * *',
+          timezone: 'Asia/Kolkata',
+          prompt: 'Legacy prompt.',
+          enabled: true,
+          source: 'system',
+          kind: 'routine',
+          createdAt: '2026-04-19T10:00:00.000Z',
+          updatedAt: '2026-04-19T10:00:00.000Z',
+        },
+      ]),
+      'utf8',
+    );
+
+    const store = new HeartbeatStore(storePath);
+    const job = await store.get('job-legacy');
+
+    expect(job).toBeDefined();
+    expect(job!.deliveryState).toBe('ready');
+    expect(job!.retryCount).toBe(0);
+    expect(job!.maxRetries).toBe(0);
+  });
+
   it('rejects duplicate policy keys', async () => {
     const store = new HeartbeatStore(storePath);
     await store.create({

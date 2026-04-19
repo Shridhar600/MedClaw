@@ -59,11 +59,34 @@ export interface HeartbeatPolicyConfig {
   };
 }
 
+export interface HeartbeatRecoveryConfig {
+  enabled: boolean;
+  windowMinutes: number;
+}
+
+export interface HeartbeatRetryConfig {
+  maxRetries: number;
+  backoffMinutes: number;
+}
+
+export interface HeartbeatRateLimitConfig {
+  maxGlobalTriggersPerMinute: number;
+  maxPerChatTriggersPerMinute: number;
+}
+
+export interface HeartbeatAuditConfig {
+  path: string;
+}
+
 export interface HeartbeatConfig {
   enabled: boolean;
   timezone: string;
   storePath: string;
   policy: HeartbeatPolicyConfig;
+  recovery: HeartbeatRecoveryConfig;
+  retry: HeartbeatRetryConfig;
+  rateLimit: HeartbeatRateLimitConfig;
+  audit: HeartbeatAuditConfig;
 }
 
 export interface AgentConfig {
