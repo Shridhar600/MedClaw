@@ -150,7 +150,13 @@ async function main(): Promise<void> {
 
   const registry = new ToolRegistry(config.tools);
   for (const tool of createMemoryTools(memory, search)) registry.register(tool);
-  for (const tool of createMedicalTools(memory, search, medicalProvider, mainProvider, workspacePath)) registry.register(tool);
+  for (const tool of createMedicalTools(memory, search, medicalProvider, mainProvider, workspacePath, {
+    medicalProviderType: config.providers.medical.type,
+    medicalProviderBaseUrl: config.providers.medical.baseUrl,
+    allowRawMedicalMedia: config.providers.medical.allowRawMedicalMedia,
+    mainProviderType: config.providers.main.type,
+    mainProviderBaseUrl: config.providers.main.baseUrl,
+  })) registry.register(tool);
 
   const assembler = new ContextAssembler(memory, config.memory.bootstrapMaxChars);
   const systemMessages = await assembler.buildSystemMessages();

@@ -19,6 +19,7 @@
     "json5": "^2.2.3",
     "node-cron": "^3.0.3",
     "openai": "^4.47.3",
+    "pdf-parse": "^2.4.5",
     "sqlite-vec": "^0.1.6"
   },
   "devDependencies": {

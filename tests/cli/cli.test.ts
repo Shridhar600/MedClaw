@@ -122,8 +122,8 @@ describe('cli router', () => {
       ].join('\n');
 
       const result = spawnSync(
-        'npx',
-        ['tsx', 'src/cli/index.ts', 'init', '--config', configPath],
+        process.execPath,
+        ['--import', 'tsx', 'src/cli/index.ts', 'init', '--config', configPath],
         {
           cwd: path.join(__dirname, '..', '..'),
           env: { ...process.env, HOME: home.tmpDir },

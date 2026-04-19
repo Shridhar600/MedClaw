@@ -18,6 +18,12 @@ export interface Message {
   }>;
 }
 
+export interface ImageAttachment {
+  mimeType: 'image/png' | 'image/jpeg';
+  data: string;            // Raw base64 without a data: prefix.
+  filename?: string;
+}
+
 export interface ToolSchema {
   type: 'function';
   function: {
@@ -45,6 +51,7 @@ export type LLMResponse = TextResponse | ToolCallResponse;
 
 export interface LLMProvider {
   chat(messages: Message[], tools?: ToolSchema[]): Promise<LLMResponse>;
+  chatWithImages?(messages: Message[], images: ImageAttachment[]): Promise<LLMResponse>;
   embed(text: string): Promise<number[]>;
 }
 
