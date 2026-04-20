@@ -5,6 +5,7 @@ export interface ProviderConfig {
   baseUrl?: string;
   model: string;
   apiKey?: string;
+  allowRawMedicalMedia?: boolean;
 }
 
 export interface ChannelConfig {

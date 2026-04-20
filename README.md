@@ -14,7 +14,7 @@ It is designed as a modular, self-hosted system:
 - Chat as a persistent personal health assistant over Telegram
 - Maintain long-term context from local health files and daily logs
 - Search relevant memory and condition history during conversations
-- Analyze uploaded **text-based** reports and use the results in later conversations
+- Analyze uploaded medical reports, including supported text, PDF, and image files
 - Store session traces on disk and resume context across restarts
 - Create and manage heartbeat reminders
 - Run scheduled medication or check-in prompts through the same agent pipeline
@@ -44,7 +44,7 @@ MedClaw is not just a generic chatbot with a health-themed prompt. It has a dedi
 - Health questions can be routed to MedGemma-backed tools instead of relying only on the main conversation model.
 - MedGemma calls are enriched with user health context from `HEALTH_PROFILE.md` plus relevant retrieved memories.
 - Report analysis is handled as a medical workflow instead of a plain file-summary workflow.
-- If MedGemma is unavailable, the system falls back gracefully, but the intended path is still medically grounded reasoning first.
+- If MedGemma is unavailable, the system falls back only to a local main provider by default, so medical context is not silently sent to a non-local generic model.
 
 That is what makes the assistant feel more domain-specific: the health path is not an afterthought, it is a first-class part of the architecture.
 
@@ -227,19 +227,20 @@ MedClaw is already usable as an MVP for:
 - personal health chat with persistent context
 - guided service setup and first-user profile onboarding
 - memory-backed conversations
-- text-based report ingestion
+- medical report ingestion for supported text, PDF, and image files
 - local health data organization
 - heartbeat reminders and scheduled check-ins
 
 ## Current Limits
 
-- Report analysis is currently **text-only**. Text-based files such as `.txt`, `.md`, `.csv`, `.json`, and `.log` work. OCR/PDF/image parsing is not implemented yet.
+- Report analysis supports files under `workspace/reports/`: text files (`.txt`, `.md`, `.csv`, `.json`, `.log`), text PDFs, scanned PDFs rendered to page images, and PNG/JPEG images. Image/scanned-PDF analysis requires a vision-capable medical provider such as a local MedGemma vision model; raw media is sent only to a local Ollama medical endpoint by default, and any non-local raw-media processing is opt-in only.
+- If the medical provider fails, health-context fallbacks are allowed only to a local main provider by default. The system does not silently send medical context or extracted report text to a non-local generic provider.
 - External health-system integrations are not part of the current MVP yet.
 - The current admin surface is a local CLI, not a web dashboard.
 
 ## Coming Soon
 
-Phase 4 is planned around integrations and platform upgrades:
+Phase 4C+ is planned around integrations and platform upgrades:
 
 - Open Wearables integration
 - FHIR integration

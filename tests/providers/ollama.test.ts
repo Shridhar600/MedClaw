@@ -66,6 +66,34 @@ describe('OllamaProvider', () => {
     expect(embedding).toEqual([0.1, 0.2, 0.3]);
   });
 
+  it('sends image attachments through the native Ollama vision API', async () => {
+    (global.fetch as jest.Mock).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        message: { role: 'assistant', content: 'Image analysis complete.' },
+      }),
+    });
+
+    const result = await provider.chatWithImages!(
+      [
+        { role: 'system', content: 'Analyze medical reports safely.' },
+        { role: 'user', content: 'Analyze this image.' },
+      ],
+      [{ mimeType: 'image/jpeg', data: 'abc123', filename: 'report.jpg' }]
+    );
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      'http://localhost:11434/api/chat',
+      expect.objectContaining({
+        method: 'POST',
+        body: expect.any(String),
+      })
+    );
+    const body = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body);
+    expect(body.messages[1].images).toEqual(['abc123']);
+    expect(result).toEqual({ type: 'text', text: 'Image analysis complete.' });
+  });
+
   it('throws on non-ok HTTP response', async () => {
     (global.fetch as jest.Mock).mockResolvedValueOnce({
       ok: false,

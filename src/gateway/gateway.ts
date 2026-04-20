@@ -67,7 +67,13 @@ export class Gateway {
 
     // Medical tools with medical provider
     const medicalProvider = createProvider(config.providers.medical);
-    for (const tool of createMedicalTools(memory, search, medicalProvider, mainProvider, config.memory.workspace)) {
+    for (const tool of createMedicalTools(memory, search, medicalProvider, mainProvider, config.memory.workspace, {
+      medicalProviderType: config.providers.medical.type,
+      medicalProviderBaseUrl: config.providers.medical.baseUrl,
+      allowRawMedicalMedia: config.providers.medical.allowRawMedicalMedia,
+      mainProviderType: config.providers.main.type,
+      mainProviderBaseUrl: config.providers.main.baseUrl,
+    })) {
       registry.register(tool);
     }
 
