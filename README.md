@@ -18,6 +18,7 @@ It is designed as a modular, self-hosted system:
 - Store session traces on disk and resume context across restarts
 - Create and manage heartbeat reminders
 - Run scheduled medication or check-in prompts through the same agent pipeline
+- Initialize local config/workspace and inspect runtime state from a local CLI
 
 ## Core Capabilities
 
@@ -69,11 +70,12 @@ flowchart TD
 ## Runtime Flow
 
 1. A Telegram message reaches the gateway.
-2. The gateway assembles session history and agent input.
-3. The agent loop calls the configured LLM.
-4. If the LLM requests a tool, the tool registry executes it and returns the result to the loop.
-5. The final response is sent back to Telegram and persisted to session storage.
-6. Scheduled heartbeats use the same gateway and agent path, so proactive messages follow the same reasoning and memory flow as normal chat.
+2. If first-user onboarding is incomplete, the gateway collects durable profile context before the normal agent loop. Urgent emergency phrasing bypasses onboarding.
+3. The gateway assembles session history and agent input.
+4. The agent loop calls the configured LLM.
+5. If the LLM requests a tool, the tool registry executes it and returns the result to the loop.
+6. The final response is sent back to Telegram and persisted to session storage.
+7. Scheduled heartbeats use the same gateway and agent path, so proactive messages follow the same reasoning and memory flow as normal chat.
 
 ## How Memory Actually Works
 
@@ -146,28 +148,31 @@ ollama pull amsaravi/medgemma-4b-it:q8
 ollama pull nomic-embed-text
 ```
 
+### Initialize local config and workspace
+
+Run the service onboarding CLI before starting the daemon:
+
+```bash
+npm run cli -- init
+```
+
+For non-interactive local setup without Telegram:
+
+```bash
+npm run cli -- init --yes --provider ollama --telegram-enabled false
+```
+
+If Telegram is enabled, provide a token via the prompt, `--telegram-token`, or `TELEGRAM_BOT_TOKEN`. CLI output redacts secrets.
+
 ### Telegram bot setup
 
 1. Open Telegram and talk to `@BotFather`
 2. Run `/newbot`
 3. Choose a bot name and username
 4. Copy the bot token
-5. Put the token into `~/.redacted/config.json`
+5. Run `npm run cli -- init` and enable Telegram when prompted
 
-Example:
-
-```json
-{
-  "channels": {
-    "telegram": {
-      "enabled": true,
-      "botToken": "YOUR_BOT_TOKEN"
-    }
-  }
-}
-```
-
-Then start the daemon and send your bot a message from Telegram.
+Then start the daemon and send your bot a message. On a fresh workspace, first chat collects basic profile context and writes it locally to `USER.md`, `HEALTH_PROFILE.md`, and onboarding state.
 
 ### Run the project
 
@@ -175,6 +180,8 @@ Then start the daemon and send your bot a message from Telegram.
 npm run build
 npm run dev
 ```
+
+The daemon requires an explicit config file. If `~/.redacted/config.json` is missing, initialize with `npm run cli -- init`.
 
 ## Configuration
 
@@ -192,6 +199,17 @@ Key areas:
 - heartbeat settings and timezone
 - tool allow/deny controls
 
+Admin CLI examples:
+
+```bash
+npm run cli -- status
+npm run cli -- config show
+npm run cli -- config set providers.main.model llama3.1
+npm run cli -- profile show
+npm run cli -- user summary
+npm run cli -- heartbeats list
+```
+
 ## Useful Commands
 
 ```bash
@@ -200,12 +218,14 @@ npm run build
 npm run typecheck
 npm run lint
 npm run test
+npm run cli -- --help
 ```
 
 ## Current MVP Scope
 
 MedClaw is already usable as an MVP for:
 - personal health chat with persistent context
+- guided service setup and first-user profile onboarding
 - memory-backed conversations
 - text-based report ingestion
 - local health data organization
@@ -215,6 +235,7 @@ MedClaw is already usable as an MVP for:
 
 - Report analysis is currently **text-only**. Text-based files such as `.txt`, `.md`, `.csv`, `.json`, and `.log` work. OCR/PDF/image parsing is not implemented yet.
 - External health-system integrations are not part of the current MVP yet.
+- The current admin surface is a local CLI, not a web dashboard.
 
 ## Coming Soon
 

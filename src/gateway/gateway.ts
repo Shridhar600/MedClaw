@@ -22,6 +22,8 @@ import type { HeartbeatJob } from '../scheduler/types';
 import { decideHeartbeatDelivery, HEARTBEAT_NOOP } from '../scheduler/delivery-policy';
 import { buildDesiredHeartbeatJobs } from '../scheduler/policy-engine';
 import { reconcilePolicyJobs } from '../scheduler/reconciler';
+import { OnboardingFlow } from '../onboarding/flow';
+import { OnboardingStore } from '../onboarding/store';
 
 export class Gateway {
   private config: AppConfig;
@@ -108,6 +110,11 @@ export class Gateway {
   }
 
   async handleTestMessage(chatId: string, text: string): Promise<string> {
+    const onboarding = await this.handleOnboarding(chatId, text);
+    if (onboarding) {
+      return onboarding;
+    }
+
     const history = await this.sessions!.prepareHistory(chatId);
     const result = await this.agentLoop!.run(text, history, { chatId });
     await this.sessions!.recordTurn(chatId, [
@@ -150,6 +157,14 @@ export class Gateway {
         console.error('[gateway] Failed to persist media upload error turn:', e);
       }
       return;
+    }
+
+    if (!incoming.mediaPath) {
+      const onboarding = await this.handleOnboarding(chatId, text);
+      if (onboarding) {
+        await this.channel!.send(chatId, { text: onboarding });
+        return;
+      }
     }
 
     const history = await this.sessions!.prepareHistory(chatId);
@@ -295,6 +310,38 @@ export class Gateway {
       parts.push('', `User id: ${incoming.userId}`);
     }
     return parts.join('\n');
+  }
+
+  private async handleOnboarding(chatId: string, input: string): Promise<string | undefined> {
+    if (input.trim() === '/onboarding restart' || input.trim() === '/profile update') {
+      const flow = new OnboardingFlow(
+        new OnboardingStore(this.config.memory.workspace),
+        this.config.memory.workspace,
+        this.config.heartbeat.timezone,
+      );
+      const result = await flow.handle('restart onboarding');
+      await this.sessions?.recordTurn(chatId, [
+        { role: 'user', content: input },
+        { role: 'assistant', content: result.response },
+      ]);
+      return result.response;
+    }
+
+    const store = new OnboardingStore(this.config.memory.workspace);
+    const flow = new OnboardingFlow(store, this.config.memory.workspace, this.config.heartbeat.timezone);
+    if (await flow.isComplete()) {
+      return undefined;
+    }
+
+    const result = await flow.handle(input);
+    if (!result.response) {
+      return undefined;
+    }
+    await this.sessions?.recordTurn(chatId, [
+      { role: 'user', content: input },
+      { role: 'assistant', content: result.response },
+    ]);
+    return result.response;
   }
 
   // Copies workspace template files from the project's workspace/ dir to the workspace/

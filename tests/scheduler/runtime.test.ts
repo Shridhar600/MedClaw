@@ -105,7 +105,7 @@ describe('HeartbeatScheduler', () => {
 
   it('recovers one missed run on startup when recovery is enabled', async () => {
     const store = new HeartbeatStore(storePath);
-    await store.create({
+    const job = await store.create({
       title: 'Recoverable job',
       chatId: 'chat-1',
       cron: '0 8 * * *',
@@ -114,6 +114,14 @@ describe('HeartbeatScheduler', () => {
       source: 'system',
       kind: 'routine',
     });
+    const rawJobs = JSON.parse(fs.readFileSync(storePath, 'utf8')) as Array<Record<string, unknown>>;
+    const jobIndex = rawJobs.findIndex((stored) => stored.id === job.id);
+    rawJobs[jobIndex] = {
+      ...rawJobs[jobIndex],
+      createdAt: '2026-04-19T07:30:00.000Z',
+      updatedAt: '2026-04-19T07:30:00.000Z',
+    };
+    fs.writeFileSync(storePath, `${JSON.stringify(rawJobs, null, 2)}\n`, 'utf8');
     const trigger = jest.fn().mockResolvedValue(undefined);
     const scheduler = new HeartbeatScheduler(store, trigger, 'UTC', {
       recoveryEnabled: true,

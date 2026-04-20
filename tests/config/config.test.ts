@@ -2,7 +2,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { loadConfig } from '../../src/config/config';
+import { getDefaultConfig, loadConfig, saveConfig } from '../../src/config/config';
+import { redactConfig, validateConfig } from '../../src/config/validation';
 
 describe('loadConfig', () => {
   let tmpDir: string;
@@ -23,6 +24,21 @@ describe('loadConfig', () => {
     expect(config.memory.workspace).toContain('.redacted');
   });
 
+  it('fails with init guidance when config is required but missing', async () => {
+    const cfgPath = path.join(tmpDir, 'missing.json');
+    await expect(loadConfig({ configPath: cfgPath, requireFile: true })).rejects.toThrow(
+      /run `npm run cli -- init`/i,
+    );
+  });
+
+  it('returns isolated default config copies', () => {
+    const first = getDefaultConfig();
+    first.providers.main.model = 'mutated-model';
+
+    const second = getDefaultConfig();
+    expect(second.providers.main.model).toBe('llama3.1');
+  });
+
   it('merges user config over defaults', async () => {
     const userConfig = {
       providers: {
@@ -37,6 +53,49 @@ describe('loadConfig', () => {
     expect(config.providers.main.model).toBe('gpt-4o');
     // Defaults preserved for unset fields
     expect(config.agent.maxIterations).toBe(15);
+  });
+
+  it('atomically saves config as valid JSON and creates parent directories', async () => {
+    const cfgPath = path.join(tmpDir, 'nested', 'config.json');
+    const config = getDefaultConfig();
+    config.channels.telegram.enabled = false;
+    config.memory.workspace = path.join(tmpDir, 'workspace');
+
+    await saveConfig(cfgPath, config);
+
+    const raw = fs.readFileSync(cfgPath, 'utf8');
+    expect(JSON.parse(raw).memory.workspace).toBe(path.join(tmpDir, 'workspace'));
+    expect(fs.existsSync(`${cfgPath}.tmp`)).toBe(false);
+  });
+
+  it('redacts provider api keys and telegram tokens', () => {
+    const config = getDefaultConfig();
+    config.providers.main = { type: 'openai', model: 'gpt-4o', apiKey: 'sk-secret' };
+    config.channels.telegram.botToken = '123456:secret-token';
+
+    const redacted = redactConfig(config);
+
+    expect(redacted.providers.main.apiKey).toBe('[REDACTED]');
+    expect(redacted.channels.telegram.botToken).toBe('[REDACTED]');
+    expect(JSON.stringify(redacted)).not.toContain('sk-secret');
+    expect(JSON.stringify(redacted)).not.toContain('secret-token');
+  });
+
+  it('validates required provider and telegram fields', () => {
+    const config = getDefaultConfig();
+    config.channels.telegram.enabled = true;
+    config.channels.telegram.botToken = '';
+    config.providers.main.model = '';
+
+    const result = validateConfig(config);
+
+    expect(result.valid).toBe(false);
+    expect(result.errors).toEqual(
+      expect.arrayContaining([
+        'providers.main.model is required',
+        'channels.telegram.botToken is required when Telegram is enabled',
+      ]),
+    );
   });
 
   it('resolves ~ in workspace path', async () => {
