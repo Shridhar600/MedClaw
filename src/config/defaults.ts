@@ -12,12 +12,12 @@ export const DEFAULT_CONFIG: AppConfig = {
     medical: {
       type: 'ollama',
       baseUrl: 'http://localhost:11434/v1',
-      model: 'amsaravi/medgemma-4b-it:q8',
+      model: 'aadide/medgemma-1.5-4b-it-Q4_K_S',
     },
     embeddings: {
       type: 'ollama',
       baseUrl: 'http://localhost:11434/v1',
-      model: 'nomic-embed-text',
+      model: 'embeddinggemma:latest',
     },
   },
   channels: {

@@ -227,7 +227,7 @@ MedClaw is already usable as an MVP for:
 - personal health chat with persistent context
 - guided service setup and first-user profile onboarding
 - memory-backed conversations
-- text-based report ingestion
+- medical report ingestion for supported text, PDF, and image files
 - local health data organization
 - heartbeat reminders and scheduled check-ins
 
@@ -240,7 +240,7 @@ MedClaw is already usable as an MVP for:
 
 ## Coming Soon
 
-Phase 4 is planned around integrations and platform upgrades:
+Phase 4C+ is planned around integrations and platform upgrades:
 
 - Open Wearables integration
 - FHIR integration
