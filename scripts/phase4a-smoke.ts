@@ -168,7 +168,7 @@ async function initInteractiveScripted(): Promise<void> {
     workspacePath,
     'ollama',
     'llama3.1',
-    'amsaravi/medgemma-4b-it:q8',
+    'aadide/medgemma-1.5-4b-it-Q4_K_S',
     'nomic-embed-text',
     'http://localhost:11434/v1',
     'n',

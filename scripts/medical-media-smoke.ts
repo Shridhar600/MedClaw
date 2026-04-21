@@ -88,13 +88,26 @@ async function main(): Promise<void> {
     path.join(tmpDir, 'reports/photo.jpg'),
     Buffer.from('/9j/4AAQSkZJRgABAQAAAQABAAD/2w==', 'base64'),
   );
+  const textReports = [
+    ['plain.txt', 'Plain text marker HbA1c 6.9'],
+    ['notes.md', '# Markdown report\nLDL marker 190'],
+    ['table.csv', 'test,value\nHDL,35'],
+    ['data.json', '{"marker":"glucose","value":126}'],
+    ['events.log', 'LOG_MARKER triglycerides elevated'],
+  ] as const;
+  for (const [fileName, content] of textReports) {
+    fs.writeFileSync(path.join(tmpDir, 'reports', fileName), content);
+  }
+  fs.writeFileSync(path.join(tmpDir, 'reports/binary.txt'), Buffer.from([0x48, 0x00, 0x49]));
 
   let lastTextPrompt = '';
   let lastVisionPrompt = '';
   let lastImages: ImageAttachment[] = [];
+  const textPrompts: string[] = [];
   const provider: LLMProvider = {
     chat: async (messages: Message[]): Promise<LLMResponse> => {
       lastTextPrompt = messages.map((message) => message.content ?? '').join('\n');
+      textPrompts.push(lastTextPrompt);
       return { type: 'text', text: 'text-report-analysis' };
     },
     chatWithImages: async (messages: Message[], images: ImageAttachment[]): Promise<LLMResponse> => {
@@ -117,17 +130,24 @@ async function main(): Promise<void> {
   if (!tool) throw new Error('medgemma_analyze_report missing');
 
   const pdfText = await tool.execute({ mediaPath: 'reports/lab.pdf' });
+  const pdfTextPrompt = lastTextPrompt;
   const scannedPdf = await tool.execute({ mediaPath: 'reports/scan.pdf' });
   const scannedPdfImages = lastImages;
   const scannedPdfPng = Buffer.from(scannedPdfImages[0]?.data ?? '', 'base64');
   const image = await tool.execute({ mediaPath: 'reports/photo.jpg' });
   const directImageImages = lastImages;
+  const textResults = await Promise.all(
+    textReports.map(([fileName]) => tool.execute({ mediaPath: `reports/${fileName}` })),
+  );
+  const binaryText = await tool.execute({ mediaPath: 'reports/binary.txt' });
 
   console.log(`SMOKE_DIR=${tmpDir}`);
-  console.log(`PDF_TEXT_OK=${!pdfText.isError && lastTextPrompt.includes('HbA1c 7.2')}`);
+  console.log(`PDF_TEXT_OK=${!pdfText.isError && pdfTextPrompt.includes('HbA1c 7.2')}`);
   console.log(`SCANNED_PDF_IMAGE_OK=${!scannedPdf.isError && scannedPdfImages[0]?.filename?.includes('reports/scan.pdf#page-1.png')}`);
   console.log(`SCANNED_PDF_PNG_SIGNATURE_OK=${scannedPdfPng[0] === 0x89 && scannedPdfPng[1] === 0x50 && scannedPdfPng[2] === 0x4e && scannedPdfPng[3] === 0x47}`);
   console.log(`IMAGE_OK=${!image.isError && directImageImages[0]?.filename === 'reports/photo.jpg'}`);
+  console.log(`TEXT_FORMATS_OK=${textResults.every((result) => !result.isError) && textPrompts.some((prompt) => prompt.includes('Plain text marker')) && textPrompts.some((prompt) => prompt.includes('LDL marker')) && textPrompts.some((prompt) => prompt.includes('HDL,35')) && textPrompts.some((prompt) => prompt.includes('"marker":"glucose"')) && textPrompts.some((prompt) => prompt.includes('LOG_MARKER'))}`);
+  console.log(`BINARY_TEXT_REJECTED=${binaryText.isError && binaryText.content[0]?.text.includes('appears to be binary')}`);
   console.log(`VISION_PROMPT_HAS_SAFETY=${lastVisionPrompt.includes('CRITICAL SAFETY RULES')}`);
 }
 

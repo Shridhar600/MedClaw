@@ -573,6 +573,27 @@ describe('Medical Tools', () => {
       expect(visionMedicalProvider.chatWithImages).not.toHaveBeenCalled();
     });
 
+    it('rejects binary content in text report files before provider calls', async () => {
+      const reportPath = path.join(tmpDir, 'reports');
+      fs.mkdirSync(reportPath, { recursive: true });
+      fs.writeFileSync(path.join(reportPath, 'binary.txt'), Buffer.from([0x48, 0x00, 0x49]));
+
+      const tools: Tool[] = createMedicalTools(
+        engine,
+        mockSearch,
+        mockMedicalProvider,
+        mockMainProvider,
+        tmpDir
+      );
+
+      const tool = tools.find((t: Tool) => t.name === 'medgemma_analyze_report')!;
+      const result = await tool.execute({ mediaPath: 'reports/binary.txt' });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('appears to be binary');
+      expect(mockMedicalProvider.chat).not.toHaveBeenCalled();
+    });
+
     it('uses report content when building memory search context', async () => {
       const reportPath = path.join(tmpDir, 'reports');
       fs.mkdirSync(reportPath, { recursive: true });
@@ -618,7 +639,9 @@ describe('Medical Tools', () => {
       const result = await tool.execute({ mediaPath: 'reports/test-report.txt' });
 
       expect(result.isError).toBe(true);
-      expect(result.content[0].text.toLowerCase()).toContain('privacy');
+      expect(result.content[0].text).toBe(
+        'Error: Medical provider unavailable. Privacy guard blocked fallback to a non-local main provider. Retry after restoring the medical provider or configure a local main provider for fallback.',
+      );
       expect(mockMainProvider.chat).not.toHaveBeenCalled();
     });
   });

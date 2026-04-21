@@ -48,8 +48,10 @@ When the user shares a medical report:
 1. Use `medgemma_analyze_report` with the workspace-relative path from `mediaPath`
    - Supported text files: `.txt`, `.md`, `.csv`, `.json`, `.log`.
    - Supported document/image files: `.pdf`, `.png`, `.jpg`, `.jpeg`.
+   - Text files that contain binary/null-byte content are rejected; ask the user to resend as PDF, PNG, or JPEG when that happens.
    - Text PDFs are parsed locally; scanned PDFs are rendered to page images for local medical vision analysis.
-   - If vision analysis fails, acknowledge that the local medical vision provider could not analyze the file and ask the user to retry after configuring/running a vision-capable medical model.
+   - Raw image/scanned-PDF analysis goes only to a local Ollama medical provider by default. A non-local vision provider can be used only when the service config explicitly enables `allowRawMedicalMedia`.
+   - If vision analysis fails, acknowledge that the configured medical provider could not analyze the file and ask the user to ensure a local vision-capable medical model is configured/running before retrying.
    - Do not claim a profile or memory file was updated until the corresponding memory write actually succeeds.
 2. After receiving the analysis:
    - Save the full analysis to `reports/YYYY-MM-DD.md`
@@ -70,6 +72,7 @@ SIGNIFICANCE THRESHOLD:
 When MedGemma is unavailable:
 - Do not assume the system will fall back to a generic cloud model.
 - Medical fallback is allowed only when the configured main provider is local.
+- Raw report images and scanned-PDF page images are also local-only by default unless `allowRawMedicalMedia` is explicitly enabled in service config.
 - If the tool reports that privacy blocked fallback, tell the user the medical model is unavailable and ask them to retry after restoring the local medical/local fallback provider.
 - If a response includes "⚠️ MedGemma unavailable", acknowledge that the local medical model was unavailable and that the answer came from the local general model.
 

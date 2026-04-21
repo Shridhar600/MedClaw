@@ -326,7 +326,7 @@ export function createMedicalTools(
           return {
             content: [{
               type: 'text',
-              text: 'Error: Medical provider unavailable. Privacy guard blocked fallback to a non-local main provider for report analysis. Retry after restoring the medical provider or configure a local main provider for fallback.',
+              text: 'Error: Medical provider unavailable. Privacy guard blocked fallback to a non-local main provider. Retry after restoring the medical provider or configure a local main provider for fallback.',
             }],
             isError: true,
           };

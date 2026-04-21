@@ -16,7 +16,16 @@ export function createMemoryTools(engine: MemoryEngine, search?: MemorySearch): 
     },
     async execute(params): Promise<ToolResult> {
       const filePath = params.path as string;
-      const content = await engine.readFile(filePath);
+      let content: string | null;
+      try {
+        content = await engine.readFile(filePath);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (msg.startsWith('Path is a directory')) {
+          return { content: [{ type: 'text', text: msg }], isError: true };
+        }
+        throw e;
+      }
       if (content === null) {
         return { content: [{ type: 'text', text: `File not found: ${filePath}` }], isError: true };
       }

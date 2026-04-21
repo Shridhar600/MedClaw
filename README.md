@@ -144,7 +144,7 @@ ollama serve
 
 ```bash
 ollama pull llama3.1
-ollama pull amsaravi/medgemma-4b-it:q8
+ollama pull aadide/medgemma-1.5-4b-it-Q4_K_S
 ollama pull nomic-embed-text
 ```
 
