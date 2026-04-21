@@ -32,6 +32,17 @@ describe('Memory Tools', () => {
     expect(result.isError).toBe(true);
   });
 
+  it('memory_get returns a clear error for directory paths', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'medications'), { recursive: true });
+
+    const tool = tools.find(t => t.name === 'memory_get')!;
+    const result = await tool.execute({ path: 'medications' });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Path is a directory');
+    expect(result.content[0].text).toContain('medications');
+  });
+
   it('memory_write creates a file', async () => {
     const tool = tools.find(t => t.name === 'memory_write')!;
     await tool.execute({ path: 'goals/bulking.md', content: '# Bulking Plan', mode: 'overwrite' });

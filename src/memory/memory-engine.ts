@@ -21,6 +21,11 @@ export class MemoryEngine {
   async readFile(relativePath: string): Promise<string | null> {
     const fullPath = this.resolve(relativePath);
     if (!fs.existsSync(fullPath)) return null;
+    const stat = fs.statSync(fullPath);
+    if (stat.isDirectory()) {
+      throw new Error(`Path is a directory, not a file: ${relativePath}`);
+    }
+    if (!stat.isFile()) return null;
     return fs.readFileSync(fullPath, 'utf8');
   }
 
