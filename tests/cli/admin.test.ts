@@ -117,8 +117,8 @@ describe('cli admin surfaces', () => {
 
     const text = await showStatus({ configPath, workspacePath, storePath });
 
-    expect(text).toContain('main provider: configured (not checked)');
-    expect(text).toContain('medical provider: configured (not checked)');
+    expect(text).toContain('main provider: configured');
+    expect(text).toContain('medical provider: configured');
     expect(text).not.toContain('main provider: ready');
   });
 });

@@ -1,96 +1,84 @@
 import * as fs from 'fs';
-import * as path from 'path';
 import * as readline from 'readline/promises';
+import { ensureWorkspaceBootstrap } from '../workspace/bootstrap';
+
+const PROMPT_COLOR = '\x1b[96m';
+const COLOR_RESET = '\x1b[0m';
+const VALUE_COLOR = '\x1b[92m';
+
+function stdoutIsTty(): boolean {
+  return Boolean(process.stdout.isTTY) && process.env.NO_COLOR !== '1';
+}
 
 let sharedReadline: readline.Interface | undefined;
 let pipedAnswers: string[] | undefined;
+type CliReadlineFactory = (options: {
+  input: NodeJS.ReadableStream;
+  output: NodeJS.WritableStream;
+}) => readline.Interface;
+let cliReadlineFactory: CliReadlineFactory = (options) => readline.createInterface(options);
 
 export interface CliIO {
   stdout?: (text: string) => void;
   stderr?: (text: string) => void;
   input?: (prompt: string) => Promise<string>;
+  secretInput?: (prompt: string, defaultValue?: string) => Promise<string>;
 }
 
-export const WORKSPACE_FILES: Record<string, string> = {
-  'SOUL.md': `# SOUL — Redacted Health Companion
+function formatPrompt(prompt: string, defaultValue = ''): string {
+  const bullet = stdoutIsTty() ? `${PROMPT_COLOR}•${COLOR_RESET}` : '•';
+  const cursor = stdoutIsTty() ? `${VALUE_COLOR}›${COLOR_RESET}` : '›';
+  const lines = [`${bullet} ${prompt}`];
+  if (defaultValue) {
+    lines.push(`  default: ${defaultValue}`);
+  }
+  lines.push(`  ${cursor} `);
+  return lines.join('\n');
+}
 
-## Identity
-You are Redacted, a personal AI health companion. You are empathetic, knowledgeable, and proactive. You remember the user's health history and provide context-aware guidance.
+function formatSecretPrompt(prompt: string, hasCurrentValue = false): string {
+  const bullet = stdoutIsTty() ? `${PROMPT_COLOR}•${COLOR_RESET}` : '•';
+  const cursor = stdoutIsTty() ? `${VALUE_COLOR}›${COLOR_RESET}` : '›';
+  const lines = [`${bullet} ${prompt}`];
+  if (hasCurrentValue) {
+    lines.push('  current: configured');
+  }
+  lines.push(`  ${cursor} `);
+  return lines.join('\n');
+}
 
-## Core Values
-- **Personalized**: Every answer accounts for the user's specific conditions, medications, and goals
-- **Honest**: You say "I don't know" rather than guessing on medical matters
-- **Proactive**: You notice patterns and suggest follow-ups without being asked
-- **Safe**: You never diagnose, never contradict doctors, always recommend professional consultation
-`,
-  'HEALTH_PROFILE.md': `# Health Profile
+function normalizePromptValue(answer: string, defaultValue = ''): string {
+  const trimmed = answer.trim();
+  return trimmed.length > 0 ? trimmed : defaultValue;
+}
 
-> This file is ALWAYS loaded. Keep it under 2,000 tokens. For detailed info, use the conditions/ and medications/ files.
+function closeSharedReadline(): void {
+  if (!sharedReadline) {
+    return;
+  }
+  sharedReadline.close();
+  sharedReadline = undefined;
+}
 
-## Basic Info
-- **Name**: [User's name]
-- **Age**: [Age]
-- **Gender**: [Gender]
-- **Timezone**: Asia/Kolkata
+export function writeStdout(io: CliIO, text: string): void {
+  io.stdout?.(text);
+}
 
-## Active Conditions
-- None recorded yet
+export function writeStderr(io: CliIO, text: string): void {
+  io.stderr?.(text);
+}
 
-## Current Medications
-- None recorded yet
+export function createCliReadline(options: {
+  input: NodeJS.ReadableStream;
+  output: NodeJS.WritableStream;
+}): readline.Interface {
+  return cliReadlineFactory(options);
+}
 
-## Known Allergies
-- None recorded yet
-
-## Recent Reports
-- None uploaded yet
-
-## Goals
-- None set yet
-
-## Emergency Contact
-- [Doctor name]: [Phone]
-`,
-  'USER.md': `# User Preferences
-
-## Communication
-- **Language**: English
-- **Timezone**: Asia/Kolkata
-- **Address me as**: [Name]
-- **Preferred detail level**: Medium
-
-## Diet
-- **Type**: [Vegetarian/Non-vegetarian/Vegan]
-- **Restrictions**: [Any restrictions]
-- **Cuisine**: Indian (primary), occasional continental
-
-## Lifestyle
-- **Activity level**: [Sedentary/Moderate/Active]
-- **Sleep schedule**: [Approx. sleep/wake times]
-- **Work schedule**: [9-6 weekdays / etc]
-
-## Health Priorities
-1. [Top priority]
-2. [Second priority]
-
-## Notification Preferences
-- Morning check-in: 8:00 AM
-- Evening summary: 9:00 PM
-- Medication reminders: [yes/no]
-`,
-  'HEARTBEAT.md': `# Heartbeat Schedule
-
-Current runtime status:
-- Scheduler runtime is active when \`heartbeat.enabled\` is true and a channel is available.
-- This file is derived from the durable JSON heartbeat store and synchronized by runtime/tools.
-- Delivery state shows whether a job is ready, snoozed, waiting for retry, or dead-lettered.
-- Retry and acknowledgement fields reflect runtime control state, not just cron metadata.
-- Policy-managed system jobs are derived from structured files in \`medications/\`, \`conditions/\`, and \`goals/\`.
-
-## Jobs
-- (none)
-`,
-};
+export function setCliReadlineFactoryForTests(factory?: CliReadlineFactory): void {
+  closeSharedReadline();
+  cliReadlineFactory = factory ?? ((options) => readline.createInterface(options));
+}
 
 export async function askText(
   io: CliIO,
@@ -98,32 +86,154 @@ export async function askText(
   defaultValue = '',
 ): Promise<string> {
   if (io.input) {
-    const answer = await io.input(defaultValue ? `${prompt} [${defaultValue}] ` : `${prompt} `);
-    const trimmed = answer.trim();
-    return trimmed.length > 0 ? trimmed : defaultValue;
+    const answer = await io.input(formatPrompt(prompt, defaultValue));
+    return normalizePromptValue(answer, defaultValue);
   }
 
-  const promptText = defaultValue ? `${prompt} [${defaultValue}] ` : `${prompt} `;
+  const promptText = formatPrompt(prompt, defaultValue);
 
   if (!process.stdin.isTTY) {
-    process.stdout.write(promptText);
+    writeStdout(io, promptText);
     if (!pipedAnswers) {
       pipedAnswers = fs.readFileSync(0, 'utf8').split(/\r?\n/);
     }
     const answer = pipedAnswers.shift() ?? '';
-    const trimmed = answer.trim();
-    return trimmed.length > 0 ? trimmed : defaultValue;
+    return normalizePromptValue(answer, defaultValue);
   }
 
   if (!sharedReadline) {
-    sharedReadline = readline.createInterface({
+    sharedReadline = createCliReadline({
       input: process.stdin as unknown as NodeJS.ReadStream,
       output: process.stdout as unknown as NodeJS.WriteStream,
     });
   }
   const answer = await sharedReadline.question(promptText);
-  const trimmed = answer.trim();
-  return trimmed.length > 0 ? trimmed : defaultValue;
+  return normalizePromptValue(answer, defaultValue);
+}
+
+function readPipedAnswer(): string {
+  if (!pipedAnswers) {
+    pipedAnswers = fs.readFileSync(0, 'utf8').split(/\r?\n/);
+  }
+  return pipedAnswers.shift() ?? '';
+}
+
+async function readHiddenFromTTY(
+  io: CliIO,
+  prompt: string,
+  defaultValue = '',
+): Promise<string> {
+  const stdin = process.stdin as NodeJS.ReadStream;
+  closeSharedReadline();
+  writeStdout(io, `${prompt} `);
+
+  const previousRawMode = Boolean(stdin.isRaw);
+  let rawModeSucceeded = false;
+
+  try {
+    stdin.setRawMode?.(true);
+    rawModeSucceeded = Boolean(stdin.isRaw);
+  } catch {
+    rawModeSucceeded = false;
+  }
+
+  if (!rawModeSucceeded) {
+    const rl = createCliReadline({
+      input: stdin as NodeJS.ReadStream,
+      output: process.stdout as NodeJS.WriteStream,
+    });
+    const answer = await rl.question('');
+    rl.close();
+    return normalizePromptValue(answer, defaultValue);
+  }
+
+  return new Promise<string>((resolve, reject) => {
+    let settled = false;
+    const chars: string[] = [];
+
+    const cleanup = (): void => {
+      stdin.off('data', onData);
+      stdin.off('error', onError);
+      stdin.setRawMode?.(previousRawMode);
+      stdin.pause();
+      writeStdout(io, '\n');
+    };
+
+    const finish = (value: string): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(normalizePromptValue(value, defaultValue));
+    };
+
+    const fail = (error: Error): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+
+    const onError = (error: Error): void => fail(error);
+
+    const onData = (chunk: Buffer | string): void => {
+      for (const char of chunk.toString('utf8')) {
+        if (char === '\r' || char === '\n') {
+          finish(chars.join(''));
+          return;
+        }
+        if (char === '\u0003') {
+          fail(new Error('Setup cancelled by user.'));
+          return;
+        }
+        if (char === '\u007f' || char === '\b') {
+          if (chars.length > 0) {
+            chars.pop();
+            writeStdout(io, '\b \b');
+          }
+          continue;
+        }
+        if (char >= ' ') {
+          chars.push(char);
+          writeStdout(io, '\u25CF');
+        }
+      }
+    };
+
+    stdin.on('error', onError);
+    stdin.on('data', onData);
+    stdin.resume();
+  });
+}
+
+export async function askHiddenText(
+  io: CliIO,
+  prompt: string,
+  defaultValue = '',
+): Promise<string> {
+  if (io.secretInput) {
+    const answer = await io.secretInput(prompt, defaultValue);
+    return normalizePromptValue(answer, defaultValue);
+  }
+
+  if (io.input) {
+    const answer = await io.input(formatSecretPrompt(prompt, defaultValue.trim().length > 0));
+    return normalizePromptValue(answer, defaultValue);
+  }
+
+  if (!process.stdin.isTTY) {
+    writeStdout(io, formatSecretPrompt(prompt, defaultValue.trim().length > 0));
+    return normalizePromptValue(readPipedAnswer(), defaultValue);
+  }
+
+  return readHiddenFromTTY(
+    io,
+    formatSecretPrompt(prompt, defaultValue.trim().length > 0).trimEnd(),
+    defaultValue,
+  );
 }
 
 export async function askYesNo(
@@ -131,22 +241,26 @@ export async function askYesNo(
   prompt: string,
   defaultValue: boolean,
 ): Promise<boolean> {
-  const suffix = defaultValue ? 'Y/n' : 'y/N';
-  const answer = await askText(io, `${prompt} (${suffix})`, defaultValue ? 'y' : 'n');
-  const normalized = answer.trim().toLowerCase();
-  return normalized === 'y' || normalized === 'yes' || normalized === 'true';
+  while (true) {
+    const answer = await askText(
+      io,
+      `${prompt}\n  options: yes, no`,
+      defaultValue ? 'yes' : 'no',
+    );
+    const normalized = answer.trim().toLowerCase();
+    if (!normalized) {
+      return defaultValue;
+    }
+    if (normalized === 'y' || normalized === 'yes' || normalized === 'true') {
+      return true;
+    }
+    if (normalized === 'n' || normalized === 'no' || normalized === 'false') {
+      return false;
+    }
+    writeStderr(io, 'Please answer yes or no.\n');
+  }
 }
 
 export function ensureWorkspaceTemplates(workspacePath: string): void {
-  fs.mkdirSync(workspacePath, { recursive: true });
-  for (const [fileName, template] of Object.entries(WORKSPACE_FILES)) {
-    const fullPath = path.join(workspacePath, fileName);
-    if (!fs.existsSync(fullPath)) {
-      fs.writeFileSync(fullPath, template, 'utf8');
-    }
-  }
-
-  for (const dirName of ['conditions', 'medications', 'reports', 'goals', 'memory', 'summaries', 'archive']) {
-    fs.mkdirSync(path.join(workspacePath, dirName), { recursive: true });
-  }
+  ensureWorkspaceBootstrap(workspacePath, { preserveExisting: true });
 }

@@ -24,6 +24,7 @@ import { buildDesiredHeartbeatJobs } from '../scheduler/policy-engine';
 import { reconcilePolicyJobs } from '../scheduler/reconciler';
 import { OnboardingFlow } from '../onboarding/flow';
 import { OnboardingStore } from '../onboarding/store';
+import { ensureWorkspaceBootstrap } from '../workspace/bootstrap';
 
 export class Gateway {
   private config: AppConfig;
@@ -165,12 +166,10 @@ export class Gateway {
       return;
     }
 
-    if (!incoming.mediaPath) {
-      const onboarding = await this.handleOnboarding(chatId, text);
-      if (onboarding) {
-        await this.channel!.send(chatId, { text: onboarding });
-        return;
-      }
+    const onboarding = await this.handleOnboarding(chatId, text);
+    if (onboarding) {
+      await this.channel!.send(chatId, { text: onboarding });
+      return;
     }
 
     const history = await this.sessions!.prepareHistory(chatId);
@@ -353,17 +352,15 @@ export class Gateway {
   // Copies workspace template files from the project's workspace/ dir to the workspace/
   // Only copies if the file does not already exist (preserves user edits).
   private bootstrapWorkspace(workspacePath: string): void {
-    fs.mkdirSync(workspacePath, { recursive: true });
-    // In compiled JS, __dirname is dist/gateway so ../../workspace goes to project root workspace/
-    // In source, we need to resolve from the source location
-    const templateDir = path.join(__dirname, '..', '..', 'workspace');
-    if (!fs.existsSync(templateDir)) return;
-    for (const file of fs.readdirSync(templateDir)) {
-      const dest = path.join(workspacePath, file);
-      if (!fs.existsSync(dest)) {
-        fs.copyFileSync(path.join(templateDir, file), dest);
-        console.log(`[gateway] Bootstrapped ${file} to workspace`);
-      }
+    try {
+      ensureWorkspaceBootstrap(workspacePath, {
+        preserveExisting: true,
+        log: (message) => console.log(`[gateway] ${message}`),
+      });
+    } catch (error) {
+      console.warn(
+        `[gateway] Workspace bootstrap skipped: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 }

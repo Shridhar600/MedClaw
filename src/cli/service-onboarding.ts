@@ -1,10 +1,14 @@
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
-import { getDefaultConfig, saveConfig } from '../config/config';
+import { spawn, type SpawnOptions } from 'child_process';
+import { getDefaultConfig, loadConfig, saveConfig } from '../config/config';
 import { validateConfig } from '../config/validation';
 import type { AppConfig, ProviderConfig } from '../config/types';
-import { redactConfig } from '../config/validation';
-import { askText, askYesNo, ensureWorkspaceTemplates, type CliIO } from './prompts';
+import { showConfig, showRedactedConfigSummary } from './admin';
+import { ensureWorkspaceTemplates, type CliIO } from './prompts';
+import { preflightStartCheck, type SetupReadinessDependencies } from './setup-readiness';
+import type { CompletionAction, SetupWizardState } from './wizard-types';
 
 export interface ServiceOnboardingArgs {
   yes?: boolean;
@@ -20,6 +24,24 @@ export interface ServiceOnboardingArgs {
   telegramEnabled?: boolean;
   timezone?: string;
   heartbeatsEnabled?: boolean;
+}
+
+export interface ResolvedSetupValues {
+  configPath: string;
+  workspacePath: string;
+  telegramToken: string;
+  providerType: ProviderConfig['type'];
+}
+
+export const SUPPORTED_ONBOARDING_PROVIDERS: readonly ProviderConfig['type'][] = [
+  'ollama',
+  'openai',
+];
+
+export function isSupportedOnboardingProvider(
+  providerType: ProviderConfig['type'],
+): providerType is 'ollama' | 'openai' {
+  return SUPPORTED_ONBOARDING_PROVIDERS.includes(providerType);
 }
 
 function parseBoolean(value: string | undefined): boolean | undefined {
@@ -127,7 +149,7 @@ function applyProvider(
     return;
   }
 
-  const apiKey = args.apiKey;
+  const apiKey = args.apiKey?.trim() ? args.apiKey.trim() : undefined;
   config.providers.main = {
     type: providerType,
     model: args.mainModel ?? 'gpt-4o-mini',
@@ -148,7 +170,7 @@ function applyProvider(
   };
 }
 
-function requiredCloudEnv(providerType: ProviderConfig['type']): string {
+export function requiredCloudEnv(providerType: ProviderConfig['type']): string {
   switch (providerType) {
     case 'openai':
       return 'OPENAI_API_KEY';
@@ -161,12 +183,12 @@ function requiredCloudEnv(providerType: ProviderConfig['type']): string {
   }
 }
 
-function modelDefaultsForProvider(providerType: ProviderConfig['type']): {
+export function modelDefaultsForProvider(providerType: ProviderConfig['type']): {
   main: string;
   medical: string;
   embeddings: string;
 } {
-  if (providerType === 'openai') {
+  if (providerType === 'openai' || providerType === 'anthropic' || providerType === 'google') {
     return {
       main: 'gpt-4o-mini',
       medical: 'gpt-4o-mini',
@@ -182,7 +204,7 @@ function modelDefaultsForProvider(providerType: ProviderConfig['type']): {
   };
 }
 
-function providerLabel(providerType: ProviderConfig['type']): string {
+export function providerLabel(providerType: ProviderConfig['type']): string {
   switch (providerType) {
     case 'openai':
       return 'OpenAI';
@@ -195,99 +217,281 @@ function providerLabel(providerType: ProviderConfig['type']): string {
   }
 }
 
-async function promptForMissingArgs(io: CliIO, args: ServiceOnboardingArgs): Promise<ServiceOnboardingArgs> {
-  if (args.workspace === undefined) {
-    args.workspace = await askText(io, 'Workspace path', getDefaultConfig().memory.workspace);
+export function resolveSetupPath(input: string): string {
+  if (input.startsWith('~/')) {
+    return path.join(os.homedir(), input.slice(2));
   }
-  if (args.provider === undefined) {
-    args.provider = (await askText(io, 'Provider type', 'ollama')) as ProviderConfig['type'];
-  }
+  return path.resolve(input);
+}
+
+export function defaultConfigPath(): string {
+  return resolveSetupPath(path.join(process.env.HOME ?? os.homedir(), '.redacted', 'config.json'));
+}
+
+export function resolveSetupValues(args: ServiceOnboardingArgs): ResolvedSetupValues {
+  const defaults = getDefaultConfig();
+  return {
+    configPath: resolveSetupPath(args.configPath ?? defaultConfigPath()),
+    workspacePath: resolveSetupPath(args.workspace ?? defaults.memory.workspace),
+    telegramToken: args.telegramToken ?? process.env.TELEGRAM_BOT_TOKEN ?? '',
+    providerType: args.provider ?? defaults.providers.main.type,
+  };
+}
+
+export function resolveNonInteractiveArgs(args: ServiceOnboardingArgs): ServiceOnboardingArgs {
+  const defaults = getDefaultConfig();
+  const values = resolveSetupValues(args);
+  const providerDefaults = modelDefaultsForProvider(values.providerType);
+
+  return {
+    ...args,
+    configPath: values.configPath,
+    workspace: values.workspacePath,
+    provider: values.providerType,
+    mainModel: args.mainModel ?? providerDefaults.main,
+    medicalModel: args.medicalModel ?? providerDefaults.medical,
+    embeddingModel: args.embeddingModel ?? providerDefaults.embeddings,
+    ollamaUrl:
+      args.ollamaUrl ?? (values.providerType === 'ollama' ? defaults.providers.main.baseUrl ?? '' : undefined),
+    apiKey: args.apiKey?.trim() ? args.apiKey.trim() : undefined,
+    telegramToken: values.telegramToken,
+    telegramEnabled: args.telegramEnabled ?? defaults.channels.telegram.enabled,
+    timezone: args.timezone ?? defaults.heartbeat.timezone,
+    heartbeatsEnabled: args.heartbeatsEnabled ?? defaults.heartbeat.enabled,
+  };
+}
+
+export function buildConfigFromArgs(inputArgs: ServiceOnboardingArgs): AppConfig {
+  const args = resolveNonInteractiveArgs(inputArgs);
+  const defaults = getDefaultConfig();
+  const values = resolveSetupValues(args);
+  const config = getDefaultConfig();
+
+  config.memory.workspace = values.workspacePath;
+  config.heartbeat.storePath = path.join(path.dirname(values.configPath), 'heartbeats', 'jobs.json');
+  config.heartbeat.audit.path = path.join(path.dirname(values.configPath), 'heartbeats', 'audit.jsonl');
+  config.heartbeat.timezone = args.timezone ?? defaults.heartbeat.timezone;
+  config.heartbeat.enabled = args.heartbeatsEnabled ?? defaults.heartbeat.enabled;
+  config.channels.telegram.enabled = args.telegramEnabled ?? defaults.channels.telegram.enabled;
+  config.channels.telegram.botToken = config.channels.telegram.enabled ? values.telegramToken : '';
+
+  applyProvider(config, values.providerType, args);
+
+  return config;
+}
+
+export function createInitialWizardState(args: ServiceOnboardingArgs): SetupWizardState {
+  const defaults = getDefaultConfig();
+  const resolved = resolveNonInteractiveArgs(args);
+  const systemTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+  return {
+    configPath: resolved.configPath ?? defaultConfigPath(),
+    workspace: resolved.workspace ?? resolveSetupPath(defaults.memory.workspace),
+    provider:
+      resolved.provider && isSupportedOnboardingProvider(resolved.provider)
+        ? resolved.provider
+        : defaults.providers.main.type,
+    mainModel: resolved.mainModel ?? defaults.providers.main.model,
+    medicalModel: resolved.medicalModel ?? defaults.providers.medical.model,
+    embeddingModel: resolved.embeddingModel ?? defaults.providers.embeddings.model,
+    ollamaUrl: resolved.ollamaUrl,
+    apiKey: resolved.apiKey,
+    telegramEnabled: args.telegramEnabled ?? false,
+    telegramToken: resolved.telegramToken,
+    timezone: args.timezone ?? systemTimezone ?? defaults.heartbeat.timezone,
+    heartbeatsEnabled: args.heartbeatsEnabled ?? false,
+  };
+}
+
+export function collectSetupErrors(args: ServiceOnboardingArgs, config: AppConfig): string[] {
+  const values = resolveSetupValues(args);
+  const errors: string[] = [];
+
   if (
-    args.provider !== 'ollama' &&
-    args.apiKey === undefined &&
-    !process.env[requiredCloudEnv(args.provider)]?.trim()
+    values.providerType !== 'ollama' &&
+    !args.apiKey?.trim() &&
+    !process.env[requiredCloudEnv(values.providerType)]?.trim()
   ) {
-    args.apiKey = await askText(io, `${providerLabel(args.provider)} API key`, '');
+    errors.push(`${requiredCloudEnv(values.providerType)} or --api-key is required for provider ${values.providerType}.`);
   }
-  const modelDefaults = modelDefaultsForProvider(args.provider);
-  if (args.mainModel === undefined) {
-    args.mainModel = await askText(io, 'Main model', modelDefaults.main);
+
+  if (config.channels.telegram.enabled && !values.telegramToken.trim()) {
+    errors.push('telegram is enabled but no bot token was provided.');
   }
-  if (args.medicalModel === undefined) {
-    args.medicalModel = await askText(io, 'Medical model', modelDefaults.medical);
+
+  const validation = validateConfig(config);
+  errors.push(...validation.errors);
+  return errors;
+}
+
+export async function persistSetupArtifacts(configPath: string, config: AppConfig): Promise<void> {
+  ensureWorkspaceTemplates(config.memory.workspace);
+  ensureParent(configPath);
+  fs.mkdirSync(path.join(path.dirname(configPath), 'sessions'), { recursive: true });
+  fs.mkdirSync(path.dirname(config.heartbeat.storePath), { recursive: true });
+  await saveConfig(configPath, config);
+}
+
+export interface DaemonLaunchSpec {
+  entrypoint: string;
+  args: string[];
+}
+
+export interface CompletionActionDependencies {
+  existsSync?: (filePath: string) => boolean;
+  projectRoot?: string;
+  spawnProcess?: (
+    command: string,
+    args: string[],
+    options: SpawnOptions,
+  ) => {
+    on: (event: 'error' | 'exit', listener: (...args: unknown[]) => void) => unknown;
+    unref?: () => void;
+    pid?: number;
+  };
+  startupWindowMs?: number;
+}
+
+export interface OnboardingDependencies extends CompletionActionDependencies, SetupReadinessDependencies {}
+
+export function resolveDaemonLaunchSpec(
+  projectRoot = process.cwd(),
+  existsSync: (filePath: string) => boolean = fs.existsSync,
+): DaemonLaunchSpec {
+  const distEntrypoint = path.join(projectRoot, 'dist', 'index.js');
+  if (existsSync(distEntrypoint)) {
+    return {
+      entrypoint: distEntrypoint,
+      args: [distEntrypoint],
+    };
   }
-  if (args.embeddingModel === undefined) {
-    args.embeddingModel = await askText(io, 'Embedding model', modelDefaults.embeddings);
+
+  const sourceEntrypoint = path.join(projectRoot, 'src', 'index.ts');
+  return {
+    entrypoint: sourceEntrypoint,
+    args: ['--import', 'tsx', sourceEntrypoint],
+  };
+}
+
+export function startDaemon(
+  configPath: string,
+  io: CliIO,
+  dependencies: CompletionActionDependencies = {},
+): Promise<{ started: boolean; message: string }> {
+  const projectRoot = dependencies.projectRoot ?? process.cwd();
+  const spec = resolveDaemonLaunchSpec(projectRoot, dependencies.existsSync);
+  const spawnProcess = dependencies.spawnProcess ?? spawn;
+  const child = spawnProcess(process.execPath, spec.args, {
+    cwd: projectRoot,
+    detached: true,
+    env: {
+      ...process.env,
+      REDACTED_CONFIG_PATH: configPath,
+    },
+    stdio: 'ignore',
+  });
+  child.unref?.();
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (started: boolean, message: string): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve({ started, message });
+    };
+
+    const timer = setTimeout(() => {
+      finish(true, `MedClaw started${child.pid ? ` (pid ${child.pid})` : ''}.`);
+    }, dependencies.startupWindowMs ?? 3000);
+
+    child.on('error', (error: unknown) => {
+      clearTimeout(timer);
+      finish(
+        false,
+        `Failed to start MedClaw: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+
+    child.on('exit', (code, signal) => {
+      clearTimeout(timer);
+      finish(false, `MedClaw exited during startup (${signal ?? code ?? 'unknown'}).`);
+    });
+  });
+}
+
+export async function handleCompletionAction(
+  action: CompletionAction,
+  configPath: string,
+  io: CliIO,
+  dependencies: OnboardingDependencies = {},
+): Promise<number> {
+  if (action === 'review-config') {
+    io.stdout?.(await showConfig({ configPath }));
+    return 0;
   }
-  if (args.ollamaUrl === undefined && args.provider === 'ollama') {
-    args.ollamaUrl = await askText(io, 'Ollama URL', getDefaultConfig().providers.main.baseUrl ?? '');
+  if (action === 'start') {
+    const config = await loadConfig({ configPath, requireFile: true });
+    const preflight = await preflightStartCheck(config, configPath, dependencies);
+    for (const warning of preflight.warnings) {
+      io.stdout?.(`[WARN] ${warning}\n`);
+    }
+    if (!preflight.ready) {
+      for (const blocker of preflight.blockers) {
+        io.stderr?.(`[BLOCKED] ${blocker}\n`);
+      }
+      return 1;
+    }
+
+    const result = await startDaemon(configPath, io, dependencies);
+    if (!result.started) {
+      io.stderr?.(`${result.message}\n`);
+      return 1;
+    }
+    io.stdout?.(`${result.message}\n`);
+    return 0;
   }
-  if (args.telegramEnabled === undefined) {
-    args.telegramEnabled = await askYesNo(io, 'Enable Telegram?', true);
-  }
-  if (args.telegramEnabled && !args.telegramToken) {
-    args.telegramToken = await askText(io, 'Telegram bot token', '');
-  }
-  if (args.timezone === undefined) {
-    args.timezone = await askText(io, 'Timezone', getDefaultConfig().heartbeat.timezone);
-  }
-  if (args.heartbeatsEnabled === undefined) {
-    args.heartbeatsEnabled = await askYesNo(io, 'Enable heartbeats?', true);
-  }
-  return args;
+  return 0;
 }
 
 export async function runServiceOnboarding(
   argv: string[],
   io: CliIO = {},
+  dependencies: OnboardingDependencies = {},
 ): Promise<number> {
   try {
     const args = parseArgs(argv);
-    const interactive = !args.yes;
-    const resolved = interactive ? await promptForMissingArgs(io, args) : args;
-    const defaults = getDefaultConfig();
-    const configPath = resolved.configPath ?? path.join(process.env.HOME ?? '', '.redacted', 'config.json');
-    const workspacePath = resolved.workspace ?? defaults.memory.workspace;
-    const telegramToken = resolved.telegramToken ?? process.env.TELEGRAM_BOT_TOKEN ?? '';
-    const providerType = resolved.provider ?? defaults.providers.main.type;
-
-    if (providerType !== 'ollama' && !resolved.apiKey?.trim() && !process.env[requiredCloudEnv(providerType)]?.trim()) {
-      io.stderr?.(`${requiredCloudEnv(providerType)} or --api-key is required for provider ${providerType}.\n`);
+    if (args.provider && !isSupportedOnboardingProvider(args.provider)) {
+      io.stderr?.(
+        `Unsupported onboard provider: ${args.provider}. Supported choices: ${SUPPORTED_ONBOARDING_PROVIDERS.join(', ')}.\n`,
+      );
       return 1;
     }
 
-    if (resolved.telegramEnabled !== false && !telegramToken.trim()) {
-      io.stderr?.('telegram is enabled but no bot token was provided.\n');
+    if (!args.yes) {
+      const initialState = createInitialWizardState(args);
+      const { runSetupWizard } = await import('./setup-wizard');
+      const { action, cancelled } = await runSetupWizard(io, initialState, dependencies);
+      if (cancelled) {
+        return 0;
+      }
+      return handleCompletionAction(action, initialState.configPath, io, dependencies);
+    }
+
+    const resolved = resolveNonInteractiveArgs(args);
+    const config = buildConfigFromArgs(resolved);
+    const errors = collectSetupErrors(resolved, config);
+    if (errors.length > 0) {
+      io.stderr?.(`${errors.join('\n')}\n`);
       return 1;
     }
 
-    ensureWorkspaceTemplates(workspacePath);
-
-    const config = getDefaultConfig();
-    config.memory.workspace = workspacePath;
-    config.heartbeat.storePath = path.join(path.dirname(configPath), 'heartbeats', 'jobs.json');
-    config.heartbeat.audit.path = path.join(path.dirname(configPath), 'heartbeats', 'audit.jsonl');
-    config.heartbeat.timezone = resolved.timezone ?? config.heartbeat.timezone;
-    config.heartbeat.enabled = resolved.heartbeatsEnabled ?? config.heartbeat.enabled;
-    config.channels.telegram.enabled = resolved.telegramEnabled ?? config.channels.telegram.enabled;
-    config.channels.telegram.botToken = config.channels.telegram.enabled ? telegramToken : '';
-
-    applyProvider(config, providerType, resolved);
-
-    const validation = validateConfig(config);
-    if (!validation.valid) {
-      io.stderr?.(`${validation.errors.join('\n')}\n`);
-      return 1;
-    }
-
-    ensureParent(configPath);
-    fs.mkdirSync(path.join(path.dirname(configPath), 'sessions'), { recursive: true });
-    fs.mkdirSync(path.dirname(config.heartbeat.storePath), { recursive: true });
-    await saveConfig(configPath, config);
-
-    io.stdout?.(`Initialized Redacted at ${workspacePath}\n`);
-    io.stdout?.(`Config written to ${configPath}\n`);
-    io.stdout?.(`${JSON.stringify(redactConfig(config), null, 2)}\n`);
+    const values = resolveSetupValues(resolved);
+    await persistSetupArtifacts(values.configPath, config);
+    io.stdout?.('Setup complete.\n');
+    io.stdout?.(showRedactedConfigSummary(config));
     return 0;
   } catch (error) {
     io.stderr?.(`${error instanceof Error ? error.message : String(error)}\n`);

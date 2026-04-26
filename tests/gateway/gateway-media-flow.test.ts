@@ -68,6 +68,8 @@ describe('Gateway media flow', () => {
     (gateway as any).agentLoop = { run };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).sessions = { prepareHistory, recordTurn, resetSession: jest.fn() };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({

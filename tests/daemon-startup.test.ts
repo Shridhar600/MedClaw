@@ -24,6 +24,6 @@ describe('daemon startup config guard', () => {
     });
 
     expect(result.status).not.toBe(0);
-    expect(`${result.stdout}\n${result.stderr}`).toContain('npm run cli -- init');
+    expect(`${result.stdout}\n${result.stderr}`).toContain('npm run cli -- onboard');
   });
 });

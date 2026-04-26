@@ -103,7 +103,7 @@ describe('cli router', () => {
     }
   });
 
-  it('real CLI init consumes scripted interactive stdin instead of blank defaults', () => {
+  it('real CLI onboard shows staged wizard output instead of the old flat prompt chain', () => {
     const home = createTempHome();
     try {
       const configPath = path.join(home.tmpDir, 'config.json');
@@ -111,19 +111,20 @@ describe('cli router', () => {
       const input = [
         workspacePath,
         'ollama',
-        'llama3.1',
-        'aadide/medgemma-1.5-4b-it-Q4_K_S',
-        'nomic-embed-text',
-        'http://localhost:11434/v1',
+        '',
+        '',
+        '',
+        '',
         'n',
         'Asia/Kolkata',
         'y',
-        '',
+        '1',
+        '3',
       ].join('\n');
 
       const result = spawnSync(
         process.execPath,
-        ['--import', 'tsx', 'src/cli/index.ts', 'init', '--config', configPath],
+        ['--import', 'tsx', 'src/cli/index.ts', 'onboard', '--config', configPath],
         {
           cwd: path.join(__dirname, '..', '..'),
           env: { ...process.env, HOME: home.tmpDir },
@@ -133,10 +134,51 @@ describe('cli router', () => {
       );
 
       expect(result.status).toBe(0);
+      expect(result.stdout).toContain('medclaw onboard');
+      expect(result.stdout).toContain('[1/5]');
+      expect(result.stdout).toContain('Setup complete');
       expect(fs.existsSync(configPath)).toBe(true);
-      const raw = fs.readFileSync(configPath, 'utf8');
-      expect(JSON.parse(raw).channels.telegram.enabled).toBe(false);
-      expect(raw).toContain(workspacePath);
+    } finally {
+      home.restore();
+    }
+  });
+
+  it('real CLI onboard can print the redacted config from the completion menu', () => {
+    const home = createTempHome();
+    try {
+      const configPath = path.join(home.tmpDir, 'config.json');
+      const workspacePath = path.join(home.tmpDir, 'workspace');
+      const input = [
+        workspacePath,
+        'ollama',
+        '',
+        '',
+        '',
+        '',
+        'y',
+        '123456:test-token',
+        'Asia/Kolkata',
+        'y',
+        '1',
+        '2',
+        '3',
+      ].join('\n');
+
+      const result = spawnSync(
+        process.execPath,
+        ['--import', 'tsx', 'src/cli/index.ts', 'onboard', '--config', configPath],
+        {
+          cwd: path.join(__dirname, '..', '..'),
+          env: { ...process.env, HOME: home.tmpDir },
+          input,
+          encoding: 'utf8',
+        },
+      );
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('Configuration:');
+      expect(result.stdout).toContain('telegram token: [REDACTED]');
+      expect(result.stdout).not.toContain('123456:test-token');
     } finally {
       home.restore();
     }

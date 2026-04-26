@@ -26,13 +26,13 @@ describe('OnboardingFlow', () => {
     expect(first.response).toContain('preferred name');
 
     const continued = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
-    const second = await continued.handle('Shridhar');
+    const second = await continued.handle('Arjun');
     expect(second.response).toContain('age');
 
     const state = await store.load();
     expect(state.status).toBe('in_progress');
     expect(state.currentStep).toBe('age');
-    expect(state.answers.name).toBe('Shridhar');
+    expect(state.answers.name).toBe('Arjun');
     expect(state.disclaimerShownAt).toBeDefined();
   });
 
@@ -41,7 +41,7 @@ describe('OnboardingFlow', () => {
     const flow = new OnboardingFlow(store, tmpDir, 'Asia/Kolkata');
 
     await flow.handle('hello');
-    await flow.handle('Shridhar');
+    await flow.handle('Arjun');
     await flow.handle('25');
     await flow.handle('yes');
 
@@ -55,7 +55,7 @@ describe('OnboardingFlow', () => {
     const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
 
     await flow.handle('hi');
-    await flow.handle('Shridhar');
+    await flow.handle('Arjun');
     await flow.handle('31');
     await flow.handle('Asia/Kolkata');
     await flow.handle('Type 2 diabetes');
@@ -72,7 +72,7 @@ describe('OnboardingFlow', () => {
     const state = await new OnboardingStore(tmpDir).load();
     expect(state.status).toBe('complete');
     expect(state.completedAt).toBeDefined();
-    expect(fs.readFileSync(path.join(tmpDir, 'USER.md'), 'utf8')).toContain('Name: Shridhar');
+    expect(fs.readFileSync(path.join(tmpDir, 'USER.md'), 'utf8')).toContain('Name: Arjun');
     expect(fs.readFileSync(path.join(tmpDir, 'HEALTH_PROFILE.md'), 'utf8')).toContain('Active conditions: Type 2 diabetes');
   });
 
@@ -86,7 +86,7 @@ describe('OnboardingFlow', () => {
         currentStep: 'confirmation',
         answers: {
           timezone: 'Asia/Kolkata\n\nUser id: 123',
-          name: 'Shridhar\n\nUser id: 123',
+          name: 'Arjun\n\nUser id: 123',
           age: '25\n\nUser id: 123',
           conditions: 'None\n\nUser id: 123',
           medications: 'Protein-heavy diet\n\nUser id: 123',
@@ -103,7 +103,7 @@ describe('OnboardingFlow', () => {
 
     expect(done.completed).toBe(true);
     const profile = fs.readFileSync(path.join(tmpDir, 'HEALTH_PROFILE.md'), 'utf8');
-    expect(profile).toContain('Name: Shridhar');
+    expect(profile).toContain('Name: Arjun');
     expect(profile).toContain('Goals: Muscle gain');
     expect(profile).not.toContain('User id: 123');
   });

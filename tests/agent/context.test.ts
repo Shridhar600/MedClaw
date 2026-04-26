@@ -16,7 +16,7 @@ describe('ContextAssembler', () => {
 
     await engine.writeFile('SOUL.md', '# SOUL\nYou are a health companion.');
     await engine.writeFile('HEALTH_PROFILE.md', '# Health\nDiabetes Type 2.');
-    await engine.writeFile('USER.md', '# User\nName: Shridhar');
+    await engine.writeFile('USER.md', '# User\nName: Arjun');
     await engine.writeFile('HEARTBEAT.md', '# Heartbeat\nPhase 3 not implemented.');
   });
 
@@ -27,7 +27,7 @@ describe('ContextAssembler', () => {
     const combined = messages.map(m => m.content).join('\n');
     expect(combined).toContain('You are a health companion');
     expect(combined).toContain('Diabetes Type 2');
-    expect(combined).toContain('Shridhar');
+    expect(combined).toContain('Arjun');
   });
 
   it('includes todays memory log if present', async () => {

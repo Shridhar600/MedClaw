@@ -24,12 +24,12 @@ const pingTool: Tool = {
 
 describe('AgentLoop', () => {
   it('returns text response directly when no tool call needed', async () => {
-    const provider = makeProvider([{ type: 'text', text: 'Hello Shridhar!' }]);
+    const provider = makeProvider([{ type: 'text', text: 'Hello Arjun!' }]);
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
     const loop = new AgentLoop(provider, registry, [], { maxIterations: 15, disclaimerEnabled: false });
 
     const result = await loop.run('Hi there');
-    expect(result.text).toBe('Hello Shridhar!');
+    expect(result.text).toBe('Hello Arjun!');
   });
 
   it('executes a tool call then returns follow-up text', async () => {

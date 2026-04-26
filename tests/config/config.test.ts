@@ -27,7 +27,7 @@ describe('loadConfig', () => {
   it('fails with init guidance when config is required but missing', async () => {
     const cfgPath = path.join(tmpDir, 'missing.json');
     await expect(loadConfig({ configPath: cfgPath, requireFile: true })).rejects.toThrow(
-      /run `npm run cli -- init`/i,
+      /run `npm run cli -- onboard`/i,
     );
   });
 
@@ -36,7 +36,7 @@ describe('loadConfig', () => {
     first.providers.main.model = 'mutated-model';
 
     const second = getDefaultConfig();
-    expect(second.providers.main.model).toBe('llama3.1');
+    expect(second.providers.main.model).toBe('kimi-k2.5:cloud');
   });
 
   it('merges user config over defaults', async () => {

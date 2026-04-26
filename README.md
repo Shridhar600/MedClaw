@@ -143,9 +143,9 @@ ollama serve
 ### Pull models
 
 ```bash
-ollama pull llama3.1
-ollama pull aadide/medgemma-1.5-4b-it-Q4_K_S
-ollama pull nomic-embed-text
+ollama pull kimi-k2.5:cloud
+ollama pull aadide/medgemma-1.5-4b-it-Q4_K_S:latest
+ollama pull embeddinggemma:latest
 ```
 
 ### Initialize local config and workspace
@@ -153,13 +153,13 @@ ollama pull nomic-embed-text
 Run the service onboarding CLI before starting the daemon:
 
 ```bash
-npm run cli -- init
+npm run cli -- onboard
 ```
 
 For non-interactive local setup without Telegram:
 
 ```bash
-npm run cli -- init --yes --provider ollama --telegram-enabled false
+npm run cli -- onboard --yes --provider ollama --telegram-enabled false
 ```
 
 If Telegram is enabled, provide a token via the prompt, `--telegram-token`, or `TELEGRAM_BOT_TOKEN`. CLI output redacts secrets.
@@ -170,7 +170,7 @@ If Telegram is enabled, provide a token via the prompt, `--telegram-token`, or `
 2. Run `/newbot`
 3. Choose a bot name and username
 4. Copy the bot token
-5. Run `npm run cli -- init` and enable Telegram when prompted
+5. Run `npm run cli -- onboard` and enable Telegram when prompted
 
 Then start the daemon and send your bot a message. On a fresh workspace, first chat collects basic profile context and writes it locally to `USER.md`, `HEALTH_PROFILE.md`, and onboarding state.
 
@@ -181,7 +181,7 @@ npm run build
 npm run dev
 ```
 
-The daemon requires an explicit config file. If `~/.redacted/config.json` is missing, initialize with `npm run cli -- init`.
+The daemon requires an explicit config file. If `~/.redacted/config.json` is missing, initialize with `npm run cli -- onboard`.
 
 ## Configuration
 
@@ -204,7 +204,7 @@ Admin CLI examples:
 ```bash
 npm run cli -- status
 npm run cli -- config show
-npm run cli -- config set providers.main.model llama3.1
+npm run cli -- config set providers.main.model kimi-k2.5:cloud
 npm run cli -- profile show
 npm run cli -- user summary
 npm run cli -- heartbeats list

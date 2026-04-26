@@ -19,7 +19,7 @@ describe('writeOnboardingProfile', () => {
 
   it('appends deterministic onboarding sections without deleting existing edits', async () => {
     const answers: OnboardingAnswers = {
-      name: 'Shridhar',
+      name: 'Arjun',
       age: '31',
       timezone: 'Asia/Kolkata',
       conditions: 'Type 2 diabetes',
@@ -34,7 +34,7 @@ describe('writeOnboardingProfile', () => {
     const user = fs.readFileSync(path.join(tmpDir, 'USER.md'), 'utf8');
     const profile = fs.readFileSync(path.join(tmpDir, 'HEALTH_PROFILE.md'), 'utf8');
     expect(user).toContain('Keep this user edit.');
-    expect(user).toContain('Name: Shridhar');
+    expect(user).toContain('Name: Arjun');
     expect(user).toContain('Timezone: Asia/Kolkata');
     expect(user).toContain('Reminder preferences: Morning reminders');
     expect(profile).toContain('Keep this health edit.');

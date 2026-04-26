@@ -17,10 +17,11 @@ function defaultIO(): CliIO {
 
 function helpText(): string {
   return [
-    'Usage: redacted <command> [options]',
+    'Usage: medclaw <command> [options]',
     '',
     'Commands:',
-    '  init',
+    '  onboard',
+    '  init (alias for onboard)',
     '  status',
     '  config show',
     '  config set <path> <value>',
@@ -68,7 +69,7 @@ export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
   const [command, ...commandArgs] = rest;
 
   try {
-    if (command === 'init') {
+    if (command === 'init' || command === 'onboard') {
       return await runServiceOnboarding(
         commandArgs.includes('--config') ? commandArgs : ['--config', configPath ?? path.join(process.env.HOME ?? '', '.redacted', 'config.json'), ...commandArgs],
         mergedIO,

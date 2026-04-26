@@ -7,12 +7,12 @@ export const DEFAULT_CONFIG: AppConfig = {
     main: {
       type: 'ollama',
       baseUrl: 'http://localhost:11434/v1',
-      model: 'llama3.1',
+      model: 'kimi-k2.5:cloud',
     },
     medical: {
       type: 'ollama',
       baseUrl: 'http://localhost:11434/v1',
-      model: 'aadide/medgemma-1.5-4b-it-Q4_K_S',
+      model: 'aadide/medgemma-1.5-4b-it-Q4_K_S:latest',
     },
     embeddings: {
       type: 'ollama',

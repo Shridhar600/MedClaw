@@ -3,13 +3,30 @@ import OpenAI from 'openai';
 import type { ImageAttachment, LLMProvider, LLMResponse, Message, ToolSchema } from './types';
 import type { ProviderConfig } from '../config/types';
 
+function resolveProviderApiKey(config: ProviderConfig): string | undefined {
+  if (config.apiKey?.trim()) {
+    return config.apiKey;
+  }
+
+  switch (config.type) {
+    case 'openai':
+      return process.env.OPENAI_API_KEY;
+    case 'anthropic':
+      return process.env.ANTHROPIC_API_KEY;
+    case 'google':
+      return process.env.GOOGLE_API_KEY;
+    case 'ollama':
+      return undefined;
+  }
+}
+
 export class OpenAIProvider implements LLMProvider {
   private client: OpenAI;
   private model: string;
 
   constructor(config: ProviderConfig) {
     this.client = new OpenAI({
-      apiKey: config.apiKey ?? process.env.OPENAI_API_KEY,
+      apiKey: resolveProviderApiKey(config),
       baseURL: config.baseUrl,
     });
     this.model = config.model;

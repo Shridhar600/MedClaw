@@ -51,7 +51,7 @@ export async function loadConfig(input?: string | LoadConfigOptions): Promise<Ap
   if (!fs.existsSync(resolvedPath)) {
     if (options.requireFile) {
       throw new Error(
-        `Config file not found at ${resolvedPath}. Run \`npm run cli -- init\` to create one, or pass --config with an existing config path.`,
+        `Config file not found at ${resolvedPath}. Run \`npm run cli -- onboard\` to create one, or pass --config with an existing config path.`,
       );
     }
     console.warn(`[config] No config file at ${resolvedPath}, using defaults`);

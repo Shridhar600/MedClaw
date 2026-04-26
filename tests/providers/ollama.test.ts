@@ -8,7 +8,7 @@ describe('OllamaProvider', () => {
   const provider = new OllamaProvider({
     type: 'ollama',
     baseUrl: 'http://localhost:11434/v1',
-    model: 'llama3.1',
+    model: 'kimi-k2.5:cloud',
   });
 
   afterEach(() => jest.clearAllMocks());

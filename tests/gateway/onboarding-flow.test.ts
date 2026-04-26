@@ -18,9 +18,9 @@ describe('Gateway onboarding integration', () => {
   function makeConfig(): AppConfig {
     return {
       providers: {
-        main: { type: 'ollama', model: 'llama3.1', baseUrl: 'http://localhost:11434/v1' },
+        main: { type: 'ollama', model: 'kimi-k2.5:cloud', baseUrl: 'http://localhost:11434/v1' },
         medical: { type: 'ollama', model: 'medgemma', baseUrl: 'http://localhost:11434/v1' },
-        embeddings: { type: 'ollama', model: 'nomic-embed-text', baseUrl: 'http://localhost:11434/v1' },
+        embeddings: { type: 'ollama', model: 'embeddinggemma:latest', baseUrl: 'http://localhost:11434/v1' },
       },
       channels: { telegram: { enabled: false, botToken: '' } },
       tools: { allow: ['*'], deny: [] },
@@ -94,7 +94,7 @@ describe('Gateway onboarding integration', () => {
 
     for (const input of [
       'hello',
-      'Shridhar',
+      'Arjun',
       '31',
       'Asia/Kolkata',
       'Type 2 diabetes',
@@ -171,13 +171,40 @@ describe('Gateway onboarding integration', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({ chatId: 'chat-1', text: 'hello', userId: 'user-1' });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (gateway as any).handleMessage({ chatId: 'chat-1', text: 'Shridhar', userId: 'user-1' });
+    await (gateway as any).handleMessage({ chatId: 'chat-1', text: 'Arjun', userId: 'user-1' });
 
     const state = JSON.parse(
       fs.readFileSync(path.join(config.memory.workspace, '.redacted', 'onboarding.json'), 'utf8'),
     );
-    expect(state.answers.name).toBe('Shridhar');
+    expect(state.answers.name).toBe('Arjun');
     expect(state.answers.name).not.toContain('User id');
+    expect(sent[0]).toContain('Before we start');
+  });
+
+  it('routes a first media message through onboarding before the agent loop', async () => {
+    const config = makeConfig();
+    fs.mkdirSync(config.memory.workspace, { recursive: true });
+    fs.writeFileSync(path.join(config.memory.workspace, 'USER.md'), '# User Preferences\n', 'utf8');
+    fs.writeFileSync(path.join(config.memory.workspace, 'HEALTH_PROFILE.md'), '# Health Profile\n', 'utf8');
+    const gateway = new Gateway(config);
+    const run = jest.fn();
+    const sent: string[] = [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).agentLoop = { run };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).sessions = { prepareHistory: jest.fn().mockResolvedValue([]), recordTurn: jest.fn().mockResolvedValue(undefined) };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).channel = { send: jest.fn(async (_chatId: string, message: { text: string }) => sent.push(message.text)) };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (gateway as any).handleMessage({
+      chatId: 'chat-1',
+      text: '',
+      mediaPath: 'reports/scan.png',
+      userId: 'user-1',
+    });
+
+    expect(run).not.toHaveBeenCalled();
     expect(sent[0]).toContain('Before we start');
   });
 });
