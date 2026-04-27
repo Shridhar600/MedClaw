@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { loadConfig } from '../../src/config/config';
 import { validateConfig } from '../../src/config/validation';
-import { modelDefaultsForProvider, runServiceOnboarding } from '../../src/cli/service-onboarding';
+import { modelDefaultsForProvider, runServiceOnboarding, startDaemon } from '../../src/cli/service-onboarding';
 
 describe('service onboarding init', () => {
   let tmpDir: string;
@@ -398,5 +398,25 @@ describe('service onboarding init', () => {
         process.env.OPENAI_API_KEY = original;
       }
     }
+  });
+
+  it('returns a structured failure when daemon spawn throws synchronously', async () => {
+    const result = await startDaemon(
+      configPath,
+      {},
+      {
+        projectRoot: '/repo',
+        existsSync: () => false,
+        spawnProcess: () => {
+          throw new Error('spawn sync failed');
+        },
+        startupWindowMs: 1,
+      },
+    );
+
+    expect(result).toEqual({
+      started: false,
+      message: 'Failed to start MedClaw: spawn sync failed',
+    });
   });
 });

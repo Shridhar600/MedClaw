@@ -4,6 +4,7 @@ import JSON5 from 'json5';
 import { getDefaultConfig, loadConfig, saveConfig } from '../config/config';
 import { redactConfig, validateConfig } from '../config/validation';
 import type { AppConfig } from '../config/types';
+import { providerEnvVar } from '../config/provider-env';
 import { HeartbeatStore } from '../scheduler/store';
 import { checkSystemReadiness } from '../providers/healthcheck';
 import type { ProviderConfig } from '../config/types';
@@ -40,19 +41,6 @@ function formatLines(lines: string[]): string {
   return lines.filter((line) => line.length > 0).join('\n') + '\n';
 }
 
-function providerEnvVar(providerType: ProviderConfig['type']): string | undefined {
-  switch (providerType) {
-    case 'openai':
-      return 'OPENAI_API_KEY';
-    case 'anthropic':
-      return 'ANTHROPIC_API_KEY';
-    case 'google':
-      return 'GOOGLE_API_KEY';
-    case 'ollama':
-      return undefined;
-  }
-}
-
 function providerApiKeyConfigured(provider: ProviderConfig): boolean {
   const envVar = providerEnvVar(provider.type);
   return Boolean(provider.apiKey?.trim() || (envVar && process.env[envVar]?.trim()));
@@ -86,6 +74,11 @@ function setPathValue(target: Record<string, unknown>, dottedPath: string, value
   const parts = dottedPath.split('.').map((part) => part.trim()).filter(Boolean);
   if (parts.length === 0) {
     throw new Error('Config path is required.');
+  }
+  for (const part of parts) {
+    if (part === '__proto__' || part === 'prototype' || part === 'constructor') {
+      throw new Error(`Unsafe config path segment: ${part}`);
+    }
   }
 
   let cursor: Record<string, unknown> = target;

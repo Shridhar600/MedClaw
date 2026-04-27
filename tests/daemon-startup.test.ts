@@ -26,4 +26,19 @@ describe('daemon startup config guard', () => {
     expect(result.status).not.toBe(0);
     expect(`${result.stdout}\n${result.stderr}`).toContain('npm run cli -- onboard');
   });
+
+  it('exits non-zero with init guidance when start runs without configured default config', () => {
+    const result = spawnSync('npm', ['run', 'start'], {
+      cwd: path.join(__dirname, '..'),
+      env: {
+        ...process.env,
+        HOME: tmpDir,
+        REDACTED_CONFIG_PATH: '',
+      },
+      encoding: 'utf8',
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain('npm run cli -- onboard');
+  });
 });

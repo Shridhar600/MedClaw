@@ -1,4 +1,3 @@
-import * as fs from 'fs';
 import * as path from 'path';
 import type { AppConfig } from '../config/types';
 import type { Channel, IncomingMessage } from '../channels/types';
@@ -99,8 +98,7 @@ export class Gateway {
     if (config.channels.telegram.enabled) {
       const token = config.channels.telegram.botToken || process.env.TELEGRAM_BOT_TOKEN;
       if (!token) {
-        console.error('[gateway] TELEGRAM_BOT_TOKEN not set. Set it in config or environment.');
-        process.exit(1);
+        throw new Error('TELEGRAM_BOT_TOKEN not set. Set it in config or environment.');
       }
       this.channel = new TelegramChannel(token, config.memory.workspace);
       this.channel.onMessage((msg) => this.handleMessage(msg));
@@ -134,7 +132,9 @@ export class Gateway {
 
   private async handleMessage(incoming: IncomingMessage): Promise<void> {
     const { chatId, text } = incoming;
-    console.log(`[gateway] Message from ${chatId}: ${text.slice(0, 80)}`);
+    console.log(
+      `[gateway] Message from ${chatId}: ${text.length} chars${incoming.mediaPath ? ', media attached' : ''}`,
+    );
 
     const agentInput = this.buildAgentInput(incoming);
 
@@ -154,14 +154,14 @@ export class Gateway {
       try {
         await this.channel!.send(chatId, { text: incoming.mediaError });
       } catch (e) {
-        console.error('[gateway] Failed to send media upload error:', e);
+        console.error('[gateway] Failed to send media upload error:', summarizeErrorForLog(e));
         return;
       }
 
       try {
         await this.sessions!.recordTurn(chatId, failureTrace);
       } catch (e) {
-        console.error('[gateway] Failed to persist media upload error turn:', e);
+        console.error('[gateway] Failed to persist media upload error turn:', summarizeErrorForLog(e));
       }
       return;
     }
@@ -172,12 +172,22 @@ export class Gateway {
       return;
     }
 
-    const history = await this.sessions!.prepareHistory(chatId);
+    let result: Awaited<ReturnType<AgentLoop['run']>>;
+    try {
+      const history = await this.sessions!.prepareHistory(chatId);
+      result = await this.agentLoop!.run(agentInput, history, { chatId });
+      await this.channel!.send(chatId, { text: result.text });
+    } catch (e) {
+      console.error('[gateway] Agent/send error:', summarizeErrorForLog(e));
+      try {
+        await this.channel!.send(chatId, { text: "I'm having trouble right now. Please try again in a moment." });
+      } catch (fallbackError) {
+        console.error('[gateway] Failed to send fallback response:', summarizeErrorForLog(fallbackError));
+      }
+      return;
+    }
 
     try {
-      const result = await this.agentLoop!.run(agentInput, history, { chatId });
-      await this.channel!.send(chatId, { text: result.text });
-
       await this.sessions!.recordTurn(
         chatId,
         [
@@ -187,8 +197,7 @@ export class Gateway {
       );
       await this.reconcileHeartbeatPolicies(chatId);
     } catch (e) {
-      console.error('[gateway] Agent error:', e);
-      await this.channel!.send(chatId, { text: "I'm having trouble right now. Please try again in a moment." });
+      console.error('[gateway] Post-send persistence/reconciliation error:', summarizeErrorForLog(e));
     }
   }
 
@@ -358,9 +367,15 @@ export class Gateway {
         log: (message) => console.log(`[gateway] ${message}`),
       });
     } catch (error) {
-      console.warn(
-        `[gateway] Workspace bootstrap skipped: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Workspace bootstrap failed: ${message}`);
     }
   }
+}
+
+function summarizeErrorForLog(error: unknown): string {
+  if (error instanceof Error) {
+    return error.name;
+  }
+  return typeof error;
 }

@@ -4,6 +4,7 @@ import * as path from 'path';
 import { spawn, type SpawnOptions } from 'child_process';
 import { getDefaultConfig, loadConfig, saveConfig } from '../config/config';
 import { validateConfig } from '../config/validation';
+import { providerEnvVar } from '../config/provider-env';
 import type { AppConfig, ProviderConfig } from '../config/types';
 import { showConfig, showRedactedConfigSummary } from './admin';
 import { ensureWorkspaceTemplates, type CliIO } from './prompts';
@@ -171,16 +172,7 @@ function applyProvider(
 }
 
 export function requiredCloudEnv(providerType: ProviderConfig['type']): string {
-  switch (providerType) {
-    case 'openai':
-      return 'OPENAI_API_KEY';
-    case 'anthropic':
-      return 'ANTHROPIC_API_KEY';
-    case 'google':
-      return 'GOOGLE_API_KEY';
-    case 'ollama':
-      return '';
-  }
+  return providerEnvVar(providerType) ?? '';
 }
 
 export function modelDefaultsForProvider(providerType: ProviderConfig['type']): {
@@ -379,22 +371,9 @@ export function startDaemon(
   io: CliIO,
   dependencies: CompletionActionDependencies = {},
 ): Promise<{ started: boolean; message: string }> {
-  const projectRoot = dependencies.projectRoot ?? process.cwd();
-  const spec = resolveDaemonLaunchSpec(projectRoot, dependencies.existsSync);
-  const spawnProcess = dependencies.spawnProcess ?? spawn;
-  const child = spawnProcess(process.execPath, spec.args, {
-    cwd: projectRoot,
-    detached: true,
-    env: {
-      ...process.env,
-      REDACTED_CONFIG_PATH: configPath,
-    },
-    stdio: 'ignore',
-  });
-  child.unref?.();
-
   return new Promise((resolve) => {
     let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const finish = (started: boolean, message: string): void => {
       if (settled) {
         return;
@@ -403,22 +382,47 @@ export function startDaemon(
       resolve({ started, message });
     };
 
-    const timer = setTimeout(() => {
-      finish(true, `MedClaw started${child.pid ? ` (pid ${child.pid})` : ''}.`);
-    }, dependencies.startupWindowMs ?? 3000);
+    try {
+      const projectRoot = dependencies.projectRoot ?? process.cwd();
+      const spec = resolveDaemonLaunchSpec(projectRoot, dependencies.existsSync);
+      const spawnProcess = dependencies.spawnProcess ?? spawn;
+      const child = spawnProcess(process.execPath, spec.args, {
+        cwd: projectRoot,
+        detached: true,
+        env: {
+          ...process.env,
+          REDACTED_CONFIG_PATH: configPath,
+        },
+        stdio: 'ignore',
+      });
+      child.unref?.();
 
-    child.on('error', (error: unknown) => {
-      clearTimeout(timer);
-      finish(
-        false,
-        `Failed to start MedClaw: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    });
+      timer = setTimeout(() => {
+        finish(true, `MedClaw started${child.pid ? ` (pid ${child.pid})` : ''}.`);
+      }, dependencies.startupWindowMs ?? 3000);
 
-    child.on('exit', (code, signal) => {
-      clearTimeout(timer);
-      finish(false, `MedClaw exited during startup (${signal ?? code ?? 'unknown'}).`);
-    });
+      child.on('error', (error: unknown) => {
+        if (timer) {
+          clearTimeout(timer);
+        }
+        finish(
+          false,
+          `Failed to start MedClaw: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+
+      child.on('exit', (code, signal) => {
+        if (timer) {
+          clearTimeout(timer);
+        }
+        finish(false, `MedClaw exited during startup (${signal ?? code ?? 'unknown'}).`);
+      });
+    } catch (error) {
+      if (timer) {
+        clearTimeout(timer);
+      }
+      finish(false, `Failed to start MedClaw: ${error instanceof Error ? error.message : String(error)}`);
+    }
   });
 }
 

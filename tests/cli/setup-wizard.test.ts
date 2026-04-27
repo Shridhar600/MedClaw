@@ -10,6 +10,7 @@ import {
   handleCompletionAction,
   resolveDaemonLaunchSpec,
   runServiceOnboarding,
+  startDaemon,
 } from '../../src/cli/service-onboarding';
 
 describe('setup wizard', () => {
@@ -43,8 +44,8 @@ describe('setup wizard', () => {
     renderStepHeader(io, 1, 5, 'Workspace');
     renderStatus(io, 'INFO', 'Collecting workspace settings');
 
-    expect(output.join('')).toContain('medclaw onboard');
-    expect(output.join('')).toContain('Guided setup for your local health agent');
+    expect(output.join('')).toContain('MedClaw');
+    expect(output.join('')).toContain('Personal AI Health Assistant');
     expect(output.join('')).toContain('[1/5] Workspace');
     expect(output.join('')).toContain('------------------------------------------------------------');
     expect(output.join('')).toContain('[INFO] Collecting workspace settings');
@@ -66,6 +67,19 @@ describe('setup wizard', () => {
 
     expect(action).toBe('telegram');
     expect(errors.join('')).toContain('Invalid choice');
+  });
+
+  it('returns the canonical option when choice input differs only by case', async () => {
+    const action = await askChoice(
+      {
+        input: async () => 'openai',
+      },
+      'Provider',
+      ['Ollama', 'OpenAI'],
+      'Ollama',
+    );
+
+    expect(action).toBe('OpenAI');
   });
 
   it('uses the hidden secret input path and preserves prefilled defaults without leaking them in the prompt', async () => {
@@ -301,6 +315,36 @@ describe('setup wizard', () => {
     expect(fs.existsSync(configPath)).toBe(false);
   });
 
+  it('does not create workspace or config directories when cancelled from review', async () => {
+    const nestedWorkspacePath = path.join(tmpDir, 'cancelled', 'workspace');
+    const nestedConfigPath = path.join(tmpDir, 'cancelled-config', 'config.json');
+    const output: string[] = [];
+    const answers = [
+      nestedWorkspacePath,
+      'ollama',
+      '',
+      '',
+      '',
+      '',
+      'n',
+      'Asia/Kolkata',
+      'y',
+      'cancel',
+    ];
+
+    const code = await runServiceOnboarding(['--config', nestedConfigPath], {
+      stdout: (text: string) => output.push(text),
+      stderr: (text: string) => output.push(text),
+      input: async () => answers.shift() ?? '',
+    });
+
+    expect(code).toBe(0);
+    expect(output.join('')).toContain('Setup cancelled. No files were written.');
+    expect(fs.existsSync(nestedWorkspacePath)).toBe(false);
+    expect(fs.existsSync(path.dirname(nestedConfigPath))).toBe(false);
+    expect(fs.existsSync(nestedConfigPath)).toBe(false);
+  });
+
   it('prints the redacted config when review-config is selected from completion', async () => {
     fs.mkdirSync(path.dirname(configPath), { recursive: true });
     fs.writeFileSync(
@@ -397,5 +441,55 @@ describe('setup wizard', () => {
       },
     });
     expect(spawnCalls[0].options.env?.REDACTED_CONFIG_PATH).toBe(configPath);
+  });
+
+  it('reports daemon startup spawn errors', async () => {
+    const errors: string[] = [];
+    const result = await startDaemon(
+      configPath,
+      { stderr: (text: string) => errors.push(text) },
+      {
+        projectRoot: '/repo',
+        existsSync: () => false,
+        spawnProcess: () => ({
+          on: (event: 'error' | 'exit', listener: (...args: unknown[]) => void) => {
+            if (event === 'error') {
+              setTimeout(() => listener(new Error('spawn failed')), 0);
+            }
+            return undefined;
+          },
+          unref: () => undefined,
+        }),
+        startupWindowMs: 50,
+      },
+    );
+
+    expect(result.started).toBe(false);
+    expect(result.message).toContain('Failed to start MedClaw: spawn failed');
+    expect(errors.join('')).not.toContain('spawn failed');
+  });
+
+  it('reports daemon early exits before marking startup successful', async () => {
+    const result = await startDaemon(
+      configPath,
+      {},
+      {
+        projectRoot: '/repo',
+        existsSync: () => false,
+        spawnProcess: () => ({
+          on: (event: 'error' | 'exit', listener: (...args: unknown[]) => void) => {
+            if (event === 'exit') {
+              setTimeout(() => listener(1, null), 0);
+            }
+            return undefined;
+          },
+          unref: () => undefined,
+        }),
+        startupWindowMs: 50,
+      },
+    );
+
+    expect(result.started).toBe(false);
+    expect(result.message).toContain('MedClaw exited during startup (1)');
   });
 });

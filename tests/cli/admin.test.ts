@@ -58,6 +58,16 @@ describe('cli admin surfaces', () => {
     expect(JSON.parse(raw).providers.main.model).toBe('gpt-4.1');
   });
 
+  it('rejects dangerous config paths instead of mutating object prototypes', async () => {
+    const config = getDefaultConfig();
+    await saveConfig(configPath, config);
+
+    await expect(setConfigValue(configPath, '__proto__.polluted', 'true')).rejects.toThrow(
+      'Unsafe config path segment',
+    );
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
   it('handles missing profile files gracefully', async () => {
     const text = await showProfile({ workspacePath });
     expect(text).toContain('No health profile found');

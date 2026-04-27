@@ -241,7 +241,7 @@ export async function askYesNo(
   prompt: string,
   defaultValue: boolean,
 ): Promise<boolean> {
-  while (true) {
+  for (;;) {
     const answer = await askText(
       io,
       `${prompt}\n  options: yes, no`,

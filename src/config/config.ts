@@ -84,6 +84,10 @@ function removeDefaultBaseUrlForCloudProviders(config: AppConfig, userConfig: Pa
 export async function saveConfig(configPath: string, config: AppConfig): Promise<void> {
   fs.mkdirSync(path.dirname(configPath), { recursive: true });
   const tmpPath = `${configPath}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tmpPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+  const existingMode = fs.existsSync(configPath) ? fs.statSync(configPath).mode & 0o777 : 0o600;
+  const finalMode = existingMode & 0o600;
+
+  fs.writeFileSync(tmpPath, `${JSON.stringify(config, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
   fs.renameSync(tmpPath, configPath);
+  fs.chmodSync(configPath, finalMode);
 }

@@ -68,6 +68,30 @@ describe('loadConfig', () => {
     expect(fs.existsSync(`${cfgPath}.tmp`)).toBe(false);
   });
 
+  it('saves new config files without group or world permissions', async () => {
+    const cfgPath = path.join(tmpDir, 'config.json');
+    const config = getDefaultConfig();
+    const oldUmask = process.umask(0o000);
+
+    try {
+      await saveConfig(cfgPath, config);
+    } finally {
+      process.umask(oldUmask);
+    }
+
+    expect(fs.statSync(cfgPath).mode & 0o777).toBe(0o600);
+  });
+
+  it('does not widen stricter existing owner-only config permissions', async () => {
+    const cfgPath = path.join(tmpDir, 'config.json');
+    const config = getDefaultConfig();
+    fs.writeFileSync(cfgPath, '{}', { mode: 0o400 });
+
+    await saveConfig(cfgPath, config);
+
+    expect(fs.statSync(cfgPath).mode & 0o777).toBe(0o400);
+  });
+
   it('redacts provider api keys and telegram tokens', () => {
     const config = getDefaultConfig();
     config.providers.main = { type: 'openai', model: 'gpt-4o', apiKey: 'sk-secret' };

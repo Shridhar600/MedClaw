@@ -1,8 +1,8 @@
-import { loadConfig } from './config/config';
 import { Gateway } from './gateway/gateway';
+import { loadRuntimeConfig } from './runtime/startup';
 
 async function main(): Promise<void> {
-  const config = await loadConfig({ configPath: process.env.REDACTED_CONFIG_PATH, requireFile: true });
+  const config = await loadRuntimeConfig();
   const gateway = new Gateway(config);
 
   await gateway.start();

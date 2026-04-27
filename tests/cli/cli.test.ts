@@ -134,7 +134,8 @@ describe('cli router', () => {
       );
 
       expect(result.status).toBe(0);
-      expect(result.stdout).toContain('medclaw onboard');
+      expect(result.stdout).toContain('MedClaw');
+      expect(result.stdout).toContain('Personal AI Health Assistant');
       expect(result.stdout).toContain('[1/5]');
       expect(result.stdout).toContain('Setup complete');
       expect(fs.existsSync(configPath)).toBe(true);

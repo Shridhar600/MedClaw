@@ -31,14 +31,15 @@ export async function askChoice<TChoice extends string>(
   options: readonly TChoice[],
   defaultValue: TChoice,
 ): Promise<TChoice> {
-  while (true) {
+  for (;;) {
     const answer = (await askValue(
       io,
       `${prompt}\n  options: ${options.join(', ')}`,
       defaultValue,
     )).toLowerCase();
-    if (options.includes(answer as TChoice)) {
-      return answer as TChoice;
+    const match = options.find((option) => option.toLowerCase() === answer);
+    if (match) {
+      return match;
     }
     io.stderr?.(`Invalid choice. Expected one of: ${options.join(', ')}.\n`);
   }
@@ -74,7 +75,7 @@ async function askMenuChoice<TValue extends string>(
     ...options.map((option, index) => `  ${index + 1}. ${option.label}`),
   ].join('\n');
 
-  while (true) {
+  for (;;) {
     const answer = (await askValue(io, promptBody, String(defaultIndex + 1))).toLowerCase();
     const numericIndex = Number.parseInt(answer, 10);
     if (Number.isInteger(numericIndex) && numericIndex >= 1 && numericIndex <= options.length) {

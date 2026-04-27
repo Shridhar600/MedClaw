@@ -4,6 +4,7 @@
   "private": true,
   "main": "dist/index.js",
   "scripts": {
+    "start": "node --import tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
     "dev:cli": "tsx watch src/test-cli.ts",
     "cli": "tsx src/cli/index.ts",

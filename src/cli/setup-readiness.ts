@@ -2,6 +2,7 @@ import { spawn, type SpawnOptions } from 'child_process';
 import * as fs from 'fs';
 import type { AppConfig } from '../config/types';
 import { validateConfig } from '../config/validation';
+import { providerEnvVar } from '../config/provider-env';
 import { probeOllamaCatalog, verifyTelegramToken, type HealthcheckOptions } from '../providers/healthcheck';
 
 export interface SetupReadinessDependencies extends Pick<HealthcheckOptions, 'fetchImpl' | 'timeoutMs'> {
@@ -41,16 +42,33 @@ function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function usesOllama(config: AppConfig): boolean {
-  return [config.providers.main, config.providers.medical, config.providers.embeddings]
-    .some((provider) => provider.type === 'ollama');
+function configuredProviders(config: AppConfig): Array<{
+  label: 'providers.main' | 'providers.medical' | 'providers.embeddings';
+  provider: AppConfig['providers']['main'];
+}> {
+  return [
+    { label: 'providers.main', provider: config.providers.main },
+    { label: 'providers.medical', provider: config.providers.medical },
+    { label: 'providers.embeddings', provider: config.providers.embeddings },
+  ];
 }
 
-function getOllamaBaseUrls(config: AppConfig): string[] {
-  return [config.providers.main, config.providers.medical, config.providers.embeddings]
-    .filter((provider) => provider.type === 'ollama')
-    .map((provider) => provider.baseUrl?.trim() ?? '')
-    .filter((baseUrl, index, all) => baseUrl.length > 0 && all.indexOf(baseUrl) === index);
+function hasProviderApiKey(provider: AppConfig['providers']['main']): boolean {
+  const envVar = providerEnvVar(provider.type);
+  return Boolean(provider.apiKey?.trim() || (envVar && process.env[envVar]?.trim()));
+}
+
+function providerDisplayName(provider: AppConfig['providers']['main']): string {
+  switch (provider.type) {
+    case 'openai':
+      return 'OpenAI';
+    case 'anthropic':
+      return 'Anthropic';
+    case 'google':
+      return 'Google';
+    case 'ollama':
+      return 'Ollama';
+  }
 }
 
 export async function ensureOllamaRuntime(
@@ -165,6 +183,8 @@ export async function preflightStartCheck(
 ): Promise<StartPreflightReport> {
   const blockers = [...validateConfig(config).errors];
   const warnings: string[] = [];
+  const ollamaCatalogs = new Map<string, Promise<OllamaRuntimeCheck>>();
+  const reportedOllamaUrls = new Set<string>();
 
   if (!config.channels.telegram.enabled && !config.heartbeat.enabled) {
     blockers.push('Nothing is enabled to keep MedClaw running. Enable Telegram or heartbeats before starting.');
@@ -172,27 +192,48 @@ export async function preflightStartCheck(
 
   if (!fs.existsSync(configPath)) {
     blockers.push(`Config file missing at ${configPath}.`);
+  } else if (!fs.statSync(configPath).isFile()) {
+    blockers.push(`Config path is not a file at ${configPath}.`);
   }
   if (!fs.existsSync(config.memory.workspace)) {
     blockers.push(`Workspace missing at ${config.memory.workspace}.`);
+  } else if (!fs.statSync(config.memory.workspace).isDirectory()) {
+    blockers.push(`Workspace path is not a directory at ${config.memory.workspace}.`);
   }
 
-  if (usesOllama(config)) {
-    const combinedModels = new Set<string>();
-    for (const baseUrl of getOllamaBaseUrls(config)) {
-      const ollama = await ensureOllamaRuntime(baseUrl, dependencies);
+  for (const { label, provider } of configuredProviders(config)) {
+    if (provider.type !== 'ollama') {
+      if (!hasProviderApiKey(provider)) {
+        const envVar = providerEnvVar(provider.type);
+        const envHint = envVar ? ` Set apiKey or ${envVar}.` : ' Set apiKey.';
+        blockers.push(`${label} apiKey is required for ${providerDisplayName(provider)} provider.${envHint}`);
+      }
+      continue;
+    }
+
+    const baseUrl = provider.baseUrl?.trim();
+    if (!baseUrl || !provider.model.trim()) {
+      continue;
+    }
+
+    if (!ollamaCatalogs.has(baseUrl)) {
+      ollamaCatalogs.set(baseUrl, ensureOllamaRuntime(baseUrl, dependencies));
+    }
+
+    const ollama = await ollamaCatalogs.get(baseUrl)!;
+    if (!reportedOllamaUrls.has(baseUrl)) {
       warnings.push(...ollama.warnings);
       blockers.push(...ollama.blockers);
-      for (const model of ollama.models) {
-        combinedModels.add(model);
-      }
       if (ollama.reachable && ollama.autoStarted) {
         warnings.push(`Ollama was started automatically for ${baseUrl}.`);
       }
+      reportedOllamaUrls.add(baseUrl);
     }
-    const missingModels = getMissingOllamaModels(getRequiredOllamaModels(config), [...combinedModels]);
-    for (const model of missingModels) {
-      blockers.push(`Missing Ollama model: ${model}. Run \`ollama pull ${model}\`.`);
+
+    if (ollama.reachable && !ollama.models.includes(provider.model)) {
+      blockers.push(
+        `Missing Ollama model for ${label} at ${baseUrl}: ${provider.model}. Run \`ollama pull ${provider.model}\` against that endpoint.`,
+      );
     }
   }
 

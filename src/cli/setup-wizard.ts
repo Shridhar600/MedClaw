@@ -46,8 +46,19 @@ function validateWritablePath(targetPath: string, kind: 'workspace' | 'config'):
   const errors: string[] = [];
   try {
     const directory = kind === 'workspace' ? targetPath : path.dirname(targetPath);
-    fs.mkdirSync(directory, { recursive: true });
-    fs.accessSync(directory, fs.constants.W_OK);
+    let probeDirectory = directory;
+    while (!fs.existsSync(probeDirectory)) {
+      const parent = path.dirname(probeDirectory);
+      if (parent === probeDirectory) {
+        break;
+      }
+      probeDirectory = parent;
+    }
+    const stat = fs.statSync(probeDirectory);
+    if (!stat.isDirectory()) {
+      throw new Error(`${probeDirectory} is not a directory`);
+    }
+    fs.accessSync(probeDirectory, fs.constants.W_OK);
   } catch (error) {
     errors.push(
       `${kind === 'workspace' ? 'Workspace' : 'Config directory'} is not writable: ${
@@ -150,7 +161,7 @@ async function runProviderStep(io: CliIO, state: SetupWizardState): Promise<void
     if (process.env[requiredEnv]?.trim()) {
       renderStatus(io, 'INFO', `Using ${requiredEnv} from the environment.`);
     } else {
-      while (true) {
+      for (;;) {
         state.apiKey = await askSecret(io, `${providerLabel(state.provider)} API key`, state.apiKey ?? '');
         if (state.apiKey?.trim()) {
           break;
@@ -216,7 +227,7 @@ async function runTelegramStep(io: CliIO, state: SetupWizardState): Promise<void
   renderStepHeader(io, 4, TOTAL_STEPS, 'Telegram');
   state.telegramEnabled = await askYesNo(io, 'Enable Telegram?', state.telegramEnabled);
   if (state.telegramEnabled) {
-    while (true) {
+    for (;;) {
       state.telegramToken = await askSecret(io, 'Telegram bot token', state.telegramToken ?? '');
       if (!state.telegramToken.trim()) {
         renderStatus(io, 'WARN', 'Telegram bot token is required when Telegram is enabled.');
@@ -237,7 +248,7 @@ async function runTelegramChecks(
     return;
   }
 
-  while (true) {
+  for (;;) {
     const config = buildConfigFromArgs(stateToArgs(state));
     const result = await verifyTelegramRuntime(config, options);
     if (result.blockers.length === 0) {
@@ -372,7 +383,7 @@ async function runCompletionStep(
   configPath: string,
   options: SetupReadinessDependencies = {},
 ): Promise<CompletionAction> {
-  while (true) {
+  for (;;) {
     const validation = validateConfig(config);
     const readiness = await checkSystemReadiness(config, {
       allowNetworkChecks: shouldRunLiveChecks(io, options),
@@ -428,7 +439,7 @@ export async function runSetupWizard(
 
   let config: AppConfig | undefined;
   let configPath: string | undefined;
-  while (true) {
+  for (;;) {
     const action = await runReviewStep(io, state, options);
     if (action === 'cancel') {
       writeLine(io);

@@ -1,7 +1,14 @@
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import type { AppConfig } from '../../src/config/types';
 
 describe('Gateway media flow', () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
   function makeConfig(): AppConfig {
     return {
       providers: {
@@ -86,6 +93,155 @@ describe('Gateway media flow', () => {
     expect(forwardedPrompt).toContain('reports/report.txt');
     expect(forwardedPrompt).toContain('42');
     expect(send).toHaveBeenCalledWith('chat-1', { text: 'processed' });
+  });
+
+  it('does not log user message text when handling incoming messages', async () => {
+    const gateway = new Gateway(makeConfig());
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    const send = jest.fn().mockResolvedValue(undefined);
+    const run = jest.fn().mockResolvedValue({
+      text: 'processed',
+      trace: [{ role: 'assistant', content: 'processed' }],
+      usedTools: [],
+      healthResponse: false,
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).channel = { send };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).agentLoop = { run };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).sessions = {
+      prepareHistory: jest.fn().mockResolvedValue([]),
+      recordTurn: jest.fn().mockResolvedValue(undefined),
+      resetSession: jest.fn(),
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (gateway as any).handleMessage({
+      chatId: 'chat-1',
+      userId: 'user-1',
+      text: 'My private glucose reading is 240 after lunch',
+    });
+
+    expect(logSpy.mock.calls.flat().join('\n')).not.toContain('glucose');
+  });
+
+  it('does not log raw agent errors that may contain sensitive context', async () => {
+    const gateway = new Gateway(makeConfig());
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const send = jest.fn().mockResolvedValue(undefined);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).channel = { send };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).agentLoop = {
+      run: jest.fn().mockRejectedValue(new Error('private report sodium value 130')),
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).sessions = {
+      prepareHistory: jest.fn().mockResolvedValue([]),
+      recordTurn: jest.fn().mockResolvedValue(undefined),
+      resetSession: jest.fn(),
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (gateway as any).handleMessage({
+      chatId: 'chat-1',
+      userId: 'user-1',
+      text: 'Please analyze my report',
+    });
+
+    expect(errorSpy.mock.calls.flat().join('\n')).not.toContain('sodium');
+  });
+
+  it('sends generic fallback when prepareHistory fails before agent execution', async () => {
+    const gateway = new Gateway(makeConfig());
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const send = jest.fn().mockResolvedValue(undefined);
+    const run = jest.fn();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).channel = { send };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).agentLoop = { run };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).sessions = {
+      prepareHistory: jest.fn().mockRejectedValue(new Error('private session glucose context')),
+      recordTurn: jest.fn(),
+      resetSession: jest.fn(),
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await expect((gateway as any).handleMessage({
+      chatId: 'chat-1',
+      userId: 'user-1',
+      text: 'Can I eat rice?',
+    })).resolves.toBeUndefined();
+
+    expect(run).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith('chat-1', {
+      text: "I'm having trouble right now. Please try again in a moment.",
+    });
+    expect(errorSpy.mock.calls.flat().join('\n')).not.toContain('glucose');
+  });
+
+  it('does not send fallback when recordTurn fails after successful response send', async () => {
+    const gateway = new Gateway(makeConfig());
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const send = jest.fn().mockResolvedValue(undefined);
+    const run = jest.fn().mockResolvedValue({
+      text: 'processed',
+      trace: [{ role: 'assistant', content: 'processed' }],
+      usedTools: [],
+      healthResponse: false,
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).channel = { send };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).agentLoop = { run };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).sessions = {
+      prepareHistory: jest.fn().mockResolvedValue([]),
+      recordTurn: jest.fn().mockRejectedValue(new Error('private persistence sodium context')),
+      resetSession: jest.fn(),
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).reconcileHeartbeatPolicies = jest.fn().mockResolvedValue(undefined);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await expect((gateway as any).handleMessage({
+      chatId: 'chat-1',
+      userId: 'user-1',
+      text: 'Please analyze my report',
+    })).resolves.toBeUndefined();
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith('chat-1', { text: 'processed' });
+    expect(errorSpy.mock.calls.flat().join('\n')).not.toContain('sodium');
+  });
+
+  it('fails startup bootstrap instead of silently continuing with an unusable workspace path', () => {
+    const tmpFile = path.join(os.tmpdir(), `redacted-bootstrap-file-${Date.now()}`);
+    fs.writeFileSync(tmpFile, 'not a directory', 'utf8');
+    const gateway = new Gateway(makeConfig());
+
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect(() => (gateway as any).bootstrapWorkspace(tmpFile)).toThrow('Workspace bootstrap failed');
+    } finally {
+      fs.rmSync(tmpFile, { force: true });
+    }
   });
 
   it('surfaces explicit error to user when media download fails', async () => {
@@ -212,6 +368,34 @@ describe('Gateway media flow', () => {
     expect(send).toHaveBeenCalledWith('chat-error', {
       text: 'Failed to download uploaded file report.pdf',
     });
+  });
+
+  it('does not log raw send errors when mediaError response delivery fails', async () => {
+    const gateway = new Gateway(makeConfig());
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const send = jest.fn().mockRejectedValue(new Error('telegram response included private glucose context'));
+    const run = jest.fn();
+    const recordTurn = jest.fn();
+    const prepareHistory = jest.fn().mockResolvedValue([]);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).channel = { send };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).agentLoop = { run };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).sessions = { prepareHistory, recordTurn, resetSession: jest.fn() };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await expect((gateway as any).handleMessage({
+      chatId: 'chat-send-fail',
+      userId: 'user-1',
+      text: 'Uploaded report',
+      mediaError: 'Failed to download uploaded file report.pdf',
+    })).resolves.toBeUndefined();
+
+    expect(run).not.toHaveBeenCalled();
+    expect(recordTurn).not.toHaveBeenCalled();
+    expect(errorSpy.mock.calls.flat().join('\n')).not.toContain('glucose');
   });
 
   it('still surfaces upload failure when prepareHistory fails', async () => {

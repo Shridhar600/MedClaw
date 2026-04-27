@@ -1,4 +1,5 @@
 import type { AppConfig, ProviderConfig } from '../config/types';
+import { providerEnvVar } from '../config/provider-env';
 
 export type ReadinessStatus = 'ok' | 'warn' | 'fail';
 
@@ -36,19 +37,6 @@ interface JsonProbeResult {
   status: number;
   body?: unknown;
   error?: string;
-}
-
-function providerEnvVar(providerType: ProviderConfig['type']): string | undefined {
-  switch (providerType) {
-    case 'openai':
-      return 'OPENAI_API_KEY';
-    case 'anthropic':
-      return 'ANTHROPIC_API_KEY';
-    case 'google':
-      return 'GOOGLE_API_KEY';
-    case 'ollama':
-      return undefined;
-  }
 }
 
 function getFetchImpl(options: HealthcheckOptions): typeof fetch | undefined {
@@ -101,9 +89,13 @@ async function probeJson(url: string, options: HealthcheckOptions): Promise<Json
     return {
       ok: false,
       status: 0,
-      error: error instanceof Error ? error.message : String(error),
+      error: redactTelegramTokens(error instanceof Error ? error.message : String(error)),
     };
   }
+}
+
+function redactTelegramTokens(text: string): string {
+  return text.replace(/bot[^/\s]+/g, 'bot[REDACTED]');
 }
 
 function getOllamaModelNames(body: unknown): string[] {
@@ -256,12 +248,13 @@ export async function verifyTelegramToken(
   }
 
   if (probe.status === 401 || body?.ok === false) {
+    const detail = body?.description?.trim() || 'token rejected by Telegram';
     return {
       ready: false,
       checked: true,
       label: 'telegram',
       status: 'fail',
-      details: [body?.description?.trim() || 'token rejected by Telegram'],
+      details: [redactTelegramTokens(detail)],
       warnings: [],
       reasonCode: 'invalid-token',
       actionHint: 'Paste a valid Telegram bot token.',
