@@ -187,6 +187,66 @@ describe('service onboarding init', () => {
     expect(config.heartbeat.enabled).toBe(true);
   });
 
+  it('refuses to overwrite an existing config during non-interactive init without force', async () => {
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(configPath, '{"existing":true}\n', 'utf8');
+    const output: string[] = [];
+
+    const code = await runServiceOnboarding(
+      [
+        '--yes',
+        '--config', configPath,
+        '--workspace', workspacePath,
+        '--provider', 'ollama',
+        '--telegram-enabled', 'false',
+        '--timezone', 'Asia/Kolkata',
+        '--heartbeats-enabled', 'true',
+      ],
+      {
+        stdout: (text: string) => output.push(text),
+        stderr: (text: string) => output.push(text),
+        input: async () => {
+          throw new Error('prompt should not be called');
+        },
+      },
+    );
+
+    expect(code).toBe(1);
+    expect(output.join('')).toContain('already exists');
+    expect(output.join('')).toContain('--force');
+    expect(fs.readFileSync(configPath, 'utf8')).toBe('{"existing":true}\n');
+  });
+
+  it('overwrites an existing config during non-interactive init when force is provided', async () => {
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(configPath, '{"existing":true}\n', 'utf8');
+
+    const code = await runServiceOnboarding(
+      [
+        '--yes',
+        '--force',
+        '--config', configPath,
+        '--workspace', workspacePath,
+        '--provider', 'ollama',
+        '--telegram-enabled', 'false',
+        '--timezone', 'Asia/Kolkata',
+        '--heartbeats-enabled', 'true',
+      ],
+      {
+        stdout: () => undefined,
+        stderr: () => undefined,
+        input: async () => {
+          throw new Error('prompt should not be called');
+        },
+      },
+    );
+
+    expect(code).toBe(0);
+    const config = await loadConfig({ configPath, requireFile: true });
+    expect(config.memory.workspace).toBe(workspacePath);
+    expect(config.channels.telegram.enabled).toBe(false);
+  });
+
   it('fails clearly for OpenAI provider without an API key', async () => {
     const original = process.env.OPENAI_API_KEY;
     delete process.env.OPENAI_API_KEY;

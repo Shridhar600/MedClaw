@@ -52,17 +52,19 @@ export class MemoryIndexer {
 
     const chunks = this.chunkContent(content, relativePath).filter(chunk => chunk.content.trim().length > 0);
     const preparedChunks: Chunk[] = [];
+    let hadEmbeddingFailure = false;
     for (const chunk of chunks) {
       try {
         chunk.embedding = await this.embeddingProvider.embed(chunk.content);
-        preparedChunks.push(chunk);
       } catch (e) {
         console.warn(`[indexer] Failed to embed chunk ${chunk.id}:`, e);
-        return;
+        hadEmbeddingFailure = true;
       }
+      preparedChunks.push(chunk);
     }
 
-    this.store.replaceFileIndex(relativePath, preparedChunks, hash);
+    const indexHash = hadEmbeddingFailure ? `embedding-partial:${hash}` : hash;
+    this.store.replaceFileIndex(relativePath, preparedChunks, indexHash);
     console.log(`[indexer] Indexed ${relativePath} (${chunks.length} chunks)`);
   }
 

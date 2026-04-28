@@ -90,7 +90,7 @@ describe('MemoryIndexer', () => {
     expect(chunks.length).toBe(0);
   });
 
-  it('keeps previous indexed chunks when embedding fails during reindex', async () => {
+  it('replaces previous indexed chunks when embedding fails during reindex', async () => {
     const filePath = path.join(workspaceDir, 'stable.md');
     fs.writeFileSync(filePath, '# Original\n\nBaseline content.');
 
@@ -101,10 +101,54 @@ describe('MemoryIndexer', () => {
     fs.writeFileSync(filePath, '# Updated\n\nNew content that fails embedding.');
     (mockProvider.embed as jest.Mock).mockRejectedValueOnce(new Error('transient embed failure'));
 
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
     await indexer.indexAll();
     const chunksAfterFailure = store.getChunksByPath('stable.md');
     expect(chunksAfterFailure.length).toBeGreaterThan(0);
-    expect(chunksAfterFailure[0].content).toContain('Baseline content');
+    expect(chunksAfterFailure[0].content).toContain('New content that fails embedding');
+    expect(store.getAllChunksWithEmbeddings().find(chunk => chunk.path === 'stable.md')?.embedding).toBeUndefined();
+    expect(store.keywordSearch('fails embedding', 5)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: 'stable.md' }),
+      ]),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it('stores failed-embedding chunks without embeddings so updated files remain keyword searchable', async () => {
+    const filePath = path.join(workspaceDir, 'partial.md');
+    const lines = Array.from({ length: 90 }, (_, i) => {
+      const marker = i === 45 ? 'chunk-two-failure-token' : `line-${i}`;
+      return `${marker} ${'memory resilience keyword '.repeat(10)}`;
+    });
+    fs.writeFileSync(filePath, lines.join('\n'));
+
+    (mockProvider.embed as jest.Mock).mockImplementation(async (content: string) => {
+      if (content.includes('chunk-two-failure-token')) {
+        throw new Error('transient chunk embed failure');
+      }
+      return [0.1, 0.2, 0.3];
+    });
+
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+    const indexer = new MemoryIndexer(store, mockProvider, workspaceDir);
+    await indexer.indexAll();
+
+    const chunks = store.getAllChunksWithEmbeddings().filter(chunk => chunk.path === 'partial.md');
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.some(chunk => chunk.embedding === undefined)).toBe(true);
+    expect(chunks.some(chunk => chunk.embedding !== undefined)).toBe(true);
+    expect(store.keywordSearch('chunk-two-failure-token', 5)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: 'partial.md' }),
+      ]),
+    );
+    expect(store.getFileHash('partial.md')).toBeDefined();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[indexer] Failed to embed chunk partial.md:'),
+      expect.anything(),
+    );
+    warnSpy.mockRestore();
   });
 
   it('retries failed indexing on next run when file content is unchanged', async () => {

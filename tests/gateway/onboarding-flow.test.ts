@@ -130,6 +130,37 @@ describe('Gateway onboarding integration', () => {
     expect(run).not.toHaveBeenCalled();
   });
 
+  it('routes urgent health messages directly after onboarding is complete', async () => {
+    const config = makeConfig();
+    fs.mkdirSync(path.join(config.memory.workspace, '.redacted'), { recursive: true });
+    fs.writeFileSync(path.join(config.memory.workspace, 'USER.md'), '# User Preferences\n', 'utf8');
+    fs.writeFileSync(path.join(config.memory.workspace, 'HEALTH_PROFILE.md'), '# Health Profile\n', 'utf8');
+    fs.writeFileSync(
+      path.join(config.memory.workspace, '.redacted', 'onboarding.json'),
+      JSON.stringify({ status: 'complete', updatedAt: new Date().toISOString(), answers: {} }),
+      'utf8',
+    );
+    const gateway = new Gateway(config);
+    const run = jest.fn().mockResolvedValue({ text: 'normal agent', trace: [{ role: 'assistant', content: 'normal agent' }] });
+    const recordTurn = jest.fn().mockResolvedValue(undefined);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).agentLoop = { run };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).sessions = { prepareHistory: jest.fn().mockResolvedValue([]), recordTurn };
+
+    const response = await gateway.handleTestMessage('chat-1', 'I have severe chest pain and cannot breathe');
+
+    expect(response).toContain('emergency');
+    expect(run).not.toHaveBeenCalled();
+    expect(recordTurn).toHaveBeenCalledWith(
+      'chat-1',
+      expect.arrayContaining([
+        expect.objectContaining({ role: 'user', content: expect.stringContaining('severe chest pain') }),
+        expect.objectContaining({ role: 'assistant', content: expect.stringContaining('emergency') }),
+      ]),
+    );
+  });
+
   it('recovers corrupt onboarding state and still returns the onboarding prompt', async () => {
     const config = makeConfig();
     fs.mkdirSync(path.join(config.memory.workspace, '.redacted'), { recursive: true });

@@ -231,6 +231,30 @@ describe('Gateway media flow', () => {
     expect(errorSpy.mock.calls.flat().join('\n')).not.toContain('sodium');
   });
 
+  it('closes the search store on stop', async () => {
+    const gateway = new Gateway(makeConfig());
+    const close = jest.fn();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).store = { close };
+
+    await gateway.stop();
+
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it('still closes the search store when channel disconnect fails during stop', async () => {
+    const gateway = new Gateway(makeConfig());
+    const close = jest.fn();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).store = { close };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).channel = { disconnect: jest.fn().mockRejectedValue(new Error('disconnect failed')) };
+
+    await expect(gateway.stop()).rejects.toThrow('disconnect failed');
+
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
   it('fails startup bootstrap instead of silently continuing with an unusable workspace path', () => {
     const tmpFile = path.join(os.tmpdir(), `redacted-bootstrap-file-${Date.now()}`);
     fs.writeFileSync(tmpFile, 'not a directory', 'utf8');

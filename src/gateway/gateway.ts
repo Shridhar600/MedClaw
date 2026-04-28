@@ -25,12 +25,18 @@ import { OnboardingFlow } from '../onboarding/flow';
 import { OnboardingStore } from '../onboarding/store';
 import { ensureWorkspaceBootstrap } from '../workspace/bootstrap';
 
+const EMERGENCY_PATTERN =
+  /\b(chest pain|can't breathe|cannot breathe|difficulty breathing|stroke|heart attack|severe bleeding|suicidal|emergency)\b/i;
+const EMERGENCY_RESPONSE =
+  'This may be an emergency. Please contact local emergency services now or go to the nearest emergency department. If you can, ask someone nearby to stay with you while you get help.';
+
 export class Gateway {
   private config: AppConfig;
   private channel?: Channel;
   private agentLoop?: AgentLoop;
   private sessions?: SessionManager;
   private scheduler?: HeartbeatScheduler;
+  private store?: SqliteStore;
 
   constructor(config: AppConfig) {
     this.config = config;
@@ -48,11 +54,16 @@ export class Gateway {
     const memory = new MemoryEngine(config.memory.workspace);
     const dbPath = path.join(config.memory.workspace, '..', 'search.db');
     const store = new SqliteStore(dbPath);
+    this.store = store;
     const embeddingProvider = createProvider(config.providers.embeddings);
     const { MemoryIndexer } = await import('../memory/indexer');
     const indexer = new MemoryIndexer(store, embeddingProvider, config.memory.workspace);
-    await indexer.indexAll();
-    console.log('[gateway] Memory index ready');
+    try {
+      await indexer.indexAll();
+      console.log('[gateway] Memory index ready');
+    } catch (error) {
+      console.warn('[gateway] Memory index unavailable; continuing with degraded search:', summarizeErrorForLog(error));
+    }
 
     const search = new MemorySearch(store, embeddingProvider, config.memory.search.hybridWeights);
 
@@ -115,6 +126,15 @@ export class Gateway {
   }
 
   async handleTestMessage(chatId: string, text: string): Promise<string> {
+    const emergency = this.handleEmergencyInput(text);
+    if (emergency) {
+      await this.sessions?.recordTurn(chatId, [
+        { role: 'user', content: text },
+        { role: 'assistant', content: emergency },
+      ]);
+      return emergency;
+    }
+
     const onboarding = await this.handleOnboarding(chatId, text);
     if (onboarding) {
       return onboarding;
@@ -145,6 +165,25 @@ export class Gateway {
       return;
     }
 
+    const emergency = this.handleEmergencyInput(text);
+    if (emergency) {
+      try {
+        await this.channel!.send(chatId, { text: emergency });
+      } catch (e) {
+        console.error('[gateway] Failed to send emergency response:', summarizeErrorForLog(e));
+        return;
+      }
+      try {
+        await this.sessions!.recordTurn(chatId, [
+          { role: 'user', content: agentInput },
+          { role: 'assistant', content: emergency },
+        ]);
+      } catch (e) {
+        console.error('[gateway] Failed to persist emergency turn:', summarizeErrorForLog(e));
+      }
+      return;
+    }
+
     if (incoming.mediaError) {
       const failureTrace = [
         { role: 'user' as const, content: agentInput },
@@ -169,6 +208,26 @@ export class Gateway {
     const onboarding = await this.handleOnboarding(chatId, text);
     if (onboarding) {
       await this.channel!.send(chatId, { text: onboarding });
+      return;
+    }
+
+    // Emergency check after onboarding completes
+    const postOnboardingEmergency = this.handleEmergencyInput(text);
+    if (postOnboardingEmergency) {
+      try {
+        await this.channel!.send(chatId, { text: postOnboardingEmergency });
+      } catch (e) {
+        console.error('[gateway] Failed to send emergency response:', summarizeErrorForLog(e));
+        return;
+      }
+      try {
+        await this.sessions!.recordTurn(chatId, [
+          { role: 'user', content: agentInput },
+          { role: 'assistant', content: postOnboardingEmergency },
+        ]);
+      } catch (e) {
+        console.error('[gateway] Failed to persist emergency turn:', summarizeErrorForLog(e));
+      }
       return;
     }
 
@@ -202,9 +261,28 @@ export class Gateway {
   }
 
   async stop(): Promise<void> {
-    await this.scheduler?.stop();
-    await this.channel?.disconnect();
+    let firstError: unknown;
+    try {
+      await this.scheduler?.stop();
+    } catch (error) {
+      firstError = firstError ?? error;
+      console.warn('[gateway] Failed to stop scheduler:', summarizeErrorForLog(error));
+    }
+    try {
+      await this.channel?.disconnect();
+    } catch (error) {
+      firstError = firstError ?? error;
+      console.warn('[gateway] Failed to disconnect channel:', summarizeErrorForLog(error));
+    }
+    try {
+      this.closeStore();
+    } catch (error) {
+      console.warn('[gateway] Failed to close store:', summarizeErrorForLog(error));
+    }
     console.log('[gateway] Stopped.');
+    if (firstError) {
+      throw firstError;
+    }
   }
 
   private async initializeScheduler(): Promise<void> {
@@ -356,6 +434,27 @@ export class Gateway {
       { role: 'assistant', content: result.response },
     ]);
     return result.response;
+  }
+
+  private handleEmergencyInput(input: string): string | undefined {
+    const cleanInput = input
+      .split(/\r?\n/)
+      .filter((line) => !/^\s*(user id|reply to message id|uploaded media path)\s*:/i.test(line))
+      .join('\n');
+    if (!EMERGENCY_PATTERN.test(cleanInput)) {
+      return undefined;
+    }
+    return EMERGENCY_RESPONSE;
+  }
+
+  private closeStore(): void {
+    try {
+      this.store?.close();
+    } catch (error) {
+      console.warn('[gateway] Failed to close memory store:', summarizeErrorForLog(error));
+    } finally {
+      this.store = undefined;
+    }
   }
 
   // Copies workspace template files from the project's workspace/ dir to the workspace/

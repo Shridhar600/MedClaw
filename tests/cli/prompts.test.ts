@@ -21,22 +21,15 @@ describe('cli prompts', () => {
     stdin.setRawMode = originalSetRawMode;
   });
 
-  it('closes the shared readline before secret fallback input on TTYs without raw mode', async () => {
+  it('fails instead of echoing secret input on TTYs without raw mode', async () => {
     const promptOutput: string[] = [];
     const firstInterface = {
       question: jest.fn(async () => ''),
       close: jest.fn(),
     };
-    const fallbackInterface = {
-      question: jest.fn(async () => '123456:test-token'),
-      close: jest.fn(),
-    };
+    const readlineFactory = jest.fn().mockImplementationOnce(() => firstInterface as never);
 
-    prompts.setCliReadlineFactoryForTests(
-      jest.fn()
-        .mockImplementationOnce(() => firstInterface as never)
-        .mockImplementationOnce(() => fallbackInterface as never),
-    );
+    prompts.setCliReadlineFactoryForTests(readlineFactory);
 
     Object.defineProperty(process.stdin, 'isTTY', {
       value: true,
@@ -48,18 +41,36 @@ describe('cli prompts', () => {
     });
 
     await prompts.askText({}, 'Warmup prompt', 'default-value');
-    const secret = await prompts.askHiddenText(
+    await expect(prompts.askHiddenText(
       {
         stdout: (text: string) => promptOutput.push(text),
+      },
+      'Telegram bot token',
+    )).rejects.toThrow('Secure hidden input is not available');
+
+    expect(firstInterface.close).toHaveBeenCalledTimes(1);
+    expect(readlineFactory).toHaveBeenCalledTimes(1);
+    expect(promptOutput.join('')).toBe('• Telegram bot token\n  › ');
+  });
+
+  it('allows injected secret input without requiring TTY raw mode', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', {
+      value: true,
+      configurable: true,
+    });
+    stdin.isRaw = false;
+    stdin.setRawMode = jest.fn(() => {
+      throw new Error('raw mode unavailable');
+    });
+
+    const secret = await prompts.askHiddenText(
+      {
+        secretInput: async () => '123456:test-token',
       },
       'Telegram bot token',
     );
 
     expect(secret).toBe('123456:test-token');
-    expect(firstInterface.close).toHaveBeenCalledTimes(1);
-    expect(fallbackInterface.question).toHaveBeenCalledWith('');
-    expect(fallbackInterface.close).toHaveBeenCalledTimes(1);
-    expect(promptOutput.join('')).toBe('• Telegram bot token\n  › ');
   });
 
   it('re-prompts invalid yes/no answers instead of silently coercing them', async () => {

@@ -138,13 +138,9 @@ async function readHiddenFromTTY(
   }
 
   if (!rawModeSucceeded) {
-    const rl = createCliReadline({
-      input: stdin as NodeJS.ReadStream,
-      output: process.stdout as NodeJS.WriteStream,
-    });
-    const answer = await rl.question('');
-    rl.close();
-    return normalizePromptValue(answer, defaultValue);
+    throw new Error(
+      'Secure hidden input is not available because TTY raw mode could not be enabled. Use piped input or injected secret input instead.',
+    );
   }
 
   return new Promise<string>((resolve, reject) => {

@@ -13,6 +13,7 @@ import type { CompletionAction, SetupWizardState } from './wizard-types';
 
 export interface ServiceOnboardingArgs {
   yes?: boolean;
+  force?: boolean;
   configPath?: string;
   workspace?: string;
   provider?: ProviderConfig['type'];
@@ -64,6 +65,9 @@ function parseArgs(argv: string[]): ServiceOnboardingArgs {
     switch (token) {
       case '--yes':
         args.yes = true;
+        break;
+      case '--force':
+        args.force = true;
         break;
       case '--config':
         args.configPath = next;
@@ -485,6 +489,11 @@ export async function runServiceOnboarding(
     }
 
     const resolved = resolveNonInteractiveArgs(args);
+    if (fs.existsSync(resolved.configPath ?? defaultConfigPath()) && !resolved.force) {
+      io.stderr?.(`Config already exists at ${resolved.configPath}. Re-run with --force to overwrite it.\n`);
+      return 1;
+    }
+
     const config = buildConfigFromArgs(resolved);
     const errors = collectSetupErrors(resolved, config);
     if (errors.length > 0) {
