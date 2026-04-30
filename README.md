@@ -10,8 +10,8 @@ It is designed as a modular, self-hosted system:
 - A raw ReAct agent loop with configurable tools
 
 ## Demo Video: 
-x - https://x.com/shridhar600/status/2046349242076393915?s=20 
-GDrive - https://drive.google.com/file/d/1d80IOSn7wuJbzLOQhFsxmdYTfUDNkpEp/view?usp=sharing
+- [ X ](https://x.com/shridhar600/status/2046349242076393915?s=20) 
+- [GDrive](https://drive.google.com/file/d/1d80IOSn7wuJbzLOQhFsxmdYTfUDNkpEp/view?usp=sharing)
 
 ## What It Can Do
 
