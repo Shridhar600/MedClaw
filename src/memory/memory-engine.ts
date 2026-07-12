@@ -5,7 +5,10 @@ import * as path from 'path';
 // Methods are async by interface even though they use synchronous fs operations.
 // This keeps callers future-proof if we switch to fs.promises without API changes.
 export class MemoryEngine {
-  constructor(private readonly workspace: string) {
+  constructor(
+    private readonly workspace: string,
+    private readonly profileId: string = 'default',
+  ) {
     fs.mkdirSync(workspace, { recursive: true });
   }
 

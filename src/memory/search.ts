@@ -34,6 +34,7 @@ export class MemorySearch {
     private readonly store: SqliteStore,
     private readonly embeddingProvider: LLMProvider,
     private readonly weights: HybridWeights,
+    private readonly profileId: string = 'default',
   ) {}
 
   async search(query: string, topK: number): Promise<SearchResult[]> {

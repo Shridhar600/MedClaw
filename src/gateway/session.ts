@@ -52,6 +52,7 @@ export class SessionManager {
     llmProvider?: LLMProvider,
     toolRegistry?: ToolRegistry,
     compactionConfig?: CompactionConfig,
+    private readonly profileId: string = 'default',
   ) {
     this.softResetMs = softResetMinutes * 60 * 1000;
     this.hardResetMs = hardResetMinutes * 60 * 1000;

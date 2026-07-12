@@ -93,6 +93,10 @@ export const DEFAULT_CONFIG: AppConfig = {
     maxIterations: 15,
     disclaimerEnabled: true,
   },
+  profiles: {
+    baseDir: path.join(os.homedir(), '.redacted'),
+    defaultProfileId: 'default',
+  },
 };
 
 export function cloneDefaultConfig(): AppConfig {

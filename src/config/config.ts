@@ -67,6 +67,7 @@ export async function loadConfig(input?: string | LoadConfigOptions): Promise<Ap
   merged.memory.workspace = resolvePath(merged.memory.workspace);
   merged.heartbeat.storePath = resolvePath(merged.heartbeat.storePath);
   merged.heartbeat.audit!.path = resolvePath(merged.heartbeat.audit!.path);
+  merged.profiles!.baseDir = resolvePath(merged.profiles!.baseDir);
 
   return merged;
 }

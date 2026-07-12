@@ -13,7 +13,10 @@ const ROTATION_CHECK_INTERVAL = 100;
 export class SchedulerAuditLog {
   private appendCount = 0;
 
-  constructor(private readonly filePath: string) {}
+  constructor(
+    private readonly filePath: string,
+    private readonly profileId: string = 'default',
+  ) {}
 
   async append(input: SchedulerAuditEventInput): Promise<SchedulerAuditEvent> {
     const event: SchedulerAuditEvent = {

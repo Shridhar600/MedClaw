@@ -9,7 +9,10 @@ import type {
 } from './types';
 
 export class HeartbeatStore {
-  constructor(private readonly filePath: string) {}
+  constructor(
+    private readonly filePath: string,
+    private readonly profileId: string = 'default',
+  ) {}
 
   async list(): Promise<HeartbeatJob[]> {
     return this.readJobs();

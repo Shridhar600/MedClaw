@@ -17,6 +17,7 @@ export class MemoryIndexer {
     private readonly store: SqliteStore,
     private readonly embeddingProvider: LLMProvider,
     private readonly workspacePath: string,
+    private readonly profileId: string = 'default',
   ) {
     this.embeddingModelName = embeddingProvider.modelName ?? 'unknown';
   }

@@ -18,7 +18,10 @@ export class SqliteStore {
   private hasVec = false;
   private vecDimensionFixed = false;
 
-  constructor(dbPath: string) {
+  constructor(
+    dbPath: string,
+    private readonly profileId: string = 'default',
+  ) {
     this.db = new Database(dbPath);
     try {
       sqliteVec.load(this.db);

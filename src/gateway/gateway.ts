@@ -44,6 +44,7 @@ export class Gateway {
 
   async start(): Promise<void> {
     const { config } = this;
+    const profileId = config.profiles?.defaultProfileId ?? 'default';
 
     console.log('[gateway] Starting Redacted...');
 
@@ -51,13 +52,13 @@ export class Gateway {
     this.bootstrapWorkspace(config.memory.workspace);
 
     // Memory
-    const memory = new MemoryEngine(config.memory.workspace);
+    const memory = new MemoryEngine(config.memory.workspace, profileId);
     const dbPath = path.join(config.memory.workspace, '..', 'search.db');
-    const store = new SqliteStore(dbPath);
+    const store = new SqliteStore(dbPath, profileId);
     this.store = store;
     const embeddingProvider = createProvider(config.providers.embeddings);
     const { MemoryIndexer } = await import('../memory/indexer');
-    const indexer = new MemoryIndexer(store, embeddingProvider, config.memory.workspace);
+    const indexer = new MemoryIndexer(store, embeddingProvider, config.memory.workspace, profileId);
     try {
       await indexer.indexAll();
       console.log('[gateway] Memory index ready');
@@ -65,7 +66,7 @@ export class Gateway {
       console.warn('[gateway] Memory index unavailable; continuing with degraded search:', summarizeErrorForLog(error));
     }
 
-    const search = new MemorySearch(store, embeddingProvider, config.memory.search.hybridWeights);
+    const search = new MemorySearch(store, embeddingProvider, config.memory.search.hybridWeights, profileId);
 
     // Providers
     const mainProvider = createProvider(config.providers.main);
@@ -89,7 +90,7 @@ export class Gateway {
     }
 
     // Context
-    const assembler = new ContextAssembler(memory, config.memory.bootstrapMaxChars);
+    const assembler = new ContextAssembler(memory, config.memory.bootstrapMaxChars, profileId);
     const systemMessages = await assembler.buildSystemMessages();
 
     // Agent
@@ -103,6 +104,7 @@ export class Gateway {
       mainProvider,
       registry,
       config.sessions.compaction,
+      profileId,
     );
 
     // Channel
@@ -293,7 +295,8 @@ export class Gateway {
       return;
     }
 
-    const store = new HeartbeatStore(this.config.heartbeat.storePath);
+    const profileId = this.config.profiles?.defaultProfileId ?? 'default';
+    const store = new HeartbeatStore(this.config.heartbeat.storePath, profileId);
     this.scheduler = new HeartbeatScheduler(
       store,
       async (job) => this.handleScheduledJob(job, true),
