@@ -1,5 +1,8 @@
+import * as fs from 'fs';
 import * as path from 'path';
 import type { AppConfig } from '../config/types';
+import { ProfileRegistry } from '../profiles/registry';
+import type { ProfileId } from '../profiles/types';
 import type { Channel, IncomingMessage } from '../channels/types';
 import { TelegramChannel } from '../channels/telegram';
 import { AgentLoop } from '../agent/agent-loop';
@@ -37,6 +40,7 @@ export class Gateway {
   private sessions?: SessionManager;
   private scheduler?: HeartbeatScheduler;
   private store?: SqliteStore;
+  private profileRegistry?: ProfileRegistry;
 
   constructor(config: AppConfig) {
     this.config = config;
@@ -44,21 +48,43 @@ export class Gateway {
 
   async start(): Promise<void> {
     const { config } = this;
-    const profileId = config.profiles?.defaultProfileId ?? 'default';
+    const profilesConfig = config.profiles;
+    const profileId = (profilesConfig?.defaultProfileId ?? 'default') as ProfileId;
 
     console.log('[gateway] Starting Redacted...');
 
     // Bootstrap workspace with template files on first run
     this.bootstrapWorkspace(config.memory.workspace);
 
+    // Profiles: construct the registry and (idempotently) migrate the legacy
+    // single-user workspace into the profile-scoped layout. Only attempted
+    // when the caller has actually configured a `profiles` section — configs
+    // that omit it (older configs, ad-hoc test configs) keep the pre-P0
+    // legacy paths untouched, which is the safest "sensible default" per the
+    // resilience rule (never assume a filesystem location the caller didn't
+    // opt into). This step must never crash boot: any failure here falls
+    // back to the legacy workspace path.
+    this.profileRegistry = profilesConfig ? this.tryCreateProfileRegistry(profilesConfig.baseDir) : undefined;
+    const memoryWorkspace = this.profileRegistry
+      ? this.migrateAndResolveWorkspace(this.profileRegistry, profileId, config.memory.workspace)
+      : config.memory.workspace;
+    const usingProfileWorkspace = memoryWorkspace !== config.memory.workspace;
+
     // Memory
-    const memory = new MemoryEngine(config.memory.workspace, profileId);
-    const dbPath = path.join(config.memory.workspace, '..', 'search.db');
+    const memory = new MemoryEngine(memoryWorkspace, profileId);
+    const dbPath = usingProfileWorkspace && this.profileRegistry
+      ? this.profileRegistry.profileSearchDb(profileId)
+      : path.join(config.memory.workspace, '..', 'search.db');
+    // SqliteStore (better-sqlite3) does not create its parent directory;
+    // the legacy path relied on config.memory.workspace's parent already
+    // existing via bootstrapWorkspace. The profile-scoped `.state/` dir has
+    // no other creator this early in startup, so ensure it here.
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     const store = new SqliteStore(dbPath, profileId);
     this.store = store;
     const embeddingProvider = createProvider(config.providers.embeddings);
     const { MemoryIndexer } = await import('../memory/indexer');
-    const indexer = new MemoryIndexer(store, embeddingProvider, config.memory.workspace, profileId);
+    const indexer = new MemoryIndexer(store, embeddingProvider, memoryWorkspace, profileId);
     try {
       await indexer.indexAll();
       console.log('[gateway] Memory index ready');
@@ -97,10 +123,17 @@ export class Gateway {
     this.agentLoop = new AgentLoop(mainProvider, registry, systemMessages, config.agent);
 
     // Sessions
+    // Path resolution stays here (Gateway) rather than inside SessionManager
+    // itself: SessionManager has no other dependency on the profiles module,
+    // and keeping it that way avoids adding module coupling for a value the
+    // caller already has to compute (ProfileRegistry.profileSessions). Only
+    // derived when a profiles config was actually supplied; otherwise
+    // SessionManager keeps its own legacy default.
+    const sessionsPath = this.profileRegistry ? this.profileRegistry.profileSessions(profileId) : undefined;
     this.sessions = new SessionManager(
       config.sessions.softResetAfterMinutes,
       config.sessions.hardResetAfterMinutes,
-      undefined,
+      sessionsPath,
       mainProvider,
       registry,
       config.sessions.compaction,
@@ -295,14 +328,15 @@ export class Gateway {
       return;
     }
 
-    const profileId = this.config.profiles?.defaultProfileId ?? 'default';
-    const store = new HeartbeatStore(this.config.heartbeat.storePath, profileId);
+    const profileId = (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
+    const { storePath, auditLogPath } = this.resolveSchedulerPaths(profileId);
+    const store = new HeartbeatStore(storePath, profileId);
     this.scheduler = new HeartbeatScheduler(
       store,
       async (job) => this.handleScheduledJob(job, true),
       this.config.heartbeat.timezone,
       {
-        auditLogPath: this.config.heartbeat.audit.path,
+        auditLogPath,
         defaultMaxRetries: this.config.heartbeat.retry.maxRetries,
         maxGlobalTriggersPerMinute: this.config.heartbeat.rateLimit.maxGlobalTriggersPerMinute,
         maxPerChatTriggersPerMinute: this.config.heartbeat.rateLimit.maxPerChatTriggersPerMinute,
@@ -471,6 +505,96 @@ export class Gateway {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(`Workspace bootstrap failed: ${message}`);
+    }
+  }
+
+  // Constructs the ProfileRegistry. Never throws — a construction failure
+  // (e.g. an unwritable baseDir) degrades to "no profile registry", which
+  // callers treat as "use the legacy single-user paths" everywhere below.
+  private tryCreateProfileRegistry(baseDir: string): ProfileRegistry | undefined {
+    try {
+      return new ProfileRegistry(baseDir);
+    } catch (error) {
+      console.error(
+        '[gateway] Failed to initialize ProfileRegistry; continuing without profile-scoped storage:',
+        summarizeErrorForLog(error),
+      );
+      return undefined;
+    }
+  }
+
+  // Idempotently migrates the legacy single-user workspace into the
+  // profile-scoped layout (via ProfileRegistry.migrateLegacyWorkspace, which
+  // already handles the sentinel + idempotent per-file copy) and decides
+  // which workspace path the rest of startup should use.
+  //
+  // Decision rule: only switch to the profile-scoped workspace once the
+  // migration sentinel is actually present (i.e. migration is confirmed
+  // complete with zero errors). A failed or partial migration must never
+  // brick the daemon, so on any error — or on an unexpected exception — this
+  // falls back to the legacy workspace path untouched.
+  private migrateAndResolveWorkspace(
+    registry: ProfileRegistry,
+    profileId: ProfileId,
+    legacyWorkspace: string,
+  ): string {
+    try {
+      if (registry.hasBeenMigrated(profileId, legacyWorkspace)) {
+        const profileWorkspace = registry.profileWorkspace(profileId);
+        console.log(`[gateway] Profile "${profileId}" already migrated; using ${profileWorkspace}`);
+        return profileWorkspace;
+      }
+
+      const result = registry.migrateLegacyWorkspace(legacyWorkspace);
+      console.log(
+        `[gateway] Legacy workspace migration: migrated=${result.migrated} skipped=${result.skipped} errors=${result.errors.length}`,
+      );
+      if (result.errors.length > 0) {
+        console.warn(`[gateway] Migration encountered ${result.errors.length} error(s):`, result.errors);
+      }
+
+      if (registry.hasBeenMigrated(profileId, legacyWorkspace)) {
+        const profileWorkspace = registry.profileWorkspace(profileId);
+        console.log(`[gateway] Using profile-scoped workspace: ${profileWorkspace}`);
+        return profileWorkspace;
+      }
+
+      console.warn(
+        `[gateway] Migration did not complete (no sentinel written); falling back to legacy workspace: ${legacyWorkspace}`,
+      );
+      return legacyWorkspace;
+    } catch (error) {
+      console.error(
+        '[gateway] Profile migration failed unexpectedly; falling back to legacy workspace:',
+        summarizeErrorForLog(error),
+      );
+      return legacyWorkspace;
+    }
+  }
+
+  // Same sentinel-gated fallback as migrateAndResolveWorkspace: heartbeat
+  // store + scheduler audit log only move to profile-scoped paths once the
+  // workspace migration sentinel confirms migration completed cleanly.
+  private resolveSchedulerPaths(profileId: ProfileId): { storePath: string; auditLogPath: string } {
+    const legacy = { storePath: this.config.heartbeat.storePath, auditLogPath: this.config.heartbeat.audit.path };
+    if (!this.profileRegistry) {
+      return legacy;
+    }
+    try {
+      if (!this.profileRegistry.hasBeenMigrated(profileId, this.config.memory.workspace)) {
+        console.warn('[gateway] Profile migration incomplete; using legacy heartbeat/audit paths.');
+        return legacy;
+      }
+      const storePath = this.profileRegistry.profileSchedulerStore(profileId);
+      const auditLogPath = this.profileRegistry.profileAuditLog(profileId);
+      console.log(`[gateway] Using profile-scoped scheduler paths: store=${storePath} audit=${auditLogPath}`);
+      return { storePath, auditLogPath };
+    } catch (error) {
+      console.error(
+        '[gateway] Failed to resolve profile-scoped scheduler paths; falling back to legacy paths:',
+        summarizeErrorForLog(error),
+      );
+      return legacy;
     }
   }
 }

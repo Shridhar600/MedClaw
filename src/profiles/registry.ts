@@ -177,13 +177,14 @@ export class ProfileRegistry {
 
   // ── Migration ────────────────────────────────────────────────────
 
-  migrateLegacyWorkspace(legacyWorkspace: string): { migrated: number; errors: string[] } {
+  migrateLegacyWorkspace(legacyWorkspace: string): { migrated: number; skipped: number; errors: string[] } {
     const errors: string[] = [];
     let migrated = 0;
+    let skipped = 0;
 
     if (!fs.existsSync(legacyWorkspace)) {
       errors.push(`Legacy workspace does not exist: ${legacyWorkspace}`);
-      return { migrated: 0, errors };
+      return { migrated: 0, skipped: 0, errors };
     }
 
     const defaultProfile = this.getOrCreateDefaultProfile();
@@ -193,6 +194,7 @@ export class ProfileRegistry {
       this.copyDirSync(legacyWorkspace, targetDir, (srcRel: string, srcAbs: string) => {
         const dest = path.join(targetDir, srcRel);
         if (fs.existsSync(dest)) {
+          skipped++;
           return false;
         }
         try {
@@ -216,7 +218,7 @@ export class ProfileRegistry {
       }
     }
 
-    return { migrated, errors };
+    return { migrated, skipped, errors };
   }
 
   hasBeenMigrated(profileId: ProfileId, legacyWorkspace: string): boolean {
