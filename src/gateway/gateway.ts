@@ -27,6 +27,10 @@ import { reconcilePolicyJobs } from '../scheduler/reconciler';
 import { OnboardingFlow } from '../onboarding/flow';
 import { OnboardingStore } from '../onboarding/store';
 import { ensureWorkspaceBootstrap } from '../workspace/bootstrap';
+import { checkSystemReadiness } from '../providers/healthcheck';
+import type { ReadinessResult } from '../providers/healthcheck';
+import { checkProviderBindAddresses } from '../security/bind-check';
+import { verifyWorkspacePermissions } from '../security/perms-check';
 
 const EMERGENCY_PATTERN =
   /\b(chest pain|can't breathe|cannot breathe|difficulty breathing|stroke|heart attack|severe bleeding|suicidal|emergency)\b/i;
@@ -42,6 +46,9 @@ export class Gateway {
   private store?: SqliteStore;
   private profileRegistry?: ProfileRegistry;
   private resolvedMemoryWorkspace?: string;
+  private bootHealth?: { providers: ReadinessResult[]; telegram: ReadinessResult };
+  private securityWarnings: string[] = [];
+  private reconcileTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 
   constructor(config: AppConfig) {
     this.config = config;
@@ -159,12 +166,20 @@ export class Gateway {
       registry.register(createHeartbeatManageTool(this.scheduler, this.getEffectiveWorkspace()));
     }
 
+    await this.runBootHealthchecks();
+    this.runSecurityChecks();
+
     console.log('[gateway] Redacted is running.');
   }
 
   async handleTestMessage(chatId: string, text: string): Promise<string> {
     // eslint-disable-next-line @typescript-eslint/no-unused-vars -- per-chat profileId resolved; stores use resolvedMemoryWorkspace
     const profileId = this.getProfileForChat(chatId);
+
+    if (text.trim() === '/status') {
+      return this.buildBootStatusText();
+    }
+
     const emergency = this.handleEmergencyInput(text);
     if (emergency) {
       await this.sessions?.recordTurn(chatId, [
@@ -185,7 +200,7 @@ export class Gateway {
       { role: 'user', content: text },
       ...result.trace,
     ]);
-    await this.reconcileHeartbeatPolicies(chatId);
+    await this.debouncedReconcile(chatId);
     return result.text;
   }
 
@@ -196,6 +211,12 @@ export class Gateway {
     console.log(
       `[gateway] Message from ${chatId}: ${text.length} chars${incoming.mediaPath ? ', media attached' : ''}`,
     );
+
+    if (text.trim() === '/status') {
+      const statusText = this.buildBootStatusText();
+      await this.channel!.send(chatId, { text: statusText });
+      return;
+    }
 
     const agentInput = this.buildAgentInput(incoming);
 
@@ -295,13 +316,17 @@ export class Gateway {
           ...result.trace,
         ],
       );
-      await this.reconcileHeartbeatPolicies(chatId);
+      await this.debouncedReconcile(chatId);
     } catch (e) {
       console.error('[gateway] Post-send persistence/reconciliation error:', summarizeErrorForLog(e));
     }
   }
 
   async stop(): Promise<void> {
+    for (const timer of this.reconcileTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.reconcileTimers.clear();
     let firstError: unknown;
     try {
       await this.scheduler?.stop();
@@ -422,6 +447,23 @@ export class Gateway {
     });
     await reconcilePolicyJobs(this.scheduler, desired);
     await syncHeartbeatMarkdown(this.getEffectiveWorkspace(), await this.scheduler.listJobs());
+  }
+
+  private async debouncedReconcile(chatId: string): Promise<void> {
+    if (!this.scheduler) {
+      return;
+    }
+
+    const existing = this.reconcileTimers.get(chatId);
+    if (existing) {
+      clearTimeout(existing);
+    }
+    const timer = setTimeout(() => {
+      this.reconcileTimers.delete(chatId);
+      void this.reconcileHeartbeatPolicies(chatId);
+    }, 30_000);
+    timer.unref();
+    this.reconcileTimers.set(chatId, timer);
   }
 
   private async resolveStartupPolicyChatId(): Promise<string | undefined> {
@@ -583,6 +625,72 @@ export class Gateway {
       );
       return legacyWorkspace;
     }
+  }
+
+  private async runBootHealthchecks(): Promise<void> {
+    try {
+      const healthResults = await checkSystemReadiness(this.config, { allowNetworkChecks: true });
+      this.bootHealth = healthResults;
+      const allReady = healthResults.providers.every((p) => p.ready) && healthResults.telegram.ready;
+      if (!allReady) {
+        console.warn('[gateway] Boot healthcheck: NOT ALL READY');
+        for (const r of [...healthResults.providers, healthResults.telegram]) {
+          if (!r.ready) {
+            console.warn(`  ${r.label}: ${r.details.join(', ')}`);
+            if (r.actionHint) {
+              console.warn(`  → ${r.actionHint}`);
+            }
+          }
+        }
+      } else {
+        console.log('[gateway] Boot healthcheck: all systems ready');
+      }
+    } catch (error) {
+      console.warn('[gateway] Boot healthcheck failed:', summarizeErrorForLog(error));
+    }
+  }
+
+  private runSecurityChecks(): void {
+    this.securityWarnings = [];
+    try {
+      const bindResult = checkProviderBindAddresses(this.config);
+      for (const w of bindResult.warnings) {
+        console.warn(`[security] ${w}`);
+        this.securityWarnings.push(w);
+      }
+    } catch (error) {
+      console.warn('[security] Bind check failed:', summarizeErrorForLog(error));
+    }
+    try {
+      const workspace = this.getEffectiveWorkspace();
+      const permsResult = verifyWorkspacePermissions(workspace);
+      for (const w of permsResult.warnings) {
+        console.warn(`[security] ${w}`);
+        this.securityWarnings.push(w);
+      }
+    } catch (error) {
+      console.warn('[security] Perms check failed:', summarizeErrorForLog(error));
+    }
+  }
+
+  private buildBootStatusText(health?: { providers: ReadinessResult[]; telegram: ReadinessResult }): string {
+    const h = health ?? this.bootHealth;
+    if (!h) {
+      return 'System health check not yet complete.';
+    }
+    const lines = [
+      'System Health:',
+      ...h.providers.map((p) => `  ${p.label}: ${p.ready ? 'OK' : 'FAIL'}`),
+      `  telegram: ${h.telegram.ready ? 'OK' : 'FAIL'}`,
+    ];
+    if (this.securityWarnings.length > 0) {
+      lines.push('', 'Security warnings:');
+      for (const w of this.securityWarnings) {
+        lines.push(`  ${w}`);
+      }
+    }
+    lines.push('', 'See `npm run cli -- status` for details.');
+    return lines.join('\n');
   }
 
   private getEffectiveWorkspace(): string {
