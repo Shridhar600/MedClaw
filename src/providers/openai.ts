@@ -21,6 +21,7 @@ function resolveProviderApiKey(config: ProviderConfig): string | undefined {
 }
 
 export class OpenAIProvider implements LLMProvider {
+  readonly modelName: string;
   private client: OpenAI;
   private model: string;
 
@@ -30,6 +31,7 @@ export class OpenAIProvider implements LLMProvider {
       baseURL: config.baseUrl,
     });
     this.model = config.model;
+    this.modelName = config.model;
   }
 
   async chat(messages: Message[], tools?: ToolSchema[]): Promise<LLMResponse> {

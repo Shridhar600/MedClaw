@@ -72,7 +72,7 @@ export class Gateway {
 
     // Tools
     const registry = new ToolRegistry(config.tools);
-    for (const tool of createMemoryTools(memory, search)) {
+    for (const tool of createMemoryTools(memory, search, indexer)) {
       registry.register(tool);
     }
 

@@ -1,8 +1,9 @@
 import type { Tool, ToolResult } from './types';
 import type { MemoryEngine } from '../memory/memory-engine';
 import type { MemorySearch } from '../memory/search';
+import type { MemoryIndexer } from '../memory/indexer';
 
-export function createMemoryTools(engine: MemoryEngine, search?: MemorySearch): Tool[] {
+export function createMemoryTools(engine: MemoryEngine, search?: MemorySearch, indexer?: MemoryIndexer): Tool[] {
   const memoryGet: Tool = {
     name: 'memory_get',
     group: 'group:memory',
@@ -54,6 +55,11 @@ export function createMemoryTools(engine: MemoryEngine, search?: MemorySearch): 
         await engine.appendToFile(filePath, content);
       } else {
         await engine.writeFile(filePath, content);
+      }
+      if (indexer) {
+        void indexer.indexFile(filePath).catch(e =>
+          console.warn(`[memory-tools] Reindex failed for ${filePath}:`, e),
+        );
       }
       return { content: [{ type: 'text', text: `Written to ${filePath}` }] };
     },

@@ -1,4 +1,3 @@
-// src/memory/search.ts
 import type { LLMProvider } from '../providers/types';
 import type { SearchResult } from './types';
 import type { SqliteStore } from './sqlite-store';
@@ -6,18 +5,6 @@ import type { SqliteStore } from './sqlite-store';
 interface HybridWeights {
   vector: number;
   keyword: number;
-}
-
-function cosineSimilarity(a: number[], b: number[]): number {
-  if (a.length !== b.length) return 0;
-  let dot = 0, normA = 0, normB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  const denom = Math.sqrt(normA) * Math.sqrt(normB);
-  return denom === 0 ? 0 : dot / denom;
 }
 
 /**
@@ -50,34 +37,18 @@ export class MemorySearch {
   ) {}
 
   async search(query: string, topK: number): Promise<SearchResult[]> {
-    // Vector search: embed query, compute cosine similarity (already [0, 1] for unit-norm embeddings)
     let vectorResults: SearchResult[] = [];
     try {
       const queryEmbedding = await this.embeddingProvider.embed(query);
-      const allChunks = this.store.getAllChunksWithEmbeddings();
-      const scored = allChunks
-        .filter(c => c.embedding)
-        .map(c => ({
-          chunkId: c.id,
-          path: c.path,
-          content: c.content,
-          // Clamp to [0, 1] for safety — unit-norm dot product should always be in this range
-          score: Math.max(0, Math.min(1, cosineSimilarity(queryEmbedding, c.embedding!))),
-          startLine: c.startLine,
-          endLine: c.endLine,
-        }))
-        .sort((a, b) => b.score - a.score)
-        .slice(0, topK * 2);
-      vectorResults = scored;
+      const float32 = new Float32Array(queryEmbedding);
+      vectorResults = this.store.vectorSearch(float32, topK * 2);
     } catch (e) {
       console.warn('[search] Vector search failed, falling back to keyword only:', e);
     }
 
-    // Keyword search: raw BM25 scores (unbounded), normalize to [0, 1] before combining
     const rawKeywordResults = this.store.keywordSearch(query, topK * 2);
     const keywordResults = normalizeBm25Scores(rawKeywordResults);
 
-    // Merge by chunk id, combine normalized scores
     const scoreMap = new Map<string, SearchResult>();
 
     for (const r of vectorResults) {
