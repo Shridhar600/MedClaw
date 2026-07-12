@@ -161,6 +161,8 @@ export class Gateway {
   }
 
   async handleTestMessage(chatId: string, text: string): Promise<string> {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- Task 5 will thread this to stores
+    const profileId = this.getProfileForChat(chatId);
     const emergency = this.handleEmergencyInput(text);
     if (emergency) {
       await this.sessions?.recordTurn(chatId, [
@@ -187,6 +189,8 @@ export class Gateway {
 
   private async handleMessage(incoming: IncomingMessage): Promise<void> {
     const { chatId, text } = incoming;
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- Task 5 will thread this to stores
+    const profileId = this.getProfileForChat(chatId);
     console.log(
       `[gateway] Message from ${chatId}: ${text.length} chars${incoming.mediaPath ? ', media attached' : ''}`,
     );
@@ -354,6 +358,8 @@ export class Gateway {
   }
 
   private async handleScheduledJob(job: HeartbeatJob, invokedByScheduler: boolean = false): Promise<void> {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- Task 5 will thread this to stores
+    const profileId = this.getProfileForChat(job.chatId);
     const decision = decideHeartbeatDelivery(job, {
       now: new Date(Date.now()),
       quietHours: this.config.heartbeat.policy.quietHours,
@@ -419,11 +425,15 @@ export class Gateway {
   private async resolveStartupPolicyChatId(): Promise<string | undefined> {
     const sessionChatId = this.sessions?.getMostRecentChatId();
     if (sessionChatId) {
+      this.getProfileForChat(sessionChatId);
       return sessionChatId;
     }
 
     const jobs = await this.scheduler!.listJobs();
     const persistedChatId = jobs.find((job) => job.chatId !== '__startup__')?.chatId;
+    if (persistedChatId) {
+      this.getProfileForChat(persistedChatId);
+    }
     return persistedChatId;
   }
 
@@ -570,6 +580,19 @@ export class Gateway {
       );
       return legacyWorkspace;
     }
+  }
+
+  private getProfileForChat(chatId: string): ProfileId {
+    if (!this.profileRegistry) {
+      return (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
+    }
+    const existing = this.profileRegistry.getProfileForChat(chatId);
+    if (existing) {
+      return existing.profileId;
+    }
+    const defaultProfile = this.profileRegistry.getOrCreateDefaultProfile();
+    this.profileRegistry.pairChatToProfile(chatId, defaultProfile.profileId);
+    return defaultProfile.profileId;
   }
 
   // Same sentinel-gated fallback as migrateAndResolveWorkspace: heartbeat
