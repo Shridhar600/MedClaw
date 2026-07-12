@@ -9,6 +9,7 @@ import { AgentLoop } from '../agent/agent-loop';
 import { ContextAssembler } from '../agent/context';
 import { MemoryEngine } from '../memory/memory-engine';
 import { ToolRegistry } from '../tools/registry';
+import { LLMSemaphore } from '../tools/semaphore';
 import { createMemoryTools } from '../tools/memory-tools';
 import { createMedicalTools } from '../tools/medical-tools';
 import { createCronManageTool } from '../tools/cron-manage';
@@ -129,7 +130,8 @@ export class Gateway {
     const systemMessages = await assembler.buildSystemMessages();
 
     // Agent
-    this.agentLoop = new AgentLoop(mainProvider, registry, systemMessages, config.agent);
+    const semaphore = new LLMSemaphore();
+    this.agentLoop = new AgentLoop(mainProvider, registry, systemMessages, config.agent, semaphore);
 
     // Sessions
     // Path resolution stays here (Gateway) rather than inside SessionManager
@@ -407,7 +409,7 @@ export class Gateway {
     ].join('\n');
 
     try {
-      const result = await this.agentLoop!.run(input, history, { chatId: job.chatId });
+      const result = await this.agentLoop!.run(input, history, { chatId: job.chatId, origin: 'heartbeat' });
       if (result.text === HEARTBEAT_NOOP) {
         await this.sessions!.recordTurn(job.chatId, [
           { role: 'user', content: input },
@@ -426,12 +428,23 @@ export class Gateway {
       await this.scheduler?.recordOutcome(job.id, 'sent');
       await this.reconcileHeartbeatPolicies(job.chatId);
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+
+      if (this.isHeartbeatQueueFull(error)) {
+        console.warn(`[gateway] Heartbeat queue full for job ${job.id}; scheduler will retry.`);
+        await this.scheduler?.recordFailure(job.id, message);
+        return;
+      }
+
       if (!invokedByScheduler) {
-        const message = error instanceof Error ? error.message : String(error);
         await this.scheduler?.recordFailure(job.id, message);
       }
       throw error;
     }
+  }
+
+  private isHeartbeatQueueFull(error: unknown): boolean {
+    return error instanceof Error && error.message === 'heartbeat queue full';
   }
 
   private async reconcileHeartbeatPolicies(chatId: string): Promise<void> {

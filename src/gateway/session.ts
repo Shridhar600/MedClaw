@@ -4,6 +4,7 @@ import * as os from 'os';
 import type { Message, ToolSchema } from '../providers/types';
 import type { LLMProvider } from '../providers/types';
 import type { ToolRegistry } from '../tools/registry';
+import { rotateFileIfNeeded, type RotationConfig } from '../scheduler/rotation';
 
 interface Session {
   chatId: string;
@@ -35,6 +36,8 @@ interface CompactionConfig {
 
 type ArchiveReason = 'manual-reset' | 'idle-hard-reset';
 
+const ROTATION_CHECK_INTERVAL = 100;
+
 export class SessionManager {
   private sessions: Map<string, Session> = new Map();
   private softResetMs: number;
@@ -44,6 +47,7 @@ export class SessionManager {
   private readonly llmProvider?: LLMProvider;
   private readonly toolRegistry?: ToolRegistry;
   private readonly compactionConfig?: CompactionConfig;
+  private readonly rotationCounts: Map<string, number> = new Map();
 
   constructor(
     softResetMinutes: number,
@@ -53,6 +57,7 @@ export class SessionManager {
     toolRegistry?: ToolRegistry,
     compactionConfig?: CompactionConfig,
     private readonly profileId: string = 'default',
+    private readonly rotationConfig?: Partial<RotationConfig>,
   ) {
     this.softResetMs = softResetMinutes * 60 * 1000;
     this.hardResetMs = hardResetMinutes * 60 * 1000;
@@ -348,14 +353,29 @@ ${response.text.trim()}`;
     }
 
     const now = new Date().toISOString();
+    this.maybeRotate(chatId);
     const lines = history.map(msg => JSON.stringify(this.serializeEntry(chatId, msg, now)));
     fs.writeFileSync(activePath, lines.join('\n') + '\n', 'utf-8');
   }
 
   private async appendMessagesToJsonl(chatId: string, messages: Message[]): Promise<void> {
     const now = new Date().toISOString();
+    this.maybeRotate(chatId);
     const lines = messages.map(msg => JSON.stringify(this.serializeEntry(chatId, msg, now)));
     fs.appendFileSync(this.activePath(chatId), lines.join('\n') + '\n', 'utf-8');
+  }
+
+  private maybeRotate(chatId: string): void {
+    const count = (this.rotationCounts.get(chatId) ?? 0) + 1;
+    this.rotationCounts.set(chatId, count);
+    if (count !== 1 && count % ROTATION_CHECK_INTERVAL !== 0) {
+      return;
+    }
+    try {
+      rotateFileIfNeeded(this.activePath(chatId), this.rotationConfig);
+    } catch (error) {
+      console.warn(`[session:${chatId}] rotation check failed, continuing without rotation:`, error);
+    }
   }
 
   private serializeEntry(chatId: string, msg: Message, timestamp: string): JsonlEntry {

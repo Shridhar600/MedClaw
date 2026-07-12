@@ -1,5 +1,6 @@
 import type { AgentRunResult, LLMProvider, Message, ToolSchema } from '../providers/types';
 import type { ToolRegistry } from '../tools/registry';
+import { LLMSemaphore, type SemaphorePriority } from '../tools/semaphore';
 
 const MEDICAL_DISCLAIMER = '\n\n---\n*I am an AI health companion, not a doctor. Always consult a healthcare professional for medical advice.*';
 const MEDICAL_TOOLS = new Set(['medgemma_query', 'medgemma_analyze_report']);
@@ -11,6 +12,7 @@ interface AgentConfig {
 
 interface AgentRunContext {
   chatId?: string;
+  origin?: SemaphorePriority;
 }
 
 export class AgentLoop {
@@ -19,11 +21,25 @@ export class AgentLoop {
     private readonly registry: ToolRegistry,
     private readonly systemMessages: Message[],
     private readonly config: AgentConfig,
+    private readonly semaphore?: LLMSemaphore,
   ) {}
 
   async run(
     userMessage: string,
     conversationHistory: Message[] = [],
+    runContext?: AgentRunContext,
+  ): Promise<AgentRunResult> {
+    const exec = (): Promise<AgentRunResult> => this.runInternal(userMessage, conversationHistory, runContext);
+    if (this.semaphore) {
+      const priority: SemaphorePriority = runContext?.origin ?? 'user';
+      return this.semaphore.run(priority, exec);
+    }
+    return exec();
+  }
+
+  private async runInternal(
+    userMessage: string,
+    conversationHistory: Message[],
     runContext?: AgentRunContext,
   ): Promise<AgentRunResult> {
     const messages: Message[] = [
