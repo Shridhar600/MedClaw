@@ -144,6 +144,35 @@ describe('cli router', () => {
     }
   });
 
+  it('real CLI onboard fails fast (no hang) when piped input runs out of answers', () => {
+    const home = createTempHome();
+    try {
+      const configPath = path.join(home.tmpDir, 'config.json');
+      const workspacePath = path.join(home.tmpDir, 'workspace');
+      // Deliberately too few answers: the wizard must abort with a clear
+      // error, not spin in a re-prompt loop (the old Node-26 hang).
+      const input = [workspacePath, 'ollama'].join('\n');
+
+      const result = spawnSync(
+        process.execPath,
+        ['--import', 'tsx', 'src/cli/index.ts', 'onboard', '--config', configPath],
+        {
+          cwd: path.join(__dirname, '..', '..'),
+          env: { ...process.env, HOME: home.tmpDir },
+          input,
+          encoding: 'utf8',
+          timeout: 20_000,
+        },
+      );
+
+      expect(result.signal).toBeNull(); // not killed by the timeout = no hang
+      expect(result.status).not.toBe(0);
+      expect(result.stderr + result.stdout).toContain('Piped input exhausted');
+    } finally {
+      home.restore();
+    }
+  });
+
   it('real CLI onboard can print the redacted config from the completion menu', () => {
     const home = createTempHome();
     try {

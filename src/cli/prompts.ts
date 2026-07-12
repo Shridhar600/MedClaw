@@ -94,10 +94,7 @@ export async function askText(
 
   if (!process.stdin.isTTY) {
     writeStdout(io, promptText);
-    if (!pipedAnswers) {
-      pipedAnswers = fs.readFileSync(0, 'utf8').split(/\r?\n/);
-    }
-    const answer = pipedAnswers.shift() ?? '';
+    const answer = nextPipedAnswer(prompt);
     return normalizePromptValue(answer, defaultValue);
   }
 
@@ -111,11 +108,59 @@ export async function askText(
   return normalizePromptValue(answer, defaultValue);
 }
 
-function readPipedAnswer(): string {
+// Reading piped stdin with fs.readFileSync(0) is not safe: when the pipe is
+// non-blocking and the parent has not written yet (a real race under load on
+// Node 26), it throws EAGAIN — and a short read leaves later prompts with no
+// answers, which used to spin the wizard's re-prompt loops forever. Read to
+// EOF ourselves, retrying transient EAGAIN with a bounded blocking backoff.
+const PIPED_STDIN_TIMEOUT_MS = 30_000;
+
+export function readAllStdinSync(): string {
+  const chunks: Buffer[] = [];
+  const buffer = Buffer.alloc(65536);
+  const deadline = Date.now() + PIPED_STDIN_TIMEOUT_MS;
+  for (;;) {
+    let bytesRead: number;
+    try {
+      bytesRead = fs.readSync(0, buffer, 0, buffer.length, null);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'EAGAIN') {
+        if (Date.now() > deadline) {
+          break; // writer never finished; proceed with what we have
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        continue;
+      }
+      if (code === 'EOF') {
+        break;
+      }
+      throw error;
+    }
+    if (bytesRead === 0) {
+      break;
+    }
+    chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+// Exhausted piped answers must fail loudly: returning '' forever turns any
+// answer-count mismatch into an infinite re-prompt loop in the wizard.
+function nextPipedAnswer(promptLabel: string): string {
   if (!pipedAnswers) {
-    pipedAnswers = fs.readFileSync(0, 'utf8').split(/\r?\n/);
+    pipedAnswers = readAllStdinSync().split(/\r?\n/);
+  }
+  if (pipedAnswers.length === 0) {
+    throw new Error(
+      `Piped input exhausted while waiting for an answer to: ${promptLabel.split('\n')[0]}`,
+    );
   }
   return pipedAnswers.shift() ?? '';
+}
+
+export function setPipedAnswersForTests(answers?: string[]): void {
+  pipedAnswers = answers;
 }
 
 async function readHiddenFromTTY(
@@ -222,7 +267,7 @@ export async function askHiddenText(
 
   if (!process.stdin.isTTY) {
     writeStdout(io, formatSecretPrompt(prompt, defaultValue.trim().length > 0));
-    return normalizePromptValue(readPipedAnswer(), defaultValue);
+    return normalizePromptValue(nextPipedAnswer(prompt), defaultValue);
   }
 
   return readHiddenFromTTY(

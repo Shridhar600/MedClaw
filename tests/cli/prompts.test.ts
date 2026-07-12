@@ -89,4 +89,78 @@ describe('cli prompts', () => {
     expect(value).toBe(true);
     expect(stderr.join('')).toContain('Please answer yes or no.');
   });
+
+  describe('piped (non-TTY) stdin', () => {
+    afterEach(() => {
+      prompts.setPipedAnswersForTests(undefined);
+    });
+
+    function goNonTty(): void {
+      Object.defineProperty(process.stdin, 'isTTY', {
+        value: false,
+        configurable: true,
+      });
+    }
+
+    it('askText consumes seeded piped answers in order', async () => {
+      goNonTty();
+      prompts.setPipedAnswersForTests(['first', 'second']);
+      const out: string[] = [];
+      const io = { stdout: (t: string) => out.push(t) };
+
+      await expect(prompts.askText(io, 'Q1')).resolves.toBe('first');
+      await expect(prompts.askText(io, 'Q2')).resolves.toBe('second');
+    });
+
+    it('askText throws a clear error when piped answers are exhausted (never loops)', async () => {
+      goNonTty();
+      prompts.setPipedAnswersForTests(['only-one']);
+      const io = { stdout: () => undefined };
+
+      await expect(prompts.askText(io, 'Q1')).resolves.toBe('only-one');
+      await expect(prompts.askText(io, 'Workspace path')).rejects.toThrow(
+        /Piped input exhausted.*Workspace path/,
+      );
+    });
+
+    it('askHiddenText throws the same exhaustion error on piped stdin', async () => {
+      goNonTty();
+      prompts.setPipedAnswersForTests([]);
+
+      await expect(
+        prompts.askHiddenText({ stdout: () => undefined }, 'Telegram bot token'),
+      ).rejects.toThrow(/Piped input exhausted.*Telegram bot token/);
+    });
+
+    it('readAllStdinSync retries transient EAGAIN and returns the full input', () => {
+      const fs = require('fs') as typeof import('fs');
+      const payload = Buffer.from('line1\nline2');
+      let calls = 0;
+      jest.spyOn(fs, 'readSync').mockImplementation(((
+        _fd: number,
+        buffer: Buffer,
+      ): number => {
+        calls += 1;
+        if (calls <= 2) {
+          const err = new Error('EAGAIN') as NodeJS.ErrnoException;
+          err.code = 'EAGAIN';
+          throw err;
+        }
+        if (calls === 3) {
+          payload.copy(buffer);
+          return payload.length;
+        }
+        return 0; // EOF
+      }) as never);
+
+      expect(prompts.readAllStdinSync()).toBe('line1\nline2');
+      expect(calls).toBe(4);
+    });
+
+    it('readAllStdinSync returns empty string on immediate EOF', () => {
+      const fs = require('fs') as typeof import('fs');
+      jest.spyOn(fs, 'readSync').mockImplementation((() => 0) as never);
+      expect(prompts.readAllStdinSync()).toBe('');
+    });
+  });
 });

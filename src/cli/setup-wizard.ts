@@ -39,7 +39,16 @@ import { listWorkspaceTemplateFiles } from '../workspace/bootstrap';
 const TOTAL_STEPS = 5;
 
 function shouldRunLiveChecks(io: CliIO, options?: SetupReadinessDependencies): boolean {
-  return !io.input || Boolean(options?.fetchImpl);
+  if (options?.fetchImpl) {
+    return true; // caller injected a fetch — checks are hermetic
+  }
+  if (io.input) {
+    return false; // injected IO (unit tests / programmatic callers)
+  }
+  // Live network checks only for a real interactive terminal. A piped stdin
+  // (scripted onboard, CI) cannot answer validation re-prompts, and the
+  // checks would make non-interactive runs depend on network reachability.
+  return process.stdin.isTTY === true;
 }
 
 function validateWritablePath(targetPath: string, kind: 'workspace' | 'config'): string[] {
