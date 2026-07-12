@@ -2,6 +2,7 @@ import type { Tool, ToolResult } from './types';
 import type { MemoryEngine } from '../memory/memory-engine';
 import type { MemorySearch } from '../memory/search';
 import type { MemoryIndexer } from '../memory/indexer';
+import { contentContainsCredentials } from '../security/credential-rejection';
 
 export function createMemoryTools(engine: MemoryEngine, search?: MemorySearch, indexer?: MemoryIndexer): Tool[] {
   const memoryGet: Tool = {
@@ -50,6 +51,13 @@ export function createMemoryTools(engine: MemoryEngine, search?: MemorySearch, i
     async execute(params): Promise<ToolResult> {
       const filePath = params.path as string;
       const content = params.content as string;
+      const rejection = contentContainsCredentials(content);
+      if (rejection.matched) {
+        return {
+          content: [{ type: 'text', text: `Write rejected: content matches credential pattern (${rejection.pattern}). PHI/sensitive data should not be stored in plain text memory files.` }],
+          isError: true,
+        };
+      }
       const mode = (params.mode as string) ?? 'overwrite';
       if (mode === 'append') {
         await engine.appendToFile(filePath, content);

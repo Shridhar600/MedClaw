@@ -53,6 +53,23 @@ export class SqliteStore {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS chunk_stats (
+        chunk_id TEXT PRIMARY KEY,
+        injected_count INTEGER DEFAULT 0,
+        used_count INTEGER DEFAULT 0,
+        last_used_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS events (
+        id TEXT PRIMARY KEY,
+        event_type TEXT,
+        entity TEXT,
+        value TEXT,
+        ts TEXT
+      );
+      CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        value TEXT
+      );
     `);
 
     try {

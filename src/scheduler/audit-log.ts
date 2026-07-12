@@ -1,13 +1,18 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
+import { rotateFileIfNeeded } from './rotation';
 import type {
   SchedulerAuditEvent,
   SchedulerAuditEventInput,
   SchedulerAuditLogQuery,
 } from './types';
 
+const ROTATION_CHECK_INTERVAL = 100;
+
 export class SchedulerAuditLog {
+  private appendCount = 0;
+
   constructor(private readonly filePath: string) {}
 
   async append(input: SchedulerAuditEventInput): Promise<SchedulerAuditEvent> {
@@ -21,6 +26,12 @@ export class SchedulerAuditLog {
     };
 
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+
+    this.appendCount++;
+    if (this.appendCount % ROTATION_CHECK_INTERVAL === 0) {
+      rotateFileIfNeeded(this.filePath);
+    }
+
     fs.appendFileSync(this.filePath, JSON.stringify(event) + '\n', 'utf8');
     return event;
   }
