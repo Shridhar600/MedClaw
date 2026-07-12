@@ -4,6 +4,7 @@ import type { MemorySearch } from '../memory/search';
 import type { MemoryIndexer } from '../memory/indexer';
 import { contentContainsCredentials } from '../security/credential-rejection';
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- profileId reserved for Task 8 (profile-scoped index metadata)
 export function createMemoryTools(engine: MemoryEngine, search?: MemorySearch, indexer?: MemoryIndexer, _profileId?: string): Tool[] {
   const memoryGet: Tool = {
     name: 'memory_get',

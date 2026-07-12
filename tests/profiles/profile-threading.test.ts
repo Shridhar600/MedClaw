@@ -1,5 +1,7 @@
 import * as path from 'path';
 import * as os from 'os';
+import * as fs from 'fs';
+import type { LLMProvider } from '../../src/providers/types';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import { SqliteStore } from '../../src/memory/sqlite-store';
 import { MemoryIndexer } from '../../src/memory/indexer';
@@ -51,7 +53,7 @@ describe('profileId threading', () => {
     it('constructs without profileId (defaults to "default")', () => {
       const dbPath = path.join(tmpDir, 'indexer.db');
       const store = new SqliteStore(dbPath);
-      const mockProvider = { embed: jest.fn(), modelName: 'test-model' } as any;
+      const mockProvider = { embed: jest.fn(), modelName: 'test-model' } as unknown as LLMProvider;
       const indexer = new MemoryIndexer(store, mockProvider, tmpDir);
       expect(indexer).toBeInstanceOf(MemoryIndexer);
       store.close();
@@ -60,7 +62,7 @@ describe('profileId threading', () => {
     it('constructs with explicit profileId', () => {
       const dbPath = path.join(tmpDir, 'indexer2.db');
       const store = new SqliteStore(dbPath);
-      const mockProvider = { embed: jest.fn(), modelName: 'test-model' } as any;
+      const mockProvider = { embed: jest.fn(), modelName: 'test-model' } as unknown as LLMProvider;
       const indexer = new MemoryIndexer(store, mockProvider, tmpDir, 'my-profile');
       expect(indexer).toBeInstanceOf(MemoryIndexer);
       store.close();
@@ -71,7 +73,7 @@ describe('profileId threading', () => {
     it('constructs without profileId (defaults to "default")', () => {
       const dbPath = path.join(tmpDir, 'search.db');
       const store = new SqliteStore(dbPath);
-      const mockProvider = { embed: jest.fn() } as any;
+      const mockProvider = { embed: jest.fn() } as unknown as LLMProvider;
       const weights = { vector: 0.7, keyword: 0.3 };
       const search = new MemorySearch(store, mockProvider, weights);
       expect(search).toBeInstanceOf(MemorySearch);
@@ -81,7 +83,7 @@ describe('profileId threading', () => {
     it('constructs with explicit profileId', () => {
       const dbPath = path.join(tmpDir, 'search2.db');
       const store = new SqliteStore(dbPath);
-      const mockProvider = { embed: jest.fn() } as any;
+      const mockProvider = { embed: jest.fn() } as unknown as LLMProvider;
       const weights = { vector: 0.7, keyword: 0.3 };
       const search = new MemorySearch(store, mockProvider, weights, 'my-profile');
       expect(search).toBeInstanceOf(MemorySearch);
@@ -155,7 +157,6 @@ describe('ProfileConfig defaults', () => {
   });
 
   it('merged config preserves user profiles section', async () => {
-    const fs = require('fs');
     const testConfigPath = path.join(tmpDir, 'test-config.json');
     const userConfig = {
       profiles: { baseDir: '/custom/path', defaultProfileId: 'work' },

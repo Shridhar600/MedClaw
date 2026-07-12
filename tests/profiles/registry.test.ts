@@ -116,8 +116,8 @@ describe('ProfileRegistry', () => {
     });
 
     it('getAllProfiles returns all created profiles', () => {
-      const a = registry.createProfile('A');
-      const b = registry.createProfile('B');
+      registry.createProfile('A');
+      registry.createProfile('B');
       expect(registry.getAllProfiles()).toHaveLength(2);
       expect(registry.getAllProfiles().map((p) => p.label).sort()).toEqual(['A', 'B']);
     });

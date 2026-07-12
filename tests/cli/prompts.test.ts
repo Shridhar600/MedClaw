@@ -1,5 +1,9 @@
 import * as prompts from '../../src/cli/prompts';
 
+// The raw CJS module object — spyable, unlike the ts-jest __importStar clone
+// produced by `import * as fs`, whose getter-only properties reject spyOn.
+const fs = jest.requireActual<typeof import('fs')>('fs');
+
 describe('cli prompts', () => {
   const stdin = process.stdin as NodeJS.ReadStream & {
     isRaw?: boolean;
@@ -133,7 +137,6 @@ describe('cli prompts', () => {
     });
 
     it('readAllStdinSync retries transient EAGAIN and returns the full input', () => {
-      const fs = require('fs') as typeof import('fs');
       const payload = Buffer.from('line1\nline2');
       let calls = 0;
       jest.spyOn(fs, 'readSync').mockImplementation(((
@@ -158,7 +161,6 @@ describe('cli prompts', () => {
     });
 
     it('readAllStdinSync returns empty string on immediate EOF', () => {
-      const fs = require('fs') as typeof import('fs');
       jest.spyOn(fs, 'readSync').mockImplementation((() => 0) as never);
       expect(prompts.readAllStdinSync()).toBe('');
     });

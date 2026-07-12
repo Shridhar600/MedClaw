@@ -85,7 +85,7 @@ describe('Profile-scoped store isolation', () => {
       const sessA = registry.profileSessions(profileA);
       const sessB = registry.profileSessions(profileB);
       const mgrA = new SessionManager(240, 1440, sessA, undefined, undefined, undefined, profileA);
-      const mgrB = new SessionManager(240, 1440, sessB, undefined, undefined, undefined, profileB);
+      new SessionManager(240, 1440, sessB, undefined, undefined, undefined, profileB);
 
       await mgrA.recordTurn('chat-1', [
         { role: 'user', content: 'A private data' },
@@ -169,7 +169,7 @@ describe('Profile-scoped store isolation', () => {
       const auditPathA = registry.profileAuditLog(profileA);
       const auditPathB = registry.profileAuditLog(profileB);
       const auditA = new SchedulerAuditLog(auditPathA, profileA);
-      const auditB = new SchedulerAuditLog(auditPathB, profileB);
+      new SchedulerAuditLog(auditPathB, profileB);
 
       await auditA.append({
         jobId: 'job-1',

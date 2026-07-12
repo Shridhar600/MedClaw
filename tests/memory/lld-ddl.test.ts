@@ -18,8 +18,9 @@ describe('LLD §4 DDL addendum tables', () => {
     fs.rmSync(tmpDir, { recursive: true });
   });
 
-  function getTableInfo(table: string): Array<{ cid: number; name: string; type: string; notnull: number; dflt_value: string | null; pk: number }> {
-    return store.db.prepare(`PRAGMA table_info(${table})`).all() as any;
+  type TableColumn = { cid: number; name: string; type: string; notnull: number; dflt_value: string | null; pk: number };
+  function getTableInfo(table: string): TableColumn[] {
+    return store.db.prepare(`PRAGMA table_info(${table})`).all() as TableColumn[];
   }
 
   it('meta table exists with exact LLD column set', () => {
