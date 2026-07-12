@@ -4,7 +4,7 @@ import type { MemorySearch } from '../memory/search';
 import type { MemoryIndexer } from '../memory/indexer';
 import { contentContainsCredentials } from '../security/credential-rejection';
 
-export function createMemoryTools(engine: MemoryEngine, search?: MemorySearch, indexer?: MemoryIndexer): Tool[] {
+export function createMemoryTools(engine: MemoryEngine, search?: MemorySearch, indexer?: MemoryIndexer, _profileId?: string): Tool[] {
   const memoryGet: Tool = {
     name: 'memory_get',
     group: 'group:memory',

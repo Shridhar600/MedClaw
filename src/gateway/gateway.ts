@@ -41,6 +41,7 @@ export class Gateway {
   private scheduler?: HeartbeatScheduler;
   private store?: SqliteStore;
   private profileRegistry?: ProfileRegistry;
+  private resolvedMemoryWorkspace?: string;
 
   constructor(config: AppConfig) {
     this.config = config;
@@ -68,6 +69,7 @@ export class Gateway {
     const memoryWorkspace = this.profileRegistry
       ? this.migrateAndResolveWorkspace(this.profileRegistry, profileId, config.memory.workspace)
       : config.memory.workspace;
+    this.resolvedMemoryWorkspace = memoryWorkspace;
     const usingProfileWorkspace = memoryWorkspace !== config.memory.workspace;
 
     // Memory
@@ -99,13 +101,13 @@ export class Gateway {
 
     // Tools
     const registry = new ToolRegistry(config.tools);
-    for (const tool of createMemoryTools(memory, search, indexer)) {
+    for (const tool of createMemoryTools(memory, search, indexer, profileId)) {
       registry.register(tool);
     }
 
     // Medical tools with medical provider
     const medicalProvider = createProvider(config.providers.medical);
-    for (const tool of createMedicalTools(memory, search, medicalProvider, mainProvider, config.memory.workspace, {
+    for (const tool of createMedicalTools(memory, search, medicalProvider, mainProvider, memoryWorkspace, {
       medicalProviderType: config.providers.medical.type,
       medicalProviderBaseUrl: config.providers.medical.baseUrl,
       allowRawMedicalMedia: config.providers.medical.allowRawMedicalMedia,
@@ -146,22 +148,22 @@ export class Gateway {
       if (!token) {
         throw new Error('TELEGRAM_BOT_TOKEN not set. Set it in config or environment.');
       }
-      this.channel = new TelegramChannel(token, config.memory.workspace);
+      this.channel = new TelegramChannel(token, memoryWorkspace);
       this.channel.onMessage((msg) => this.handleMessage(msg));
       await this.channel.connect();
     }
 
     await this.initializeScheduler();
     if (this.scheduler) {
-      registry.register(createCronManageTool(this.scheduler, config.memory.workspace));
-      registry.register(createHeartbeatManageTool(this.scheduler, config.memory.workspace));
+      registry.register(createCronManageTool(this.scheduler, this.getEffectiveWorkspace()));
+      registry.register(createHeartbeatManageTool(this.scheduler, this.getEffectiveWorkspace()));
     }
 
     console.log('[gateway] Redacted is running.');
   }
 
   async handleTestMessage(chatId: string, text: string): Promise<string> {
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- Task 5 will thread this to stores
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- per-chat profileId resolved; stores use resolvedMemoryWorkspace
     const profileId = this.getProfileForChat(chatId);
     const emergency = this.handleEmergencyInput(text);
     if (emergency) {
@@ -189,7 +191,7 @@ export class Gateway {
 
   private async handleMessage(incoming: IncomingMessage): Promise<void> {
     const { chatId, text } = incoming;
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- Task 5 will thread this to stores
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- per-chat profileId resolved; stores use resolvedMemoryWorkspace
     const profileId = this.getProfileForChat(chatId);
     console.log(
       `[gateway] Message from ${chatId}: ${text.length} chars${incoming.mediaPath ? ', media attached' : ''}`,
@@ -354,11 +356,11 @@ export class Gateway {
     if (startupChatId) {
       await this.reconcileHeartbeatPolicies(startupChatId);
     }
-    await syncHeartbeatMarkdown(this.config.memory.workspace, await this.scheduler.listJobs());
+    await syncHeartbeatMarkdown(this.getEffectiveWorkspace(), await this.scheduler.listJobs());
   }
 
   private async handleScheduledJob(job: HeartbeatJob, invokedByScheduler: boolean = false): Promise<void> {
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- Task 5 will thread this to stores
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- per-chat profileId resolved; stores use resolvedMemoryWorkspace
     const profileId = this.getProfileForChat(job.chatId);
     const decision = decideHeartbeatDelivery(job, {
       now: new Date(Date.now()),
@@ -413,13 +415,13 @@ export class Gateway {
     }
 
     const desired = await buildDesiredHeartbeatJobs({
-      workspacePath: this.config.memory.workspace,
+      workspacePath: this.getEffectiveWorkspace(),
       chatId,
       timezone: this.config.heartbeat.timezone,
       policy: this.config.heartbeat.policy,
     });
     await reconcilePolicyJobs(this.scheduler, desired);
-    await syncHeartbeatMarkdown(this.config.memory.workspace, await this.scheduler.listJobs());
+    await syncHeartbeatMarkdown(this.getEffectiveWorkspace(), await this.scheduler.listJobs());
   }
 
   private async resolveStartupPolicyChatId(): Promise<string | undefined> {
@@ -452,10 +454,11 @@ export class Gateway {
   }
 
   private async handleOnboarding(chatId: string, input: string): Promise<string | undefined> {
+    const workspace = this.getEffectiveWorkspace();
     if (input.trim() === '/onboarding restart' || input.trim() === '/profile update') {
       const flow = new OnboardingFlow(
-        new OnboardingStore(this.config.memory.workspace),
-        this.config.memory.workspace,
+        new OnboardingStore(workspace),
+        workspace,
         this.config.heartbeat.timezone,
       );
       const result = await flow.handle('restart onboarding');
@@ -466,8 +469,8 @@ export class Gateway {
       return result.response;
     }
 
-    const store = new OnboardingStore(this.config.memory.workspace);
-    const flow = new OnboardingFlow(store, this.config.memory.workspace, this.config.heartbeat.timezone);
+    const store = new OnboardingStore(workspace);
+    const flow = new OnboardingFlow(store, workspace, this.config.heartbeat.timezone);
     if (await flow.isComplete()) {
       return undefined;
     }
@@ -580,6 +583,10 @@ export class Gateway {
       );
       return legacyWorkspace;
     }
+  }
+
+  private getEffectiveWorkspace(): string {
+    return this.resolvedMemoryWorkspace ?? this.config.memory.workspace;
   }
 
   private getProfileForChat(chatId: string): ProfileId {
