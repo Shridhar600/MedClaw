@@ -40,7 +40,7 @@ export class SessionManager {
   private softResetMs: number;
   private hardResetMs: number;
   private sessionsPath: string;
-  private operationQueues: Map<string, Promise<void>> = new Map();
+  private operationQueues: Map<string, Array<() => Promise<void>>> = new Map();
   private readonly llmProvider?: LLMProvider;
   private readonly toolRegistry?: ToolRegistry;
   private readonly compactionConfig?: CompactionConfig;
@@ -460,15 +460,37 @@ ${response.text.trim()}`;
   }
 
   private enqueue<T>(chatId: string, operation: () => Promise<T>): Promise<T> {
-    const previous = this.operationQueues.get(chatId) ?? Promise.resolve();
-    const nextOperation = previous.catch(() => undefined).then(operation);
-    const settled = nextOperation.then(() => undefined, () => undefined);
-    this.operationQueues.set(chatId, settled);
-
-    return nextOperation.finally(() => {
-      if (this.operationQueues.get(chatId) === settled) {
-        this.operationQueues.delete(chatId);
+    return new Promise((resolve, reject) => {
+      const queue = this.operationQueues.get(chatId) ?? [];
+      queue.push(async () => {
+        try {
+          resolve(await operation());
+        } catch (e) {
+          reject(e);
+        }
+      });
+      this.operationQueues.set(chatId, queue);
+      if (queue.length === 1) {
+        void this.drainQueue(chatId);
       }
     });
+  }
+
+  private async drainQueue(chatId: string): Promise<void> {
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const queue = this.operationQueues.get(chatId);
+      if (!queue || queue.length === 0) {
+        this.operationQueues.delete(chatId);
+        return;
+      }
+      const job = queue[0];
+      try {
+        await job();
+      } catch {
+        // error propagated via reject in caller
+      }
+      queue.shift();
+    }
   }
 }

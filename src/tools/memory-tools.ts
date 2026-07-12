@@ -112,12 +112,37 @@ export function createMemoryTools(engine: MemoryEngine, search?: MemorySearch, i
       if (results.length === 0) {
         return { content: [{ type: 'text', text: 'No results found' }] };
       }
-      const text = results
+      const status = results[0].status ?? 'full';
+      const qualityBanner = status === 'full' ? '' : `[search-quality: ${status}]\n`;
+      const text = qualityBanner + results
         .map(r => `## ${r.path} [${r.chunkId}] lines ${r.startLine}-${r.endLine} (score: ${r.score.toFixed(3)})\n${r.content}`)
         .join('\n\n---\n\n');
       return { content: [{ type: 'text', text }] };
     },
   };
 
-  return [memoryGet, memoryWrite, memorySearch];
+  const memoryList: Tool = {
+    name: 'memory_list',
+    group: 'group:memory',
+    description: 'List files and directories in a memory workspace path',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Relative path within workspace (default: root)' },
+      },
+    },
+    async execute(params): Promise<ToolResult> {
+      const dirPath = (params.path as string) ?? '';
+      if (dirPath.includes('..')) {
+        return { content: [{ type: 'text', text: 'Path traversal is not allowed.' }], isError: true };
+      }
+      const files = await engine.listFiles(dirPath);
+      if (files.length === 0) {
+        return { content: [{ type: 'text', text: 'No files found' }] };
+      }
+      return { content: [{ type: 'text', text: files.join('\n') }] };
+    },
+  };
+
+  return [memoryGet, memoryWrite, memorySearch, memoryList];
 }

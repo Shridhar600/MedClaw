@@ -737,9 +737,14 @@ export class Gateway {
   }
 }
 
+// Deliberately excludes error.message: agent/session/provider errors in this
+// domain can echo user health content (PHI) into their messages, and gateway
+// logs must never carry it (see gateway-media-flow PHI-guard tests). The top
+// stack frame gives the debuggable location without the message body.
 function summarizeErrorForLog(error: unknown): string {
   if (error instanceof Error) {
-    return error.name;
+    const frame = error.stack?.split('\n')[1]?.trim();
+    return frame ? `${error.name} (${frame})` : error.name;
   }
   return typeof error;
 }

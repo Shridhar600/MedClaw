@@ -52,4 +52,53 @@ describe('MemoryEngine', () => {
     const files = await engine.listFiles('memory');
     expect(files).toHaveLength(2);
   });
+
+  it('rejects reading a path with ".." (traversal)', async () => {
+    await expect(engine.readFile('../outside.txt')).rejects.toThrow('Path traversal');
+  });
+
+  it('rejects writing a path with ".." (traversal)', async () => {
+    await expect(engine.writeFile('../outside.txt', 'bad')).rejects.toThrow('Path traversal');
+  });
+
+  describe('symlink guard (TOCTOU)', () => {
+    it('rejects read through a symlink pointing outside workspace', async () => {
+      const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-outside-'));
+      try {
+        const outsideFile = path.join(outsideDir, 'secret.txt');
+        fs.writeFileSync(outsideFile, 'outside content', 'utf-8');
+        const symlinkPath = path.join(tmpDir, 'evil-link.txt');
+        fs.symlinkSync(outsideFile, symlinkPath);
+
+        await expect(engine.readFile('evil-link.txt')).rejects.toThrow('symlink outside workspace');
+      } finally {
+        fs.rmSync(outsideDir, { recursive: true });
+      }
+    });
+
+    it('rejects write through a directory symlink pointing outside workspace', async () => {
+      const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-outside-'));
+      try {
+        const symlinkPath = path.join(tmpDir, 'evil-dir');
+        fs.symlinkSync(outsideDir, symlinkPath, 'dir');
+
+        await expect(engine.writeFile('evil-dir/bad.md', 'bad')).rejects.toThrow('symlink outside workspace');
+      } finally {
+        fs.rmSync(outsideDir, { recursive: true });
+      }
+    });
+
+    it('allows read/write of normal nested paths (realpath on both sides)', async () => {
+      await engine.writeFile('conditions/diabetes.md', '# Diabetes');
+      const content = await engine.readFile('conditions/diabetes.md');
+      expect(content).toBe('# Diabetes');
+    });
+
+    it('allows write to a new path within workspace (parent exists)', async () => {
+      await engine.writeFile('conditions/knee.md', '# Knee pain');
+      const content = await engine.readFile('conditions/knee.md');
+      expect(content).toBe('# Knee pain');
+    });
+  });
+
 });

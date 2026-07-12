@@ -138,7 +138,7 @@ describe('HeartbeatScheduler', () => {
 
   it('automatically wakes retry-wait jobs when nextRetryAt is due', async () => {
     jest.useFakeTimers();
-    let now = new Date('2026-04-19T08:00:00.000Z');
+    jest.setSystemTime(new Date('2026-04-19T08:00:00.000Z'));
     try {
       const store = new HeartbeatStore(storePath);
       let attempts = 0;
@@ -154,7 +154,7 @@ describe('HeartbeatScheduler', () => {
         {
           defaultMaxRetries: 1,
           retryBackoffMinutes: 5,
-          now: () => now,
+          now: () => new Date(Date.now()),
         },
       );
       await scheduler.start();
@@ -171,7 +171,6 @@ describe('HeartbeatScheduler', () => {
       await scheduler.runNow(job.id);
       expect((await store.get(job.id))?.deliveryState).toBe('retry-wait');
 
-      now = new Date('2026-04-19T08:05:00.000Z');
       await jest.advanceTimersByTimeAsync(5 * 60 * 1000);
 
       expect(attempts).toBe(2);
@@ -185,11 +184,13 @@ describe('HeartbeatScheduler', () => {
 
   it('automatically wakes snoozed jobs when snoozedUntil is due', async () => {
     jest.useFakeTimers();
-    let now = new Date('2026-04-19T08:00:00.000Z');
+    jest.setSystemTime(new Date('2026-04-19T08:00:00.000Z'));
     try {
       const store = new HeartbeatStore(storePath);
       const trigger = jest.fn().mockResolvedValue(undefined);
-      const scheduler = new HeartbeatScheduler(store, trigger, 'UTC', { now: () => now });
+      const scheduler = new HeartbeatScheduler(store, trigger, 'UTC', {
+        now: () => new Date(Date.now()),
+      });
       await scheduler.start();
       const job = await scheduler.createJob({
         title: 'Snooze wakeup',
@@ -206,7 +207,6 @@ describe('HeartbeatScheduler', () => {
         snoozedUntil: '2026-04-19T08:10:00.000Z',
       });
 
-      now = new Date('2026-04-19T08:10:00.000Z');
       await jest.advanceTimersByTimeAsync(10 * 60 * 1000);
 
       expect(trigger).toHaveBeenCalledTimes(1);
@@ -219,13 +219,13 @@ describe('HeartbeatScheduler', () => {
 
   it('automatically wakes rate-limited jobs when deferredUntil is due', async () => {
     jest.useFakeTimers();
-    let now = new Date('2026-04-19T08:00:00.000Z');
+    jest.setSystemTime(new Date('2026-04-19T08:00:00.000Z'));
     try {
       const store = new HeartbeatStore(storePath);
       const trigger = jest.fn().mockResolvedValue(undefined);
       const scheduler = new HeartbeatScheduler(store, trigger, 'UTC', {
         maxGlobalTriggersPerMinute: 1,
-        now: () => now,
+        now: () => new Date(Date.now()),
       });
       await scheduler.start();
       const first = await scheduler.createJob({
@@ -251,7 +251,6 @@ describe('HeartbeatScheduler', () => {
       await scheduler.runNow(second.id);
       expect((await store.get(second.id))?.deliveryState).toBe('retry-wait');
 
-      now = new Date('2026-04-19T08:01:00.000Z');
       await jest.advanceTimersByTimeAsync(60 * 1000);
 
       expect(trigger).toHaveBeenCalledTimes(2);

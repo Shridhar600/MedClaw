@@ -70,5 +70,9 @@ describe('Gateway startup resilience', () => {
     await gateway.stop();
 
     expect(warn.mock.calls.flat().join('\n')).toContain('Memory index unavailable');
+    // Error NAME + code location are logged; the message body is deliberately
+    // excluded (may carry PHI — see summarizeErrorForLog).
+    expect(warn.mock.calls.flat().join('\n')).toContain('Error (at ');
+    expect(warn.mock.calls.flat().join('\n')).not.toContain('embedding provider unavailable');
   });
 });

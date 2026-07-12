@@ -10,6 +10,19 @@ export class MemoryEngine {
     private readonly profileId: string = 'default',
   ) {
     fs.mkdirSync(workspace, { recursive: true });
+    // Eagerly resolve the real workspace path to prevent a TOCTOU window
+    // between construction and the first resolve() call.
+    void this.realWorkspace;
+  }
+
+  // Cached on first access — the workspace doesn't change during the engine's lifetime.
+  private _realWorkspace: string | undefined;
+
+  private get realWorkspace(): string {
+    if (this._realWorkspace === undefined) {
+      this._realWorkspace = fs.realpathSync(this.workspace);
+    }
+    return this._realWorkspace;
   }
 
   private resolve(relativePath: string): string {
@@ -18,7 +31,29 @@ export class MemoryEngine {
     if (!full.startsWith(this.workspace + path.sep) && full !== this.workspace) {
       throw new Error(`Path traversal detected: ${relativePath}`);
     }
+    // Symlink/TOCTOU guard — resolve the parent directory (or file itself) to
+    // detect symlinks that point outside the real workspace root.
+    const checkTarget = fs.existsSync(full) ? full : this.nearestExistingParent(full);
+    const realTarget = fs.realpathSync(checkTarget);
+    const realRoot = this.realWorkspace;
+    if (
+      !realTarget.startsWith(realRoot + path.sep) &&
+      realTarget !== realRoot
+    ) {
+      throw new Error(`Path traversal detected: ${relativePath} (symlink outside workspace)`);
+    }
     return full;
+  }
+
+  private nearestExistingParent(targetPath: string): string {
+    let current = path.dirname(targetPath);
+    while (current && current !== path.parse(current).root) {
+      if (fs.existsSync(current)) {
+        return current;
+      }
+      current = path.dirname(current);
+    }
+    return current;
   }
 
   async readFile(relativePath: string): Promise<string | null> {

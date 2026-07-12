@@ -1,5 +1,5 @@
 import type { LLMProvider } from '../providers/types';
-import type { SearchResult } from './types';
+import type { SearchResult, SearchStatus } from './types';
 import type { SqliteStore } from './sqlite-store';
 
 interface HybridWeights {
@@ -39,16 +39,26 @@ export class MemorySearch {
 
   async search(query: string, topK: number): Promise<SearchResult[]> {
     let vectorResults: SearchResult[] = [];
+    let status: SearchStatus = 'full';
+    let vectorFailed = false;
     try {
       const queryEmbedding = await this.embeddingProvider.embed(query);
       const float32 = new Float32Array(queryEmbedding);
       vectorResults = this.store.vectorSearch(float32, topK * 2);
     } catch (e) {
       console.warn('[search] Vector search failed, falling back to keyword only:', e);
+      vectorFailed = true;
     }
 
     const rawKeywordResults = this.store.keywordSearch(query, topK * 2);
     const keywordResults = normalizeBm25Scores(rawKeywordResults);
+    const keywordSucceeded = rawKeywordResults.length > 0;
+
+    if (vectorFailed) {
+      status = keywordSucceeded ? 'keyword-only' : 'failed';
+    } else if (vectorResults.length === 0 && !keywordSucceeded) {
+      status = 'failed';
+    }
 
     const scoreMap = new Map<string, SearchResult>();
 
@@ -81,6 +91,7 @@ export class MemorySearch {
 
     return [...scoreMap.values()]
       .sort((a, b) => b.score - a.score)
-      .slice(0, topK);
+      .slice(0, topK)
+      .map(r => ({ ...r, status }));
   }
 }

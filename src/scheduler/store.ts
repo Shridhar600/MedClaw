@@ -9,6 +9,8 @@ import type {
 } from './types';
 
 export class HeartbeatStore {
+  public lastCorruptionAt?: string;
+
   constructor(
     private readonly filePath: string,
     private readonly profileId: string = 'default',
@@ -149,8 +151,13 @@ export class HeartbeatStore {
       if (!Array.isArray(parsed)) {
         throw new Error('Heartbeat store payload must be an array.');
       }
+      this.lastCorruptionAt = undefined;
       return parsed.map((job) => this.normalizeJob(job));
     } catch (error) {
+      this.lastCorruptionAt = new Date().toISOString();
+      console.error(
+        `[scheduler] CORRUPTION DETECTED at ${this.lastCorruptionAt}`,
+      );
       const reason = error instanceof Error ? error.message : String(error);
       try {
         const quarantinedPath = this.quarantineCorruptFile();

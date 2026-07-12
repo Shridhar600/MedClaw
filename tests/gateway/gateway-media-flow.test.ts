@@ -126,10 +126,11 @@ describe('Gateway media flow', () => {
       text: 'My private glucose reading is 240 after lunch',
     });
 
+    // console.log only logs character count, not message text
     expect(logSpy.mock.calls.flat().join('\n')).not.toContain('glucose');
   });
 
-  it('does not log raw agent errors that may contain sensitive context', async () => {
+  it('logs agent error name+location but never the sensitive message body', async () => {
     const gateway = new Gateway(makeConfig());
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     const send = jest.fn().mockResolvedValue(undefined);
@@ -157,9 +158,10 @@ describe('Gateway media flow', () => {
     });
 
     expect(errorSpy.mock.calls.flat().join('\n')).not.toContain('sodium');
+    expect(errorSpy.mock.calls.flat().join('\n')).toContain('Error (at ');
   });
 
-  it('sends generic fallback when prepareHistory fails before agent execution', async () => {
+  it('sends generic fallback and never logs sensitive session context when prepareHistory fails', async () => {
     const gateway = new Gateway(makeConfig());
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     const send = jest.fn().mockResolvedValue(undefined);
@@ -193,7 +195,7 @@ describe('Gateway media flow', () => {
     expect(errorSpy.mock.calls.flat().join('\n')).not.toContain('glucose');
   });
 
-  it('does not send fallback when recordTurn fails after successful response send', async () => {
+  it('does not send fallback nor log sensitive context when recordTurn fails after successful send', async () => {
     const gateway = new Gateway(makeConfig());
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     const send = jest.fn().mockResolvedValue(undefined);
