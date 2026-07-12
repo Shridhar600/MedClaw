@@ -1,20 +1,28 @@
 export type SemaphorePriority = 'user' | 'heartbeat';
 
 interface QueueEntry {
-  priority: number;
   fn: () => Promise<void>;
 }
 
+const MAX_QUEUED_HEARTBEATS = 10;
+
 export class LLMSemaphore {
   private running = false;
-  private queue: QueueEntry[] = [];
+  private userQueue: QueueEntry[] = [];
+  private heartbeatQueue: QueueEntry[] = [];
 
   async run<T>(priority: SemaphorePriority, fn: () => Promise<T>): Promise<T> {
+    if (priority === 'heartbeat' && this.heartbeatQueue.length >= MAX_QUEUED_HEARTBEATS) {
+      return Promise.reject(new Error('heartbeat queue full'));
+    }
+
     return new Promise<T>((resolve, reject) => {
-      this.queue.push({
-        priority: priority === 'user' ? 0 : 1,
-        fn: () => fn().then(resolve, reject),
-      });
+      const entry: QueueEntry = { fn: () => fn().then(resolve, reject) };
+      if (priority === 'user') {
+        this.userQueue.push(entry);
+      } else {
+        this.heartbeatQueue.push(entry);
+      }
       void this.drain();
     });
   }
@@ -23,9 +31,10 @@ export class LLMSemaphore {
     if (this.running) return;
     this.running = true;
     try {
-      while (this.queue.length > 0) {
-        this.queue.sort((a, b) => a.priority - b.priority);
-        const job = this.queue.shift()!;
+      // User priority is absolute: drain the user queue fully before
+      // touching any queued heartbeat work.
+      while (this.userQueue.length > 0 || this.heartbeatQueue.length > 0) {
+        const job = this.userQueue.length > 0 ? this.userQueue.shift()! : this.heartbeatQueue.shift()!;
         try {
           await job.fn();
         } catch {
@@ -35,7 +44,7 @@ export class LLMSemaphore {
     } finally {
       this.running = false;
       // If more jobs were added during the finally block, restart drain
-      if (this.queue.length > 0) {
+      if (this.userQueue.length > 0 || this.heartbeatQueue.length > 0) {
         void this.drain();
       }
     }

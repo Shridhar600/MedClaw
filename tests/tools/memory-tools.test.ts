@@ -88,4 +88,54 @@ describe('Memory Tools', () => {
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('Memory search not available');
   });
+
+  describe('append credential smuggling prevention', () => {
+    it('rejects first append that directly contains a full credential', async () => {
+      const tool = tools.find(t => t.name === 'memory_write')!;
+      const result = await tool.execute({
+        path: 'secrets.md',
+        content: 'sk-abc123def456ghi789jkl012mno345pqr678',
+        mode: 'append',
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('credential');
+    });
+
+    it('rejects second append when combined with existing tail forms a credential', async () => {
+      const tool = tools.find(t => t.name === 'memory_write')!;
+      await engine.writeFile('creep.md', 'some prefix ');
+      const first = await tool.execute({
+        path: 'creep.md',
+        content: 'sk-',
+        mode: 'append',
+      });
+      expect(first.isError).toBeFalsy();
+
+      const second = await tool.execute({
+        path: 'creep.md',
+        content: 'abc123def456ghi789jkl012mno345pqr678',
+        mode: 'append',
+      });
+      expect(second.isError).toBe(true);
+      expect(second.content[0].text).toContain('credential');
+    });
+
+    it('allows normal medical content even in append mode', async () => {
+      const tool = tools.find(t => t.name === 'memory_write')!;
+
+      const first = await tool.execute({
+        path: 'health.md',
+        content: 'Patient has type 2 diabetes. ',
+        mode: 'append',
+      });
+      expect(first.isError).toBeFalsy();
+
+      const second = await tool.execute({
+        path: 'health.md',
+        content: 'NDC 0093-7146-56, ICD-10 E11.9, take metformin 500mg.',
+        mode: 'append',
+      });
+      expect(second.isError).toBeFalsy();
+    });
+  });
 });

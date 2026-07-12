@@ -51,17 +51,35 @@ export function createMemoryTools(engine: MemoryEngine, search?: MemorySearch, i
     async execute(params): Promise<ToolResult> {
       const filePath = params.path as string;
       const content = params.content as string;
-      const rejection = contentContainsCredentials(content);
-      if (rejection.matched) {
-        return {
-          content: [{ type: 'text', text: `Write rejected: content matches credential pattern (${rejection.pattern}). PHI/sensitive data should not be stored in plain text memory files.` }],
-          isError: true,
-        };
-      }
       const mode = (params.mode as string) ?? 'overwrite';
+
       if (mode === 'append') {
+        let existingTail = '';
+        try {
+          const existing = await engine.readFile(filePath);
+          if (existing !== null && existing.length > 0) {
+            existingTail = existing.slice(-8192);
+          }
+        } catch {
+          // file doesn't exist yet, that's fine
+        }
+        const combined = existingTail + content;
+        const rejection = contentContainsCredentials(combined);
+        if (rejection.matched) {
+          return {
+            content: [{ type: 'text', text: `Write rejected: content matches credential pattern (${rejection.pattern}). PHI/sensitive data should not be stored in plain text memory files.` }],
+            isError: true,
+          };
+        }
         await engine.appendToFile(filePath, content);
       } else {
+        const rejection = contentContainsCredentials(content);
+        if (rejection.matched) {
+          return {
+            content: [{ type: 'text', text: `Write rejected: content matches credential pattern (${rejection.pattern}). PHI/sensitive data should not be stored in plain text memory files.` }],
+            isError: true,
+          };
+        }
         await engine.writeFile(filePath, content);
       }
       if (indexer) {

@@ -59,9 +59,12 @@ describe('LLD §4 DDL addendum tables', () => {
     ]);
   });
 
-  it('existing vec_meta table still present and unchanged', () => {
-    const cols = getTableInfo('vec_meta');
-    const colDefs = cols.map(c => ({ name: c.name, type: c.type.toUpperCase() }));
+  it('vec_meta table has been consolidated away — meta is the sole kv store', () => {
+    const vecMetaCols = getTableInfo('vec_meta');
+    expect(vecMetaCols).toEqual([]);
+
+    const metaCols = getTableInfo('meta');
+    const colDefs = metaCols.map(c => ({ name: c.name, type: c.type.toUpperCase() }));
     expect(colDefs).toEqual([
       { name: 'key', type: 'TEXT' },
       { name: 'value', type: 'TEXT' },
@@ -74,9 +77,25 @@ describe('LLD §4 DDL addendum tables', () => {
     expect(colNames).toEqual(['content', 'embedding', 'end_line', 'id', 'path', 'start_line']);
   });
 
-  it('existing chunks_fts virtual table present', () => {
-    const cols = getTableInfo('chunks_fts');
-    expect(cols.length).toBeGreaterThan(0);
+  it('chunks_fts indexes chunk content and is queryable via MATCH', () => {
+    store.upsertChunk({
+      id: 'fts-chunk:0',
+      path: 'fts-test.md',
+      content: 'The quick brown fox jumps over the lazy zorbnaxx',
+      startLine: 1,
+      endLine: 1,
+    });
+
+    const matches = store.db.prepare(
+      'SELECT id, path FROM chunks_fts WHERE chunks_fts MATCH ?',
+    ).all('zorbnaxx') as Array<{ id: string; path: string }>;
+
+    expect(matches).toEqual([{ id: 'fts-chunk:0', path: 'fts-test.md' }]);
+
+    const noMatches = store.db.prepare(
+      'SELECT id FROM chunks_fts WHERE chunks_fts MATCH ?',
+    ).all('nonexistentterm12345') as Array<{ id: string }>;
+    expect(noMatches).toEqual([]);
   });
 
   it('existing file_hashes table still present', () => {

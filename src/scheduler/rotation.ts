@@ -23,8 +23,6 @@ export function rotateFileIfNeeded(filePath: string, config?: Partial<RotationCo
     return false;
   }
 
-  const content = fs.readFileSync(filePath);
-
   // Prune oldest archive beyond maxArchived
   const oldestPath = filePath + '.' + resolved.maxArchived + '.gz';
   if (fs.existsSync(oldestPath)) {
@@ -40,12 +38,26 @@ export function rotateFileIfNeeded(filePath: string, config?: Partial<RotationCo
     }
   }
 
-  // Write compressed archive
-  const compressed = zlib.gzipSync(content);
-  fs.writeFileSync(filePath + '.1.gz', compressed);
+  // Rename-first: move the active file out of the way so concurrent
+  // appenders can recreate the original path safely while we compress
+  // the staged content.
+  const stagingPath = filePath + '.rotating';
+  fs.renameSync(filePath, stagingPath);
 
-  // Truncate original file
-  fs.writeFileSync(filePath, '');
-
-  return true;
+  try {
+    const content = fs.readFileSync(stagingPath);
+    const compressed = zlib.gzipSync(content);
+    fs.writeFileSync(filePath + '.1.gz', compressed, { mode: 0o600 });
+    fs.unlinkSync(stagingPath);
+    return true;
+  } catch (error) {
+    // Restore the staged file back to the original path so no data is lost.
+    try {
+      fs.renameSync(stagingPath, filePath);
+    } catch {
+      // If even the restore fails, there is nothing more we can safely do
+      // here; the staging file is left on disk for manual recovery.
+    }
+    return false;
+  }
 }

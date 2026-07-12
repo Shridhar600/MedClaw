@@ -43,4 +43,10 @@ more text`;
     const result = contentContainsCredentials(content);
     expect(result.matched).toBe(true);
   });
+
+  it('allows real medical note with NDC/ICD-10 codes', () => {
+    const content = 'Patient presents with type 2 diabetes. NDC 0093-7146-56, ICD-10 E11.9, take metformin 500mg twice daily with meals.';
+    const result = contentContainsCredentials(content);
+    expect(result.matched).toBe(false);
+  });
 });

@@ -227,4 +227,69 @@ describe('LLMSemaphore', () => {
 
     expect(order).toEqual(['hb1-start', 'hb1-end', 'u1', 'u2', 'hb2-start']);
   });
+
+  it('an 11th queued heartbeat rejects with queue-full error while user jobs are still accepted', async () => {
+    // Occupy the running slot so subsequent heartbeats stay queued.
+    const blockerRunning = deferred();
+    const blockerDone = deferred();
+    const pBlocker = sem.run('heartbeat', async () => {
+      blockerRunning.resolve();
+      await blockerDone.promise;
+    });
+    await blockerRunning.promise;
+
+    // Queue MAX_QUEUED_HEARTBEATS (10) heartbeats behind the running one.
+    const queued: Array<Promise<void>> = [];
+    for (let i = 0; i < 10; i++) {
+      queued.push(sem.run('heartbeat', async () => {}));
+    }
+
+    // The 11th queued heartbeat must be rejected immediately.
+    await expect(sem.run('heartbeat', async () => {})).rejects.toThrow('heartbeat queue full');
+
+    // A user job must still be accepted (enqueued, not rejected) while the
+    // heartbeat queue is full — user jobs are never bounded.
+    const userResult = sem.run('user', async () => 'user-ok');
+
+    blockerDone.resolve();
+    await pBlocker;
+    await expect(userResult).resolves.toBe('user-ok');
+    await Promise.all(queued);
+  });
+
+  it('a user job enqueued while 5 heartbeats wait runs before all of them', async () => {
+    const order: string[] = [];
+    const blockerRunning = deferred();
+    const blockerDone = deferred();
+
+    const pBlocker = sem.run('heartbeat', async () => {
+      order.push('blocker-start');
+      blockerRunning.resolve();
+      await blockerDone.promise;
+      order.push('blocker-end');
+    });
+    await blockerRunning.promise;
+
+    const hbPromises: Array<Promise<void>> = [];
+    for (let i = 0; i < 5; i++) {
+      const idx = i;
+      hbPromises.push(sem.run('heartbeat', async () => {
+        order.push(`hb${idx}`);
+      }));
+    }
+
+    // Let the heartbeats settle into the queue before the user job arrives.
+    await Promise.resolve();
+
+    const pUser = sem.run('user', async () => {
+      order.push('user');
+    });
+
+    blockerDone.resolve();
+    await pBlocker;
+    await pUser;
+    await Promise.all(hbPromises);
+
+    expect(order).toEqual(['blocker-start', 'blocker-end', 'user', 'hb0', 'hb1', 'hb2', 'hb3', 'hb4']);
+  });
 });

@@ -52,10 +52,6 @@ export class SqliteStore {
         hash TEXT NOT NULL,
         indexed_at TEXT NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS vec_meta (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
       CREATE TABLE IF NOT EXISTS chunk_stats (
         chunk_id TEXT PRIMARY KEY,
         injected_count INTEGER DEFAULT 0,
@@ -81,6 +77,17 @@ export class SqliteStore {
       // Column already exists
     }
 
+    // Migrate legacy vec_meta table (pre-consolidation) into meta, then drop it.
+    const vecMetaExists = this.db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'vec_meta'",
+    ).get();
+    if (vecMetaExists) {
+      this.db.exec('INSERT OR IGNORE INTO meta (key, value) SELECT key, value FROM vec_meta');
+      this.db.exec('DROP TABLE vec_meta');
+    }
+
+    this.db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1')").run();
+
     if (this.hasVec) {
       const dim = this.getStoredDimension();
       this.db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec0 USING vec0(chunk_id TEXT, embedding FLOAT[${dim}] distance_metric=cosine)`);
@@ -88,12 +95,12 @@ export class SqliteStore {
   }
 
   private getStoredDimension(): number {
-    const row = this.db.prepare("SELECT value FROM vec_meta WHERE key = 'embedding_dimension'").get() as { value: string } | undefined;
+    const row = this.db.prepare("SELECT value FROM meta WHERE key = 'embedding_dimension'").get() as { value: string } | undefined;
     return row ? parseInt(row.value, 10) : 768;
   }
 
   private setStoredDimension(dim: number): void {
-    this.db.prepare("INSERT OR REPLACE INTO vec_meta (key, value) VALUES ('embedding_dimension', ?)").run(String(dim));
+    this.db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('embedding_dimension', ?)").run(String(dim));
   }
 
   ensureVecTable(dimension: number): void {
@@ -108,12 +115,12 @@ export class SqliteStore {
   }
 
   getEmbeddingModel(): string | undefined {
-    const row = this.db.prepare("SELECT value FROM vec_meta WHERE key = 'embedding_model'").get() as { value: string } | undefined;
+    const row = this.db.prepare("SELECT value FROM meta WHERE key = 'embedding_model'").get() as { value: string } | undefined;
     return row?.value;
   }
 
   setEmbeddingModel(model: string): void {
-    this.db.prepare("INSERT OR REPLACE INTO vec_meta (key, value) VALUES ('embedding_model', ?)").run(model);
+    this.db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('embedding_model', ?)").run(model);
   }
 
   vectorSearch(queryEmbedding: Float32Array, topK: number): SearchResult[] {

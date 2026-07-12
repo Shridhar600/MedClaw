@@ -54,7 +54,7 @@ module.exports = {
      * 3. V2 core module boundary (specs/16 §1)
      *
      * V2 core modules (memcore, profiles, recall, context2, capture,
-     * subagents, indexstore) may import ONLY from:
+     * subagents, indexstore, security) may import ONLY from:
      *   - src/ports/          (interfaces)
      *   - src/shared/         (error types, utilities)
      *   - their own directory (sub-modules)
@@ -63,6 +63,11 @@ module.exports = {
      * They MUST NOT import from legacy v1 modules (agent, channels, cli,
      * config, gateway, media, memory, onboarding, providers, runtime,
      * scheduler, tools, workspace) or from each other's internals.
+     *
+     * Note: this only restricts what security itself may import. Legacy
+     * modules importing FROM security (e.g. src/tools/memory-tools.ts
+     * importing src/security/credential-rejection) are unaffected — that
+     * direction is covered by the legacy module exemption below.
      */
     {
       name: 'v2-core-boundary',
@@ -72,7 +77,7 @@ module.exports = {
         'their own directory, and external packages. This rule blocks ' +
         'imports from legacy (v1) modules.',
       from: {
-        path: '^src/(memcore|profiles|recall|context2|capture|subagents|indexstore)/',
+        path: '^src/(memcore|profiles|recall|context2|capture|subagents|indexstore|security)/',
       },
       to: {
         path: '^src/(agent|channels|cli|config|gateway|media|memory|onboarding|providers|runtime|scheduler|tools|workspace)/',

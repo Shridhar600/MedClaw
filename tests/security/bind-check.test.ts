@@ -48,4 +48,39 @@ describe('checkProviderBindAddresses', () => {
     expect(result.localhostOnly).toBe(true);
     expect(result.warnings).toHaveLength(0);
   });
+
+  it('flags 0.0.0.0 as NOT safe with distinct warning', () => {
+    const config = {
+      providers: {
+        ollama: { baseUrl: 'http://0.0.0.0:11434' },
+      },
+    };
+    const result = checkProviderBindAddresses(config);
+    expect(result.localhostOnly).toBe(false);
+    expect(result.warnings[0]).toContain('0.0.0.0');
+    expect(result.warnings[0]).toContain('NOT localhost');
+  });
+
+  it('accepts [::1] as localhost', () => {
+    const config = {
+      providers: {
+        ollama: { baseUrl: 'http://[::1]:11434' },
+      },
+    };
+    const result = checkProviderBindAddresses(config);
+    expect(result.localhostOnly).toBe(true);
+    expect(result.warnings).toHaveLength(0);
+  });
+
+  it('accepts 127.x.x.x loopback variations', () => {
+    const config = {
+      providers: {
+        a: { baseUrl: 'http://127.0.0.2:11434' },
+        b: { baseUrl: 'http://127.1.2.3:11434' },
+      },
+    };
+    const result = checkProviderBindAddresses(config);
+    expect(result.localhostOnly).toBe(true);
+    expect(result.warnings).toHaveLength(0);
+  });
 });

@@ -31,14 +31,27 @@ export class SchedulerAuditLog {
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
 
     this.appendCount++;
-    if (this.appendCount % ROTATION_CHECK_INTERVAL === 0) {
-      rotateFileIfNeeded(this.filePath);
+    // Check on the very first append (in case a prior process left the
+    // file near/above the rotation threshold before this instance was
+    // constructed), then every ROTATION_CHECK_INTERVAL appends after that.
+    if (this.appendCount === 1 || this.appendCount % ROTATION_CHECK_INTERVAL === 0) {
+      try {
+        rotateFileIfNeeded(this.filePath);
+      } catch (error) {
+        // Rotation failures must never prevent the append itself.
+        console.warn('[audit-log] rotation check failed, continuing without rotation:', error);
+      }
     }
 
     fs.appendFileSync(this.filePath, JSON.stringify(event) + '\n', 'utf8');
     return event;
   }
 
+  /**
+   * Reads recent audit events from the ACTIVE log file only. Rotated
+   * `.N.gz` archives are not consulted — merging archived history into
+   * this read path is a known limitation and future work.
+   */
   async readRecent(query: SchedulerAuditLogQuery = {}): Promise<SchedulerAuditEvent[]> {
     const events = this.readAll();
     const filtered = query.jobId ? events.filter((event) => event.jobId === query.jobId) : events;

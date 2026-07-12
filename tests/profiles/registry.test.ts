@@ -21,6 +21,48 @@ describe('ProfileRegistry', () => {
     fs.rmSync(baseDir, { recursive: true, force: true });
   });
 
+  describe('validateProfileId', () => {
+    const badIds = ['../evil', 'a/b', 'a\\b', '..', '', 'UPPERCASE', 'has space', '-leading'];
+
+    const standaloneMethods: ((id: ProfileId) => unknown)[] = [
+      (id) => registry.profileDir(id),
+      (id) => registry.profileWorkspace(id),
+      (id) => registry.profileSessions(id),
+      (id) => registry.profileSearchDb(id),
+      (id) => registry.profileSchedulerStore(id),
+      (id) => registry.profileAuditLog(id),
+      (id) => registry.getProfile(id),
+      (id) => registry.deleteProfile(id),
+    ];
+
+    const methodsWithExistingProfile: ((id: ProfileId) => unknown)[] = [
+      (id) => registry.renameProfile(id, 'new-label'),
+      (id) => registry.pairChatToProfile('chat', id),
+    ];
+
+    for (const bad of badIds) {
+      for (const method of standaloneMethods) {
+        it(`rejects "${bad}" from method`, () => {
+          expect(() => method(bad as ProfileId)).toThrow(/Invalid profileId/);
+        });
+      }
+    }
+
+    for (const bad of badIds) {
+      for (const method of methodsWithExistingProfile) {
+        it(`rejects "${bad}" from rename/pair method`, () => {
+          registry.createProfile('existing-profile');
+          expect(() => method(bad as ProfileId)).toThrow(/Invalid profileId/);
+        });
+      }
+    }
+
+    it('accepts valid profileId "my-profile-1" and "trailing-"', () => {
+      expect(() => registry.profileDir('my-profile-1' as ProfileId)).not.toThrow();
+      expect(() => registry.profileDir('trailing-' as ProfileId)).not.toThrow();
+    });
+  });
+
   describe('path derivation', () => {
     it('profileDir returns the profiles directory', () => {
       const pid = 'test-profile' as ProfileId;
@@ -80,6 +122,13 @@ describe('ProfileRegistry', () => {
       expect(registry.getAllProfiles().map((p) => p.label).sort()).toEqual(['A', 'B']);
     });
 
+    it('getAllProfiles returns a copy not live reference', () => {
+      registry.createProfile('P');
+      const arr = registry.getAllProfiles();
+      arr.push({ profileId: 'fake' as ProfileId, createdAt: '', label: 'fake', chatIds: [] });
+      expect(registry.getAllProfiles()).toHaveLength(1);
+    });
+
     it('deleteProfile removes a profile', () => {
       const created = registry.createProfile('to-delete');
       expect(registry.getProfile(created.profileId)).toBeDefined();
@@ -89,7 +138,7 @@ describe('ProfileRegistry', () => {
     });
 
     it('deleteProfile on nonexistent profile is a no-op (does not throw)', () => {
-      expect(() => registry.deleteProfile('nope' as ProfileId)).not.toThrow();
+      expect(() => registry.deleteProfile('valid-but-nonexistent' as ProfileId)).not.toThrow();
     });
 
     it('renameProfile changes the label', () => {
@@ -99,7 +148,52 @@ describe('ProfileRegistry', () => {
     });
 
     it('renameProfile on nonexistent profile throws', () => {
-      expect(() => registry.renameProfile('nope' as ProfileId, 'x')).toThrow(/not found/i);
+      expect(() => registry.renameProfile('valid-but-nonexistent' as ProfileId, 'x')).toThrow(/not found/i);
+    });
+  });
+
+  describe('renameProfile validation', () => {
+    it('rejects empty label', () => {
+      const p = registry.createProfile('test');
+      expect(() => registry.renameProfile(p.profileId, '')).toThrow(/empty/);
+    });
+
+    it('rejects whitespace-only label', () => {
+      const p = registry.createProfile('test');
+      expect(() => registry.renameProfile(p.profileId, '   ')).toThrow(/empty/);
+    });
+
+    it('rejects label over 64 chars', () => {
+      const p = registry.createProfile('test');
+      expect(() => registry.renameProfile(p.profileId, 'a'.repeat(65))).toThrow(/64/);
+    });
+  });
+
+  describe('deleteProfile soft-delete', () => {
+    it('moves profile directory to .trash', () => {
+      const p = registry.createProfile('softy');
+      const profileDir = registry.profileDir(p.profileId);
+      fs.mkdirSync(profileDir, { recursive: true });
+      fs.writeFileSync(path.join(profileDir, 'data.txt'), 'health data', 'utf8');
+
+      registry.deleteProfile(p.profileId);
+      expect(registry.getProfile(p.profileId)).toBeUndefined();
+      expect(fs.existsSync(profileDir)).toBe(false);
+
+      const trashDir = path.join(baseDir, 'profiles', '.trash');
+      const trashContents = fs.readdirSync(trashDir);
+      expect(trashContents.length).toBeGreaterThan(0);
+      const trashItem = trashContents.find((f) => f.startsWith('softy-'));
+      expect(trashItem).toBeDefined();
+
+      const trashFile = path.join(trashDir, trashItem!, 'data.txt');
+      expect(fs.existsSync(trashFile)).toBe(true);
+      expect(fs.readFileSync(trashFile, 'utf8')).toBe('health data');
+    });
+
+    it('does not crash when profile directory does not exist', () => {
+      const p = registry.createProfile('nodir');
+      expect(() => registry.deleteProfile(p.profileId)).not.toThrow();
     });
   });
 
@@ -181,6 +275,43 @@ describe('ProfileRegistry', () => {
     });
   });
 
+  describe('file permissions', () => {
+    it('profiles.json mode is 0o600 after write', () => {
+      if (process.platform === 'win32') return;
+      registry.createProfile('perm-test');
+      const stat = fs.statSync(path.join(baseDir, 'profiles.json'));
+      const mode = stat.mode & 0o777;
+      expect(mode).toBe(0o600);
+    });
+  });
+
+  describe('corruption handling', () => {
+    it('corrupt profiles.json is quarantined not silently erased', () => {
+      const corruptJson = '{not valid json!!';
+      fs.writeFileSync(path.join(baseDir, 'profiles.json'), corruptJson, 'utf8');
+
+      const r2 = new ProfileRegistry(baseDir);
+      const profiles = r2.getAllProfiles();
+      expect(profiles).toEqual([]);
+
+      const files = fs.readdirSync(baseDir);
+      const corruptFiles = files.filter((f) => f.startsWith('profiles.json.corrupt-'));
+      expect(corruptFiles.length).toBe(1);
+    });
+
+    it('corrupt profiles.json with invalid shape is quarantined', () => {
+      fs.writeFileSync(path.join(baseDir, 'profiles.json'), JSON.stringify({ notProfiles: true }), 'utf8');
+
+      const r2 = new ProfileRegistry(baseDir);
+      const profiles = r2.getAllProfiles();
+      expect(profiles).toEqual([]);
+
+      const files = fs.readdirSync(baseDir);
+      const corruptFiles = files.filter((f) => f.startsWith('profiles.json.corrupt-'));
+      expect(corruptFiles.length).toBe(1);
+    });
+  });
+
   describe('migrateLegacyWorkspace', () => {
     let legacyDir: string;
 
@@ -227,7 +358,31 @@ describe('ProfileRegistry', () => {
       const result = registry.migrateLegacyWorkspace(legacyDir);
       expect(result.migrated).toBeGreaterThanOrEqual(0);
       expect(Array.isArray(result.errors)).toBe(true);
-      // At least good.txt may still be copied
+    });
+  });
+
+  describe('migration sentinel', () => {
+    it('writes sentinel and hasBeenMigrated returns true', () => {
+      const legacyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sentinel-ws-'));
+      try {
+        fs.writeFileSync(path.join(legacyDir, 'note.md'), 'hello', 'utf8');
+        const result = registry.migrateLegacyWorkspace(legacyDir);
+        expect(result.migrated).toBe(1);
+        expect(result.errors).toEqual([]);
+
+        expect(registry.hasBeenMigrated('default' as ProfileId, legacyDir)).toBe(true);
+      } finally {
+        fs.rmSync(legacyDir, { recursive: true, force: true });
+      }
+    });
+
+    it('hasBeenMigrated returns false for unmigrated workspace', () => {
+      const unmigrated = '/tmp/nonexistent-sentinel-test';
+      expect(registry.hasBeenMigrated('default' as ProfileId, unmigrated)).toBe(false);
+    });
+
+    it('validates profileId in hasBeenMigrated', () => {
+      expect(() => registry.hasBeenMigrated('../evil' as ProfileId, '/tmp/x')).toThrow(/Invalid profileId/);
     });
   });
 });
