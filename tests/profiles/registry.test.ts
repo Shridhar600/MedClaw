@@ -343,6 +343,11 @@ describe('ProfileRegistry', () => {
       expect(first.migrated).toBe(1);
       const second = registry.migrateLegacyWorkspace(legacyDir);
       expect(second.migrated).toBe(0);
+      // CORR-B1: the sentinel must be present after the second run even though
+      // nothing was copied this run (migrated===0). Previously the stuck-on-
+      // legacy-forever bug hid here — the test only checked migrated===0.
+      expect(second.errors).toEqual([]);
+      expect(registry.hasBeenMigrated('default' as ProfileId, legacyDir)).toBe(true);
     });
 
     it('handles missing legacy workspace gracefully', () => {
@@ -383,6 +388,76 @@ describe('ProfileRegistry', () => {
 
     it('validates profileId in hasBeenMigrated', () => {
       expect(() => registry.hasBeenMigrated('../evil' as ProfileId, '/tmp/x')).toThrow(/Invalid profileId/);
+    });
+  });
+
+  // ── CORR-B1 regression: verify-then-seal ──────────────────────────────
+  describe('CORR-B1 verify-then-seal', () => {
+    it('boot 1 sentinel write fails → boot 2 writes sentinel and hasBeenMigrated() === true', () => {
+      const legacyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sentinel-fail-'));
+      try {
+        fs.writeFileSync(path.join(legacyDir, 'hello.md'), 'world', 'utf8');
+        jest.spyOn(console, 'log').mockImplementation(() => undefined);
+
+        // Mock the private sentinel writer to fail once (boot 1), then fall
+        // back to the real implementation (boot 2).
+        const sentinelSpy = jest
+          .spyOn(ProfileRegistry.prototype as unknown as {
+            writeMigrationSentinel: (p: ProfileId, lw: string) => string | null;
+          }, 'writeMigrationSentinel')
+          .mockReturnValueOnce(null);
+
+        // Boot 1: full copy succeeds but the sentinel write fails.
+        const first = registry.migrateLegacyWorkspace(legacyDir);
+        expect(first.migrated).toBe(1);
+        expect(first.errors.length).toBe(1);
+        expect(first.errors[0]).toContain('sentinel');
+        expect(registry.hasBeenMigrated('default' as ProfileId, legacyDir)).toBe(false);
+
+        sentinelSpy.mockRestore();
+
+        // Boot 2: every file already exists (skipped, migrated===0). With the
+        // old code the sentinel would never be re-attempted. Verify-then-seal
+        // must re-run and seal so the daemon escapes the legacy workspace.
+        const second = registry.migrateLegacyWorkspace(legacyDir);
+        expect(second.migrated).toBe(0);
+        expect(second.errors).toEqual([]);
+        expect(registry.hasBeenMigrated('default' as ProfileId, legacyDir)).toBe(true);
+      } finally {
+        fs.rmSync(legacyDir, { recursive: true, force: true });
+      }
+    });
+
+    it('truncated dest (short file at dest before migration) → re-copied with correct content + sentinel written', () => {
+      const legacyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'trunc-dest-'));
+      try {
+        // Source file is 5 bytes.
+        fs.writeFileSync(path.join(legacyDir, 'hello.md'), 'world', 'utf8');
+        const targetDir = registry.profileWorkspace('default' as ProfileId);
+        fs.mkdirSync(targetDir, { recursive: true });
+        // Pre-create a truncated (2-byte) dest simulating a partial copyFileSync
+        // that ENOSPC'd mid-write in a prior boot.
+        const destPath = path.join(targetDir, 'hello.md');
+        fs.writeFileSync(destPath, 'wo', 'utf8');
+
+        jest.spyOn(console, 'log').mockImplementation(() => undefined);
+
+        const result = registry.migrateLegacyWorkspace(legacyDir);
+        expect(result.errors).toEqual([]);
+
+        // The truncated dest must have been detected (size mismatch) and
+        // re-copied with the correct full content.
+        expect(fs.readFileSync(destPath, 'utf8')).toBe('world');
+        expect(fs.statSync(destPath).size).toBe(5);
+
+        // A fresh registry instance confirms disk state: all skipped now, and
+        // the sentinel is present.
+        expect(registry.hasBeenMigrated('default' as ProfileId, legacyDir)).toBe(true);
+        const registry2 = new ProfileRegistry(baseDir);
+        expect(registry2.hasBeenMigrated('default' as ProfileId, legacyDir)).toBe(true);
+      } finally {
+        fs.rmSync(legacyDir, { recursive: true, force: true });
+      }
     });
   });
 });

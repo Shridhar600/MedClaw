@@ -30,6 +30,7 @@ interface HeartbeatSchedulerOptions {
 export class HeartbeatScheduler {
   private tasks: Map<string, cron.ScheduledTask> = new Map();
   private wakeupTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+  private readonly inFlight: Set<string> = new Set();
   private readonly auditLog?: SchedulerAuditLog;
   private readonly defaultMaxRetries: number;
   private readonly rateLimiter: HeartbeatRateLimiter;
@@ -240,71 +241,80 @@ export class HeartbeatScheduler {
   }
 
   private async executeJob(job: HeartbeatJob): Promise<void> {
-    let current = await this.store.get(job.id);
-    if (!current || !current.enabled) {
+    if (this.inFlight.has(job.id)) {
+      console.log(`[scheduler] Skipping tick for ${job.id}: previous run still in flight`);
       return;
     }
-
-    const now = this.now();
-    if (current.deliveryState === 'dead-letter') {
-      return;
-    }
-
-    if (current.deliveryState === 'snoozed') {
-      if (!current.snoozedUntil || new Date(current.snoozedUntil).getTime() > now.getTime()) {
-        this.scheduleStateWakeup(current);
-        return;
-      }
-      current = await this.store.update(current.id, {
-        deliveryState: 'ready',
-        snoozedUntil: undefined,
-      });
-    }
-
-    if (current.deliveryState === 'retry-wait') {
-      if (!current.nextRetryAt || new Date(current.nextRetryAt).getTime() > now.getTime()) {
-        this.scheduleStateWakeup(current);
-        return;
-      }
-      current = await this.store.update(current.id, {
-        deliveryState: 'ready',
-        nextRetryAt: undefined,
-      });
-      await this.appendAudit(current, 'retried', { retryCount: current.retryCount });
-    }
-
-    const decision = this.rateLimiter.consume(current.chatId, now);
-    if (decision.action === 'defer') {
-      const deferred = await this.store.update(current.id, {
-        deliveryState: 'retry-wait',
-        nextRetryAt: decision.deferredUntil,
-      });
-      this.scheduleStateWakeup(deferred);
-      await this.appendAudit(current, 'rate_limited', {
-        scope: decision.scope,
-        deferredUntil: decision.deferredUntil,
-      });
-      return;
-    }
-
+    this.inFlight.add(job.id);
     try {
-      await this.trigger(current);
-      await this.store.markRun(current.id, now.toISOString());
-    } catch (error) {
-      // lastError is persisted and this line hits the console — sanitize;
-      // provider/agent errors can echo PHI in their messages.
-      const message = summarizeErrorForLog(error);
-      console.error(`[scheduler] Heartbeat job failed (${current.id}):`, message);
-      try {
-        await this.recordFailure(current.id, message);
-      } catch (recordError) {
-        // executeJob is invoked fire-and-forget from cron ticks; a storage
-        // failure here must not become an unhandled rejection.
-        console.error(
-          `[scheduler] Failed to record heartbeat failure (${current.id}):`,
-          summarizeErrorForLog(recordError),
-        );
+      let current = await this.store.get(job.id);
+      if (!current || !current.enabled) {
+        return;
       }
+
+      const now = this.now();
+      if (current.deliveryState === 'dead-letter') {
+        return;
+      }
+
+      if (current.deliveryState === 'snoozed') {
+        if (!current.snoozedUntil || new Date(current.snoozedUntil).getTime() > now.getTime()) {
+          this.scheduleStateWakeup(current);
+          return;
+        }
+        current = await this.store.update(current.id, {
+          deliveryState: 'ready',
+          snoozedUntil: undefined,
+        });
+      }
+
+      if (current.deliveryState === 'retry-wait') {
+        if (!current.nextRetryAt || new Date(current.nextRetryAt).getTime() > now.getTime()) {
+          this.scheduleStateWakeup(current);
+          return;
+        }
+        current = await this.store.update(current.id, {
+          deliveryState: 'ready',
+          nextRetryAt: undefined,
+        });
+        await this.appendAudit(current, 'retried', { retryCount: current.retryCount });
+      }
+
+      const decision = this.rateLimiter.consume(current.chatId, now);
+      if (decision.action === 'defer') {
+        const deferred = await this.store.update(current.id, {
+          deliveryState: 'retry-wait',
+          nextRetryAt: decision.deferredUntil,
+        });
+        this.scheduleStateWakeup(deferred);
+        await this.appendAudit(current, 'rate_limited', {
+          scope: decision.scope,
+          deferredUntil: decision.deferredUntil,
+        });
+        return;
+      }
+
+      try {
+        await this.trigger(current);
+        await this.store.markRun(current.id, now.toISOString());
+      } catch (error) {
+        // lastError is persisted and this line hits the console — sanitize;
+        // provider/agent errors can echo PHI in their messages.
+        const message = summarizeErrorForLog(error);
+        console.error(`[scheduler] Heartbeat job failed (${current.id}):`, message);
+        try {
+          await this.recordFailure(current.id, message);
+        } catch (recordError) {
+          // executeJob is invoked fire-and-forget from cron ticks; a storage
+          // failure here must not become an unhandled rejection.
+          console.error(
+            `[scheduler] Failed to record heartbeat failure (${current.id}):`,
+            summarizeErrorForLog(recordError),
+          );
+        }
+      }
+    } finally {
+      this.inFlight.delete(job.id);
     }
   }
 

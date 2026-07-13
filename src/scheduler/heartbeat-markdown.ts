@@ -1,5 +1,5 @@
-import * as fs from 'fs';
 import * as path from 'path';
+import { secureMkdir, secureWrite } from '../security';
 import type { HeartbeatJob } from './types';
 
 function formatJob(job: HeartbeatJob): string {
@@ -48,6 +48,6 @@ export async function syncHeartbeatMarkdown(
     }
   }
 
-  fs.mkdirSync(workspacePath, { recursive: true });
-  fs.writeFileSync(path.join(workspacePath, 'HEARTBEAT.md'), lines.join('\n') + '\n', 'utf8');
+  secureMkdir(workspacePath);
+  secureWrite(path.join(workspacePath, 'HEARTBEAT.md'), lines.join('\n') + '\n');
 }

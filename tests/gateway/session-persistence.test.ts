@@ -4,6 +4,10 @@ import * as os from 'os';
 import type { LLMProvider, Message } from '../../src/providers/types';
 import { SessionManager } from '../../src/gateway/session';
 
+// The raw CJS module object — spyable, unlike the ts-jest __importStar clone
+// produced by `import * as fs`, whose getter-only properties reject spyOn.
+const fsReal = jest.requireActual<typeof import('fs')>('fs');
+
 describe('SessionManager JSONL Persistence', () => {
   let tmpDir: string;
   let manager: SessionManager;
@@ -229,6 +233,56 @@ describe('SessionManager JSONL Persistence', () => {
 
       const systemMessages = history2.filter((m: Message) => m.role === 'system');
       expect(systemMessages).toHaveLength(1);
+    });
+  });
+
+  // ── CORR-M3: persist-first regression ─────────────────────────────────
+  describe('CORR-M3 persist-first', () => {
+    it('appendFileSync throw → recordTurn rejects, getHistory does NOT contain the turn, JSONL on disk does NOT contain it', async () => {
+      const errorSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const appendSpy = jest
+        .spyOn(fsReal, 'appendFileSync')
+        .mockImplementation(() => {
+          throw new Error('disk full simulated');
+        });
+      try {
+        await expect(
+          manager.recordTurn('chat-m3', [
+            { role: 'user', content: 'should not persist' },
+            { role: 'assistant', content: 'also lost' },
+          ]),
+        ).rejects.toThrow('disk full simulated');
+
+        // In-memory history must NOT contain the failed turn.
+        expect(manager.getHistory('chat-m3')).toEqual([]);
+
+        // JSONL on disk must NOT contain the failed turn.
+        const jsonlPath = path.join(tmpDir, 'active-chat-m3.jsonl');
+        if (fs.existsSync(jsonlPath)) {
+          const raw = fs.readFileSync(jsonlPath, 'utf-8');
+          expect(raw).not.toContain('should not persist');
+          expect(raw).not.toContain('also lost');
+        }
+      } finally {
+        appendSpy.mockRestore();
+        errorSpy.mockRestore();
+      }
+    });
+
+    it('happy path: after recordTurn, the JSONL on disk actually contains the turn content', async () => {
+      await manager.recordTurn('chat-happy', [
+        { role: 'user', content: 'persisted-ok' },
+        { role: 'assistant', content: 'confirmed' },
+      ]);
+
+      const jsonlPath = path.join(tmpDir, 'active-chat-happy.jsonl');
+      expect(fs.existsSync(jsonlPath)).toBe(true);
+      const lines = fs.readFileSync(jsonlPath, 'utf-8').trim().split('\n').map((l) => JSON.parse(l));
+      expect(lines).toHaveLength(2);
+      expect(lines[0].content).toBe('persisted-ok');
+      expect(lines[1].content).toBe('confirmed');
+      expect(lines[0].role).toBe('user');
+      expect(lines[1].role).toBe('assistant');
     });
   });
 });

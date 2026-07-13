@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { rotateFileIfNeeded } from './rotation';
+import { secureMkdir, secureAppend } from '../security';
 import type {
   SchedulerAuditEvent,
   SchedulerAuditEventInput,
@@ -28,7 +29,7 @@ export class SchedulerAuditLog {
       details: input.details ?? {},
     };
 
-    fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+    secureMkdir(path.dirname(this.filePath));
 
     this.appendCount++;
     // Check on the very first append (in case a prior process left the
@@ -43,7 +44,7 @@ export class SchedulerAuditLog {
       }
     }
 
-    fs.appendFileSync(this.filePath, JSON.stringify(event) + '\n', 'utf8');
+    secureAppend(this.filePath, JSON.stringify(event) + '\n');
     return event;
   }
 

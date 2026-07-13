@@ -1,8 +1,7 @@
 import { Bot } from 'grammy';
-import { promisify } from 'util';
-import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { secureMkdir, secureWrite } from '../security';
 import type { Channel, IncomingMessage, OutgoingMessage } from './types';
 
 export function redactTelegramBotTokens(text: string): string {
@@ -27,8 +26,6 @@ export class TelegramChannel implements Channel {
   private bot: Bot;
   private messageHandler?: (msg: IncomingMessage) => Promise<void>;
   private workspacePath: string;
-  private mkdir = promisify(fs.mkdir);
-  private writeFile = promisify(fs.writeFile);
 
   constructor(botToken: string, workspacePath: string) {
     this.bot = new Bot(botToken);
@@ -49,11 +46,11 @@ export class TelegramChannel implements Channel {
     const buffer = Buffer.from(await response.arrayBuffer());
 
     const reportsDir = path.join(this.workspacePath, 'reports');
-    await this.mkdir(reportsDir, { recursive: true });
+    secureMkdir(reportsDir);
     const safeFileName = this.sanitizeFileName(fileName);
     const relativePath = path.join('reports', `${Date.now()}-${crypto.randomUUID()}-${safeFileName}`);
     const savePath = path.join(this.workspacePath, relativePath);
-    await this.writeFile(savePath, buffer);
+    secureWrite(savePath, buffer);
     return relativePath.split(path.sep).join('/');
   }
 

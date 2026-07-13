@@ -5,7 +5,7 @@ import type { Message, ToolSchema } from '../providers/types';
 import type { LLMProvider } from '../providers/types';
 import type { ToolRegistry } from '../tools/registry';
 import { rotateFileIfNeeded, type RotationConfig } from '../scheduler/rotation';
-import { summarizeErrorForLog } from '../security';
+import { summarizeErrorForLog, secureMkdir, secureWrite, secureAppend, tightenFile } from '../security';
 
 interface Session {
   chatId: string;
@@ -66,7 +66,7 @@ export class SessionManager {
     this.llmProvider = llmProvider;
     this.toolRegistry = toolRegistry;
     this.compactionConfig = compactionConfig;
-    fs.mkdirSync(this.sessionsPath, { recursive: true });
+    secureMkdir(this.sessionsPath);
     this.loadActiveSessions();
   }
 
@@ -131,11 +131,15 @@ export class SessionManager {
       if (turnTrace.length === 0) {
         return;
       }
+      // Persist-first: append to the JSONL BEFORE mutating in-memory state.
+      // If the append/rotation throws, the enqueue promise rejects and the
+      // in-memory session.history never sees the turn — no memory/disk
+      // divergence.
+      await this.appendMessagesToJsonl(chatId, turnTrace);
       const session = this.getOrCreateSessionState(chatId);
       session.history.push(...turnTrace);
       session.lastActiveAt = new Date();
       this.sessions.set(chatId, session);
-      await this.appendMessagesToJsonl(chatId, turnTrace);
     });
   }
 
@@ -266,21 +270,23 @@ Keep it concise and structured.`;
     const stamp = Date.now();
     const archiveDir = path.join(this.sessionsPath, 'archive');
     const summariesDir = path.join(this.sessionsPath, 'summaries');
-    fs.mkdirSync(archiveDir, { recursive: true });
-    fs.mkdirSync(summariesDir, { recursive: true });
+    secureMkdir(archiveDir);
+    secureMkdir(summariesDir);
 
     const archivePath = path.join(archiveDir, `${dateStr}-${chatId}-${stamp}.jsonl`);
     const summaryPath = path.join(summariesDir, `${dateStr}-${chatId}-${stamp}.md`);
 
     if (hasActiveFile) {
       fs.renameSync(activePath, archivePath);
+      // rename preserves mode; tighten in case the active file was loose.
+      tightenFile(archivePath);
     } else {
       const lines = history.map(msg => JSON.stringify(this.serializeEntry(chatId, msg, now.toISOString())));
-      fs.writeFileSync(archivePath, lines.join('\n') + (lines.length > 0 ? '\n' : ''));
+      secureWrite(archivePath, lines.join('\n') + (lines.length > 0 ? '\n' : ''));
     }
 
     const summaryContent = await this.generateSummary(chatId, history, reason, now);
-    fs.writeFileSync(summaryPath, summaryContent, 'utf-8');
+    secureWrite(summaryPath, summaryContent);
 
     this.sessions.delete(chatId);
     console.log(`[session:${chatId}] Archived to ${archivePath}`);
@@ -356,14 +362,14 @@ ${response.text.trim()}`;
     const now = new Date().toISOString();
     this.maybeRotate(chatId);
     const lines = history.map(msg => JSON.stringify(this.serializeEntry(chatId, msg, now)));
-    fs.writeFileSync(activePath, lines.join('\n') + '\n', 'utf-8');
+    secureWrite(activePath, lines.join('\n') + '\n');
   }
 
   private async appendMessagesToJsonl(chatId: string, messages: Message[]): Promise<void> {
     const now = new Date().toISOString();
     this.maybeRotate(chatId);
     const lines = messages.map(msg => JSON.stringify(this.serializeEntry(chatId, msg, now)));
-    fs.appendFileSync(this.activePath(chatId), lines.join('\n') + '\n', 'utf-8');
+    secureAppend(this.activePath(chatId), lines.join('\n') + '\n');
   }
 
   private maybeRotate(chatId: string): void {

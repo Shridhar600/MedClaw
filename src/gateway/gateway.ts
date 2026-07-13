@@ -1,4 +1,3 @@
-import * as fs from 'fs';
 import * as path from 'path';
 import type { AppConfig } from '../config/types';
 import { ProfileRegistry } from '../profiles';
@@ -30,7 +29,7 @@ import { OnboardingStore } from '../onboarding/store';
 import { ensureWorkspaceBootstrap } from '../workspace/bootstrap';
 import { checkSystemReadiness } from '../providers/healthcheck';
 import type { ReadinessResult } from '../providers/healthcheck';
-import { checkProviderBindAddresses, verifyWorkspacePermissions, summarizeErrorForLog } from '../security';
+import { checkProviderBindAddresses, verifyWorkspacePermissions, summarizeErrorForLog, secureMkdir } from '../security';
 
 const EMERGENCY_PATTERN =
   /\b(chest pain|can't breathe|cannot breathe|difficulty breathing|stroke|heart attack|severe bleeding|suicidal|emergency)\b/i;
@@ -90,7 +89,7 @@ export class Gateway {
     // the legacy path relied on config.memory.workspace's parent already
     // existing via bootstrapWorkspace. The profile-scoped `.state/` dir has
     // no other creator this early in startup, so ensure it here.
-    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    secureMkdir(path.dirname(dbPath));
     const store = new SqliteStore(dbPath, profileId);
     this.store = store;
     const embeddingProvider = createProvider(config.providers.embeddings);

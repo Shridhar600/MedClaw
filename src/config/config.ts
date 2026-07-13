@@ -5,6 +5,7 @@ import * as path from 'path';
 import JSON5 from 'json5';
 import type { AppConfig } from './types';
 import { cloneDefaultConfig } from './defaults';
+import { secureMkdir } from '../security';
 
 export interface LoadConfigOptions {
   configPath?: string;
@@ -83,7 +84,7 @@ function removeDefaultBaseUrlForCloudProviders(config: AppConfig, userConfig: Pa
 }
 
 export async function saveConfig(configPath: string, config: AppConfig): Promise<void> {
-  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  secureMkdir(path.dirname(configPath));
   const tmpPath = `${configPath}.tmp-${process.pid}-${Date.now()}`;
   const existingMode = fs.existsSync(configPath) ? fs.statSync(configPath).mode & 0o777 : 0o600;
   const finalMode = existingMode & 0o600;

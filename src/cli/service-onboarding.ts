@@ -10,6 +10,7 @@ import { showConfig, showRedactedConfigSummary } from './admin';
 import { ensureWorkspaceTemplates, type CliIO } from './prompts';
 import { preflightStartCheck, type SetupReadinessDependencies } from './setup-readiness';
 import type { CompletionAction, SetupWizardState } from './wizard-types';
+import { secureMkdir } from '../security';
 
 export interface ServiceOnboardingArgs {
   yes?: boolean;
@@ -126,7 +127,7 @@ function parseArgs(argv: string[]): ServiceOnboardingArgs {
 }
 
 function ensureParent(filePath: string): void {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  secureMkdir(path.dirname(filePath));
 }
 
 function applyProvider(
@@ -324,8 +325,8 @@ export function collectSetupErrors(args: ServiceOnboardingArgs, config: AppConfi
 export async function persistSetupArtifacts(configPath: string, config: AppConfig): Promise<void> {
   ensureWorkspaceTemplates(config.memory.workspace);
   ensureParent(configPath);
-  fs.mkdirSync(path.join(path.dirname(configPath), 'sessions'), { recursive: true });
-  fs.mkdirSync(path.dirname(config.heartbeat.storePath), { recursive: true });
+  secureMkdir(path.join(path.dirname(configPath), 'sessions'));
+  secureMkdir(path.dirname(config.heartbeat.storePath));
   await saveConfig(configPath, config);
 }
 

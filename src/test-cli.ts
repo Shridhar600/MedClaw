@@ -13,6 +13,7 @@ import { MemorySearch } from './memory/search';
 import { createProvider } from './providers/factory';
 import { SessionManager } from './gateway/session';
 import { createInterface } from 'readline';
+import { secureMkdir } from './security';
 
 const HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -131,7 +132,7 @@ async function main(): Promise<void> {
   process.stdout.write('[cli] Starting Redacted...\n');
 
   const workspacePath = path.resolve(config.memory.workspace.replace('~', process.env.HOME ?? ''));
-  fs.mkdirSync(workspacePath, { recursive: true });
+  secureMkdir(workspacePath);
 
   const memory = new MemoryEngine(workspacePath);
   const dbPath = path.join(workspacePath, '..', 'search.db');

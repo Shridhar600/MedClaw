@@ -322,4 +322,69 @@ describe('HeartbeatScheduler', () => {
       jest.useRealTimers();
     }
   });
+
+  // ── CORR-M1: executeJob overlap guard ────────────────────────────────
+  it('overlapping executeJob calls for the same job run the trigger ONCE; markRun runs ONCE; state stays coherent', async () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      const store = new HeartbeatStore(storePath);
+      const job = await store.create({
+        title: 'Slow overlap job',
+        chatId: 'chat-1',
+        cron: '* * * * *',
+        prompt: 'Slow.',
+        source: 'system',
+        kind: 'routine',
+        policyKey: 'defaults:overlap',
+      });
+
+      let releaseTrigger!: () => void;
+      const triggerGate = new Promise<void>((resolve) => {
+        releaseTrigger = resolve;
+      });
+
+      const trigger = jest.fn().mockImplementation(async () => {
+        // Block every invocation so a second executeJob overlaps it. With the
+        // guard, only the first call enters; without it, both enter and we
+        // see trigger called twice.
+        await triggerGate;
+      });
+
+      // Wrap markRun to count calls while delegating to the real implementation.
+      const markRunSpy = jest.spyOn(store, 'markRun');
+
+      const scheduler = new HeartbeatScheduler(store, trigger, 'UTC');
+      await scheduler.start();
+
+      // Fire two overlapping executeJob calls (mirrors two cron ticks landing
+      // before a slow LLM call settles). runNow → executeJob both times.
+      const p1 = scheduler.runNow(job.id);
+      // Let the first executeJob enter the trigger (await triggerGate).
+      await Promise.resolve();
+      await Promise.resolve();
+      const p2 = scheduler.runNow(job.id);
+
+      // Release the trigger gate and let both runNow calls settle.
+      releaseTrigger();
+      await p1;
+      await p2;
+
+      // The trigger ran exactly once (the second tick was skipped).
+      expect(trigger).toHaveBeenCalledTimes(1);
+      // markRun ran exactly once (no double-delivery state churn).
+      expect(markRunSpy).toHaveBeenCalledTimes(1);
+
+      // Final store state is coherent: enabled, ready, lastRunAt set.
+      const refreshed = await store.get(job.id);
+      expect(refreshed?.enabled).toBe(true);
+      expect(refreshed?.deliveryState).toBe('ready');
+      expect(refreshed?.lastRunAt).toBeTruthy();
+
+      await scheduler.stop();
+    } finally {
+      errorSpy.mockRestore();
+      logSpy.mockRestore();
+    }
+  });
 });

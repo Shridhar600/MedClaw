@@ -6,6 +6,7 @@ import {
   Provenance, RecordFactResult, RetractResult, StoredToken, TYPE_TO_FILE,
 } from './types';
 import { parseLedgerFile, renderLedgerFile } from './ledger-parser';
+import { secureMkdir, secureChmodFile } from '../security';
 
 function hash(s: string): string {
   return createHash('sha256').update(s).digest('hex').slice(0, 16);
@@ -62,11 +63,15 @@ export class LedgerStore {
 
   private async writeFacts(type: FactType, facts: LedgerFact[]): Promise<void> {
     const fp = this.filePath(type);
-    await fs.promises.mkdir(path.dirname(fp), { recursive: true });
+    secureMkdir(path.dirname(fp));
     const content = renderLedgerFile(facts);
     const tmpPath = fp + '.tmp';
     await fs.promises.writeFile(tmpPath, content, 'utf-8');
+    // tight tmp + chmod-after-rename defends against umask widening and a
+    // cross-filesystem rename fallback (copy+delete) that drops the temp mode.
+    secureChmodFile(tmpPath);
     await fs.promises.rename(tmpPath, fp);
+    secureChmodFile(fp);
   }
 
   private nextVersion(facts: LedgerFact[], entity: string): number {

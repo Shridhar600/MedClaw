@@ -205,6 +205,16 @@ describe('LLM semaphore wiring', () => {
 
       const refreshed = await scheduler.getStore().get(job.id);
       expect(refreshed?.deliveryState).toBe('retry-wait');
+
+      // T1 strengthening: nextRetryAt must survive (markRun must not clobber
+      // retry state). handleScheduledJob (invoked-by-scheduler) calls
+      // scheduler.recordFailure, which schedules a wakeup — assert both the
+      // persisted retry state and the in-memory wakeup timer.
+      expect(refreshed?.nextRetryAt).toBeTruthy();
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const wakeupTimers = (scheduler as any).wakeupTimers as Map<string, unknown>;
+      expect(wakeupTimers.has(job.id)).toBe(true);
     } catch (e) {
       assertionError = e;
     } finally {

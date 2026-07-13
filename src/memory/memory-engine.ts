@@ -1,6 +1,7 @@
 // src/memory/memory-engine.ts
 import * as fs from 'fs';
 import * as path from 'path';
+import { secureMkdir, secureWrite, secureAppend } from '../security';
 
 // Methods are async by interface even though they use synchronous fs operations.
 // This keeps callers future-proof if we switch to fs.promises without API changes.
@@ -9,7 +10,7 @@ export class MemoryEngine {
     private readonly workspace: string,
     private readonly profileId: string = 'default',
   ) {
-    fs.mkdirSync(workspace, { recursive: true });
+    secureMkdir(workspace);
     // Eagerly resolve the real workspace path to prevent a TOCTOU window
     // between construction and the first resolve() call.
     void this.realWorkspace;
@@ -69,14 +70,14 @@ export class MemoryEngine {
 
   async writeFile(relativePath: string, content: string): Promise<void> {
     const fullPath = this.resolve(relativePath);
-    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-    fs.writeFileSync(fullPath, content, 'utf8');
+    secureMkdir(path.dirname(fullPath));
+    secureWrite(fullPath, content);
   }
 
   async appendToFile(relativePath: string, content: string): Promise<void> {
     const fullPath = this.resolve(relativePath);
-    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-    fs.appendFileSync(fullPath, content, 'utf8');
+    secureMkdir(path.dirname(fullPath));
+    secureAppend(fullPath, content);
   }
 
   async listFiles(relativeDir: string = ''): Promise<string[]> {

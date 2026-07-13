@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { secureMkdir, secureCopyFile } from '../security';
 
 export const REQUIRED_WORKSPACE_DIRS = [
   'conditions',
@@ -43,7 +44,7 @@ export function ensureWorkspaceBootstrap(
   const templateDir = resolveWorkspaceTemplateDir(options.projectRoot);
   const preserveExisting = options.preserveExisting ?? true;
 
-  fs.mkdirSync(workspacePath, { recursive: true });
+  secureMkdir(workspacePath);
 
   for (const fileName of listWorkspaceTemplateFiles(templateDir)) {
     const source = path.join(templateDir, fileName);
@@ -51,11 +52,11 @@ export function ensureWorkspaceBootstrap(
     if (preserveExisting && fs.existsSync(dest)) {
       continue;
     }
-    fs.copyFileSync(source, dest);
+    secureCopyFile(source, dest);
     options.log?.(`Bootstrapped ${fileName} to workspace`);
   }
 
   for (const dirName of REQUIRED_WORKSPACE_DIRS) {
-    fs.mkdirSync(path.join(workspacePath, dirName), { recursive: true });
+    secureMkdir(path.join(workspacePath, dirName));
   }
 }

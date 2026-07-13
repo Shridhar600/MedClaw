@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { secureMkdir, secureWriteViaTmp } from '../security';
 import type { OnboardingAnswers } from './types';
 
 const USER_START = '<!-- REDACTED_ONBOARDING_USER_START -->';
@@ -8,7 +9,7 @@ const HEALTH_START = '<!-- REDACTED_ONBOARDING_HEALTH_START -->';
 const HEALTH_END = '<!-- REDACTED_ONBOARDING_HEALTH_END -->';
 
 export async function writeOnboardingProfile(workspacePath: string, answers: OnboardingAnswers): Promise<void> {
-  fs.mkdirSync(workspacePath, { recursive: true });
+  secureMkdir(workspacePath);
   updateManagedSection(
     path.join(workspacePath, 'USER.md'),
     renderUserSection(answers),
@@ -55,9 +56,7 @@ function updateManagedSection(filePath: string, body: string, start: string, end
   const next = pattern.test(existing)
     ? existing.replace(pattern, section)
     : `${existing.trimEnd()}\n\n${section}\n`;
-  const tmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tmpPath, next, 'utf8');
-  fs.renameSync(tmpPath, filePath);
+  secureWriteViaTmp(filePath, next);
 }
 
 function valueOrNone(value: string | undefined): string {

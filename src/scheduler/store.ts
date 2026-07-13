@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
+import { secureMkdir, secureWriteViaTmp, tightenFile } from '../security';
 import type {
   CreateHeartbeatJobInput,
   HeartbeatJob,
@@ -175,16 +176,16 @@ export class HeartbeatStore {
   }
 
   private writeJobs(jobs: HeartbeatJob[]): void {
-    fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-    const tmpPath = `${this.filePath}.tmp`;
-    fs.writeFileSync(tmpPath, JSON.stringify(jobs, null, 2), 'utf8');
-    fs.renameSync(tmpPath, this.filePath);
+    secureWriteViaTmp(this.filePath, JSON.stringify(jobs, null, 2));
   }
 
   private quarantineCorruptFile(): string {
     const quarantinedPath = `${this.filePath}.corrupt-${Date.now()}`;
-    fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+    secureMkdir(path.dirname(this.filePath));
     fs.renameSync(this.filePath, quarantinedPath);
+    // The quarantined copy may inherit a loose mode; tighten so the corrupt
+    // PHI-bearing payload is not left world-readable.
+    tightenFile(quarantinedPath);
     return quarantinedPath;
   }
 

@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID, createHash } from 'crypto';
+import { secureMkdir, secureWrite, secureCopyFile, secureChmodTree, tightenFile } from '../security';
 import type { ProfileId, ProfileMeta } from './types';
 
 interface RegistryData {
@@ -13,7 +14,7 @@ export class ProfileRegistry {
 
   constructor(private readonly baseDir: string) {
     this.filePath = path.join(baseDir, 'profiles.json');
-    fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+    secureMkdir(path.dirname(this.filePath));
   }
 
   // ── Validation ────────────────────────────────────────────────────
@@ -103,10 +104,14 @@ export class ProfileRegistry {
       if (fs.existsSync(profileDir)) {
         try {
           const trashDir = path.join(this.baseDir, 'profiles', '.trash');
-          fs.mkdirSync(trashDir, { recursive: true });
+          secureMkdir(trashDir);
           const stamp = new Date().toISOString().replace(/[:.]/g, '-');
           const trashPath = path.join(trashDir, `${profileId}-${stamp}`);
           fs.renameSync(profileDir, trashPath);
+          // The soft-deleted subtree retains its existing modes (already 0700/0600
+          // if created under hardened paths), but a legacy subtree copied/migrated
+          // before hardening could still be loose — re-tighten defensively.
+          secureChmodTree(trashPath);
         } catch (err) {
           console.error(`[profiles] Failed to move ${profileId} to .trash:`, err);
         }
@@ -195,16 +200,20 @@ export class ProfileRegistry {
     const defaultProfile = this.getOrCreateDefaultProfile();
     const targetDir = this.profileWorkspace(defaultProfile.profileId);
 
+    // Collect every source file so we can verify-then-seal after the copy loop.
+    const sourceFiles: Array<{ rel: string; abs: string }> = [];
+
     try {
       this.copyDirSync(legacyWorkspace, targetDir, (srcRel: string, srcAbs: string) => {
+        sourceFiles.push({ rel: srcRel, abs: srcAbs });
         const dest = path.join(targetDir, srcRel);
         if (fs.existsSync(dest)) {
           skipped++;
           return false;
         }
         try {
-          fs.mkdirSync(path.dirname(dest), { recursive: true });
-          fs.copyFileSync(srcAbs, dest);
+          secureMkdir(path.dirname(dest));
+          secureCopyFile(srcAbs, dest);
           migrated++;
           return true;
         } catch (err) {
@@ -216,10 +225,44 @@ export class ProfileRegistry {
       errors.push(`Failed to scan legacy workspace: ${err instanceof Error ? err.message : String(err)}`);
     }
 
-    if (errors.length === 0 && migrated > 0) {
+    // Verify-then-seal: when no copy errors occurred, confirm every destination
+    // exists with matching byte size. Size-mismatched dests (e.g. a truncated
+    // partial copy from a prior boot) are deleted and re-copied. Only once
+    // verification passes is the sentinel written — even when nothing was copied
+    // this run (migrated === 0), which closes the stuck-on-legacy-forever path.
+    if (errors.length === 0) {
+      try {
+        for (const sf of sourceFiles) {
+          const dest = path.join(targetDir, sf.rel);
+          const srcSize = fs.statSync(sf.abs).size;
+          const destExists = fs.existsSync(dest);
+          const destSize = destExists ? fs.statSync(dest).size : -1;
+          if (!destExists || destSize !== srcSize) {
+            // Delete a stale/truncated dest before re-copying.
+            if (destExists) {
+              fs.unlinkSync(dest);
+            }
+            secureMkdir(path.dirname(dest));
+            secureCopyFile(sf.abs, dest);
+            migrated++;
+            skipped = Math.max(0, skipped - 1);
+          }
+        }
+      } catch (err) {
+        errors.push(
+          `Verify-then-seal failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    if (errors.length === 0) {
       const sentinel = this.writeMigrationSentinel(defaultProfile.profileId, legacyWorkspace);
       if (sentinel) {
         console.log(`[profiles] Migration sentinel written: ${sentinel}`);
+      } else {
+        // Sentinel write failed: surface it so the caller falls back to legacy
+        // rather than silently sealing an incomplete migration.
+        errors.push('Failed to write migration sentinel');
       }
     }
 
@@ -280,6 +323,7 @@ export class ProfileRegistry {
     const quarantinedPath = `${this.filePath}.corrupt-${stamp}`;
     try {
       fs.renameSync(this.filePath, quarantinedPath);
+      tightenFile(quarantinedPath);
     } catch (qerr) {
       console.error(`[profiles] Failed to quarantine corrupt file:`, qerr);
     }
@@ -305,7 +349,7 @@ export class ProfileRegistry {
     const hash = this.sha256Prefix(legacyWorkspace, 12);
     const sentinelPath = path.join(this.profileDir(profileId), `.migrated-from-${hash}`);
     try {
-      fs.writeFileSync(sentinelPath, '', 'utf8');
+      secureWrite(sentinelPath, '');
       return sentinelPath;
     } catch (err) {
       console.error(`[profiles] Failed to write migration sentinel:`, err);

@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { secureWriteViaTmp, tightenFile } from '../security';
 import type { OnboardingState } from './types';
 
 const DEFAULT_STATE: OnboardingState = {
@@ -33,10 +34,7 @@ export class OnboardingStore {
   }
 
   async save(state: OnboardingState): Promise<void> {
-    fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-    const tmpPath = `${this.filePath}.tmp-${process.pid}-${Date.now()}`;
-    fs.writeFileSync(tmpPath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
-    fs.renameSync(tmpPath, this.filePath);
+    secureWriteViaTmp(this.filePath, `${JSON.stringify(state, null, 2)}\n`);
   }
 
   private quarantineCorruptState(error: unknown): void {
@@ -44,6 +42,7 @@ export class OnboardingStore {
     try {
       const corruptPath = `${this.filePath}.corrupt-${Date.now()}`;
       fs.renameSync(this.filePath, corruptPath);
+      tightenFile(corruptPath);
       console.error(`[onboarding] Corrupt onboarding state recovered: ${reason}. Quarantined at ${corruptPath}.`);
     } catch (quarantineError) {
       const quarantineReason = quarantineError instanceof Error ? quarantineError.message : String(quarantineError);
