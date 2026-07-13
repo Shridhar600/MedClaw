@@ -143,4 +143,62 @@ describe('vec0 ANN Search', () => {
     store2.close();
     fs.rmSync(tmpDir2, { recursive: true });
   });
+
+  // P0 gate: "Recall query < 200ms @ 5K chunks" (plan §P0 Gate Verification
+  // Checklist). Uses the real embedding dimension (embeddinggemma = 768) and
+  // deterministic synthetic vectors — no embedding provider needed.
+  describe('P0 gate: ANN performance @ 5K chunks', () => {
+    it('vectorSearch top-10 over 5000 chunks (768 dims) completes in <200ms', () => {
+      const DIM = 768;
+      const CHUNKS = 5000;
+      const perfDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-vec0-perf-'));
+      const perfStore = new SqliteStore(path.join(perfDir, 'perf.db'));
+      try {
+        perfStore.ensureVecTable(DIM);
+
+        // Deterministic pseudo-random vectors (mulberry32) so the test is
+        // reproducible and needs no embedding provider.
+        let seed = 0x9e3779b9;
+        const rand = (): number => {
+          seed |= 0; seed = (seed + 0x6d2b79f5) | 0;
+          let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+          t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+          return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+        const makeVec = (): number[] => Array.from({ length: DIM }, () => rand() * 2 - 1);
+
+        for (let i = 0; i < CHUNKS; i++) {
+          perfStore.upsertChunk({
+            id: `perf-${i}:0`,
+            path: `notes/perf-${i % 50}.md`,
+            content: `Synthetic chunk ${i}`,
+            embedding: makeVec(),
+            startLine: 1,
+            endLine: 3,
+          });
+        }
+
+        const query = new Float32Array(makeVec());
+        // Warm-up query (page cache, statement prep), then measure 3 runs
+        // and gate on the median to damp CI jitter.
+        perfStore.vectorSearch(query, 10);
+        const timings: number[] = [];
+        let results: ReturnType<typeof perfStore.vectorSearch> = [];
+        for (let run = 0; run < 3; run++) {
+          const start = performance.now();
+          results = perfStore.vectorSearch(query, 10);
+          timings.push(performance.now() - start);
+        }
+
+        // Guard: if sqlite-vec failed to load, vectorSearch returns [] instantly
+        // and the timing would be meaningless — the gate requires real results.
+        expect(results).toHaveLength(10);
+        const median = timings.sort((a, b) => a - b)[1];
+        expect(median).toBeLessThan(200);
+      } finally {
+        perfStore.close();
+        fs.rmSync(perfDir, { recursive: true, force: true });
+      }
+    }, 120_000);
+  });
 });
