@@ -5,6 +5,7 @@ import type { Message, ToolSchema } from '../providers/types';
 import type { LLMProvider } from '../providers/types';
 import type { ToolRegistry } from '../tools/registry';
 import { rotateFileIfNeeded, type RotationConfig } from '../scheduler/rotation';
+import { summarizeErrorForLog } from '../security';
 
 interface Session {
   chatId: string;
@@ -374,7 +375,10 @@ ${response.text.trim()}`;
     try {
       rotateFileIfNeeded(this.activePath(chatId), this.rotationConfig);
     } catch (error) {
-      console.warn(`[session:${chatId}] rotation check failed, continuing without rotation:`, error);
+      console.warn(
+        `[session:${chatId}] rotation check failed, continuing without rotation:`,
+        summarizeErrorForLog(error),
+      );
     }
   }
 

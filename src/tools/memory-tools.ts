@@ -2,7 +2,7 @@ import type { Tool, ToolResult } from './types';
 import type { MemoryEngine } from '../memory/memory-engine';
 import type { MemorySearch } from '../memory/search';
 import type { MemoryIndexer } from '../memory/indexer';
-import { contentContainsCredentials } from '../security/credential-rejection';
+import { contentContainsCredentials } from '../security';
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars -- profileId reserved for Task 8 (profile-scoped index metadata)
 export function createMemoryTools(engine: MemoryEngine, search?: MemorySearch, indexer?: MemoryIndexer, _profileId?: string): Tool[] {

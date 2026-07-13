@@ -1,5 +1,14 @@
 export type SemaphorePriority = 'user' | 'heartbeat';
 
+// Typed sentinel so callers (gateway queue-full handling) can instanceof-check
+// instead of matching the message string, which breaks silently under wrapping.
+export class HeartbeatQueueFullError extends Error {
+  constructor() {
+    super('heartbeat queue full');
+    this.name = 'HeartbeatQueueFullError';
+  }
+}
+
 interface QueueEntry {
   fn: () => Promise<void>;
 }
@@ -13,7 +22,7 @@ export class LLMSemaphore {
 
   async run<T>(priority: SemaphorePriority, fn: () => Promise<T>): Promise<T> {
     if (priority === 'heartbeat' && this.heartbeatQueue.length >= MAX_QUEUED_HEARTBEATS) {
-      return Promise.reject(new Error('heartbeat queue full'));
+      return Promise.reject(new HeartbeatQueueFullError());
     }
 
     return new Promise<T>((resolve, reject) => {

@@ -218,6 +218,9 @@ describe('Gateway reconciler debounce', () => {
     const timers = (gateway as any).reconcileTimers as Map<string, ReturnType<typeof setTimeout>>;
     const timer = timers.get('chat-1');
     expect(timer).toBeDefined();
+    // Sinon fake timers implement hasRef(); an unref'd timeout reports false.
+    // This pins the actual unref() contract, not just the timer's existence.
+    expect((timer as unknown as { hasRef(): boolean }).hasRef()).toBe(false);
   });
 
   it('stop() clears pending debounce timers', async () => {

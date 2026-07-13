@@ -12,6 +12,7 @@ import { HeartbeatRateLimiter } from './rate-limit';
 import { findMostRecentMissedRun } from './recovery';
 import { determineRetryAction } from './retry-policy';
 import { HeartbeatStore } from './store';
+import { summarizeErrorForLog } from '../security';
 
 type HeartbeatTrigger = (job: HeartbeatJob) => Promise<void>;
 
@@ -290,9 +291,20 @@ export class HeartbeatScheduler {
       await this.trigger(current);
       await this.store.markRun(current.id, now.toISOString());
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      await this.recordFailure(current.id, message);
+      // lastError is persisted and this line hits the console — sanitize;
+      // provider/agent errors can echo PHI in their messages.
+      const message = summarizeErrorForLog(error);
       console.error(`[scheduler] Heartbeat job failed (${current.id}):`, message);
+      try {
+        await this.recordFailure(current.id, message);
+      } catch (recordError) {
+        // executeJob is invoked fire-and-forget from cron ticks; a storage
+        // failure here must not become an unhandled rejection.
+        console.error(
+          `[scheduler] Failed to record heartbeat failure (${current.id}):`,
+          summarizeErrorForLog(recordError),
+        );
+      }
     }
   }
 

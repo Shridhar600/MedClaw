@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { AgentLoop } from '../../src/agent/agent-loop';
-import { LLMSemaphore } from '../../src/tools/semaphore';
+import { LLMSemaphore, HeartbeatQueueFullError } from '../../src/tools/semaphore';
 import { SessionManager } from '../../src/gateway/session';
 import { Gateway } from '../../src/gateway/gateway';
 import { ToolRegistry } from '../../src/tools/registry';
@@ -220,6 +220,53 @@ describe('LLM semaphore wiring', () => {
 
     if (assertionError) {
       throw assertionError;
+    }
+  });
+
+  it('queue-full recordFailure storage failure does not escape handleScheduledJob', async () => {
+    const config = makeConfig();
+    const gateway = new Gateway(config);
+    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).sessions = sessions;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).agentLoop = { run: jest.fn().mockRejectedValue(new HeartbeatQueueFullError()) };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).scheduler = {
+      recordFailure: jest.fn().mockRejectedValue(new Error('disk full')),
+    };
+
+    const job = {
+      id: 'job-rf',
+      title: 'Queue-full storage failure',
+      chatId: 'chat-1',
+      cron: '0 8 * * *',
+      timezone: 'Asia/Kolkata',
+      prompt: 'Check in.',
+      enabled: true,
+      source: 'system' as const,
+      kind: 'routine' as const,
+      deliveryState: 'ready' as const,
+      retryCount: 0,
+      maxRetries: 3,
+      policyKey: 'defaults:morning-check-in',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await expect(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (gateway as any).handleScheduledJob(job, true),
+      ).resolves.toBeUndefined();
+      const warned = warnSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+      expect(warned).toContain('Failed to record queue-full');
+    } finally {
+      warnSpy.mockRestore();
     }
   });
 

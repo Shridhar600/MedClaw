@@ -253,7 +253,7 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     await gateway.stop();
   });
 
-  it('security warnings from bind check appear in /status output', async () => {
+  it('/status over the channel shows a bind-warning count but never the warning text (config-internals leak guard)', async () => {
     mockCheckSystemReadiness.mockResolvedValue(allReadyResult());
     mockCheckProviderBindAddresses.mockReturnValue({
       localhostOnly: false,
@@ -273,13 +273,16 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     await (gateway as any).handleMessage({ chatId: 'chat-1', text: '/status' });
 
     const statusText = send.mock.calls[0][1].text;
-    expect(statusText).toContain('Security warnings');
-    expect(statusText).toContain('not localhost');
+    expect(statusText).toContain('Security warnings: 1');
+    // Provider baseUrls and warning bodies are config internals — they must
+    // never reach a network channel.
+    expect(statusText).not.toContain('api.example.com');
+    expect(statusText).not.toContain('not localhost');
 
     await gateway.stop();
   });
 
-  it('security warnings from perms check appear in /status output', async () => {
+  it('/status over the channel shows a perms-warning count but never the workspace path (filesystem-path leak guard)', async () => {
     mockCheckSystemReadiness.mockResolvedValue(allReadyResult());
     mockVerifyWorkspacePermissions.mockReturnValue({
       secure: false,
@@ -299,8 +302,27 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     await (gateway as any).handleMessage({ chatId: 'chat-1', text: '/status' });
 
     const statusText = send.mock.calls[0][1].text;
-    expect(statusText).toContain('Security warnings');
-    expect(statusText).toContain('perms');
+    expect(statusText).toContain('Security warnings: 1');
+    // Absolute workspace paths point at the PHI tree — never over the channel.
+    expect(statusText).not.toContain('/tmp/test');
+    expect(statusText).not.toContain('perms');
+
+    await gateway.stop();
+  });
+
+  it('security warnings still reach the local console in full', async () => {
+    mockCheckSystemReadiness.mockResolvedValue(allReadyResult());
+    mockCheckProviderBindAddresses.mockReturnValue({
+      localhostOnly: false,
+      warnings: ['main provider (https://api.example.com) is not localhost — health data may leave the machine'],
+    });
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    const gateway = new Gateway(makeConfig());
+    await gateway.start();
+
+    const warned = warnSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+    expect(warned).toContain('not localhost');
 
     await gateway.stop();
   });

@@ -64,13 +64,17 @@ export class ProfileRegistry {
 
   // ── Registry CRUD ────────────────────────────────────────────────
 
+  // Read accessors return defensive copies: the underlying objects live in the
+  // mtime-keyed read cache, and a caller mutating a returned profile would
+  // silently corrupt the cache until the next write invalidates it.
   getAllProfiles(): ProfileMeta[] {
-    return [...this.readData().profiles];
+    return this.readData().profiles.map((p) => ({ ...p, chatIds: [...p.chatIds] }));
   }
 
   getProfile(profileId: ProfileId): ProfileMeta | undefined {
     this.validateProfileId(profileId);
-    return this.readData().profiles.find((p) => p.profileId === profileId);
+    const found = this.readData().profiles.find((p) => p.profileId === profileId);
+    return found ? { ...found, chatIds: [...found.chatIds] } : undefined;
   }
 
   createProfile(label: string, chatId?: string): ProfileMeta {
@@ -130,7 +134,8 @@ export class ProfileRegistry {
   // ── Chat pairing ─────────────────────────────────────────────────
 
   getProfileForChat(chatId: string): ProfileMeta | undefined {
-    return this.readData().profiles.find((p) => p.chatIds.includes(chatId));
+    const found = this.readData().profiles.find((p) => p.chatIds.includes(chatId));
+    return found ? { ...found, chatIds: [...found.chatIds] } : undefined;
   }
 
   pairChatToProfile(chatId: string, profileId: ProfileId): void {

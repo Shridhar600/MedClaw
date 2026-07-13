@@ -80,7 +80,9 @@ export class AgentLoop {
       // Tool call
       const { id, name, arguments: args } = response.toolCall;
       usedTools.push(name);
-      console.log(`[agent] Tool call: ${name}(${JSON.stringify(args)})`);
+      // Tool args routinely carry PHI (memory content, health queries, report
+      // paths) — log the tool name only, never the arguments.
+      console.log(`[agent] Tool call: ${name}`);
 
       // Append assistant's tool request to messages
       const toolRequestMessage: Message = {

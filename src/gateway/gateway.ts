@@ -1,15 +1,15 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { AppConfig } from '../config/types';
-import { ProfileRegistry } from '../profiles/registry';
-import type { ProfileId } from '../profiles/types';
+import { ProfileRegistry } from '../profiles';
+import type { ProfileId } from '../profiles';
 import type { Channel, IncomingMessage } from '../channels/types';
 import { TelegramChannel } from '../channels/telegram';
 import { AgentLoop } from '../agent/agent-loop';
 import { ContextAssembler } from '../agent/context';
 import { MemoryEngine } from '../memory/memory-engine';
 import { ToolRegistry } from '../tools/registry';
-import { LLMSemaphore } from '../tools/semaphore';
+import { LLMSemaphore, HeartbeatQueueFullError } from '../tools/semaphore';
 import { createMemoryTools } from '../tools/memory-tools';
 import { createMedicalTools } from '../tools/medical-tools';
 import { createCronManageTool } from '../tools/cron-manage';
@@ -30,13 +30,14 @@ import { OnboardingStore } from '../onboarding/store';
 import { ensureWorkspaceBootstrap } from '../workspace/bootstrap';
 import { checkSystemReadiness } from '../providers/healthcheck';
 import type { ReadinessResult } from '../providers/healthcheck';
-import { checkProviderBindAddresses } from '../security/bind-check';
-import { verifyWorkspacePermissions } from '../security/perms-check';
+import { checkProviderBindAddresses, verifyWorkspacePermissions, summarizeErrorForLog } from '../security';
 
 const EMERGENCY_PATTERN =
   /\b(chest pain|can't breathe|cannot breathe|difficulty breathing|stroke|heart attack|severe bleeding|suicidal|emergency)\b/i;
 const EMERGENCY_RESPONSE =
   'This may be an emergency. Please contact local emergency services now or go to the nearest emergency department. If you can, ask someone nearby to stay with you while you get help.';
+const UNRECOGNIZED_CHAT_RESPONSE =
+  'This chat is not recognized. This is a private health assistant; new chats cannot be added over this channel.';
 
 export class Gateway {
   private config: AppConfig;
@@ -175,8 +176,13 @@ export class Gateway {
   }
 
   async handleTestMessage(chatId: string, text: string): Promise<string> {
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- per-chat profileId resolved; stores use resolvedMemoryWorkspace
     const profileId = this.getProfileForChat(chatId);
+    if (profileId === null) {
+      // Refused chats still get emergency guidance (medical-safety rule; the
+      // emergency text carries no PHI) — but no agent run, no session write.
+      const emergency = this.handleEmergencyInput(text);
+      return emergency ?? UNRECOGNIZED_CHAT_RESPONSE;
+    }
 
     if (text.trim() === '/status') {
       return this.buildBootStatusText();
@@ -208,11 +214,22 @@ export class Gateway {
 
   private async handleMessage(incoming: IncomingMessage): Promise<void> {
     const { chatId, text } = incoming;
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- per-chat profileId resolved; stores use resolvedMemoryWorkspace
-    const profileId = this.getProfileForChat(chatId);
     console.log(
       `[gateway] Message from ${chatId}: ${text.length} chars${incoming.mediaPath ? ', media attached' : ''}`,
     );
+
+    const profileId = this.getProfileForChat(chatId);
+    if (profileId === null) {
+      // Refused chats still get emergency guidance (medical-safety rule; the
+      // emergency text carries no PHI) — but no agent run, no session write.
+      const emergency = this.handleEmergencyInput(text);
+      try {
+        await this.channel!.send(chatId, { text: emergency ?? UNRECOGNIZED_CHAT_RESPONSE });
+      } catch (e) {
+        console.error('[gateway] Failed to respond to unrecognized chat:', summarizeErrorForLog(e));
+      }
+      return;
+    }
 
     if (text.trim() === '/status') {
       const statusText = this.buildBootStatusText();
@@ -387,8 +404,11 @@ export class Gateway {
   }
 
   private async handleScheduledJob(job: HeartbeatJob, invokedByScheduler: boolean = false): Promise<void> {
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- per-chat profileId resolved; stores use resolvedMemoryWorkspace
     const profileId = this.getProfileForChat(job.chatId);
+    if (profileId === null) {
+      console.warn(`[gateway] Skipping heartbeat job ${job.id}: chat is not paired to any profile.`);
+      return;
+    }
     const decision = decideHeartbeatDelivery(job, {
       now: new Date(Date.now()),
       quietHours: this.config.heartbeat.policy.quietHours,
@@ -428,23 +448,34 @@ export class Gateway {
       await this.scheduler?.recordOutcome(job.id, 'sent');
       await this.reconcileHeartbeatPolicies(job.chatId);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-
-      if (this.isHeartbeatQueueFull(error)) {
+      if (error instanceof HeartbeatQueueFullError) {
         console.warn(`[gateway] Heartbeat queue full for job ${job.id}; scheduler will retry.`);
-        await this.scheduler?.recordFailure(job.id, message);
+        // recordFailure itself touches disk; a storage failure here must not
+        // escape (it would double-count the failure via executeJob's catch).
+        try {
+          await this.scheduler?.recordFailure(job.id, 'heartbeat queue full');
+        } catch (recordError) {
+          console.warn(
+            `[gateway] Failed to record queue-full for job ${job.id}:`,
+            summarizeErrorForLog(recordError),
+          );
+        }
         return;
       }
 
       if (!invokedByScheduler) {
-        await this.scheduler?.recordFailure(job.id, message);
+        // lastError is persisted to disk — sanitize; provider/agent errors can echo PHI.
+        try {
+          await this.scheduler?.recordFailure(job.id, summarizeErrorForLog(error));
+        } catch (recordError) {
+          console.warn(
+            `[gateway] Failed to record heartbeat failure for job ${job.id}:`,
+            summarizeErrorForLog(recordError),
+          );
+        }
       }
       throw error;
     }
-  }
-
-  private isHeartbeatQueueFull(error: unknown): boolean {
-    return error instanceof Error && error.message === 'heartbeat queue full';
   }
 
   private async reconcileHeartbeatPolicies(chatId: string): Promise<void> {
@@ -618,7 +649,9 @@ export class Gateway {
         `[gateway] Legacy workspace migration: migrated=${result.migrated} skipped=${result.skipped} errors=${result.errors.length}`,
       );
       if (result.errors.length > 0) {
-        console.warn(`[gateway] Migration encountered ${result.errors.length} error(s):`, result.errors);
+        // Error strings carry workspace-relative health-file paths (PHI
+        // context) — log the count only, never the list.
+        console.warn(`[gateway] Migration encountered ${result.errors.length} error(s); details withheld from logs.`);
       }
 
       if (registry.hasBeenMigrated(profileId, legacyWorkspace)) {
@@ -696,11 +729,11 @@ export class Gateway {
       ...h.providers.map((p) => `  ${p.label}: ${p.ready ? 'OK' : 'FAIL'}`),
       `  telegram: ${h.telegram.ready ? 'OK' : 'FAIL'}`,
     ];
+    // Security warnings carry config internals (provider baseUrls, workspace
+    // filesystem paths) and must never reach a network channel — surface the
+    // count only; full text stays on the local console/CLI.
     if (this.securityWarnings.length > 0) {
-      lines.push('', 'Security warnings:');
-      for (const w of this.securityWarnings) {
-        lines.push(`  ${w}`);
-      }
+      lines.push('', `Security warnings: ${this.securityWarnings.length} (details in local logs)`);
     }
     lines.push('', 'See `npm run cli -- status` for details.');
     return lines.join('\n');
@@ -710,7 +743,13 @@ export class Gateway {
     return this.resolvedMemoryWorkspace ?? this.config.memory.workspace;
   }
 
-  private getProfileForChat(chatId: string): ProfileId {
+  // P0 persists pairings only; runtime dispatch is single-profile at boot.
+  // Auto-pair is a first-contact bridge (PD-16 pairing codes land in P6): it
+  // fires ONLY while no chat is paired to any profile. Once the owner's first
+  // chat is paired, every other unknown chatId is refused (returns null) —
+  // otherwise a leaked bot token would let a stranger pair themselves to the
+  // default profile and read the owner's health memory through the chat tools.
+  private getProfileForChat(chatId: string): ProfileId | null {
     if (!this.profileRegistry) {
       return (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
     }
@@ -718,8 +757,14 @@ export class Gateway {
     if (existing) {
       return existing.profileId;
     }
+    const anyChatPaired = this.profileRegistry.getAllProfiles().some((p) => p.chatIds.length > 0);
+    if (anyChatPaired) {
+      console.warn(`[gateway] Refused unrecognized chat ${chatId} (auto-pair closed after first pairing)`);
+      return null;
+    }
     const defaultProfile = this.profileRegistry.getOrCreateDefaultProfile();
     this.profileRegistry.pairChatToProfile(chatId, defaultProfile.profileId);
+    console.log(`[gateway] Paired chat ${chatId} to profile "${defaultProfile.profileId}" (first-contact auto-pair)`);
     return defaultProfile.profileId;
   }
 
@@ -750,14 +795,3 @@ export class Gateway {
   }
 }
 
-// Deliberately excludes error.message: agent/session/provider errors in this
-// domain can echo user health content (PHI) into their messages, and gateway
-// logs must never carry it (see gateway-media-flow PHI-guard tests). The top
-// stack frame gives the debuggable location without the message body.
-function summarizeErrorForLog(error: unknown): string {
-  if (error instanceof Error) {
-    const frame = error.stack?.split('\n')[1]?.trim();
-    return frame ? `${error.name} (${frame})` : error.name;
-  }
-  return typeof error;
-}

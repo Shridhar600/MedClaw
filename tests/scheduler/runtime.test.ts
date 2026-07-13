@@ -38,6 +38,68 @@ describe('HeartbeatScheduler', () => {
     await scheduler.stop();
   });
 
+  it('a failing trigger persists a sanitized lastError (never the raw error message)', async () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const store = new HeartbeatStore(storePath);
+      const job = await store.create({
+        title: 'Failing check-in',
+        chatId: 'chat-1',
+        cron: '* * * * *',
+        prompt: 'Ask how the user is feeling.',
+        source: 'system',
+        kind: 'routine',
+        policyKey: 'defaults:morning-check-in',
+      });
+      // Provider/agent error messages can echo user health content (PHI).
+      const trigger = jest.fn().mockRejectedValue(new Error('glucose 300 spiking, chest pain reported'));
+      const scheduler = new HeartbeatScheduler(store, trigger);
+
+      await scheduler.start();
+      await scheduler.runNow(job.id);
+
+      const refreshed = await store.get(job.id);
+      expect(refreshed?.lastError).toBeTruthy();
+      expect(refreshed?.lastError).not.toContain('glucose');
+      expect(refreshed?.lastError).not.toContain('chest pain');
+      expect(refreshed?.lastError).toContain('Error');
+
+      const logged = errorSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+      expect(logged).not.toContain('glucose');
+      await scheduler.stop();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('a storage failure while recording a trigger failure does not escape executeJob', async () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const store = new HeartbeatStore(storePath);
+      const job = await store.create({
+        title: 'Failing check-in',
+        chatId: 'chat-1',
+        cron: '* * * * *',
+        prompt: 'Ask how the user is feeling.',
+        source: 'system',
+        kind: 'routine',
+        policyKey: 'defaults:morning-check-in',
+      });
+      const trigger = jest.fn().mockRejectedValue(new Error('send failed'));
+      const scheduler = new HeartbeatScheduler(store, trigger);
+      await scheduler.start();
+
+      // recordFailure's store.update now fails too — executeJob is invoked
+      // fire-and-forget from cron ticks, so nothing may escape it.
+      jest.spyOn(store, 'update').mockRejectedValue(new Error('disk full'));
+
+      await expect(scheduler.runNow(job.id)).resolves.toBeUndefined();
+      await scheduler.stop();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   it('pause prevents runNow from executing the callback', async () => {
     const store = new HeartbeatStore(storePath);
     const job = await store.create({

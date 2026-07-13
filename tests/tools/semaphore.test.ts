@@ -1,4 +1,4 @@
-import { LLMSemaphore } from '../../src/tools/semaphore';
+import { LLMSemaphore, HeartbeatQueueFullError } from '../../src/tools/semaphore';
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -244,8 +244,11 @@ describe('LLMSemaphore', () => {
       queued.push(sem.run('heartbeat', async () => {}));
     }
 
-    // The 11th queued heartbeat must be rejected immediately.
-    await expect(sem.run('heartbeat', async () => {})).rejects.toThrow('heartbeat queue full');
+    // The 11th queued heartbeat must be rejected immediately, with the typed
+    // sentinel the gateway instanceof-checks (never a message-string contract).
+    const overflow = sem.run('heartbeat', async () => {});
+    await expect(overflow).rejects.toThrow('heartbeat queue full');
+    await expect(overflow).rejects.toBeInstanceOf(HeartbeatQueueFullError);
 
     // A user job must still be accepted (enqueued, not rejected) while the
     // heartbeat queue is full — user jobs are never bounded.
