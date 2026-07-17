@@ -5,7 +5,7 @@ import type { Message, ToolSchema } from '../providers/types';
 import type { LLMProvider } from '../providers/types';
 import type { ToolRegistry } from '../tools/registry';
 import { rotateFileIfNeeded, type RotationConfig } from '../scheduler/rotation';
-import { summarizeErrorForLog, secureMkdir, secureWrite, secureAppend, tightenFile } from '../security';
+import { summarizeErrorForLog, secureMkdir, secureWrite, secureWriteViaTmp, secureAppend, tightenFile } from '../security';
 
 interface Session {
   chatId: string;
@@ -167,8 +167,12 @@ export class SessionManager {
     const doFlush = this.compactionConfig?.memoryFlush ?? true;
 
     if (!this.llmProvider) {
-      session.history = session.history.slice(-keepRecent);
-      await this.persistHistory(chatId, session.history);
+      const newHistory = session.history.slice(-keepRecent);
+      // Atomicity (RES-P1-2): persist the compacted history to disk FIRST;
+      // only mutate session.history once the on-disk write committed. A crash
+      // (or persist throw) leaves the in-memory history untouched.
+      await this.persistHistory(chatId, newHistory);
+      session.history = newHistory;
       return;
     }
 
@@ -176,8 +180,8 @@ export class SessionManager {
     const olderTurns = session.history.slice(0, -keepRecent);
 
     if (olderTurns.length === 0) {
+      await this.persistHistory(chatId, recentTurns);
       session.history = recentTurns;
-      await this.persistHistory(chatId, session.history);
       return;
     }
 
@@ -234,20 +238,34 @@ Keep it concise and structured.`;
         { role: 'user', content: JSON.stringify(olderTurns) },
       ]);
 
-      if (summaryResponse.type === 'text' && summaryResponse.text.trim().length > 0) {
-        session.history = [
-          { role: 'system', content: `[Previous conversation summary]\n${summaryResponse.text.trim()}` },
+      const summaryText =
+        summaryResponse.type === 'text' && summaryResponse.text.trim().length > 0
+          ? summaryResponse.text.trim()
+          : null;
+      const newHistory: Message[] = summaryText
+        ? [
+          { role: 'system', content: `[Previous conversation summary]\n${summaryText}` },
           ...recentTurns,
-        ];
-      } else {
-        session.history = recentTurns;
-      }
-
-      await this.persistHistory(chatId, session.history);
+        ]
+        : recentTurns;
+      // Persist FIRST, assign on success (RES-P1-2 atomicity).
+      await this.persistHistory(chatId, newHistory);
+      session.history = newHistory;
     } catch (e) {
       console.warn('[session] Compact turn failed:', e);
-      session.history = recentTurns;
-      await this.persistHistory(chatId, session.history);
+      // Fallback: keep the recent turns. Persist FIRST, then assign — so a
+      // crash during this fallback cannot leave in-memory state diverged from
+      // disk. If even this persist fails, leave session.history unchanged and
+      // log sanitized; the caller keeps the pre-compaction history.
+      try {
+        await this.persistHistory(chatId, recentTurns);
+        session.history = recentTurns;
+      } catch (persistError) {
+        console.warn(
+          '[session] Fallback persist after failed compaction also failed; in-memory history left unchanged:',
+          summarizeErrorForLog(persistError),
+        );
+      }
     }
   }
 
@@ -362,7 +380,11 @@ ${response.text.trim()}`;
     const now = new Date().toISOString();
     this.maybeRotate(chatId);
     const lines = history.map(msg => JSON.stringify(this.serializeEntry(chatId, msg, now)));
-    secureWrite(activePath, lines.join('\n') + '\n');
+    // Atomic write (tmp+rename): a crash mid-compaction must NOT truncate the
+    // on-disk JSONL to zero bytes (RES-P1-1). secureWriteViaTmp writes a tmp
+    // file at 0o600 then renames over the target; the original stays intact
+    // until rename succeeds.
+    secureWriteViaTmp(activePath, lines.join('\n') + '\n');
   }
 
   private async appendMessagesToJsonl(chatId: string, messages: Message[]): Promise<void> {

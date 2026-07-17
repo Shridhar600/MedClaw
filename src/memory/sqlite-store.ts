@@ -1,6 +1,9 @@
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
+import * as fs from 'fs';
+import * as path from 'path';
 import type { Chunk, SearchResult } from './types';
+import { summarizeErrorForLog, secureMkdir, tightenFile } from '../security';
 
 function serializeFloat32(arr: Float32Array): Buffer {
   return Buffer.from(arr.buffer, arr.byteOffset, arr.byteLength);
@@ -14,7 +17,10 @@ function hasNaN(values: number[] | Float32Array): boolean {
 }
 
 export class SqliteStore {
-  readonly db: Database.Database;
+  // `db` is mutable to allow the corruption-recovery path to reopen a fresh
+  // handle. Reads from tests/runtime go through this field (public). Assigned
+  // inside openDatabaseOrRecover (called from the constructor).
+  db!: Database.Database;
   private hasVec = false;
   private vecDimensionFixed = false;
 
@@ -22,14 +28,146 @@ export class SqliteStore {
     dbPath: string,
     private readonly profileId: string = 'default',
   ) {
-    this.db = new Database(dbPath);
+    this.openDatabaseOrRecover(dbPath);
+  }
+
+  // RES-P0-3: open the DB (and run schema init) inside a guard. A corrupt DB
+  // file (garbage bytes / SQLite "file is not a database") only manifests at the
+  // first PRAGMA/exec inside init(), not at construction — so the whole
+  // open+vec-load+init sequence is wrapped. On a SqliteError we quarantine the
+  // bad files (-wal/-shm siblings included) and open a fresh DB. The gateway
+  // reindexes from Markdown via indexer.indexAll() at boot, so the fresh DB is
+  // fully repopulated automatically. Never throws on corruption (resilience law:
+  // try→catch→log→fallback→continue); only genuine non-SQLite errors re-throw.
+  private openDatabaseOrRecover(dbPath: string): void {
+    this.hasVec = false;
+    let db: Database.Database | undefined;
     try {
-      sqliteVec.load(this.db);
+      db = new Database(dbPath);
+      this.db = db;
+      this.tryLoadVec(db);
+      this.init();
+      return;
+    } catch (e) {
+      // Identify a SQLite corruption-class error in an identity-stable way.
+      // `instanceof Database.SqliteError` is NOT identity-stable: if this
+      // module and the throwing `better-sqlite3` copy differ (e.g. under some
+      // test-runner module layouts), the instanceof check returns false and
+      // a corrupt DB would re-throw instead of recovering. Match on the
+      // error name + SQLite corruption codes / messages instead. Logic bugs
+      // in our own init SQL (generic SQLITE_ERROR) deliberately do NOT match,
+      // so a programmer error never silently nukes a valid DB.
+      if (!SqliteStore.isSqliteCorruptionError(e)) {
+        throw e;
+      }
+      const reason = summarizeErrorForLog(e);
+      // Quarantine FIRST, before any close(): a better-sqlite3 close() on a
+      // corrupt handle checkpoints/deletes the -wal/-shm siblings, which would
+      // erase the very quarantine evidence we want to preserve.
+      this.quarantineCorruptDb(dbPath);
+      try {
+        db?.close();
+      } catch {
+        // The corrupt handle may be unusable; best-effort close.
+      }
+      console.error(
+        `[sqlite-store] CORRUPTION DETECTED. DB file quarantined; opened a fresh DB. Reason: ${reason}`,
+      );
+      this.hasVec = false;
+      // Bounded reopen-retry. Under heavier test load the fresh `new
+      // Database(path)` + init() can transiently re-fail with a corruption-
+      // class error (native better-sqlite3 / WAL-sibling timing after a
+      // close() on the corrupt handle). Each attempt unlinks the path + any
+      // -wal/-shm siblings first (quarantine already moved the original
+      // corrupt file; this only clears post-close leftovers), then opens
+      // fresh. Non-corruption errors re-throw immediately. A real corrupt
+      // file is already quarantined, so this loop only ever opens a path that
+      // does not yet exist — it cannot mask a genuine logic bug.
+      let lastReopenError: unknown;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        for (const candidate of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+          try {
+            fs.unlinkSync(candidate);
+          } catch {
+            // already gone — expected
+          }
+        }
+        try {
+          db = new Database(dbPath);
+          this.db = db;
+          this.tryLoadVec(db);
+          this.init();
+          return;
+        } catch (reopenError) {
+          lastReopenError = reopenError;
+          if (!SqliteStore.isSqliteCorruptionError(reopenError)) {
+            throw reopenError;
+          }
+          // corruption-class transient error → retry (unlink + fresh open)
+        }
+      }
+      throw lastReopenError;
+    }
+  }
+
+  private tryLoadVec(db: Database.Database): void {
+    try {
+      sqliteVec.load(db);
       this.hasVec = true;
     } catch (e) {
-      console.warn('[sqlite-store] sqlite-vec not available, vector search disabled:', e);
+      // sqlite-vec is optional (BM25-only fallback). Log sanitized; never crash.
+      console.warn('[sqlite-store] sqlite-vec not available, vector search disabled:', summarizeErrorForLog(e));
     }
-    this.init();
+  }
+
+  // Identity-stable SQLite corruption detection (see openDatabaseOrRecover).
+  // Duck-typed, NOT `instanceof Error`/`instanceof Database.SqliteError`:
+  // under some test-runner module layouts a SECOND copy of better-sqlite3 is
+  //resolved (its Error base class lives in a different realm), so the thrown
+  // object is `typeof === 'object'` but NOT `instanceof Error`. Matching on
+  // the `.code` property / message text is realm-stable and matches SQLite's
+  // own corruption errors regardless of which copy threw.
+  private static isSqliteCorruptionError(e: unknown): boolean {
+    const code = (e as { code?: unknown }).code;
+    if (typeof code === 'string') {
+      if ([
+        'SQLITE_NOTADB',
+        'SQLITE_CORRUPT',
+        'SQLITE_CORRUPT_VFS',
+        'SQLITE_IOERR_READ',
+        'SQLITE_IOERR_SHORT_READ',
+      ].includes(code)) {
+        return true;
+      }
+    }
+    const text = typeof e === 'object' && e !== null && 'message' in e && typeof (e as { message: unknown }).message === 'string'
+      ? (e as { message: string }).message
+      : String(e);
+    return /(?:not a database|database disk image is malformed|file is not a database)/i.test(text);
+  }
+
+  // Quarantine the corrupt DB file plus its WAL/SHM siblings to
+  // `<path>.corrupt-<stamp>`. Mirrors HeartbeatStore store.ts:150-176. Falls
+  // back to unlink if rename is impossible (best-effort; the fresh DB needs the
+  // original path available). Quarantined copies are tightened to 0o600.
+  private quarantineCorruptDb(dbPath: string): void {
+    secureMkdir(path.dirname(dbPath));
+    const stamp = Date.now();
+    for (const candidate of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+      if (!fs.existsSync(candidate)) continue;
+      const quarantined = `${candidate}.corrupt-${stamp}`;
+      try {
+        fs.renameSync(candidate, quarantined);
+        tightenFile(quarantined);
+      } catch {
+        try {
+          fs.unlinkSync(candidate);
+        } catch {
+          // Give up on this sibling; the fresh open below will overwrite the
+          // main file regardless, so a leftover -wal/-shm is non-fatal.
+        }
+      }
+    }
   }
 
   private init(): void {

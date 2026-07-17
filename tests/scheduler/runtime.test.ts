@@ -345,37 +345,26 @@ describe('HeartbeatScheduler', () => {
       });
 
       const trigger = jest.fn().mockImplementation(async () => {
-        // Block every invocation so a second executeJob overlaps it. With the
-        // guard, only the first call enters; without it, both enter and we
-        // see trigger called twice.
         await triggerGate;
       });
 
-      // Wrap markRun to count calls while delegating to the real implementation.
       const markRunSpy = jest.spyOn(store, 'markRun');
 
       const scheduler = new HeartbeatScheduler(store, trigger, 'UTC');
       await scheduler.start();
 
-      // Fire two overlapping executeJob calls (mirrors two cron ticks landing
-      // before a slow LLM call settles). runNow → executeJob both times.
       const p1 = scheduler.runNow(job.id);
-      // Let the first executeJob enter the trigger (await triggerGate).
       await Promise.resolve();
       await Promise.resolve();
       const p2 = scheduler.runNow(job.id);
 
-      // Release the trigger gate and let both runNow calls settle.
       releaseTrigger();
       await p1;
       await p2;
 
-      // The trigger ran exactly once (the second tick was skipped).
       expect(trigger).toHaveBeenCalledTimes(1);
-      // markRun ran exactly once (no double-delivery state churn).
       expect(markRunSpy).toHaveBeenCalledTimes(1);
 
-      // Final store state is coherent: enabled, ready, lastRunAt set.
       const refreshed = await store.get(job.id);
       expect(refreshed?.enabled).toBe(true);
       expect(refreshed?.deliveryState).toBe('ready');
@@ -384,6 +373,59 @@ describe('HeartbeatScheduler', () => {
       await scheduler.stop();
     } finally {
       errorSpy.mockRestore();
+      logSpy.mockRestore();
+    }
+  });
+
+  // ── RES-P2-3: stop() drains inFlight ─────────────────────────────────
+  it('stop() waits for a blocked inFlight executeJob to finish before resolving', async () => {
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      const store = new HeartbeatStore(storePath);
+      const job = await store.create({
+        title: 'Drain job',
+        chatId: 'chat-1',
+        cron: '* * * * *',
+        prompt: 'drain.',
+        source: 'system',
+        kind: 'routine',
+        policyKey: 'defaults:drain',
+      });
+
+      let releaseTrigger!: () => void;
+      const triggerGate = new Promise<void>((resolve) => {
+        releaseTrigger = resolve;
+      });
+      const trigger = jest.fn().mockImplementation(async () => {
+        await triggerGate;
+      });
+
+      const scheduler = new HeartbeatScheduler(store, trigger, 'UTC');
+      await scheduler.start();
+
+      // Kick off an inFlight executeJob without awaiting it.
+      const runP = scheduler.runNow(job.id);
+      // Let executeJob enter the blocked trigger (await triggerGate).
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const stopP = scheduler.stop();
+
+      // While the job is still blocked, stop() must NOT resolve within 150ms.
+      await expect(
+        Promise.race([
+          stopP.then(() => 'resolved'),
+          new Promise<string>((resolve) => setTimeout(() => resolve('pending'), 150)),
+        ]),
+      ).resolves.toBe('pending');
+
+      // Now release the blocked trigger; executeJob settles, inFlight clears,
+      // and stop() resolves.
+      releaseTrigger();
+      await expect(runP).resolves.toBeUndefined();
+      await expect(stopP).resolves.toBeUndefined();
+      expect(trigger).toHaveBeenCalledTimes(1);
+    } finally {
       logSpy.mockRestore();
     }
   });

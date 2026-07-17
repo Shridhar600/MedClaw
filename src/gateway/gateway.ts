@@ -109,20 +109,31 @@ export class Gateway {
 
     // Tools
     const registry = new ToolRegistry(config.tools);
-    for (const tool of createMemoryTools(memory, search, indexer, profileId)) {
-      registry.register(tool);
+    // RES-P2-1: each tool group is registered independently so a failure in
+    // one factory/dependency disables only that group and boot continues with
+    // the remaining tools (resilience law: disable tool, log, continue).
+    try {
+      for (const tool of createMemoryTools(memory, search, indexer, profileId)) {
+        registry.register(tool);
+      }
+    } catch (e) {
+      console.warn('[gateway] Memory tools unavailable; continuing without them:', summarizeErrorForLog(e));
     }
 
     // Medical tools with medical provider
-    const medicalProvider = createProvider(config.providers.medical);
-    for (const tool of createMedicalTools(memory, search, medicalProvider, mainProvider, memoryWorkspace, {
-      medicalProviderType: config.providers.medical.type,
-      medicalProviderBaseUrl: config.providers.medical.baseUrl,
-      allowRawMedicalMedia: config.providers.medical.allowRawMedicalMedia,
-      mainProviderType: config.providers.main.type,
-      mainProviderBaseUrl: config.providers.main.baseUrl,
-    })) {
-      registry.register(tool);
+    try {
+      const medicalProvider = createProvider(config.providers.medical);
+      for (const tool of createMedicalTools(memory, search, medicalProvider, mainProvider, memoryWorkspace, {
+        medicalProviderType: config.providers.medical.type,
+        medicalProviderBaseUrl: config.providers.medical.baseUrl,
+        allowRawMedicalMedia: config.providers.medical.allowRawMedicalMedia,
+        mainProviderType: config.providers.main.type,
+        mainProviderBaseUrl: config.providers.main.baseUrl,
+      })) {
+        registry.register(tool);
+      }
+    } catch (e) {
+      console.warn('[gateway] Medical tools unavailable; continuing without them:', summarizeErrorForLog(e));
     }
 
     // Context
@@ -164,8 +175,12 @@ export class Gateway {
 
     await this.initializeScheduler();
     if (this.scheduler) {
-      registry.register(createCronManageTool(this.scheduler, this.getEffectiveWorkspace()));
-      registry.register(createHeartbeatManageTool(this.scheduler, this.getEffectiveWorkspace()));
+      try {
+        registry.register(createCronManageTool(this.scheduler, this.getEffectiveWorkspace()));
+        registry.register(createHeartbeatManageTool(this.scheduler, this.getEffectiveWorkspace()));
+      } catch (e) {
+        console.warn('[gateway] Cron/heartbeat tools unavailable; continuing without them:', summarizeErrorForLog(e));
+      }
     }
 
     await this.runBootHealthchecks();
@@ -247,19 +262,29 @@ export class Gateway {
 
     const emergency = this.handleEmergencyInput(text);
     if (emergency) {
+      // Persist-first (RES-P0-4): record the turn BEFORE sending so a crash
+      // between the two never loses the turn. The emergency text is canned
+      // and carries no PHI, but ordering still matters for transcript
+      // integrity. On persistence failure we still send the guidance —
+      // medical-safety prioritizes reaching the user over disk hygiene
+      // (divergence is logged, sanitized). On send failure we just log;
+      // the (possibly persisted) turn is not double-sent.
+      const emergencyTurn = [
+        { role: 'user' as const, content: agentInput },
+        { role: 'assistant' as const, content: emergency },
+      ];
+      try {
+        await this.sessions!.recordTurn(chatId, emergencyTurn);
+      } catch (e) {
+        console.error(
+          '[gateway] Failed to persist emergency turn (sending guidance anyway):',
+          summarizeErrorForLog(e),
+        );
+      }
       try {
         await this.channel!.send(chatId, { text: emergency });
       } catch (e) {
         console.error('[gateway] Failed to send emergency response:', summarizeErrorForLog(e));
-        return;
-      }
-      try {
-        await this.sessions!.recordTurn(chatId, [
-          { role: 'user', content: agentInput },
-          { role: 'assistant', content: emergency },
-        ]);
-      } catch (e) {
-        console.error('[gateway] Failed to persist emergency turn:', summarizeErrorForLog(e));
       }
       return;
     }
@@ -294,19 +319,22 @@ export class Gateway {
     // Emergency check after onboarding completes
     const postOnboardingEmergency = this.handleEmergencyInput(text);
     if (postOnboardingEmergency) {
-      try {
-        await this.channel!.send(chatId, { text: postOnboardingEmergency });
-      } catch (e) {
-        console.error('[gateway] Failed to send emergency response:', summarizeErrorForLog(e));
-        return;
-      }
+      // Persist-first (RES-P0-4), mirroring the early emergency branch above.
       try {
         await this.sessions!.recordTurn(chatId, [
           { role: 'user', content: agentInput },
           { role: 'assistant', content: postOnboardingEmergency },
         ]);
       } catch (e) {
-        console.error('[gateway] Failed to persist emergency turn:', summarizeErrorForLog(e));
+        console.error(
+          '[gateway] Failed to persist emergency turn (sending guidance anyway):',
+          summarizeErrorForLog(e),
+        );
+      }
+      try {
+        await this.channel!.send(chatId, { text: postOnboardingEmergency });
+      } catch (e) {
+        console.error('[gateway] Failed to send emergency response:', summarizeErrorForLog(e));
       }
       return;
     }
@@ -315,9 +343,8 @@ export class Gateway {
     try {
       const history = await this.sessions!.prepareHistory(chatId);
       result = await this.agentLoop!.run(agentInput, history, { chatId });
-      await this.channel!.send(chatId, { text: result.text });
     } catch (e) {
-      console.error('[gateway] Agent/send error:', summarizeErrorForLog(e));
+      console.error('[gateway] Agent error:', summarizeErrorForLog(e));
       try {
         await this.channel!.send(chatId, { text: "I'm having trouble right now. Please try again in a moment." });
       } catch (fallbackError) {
@@ -326,17 +353,43 @@ export class Gateway {
       return;
     }
 
+    // Persist-first (RES-P0-4): record the turn BEFORE sending so a crash
+    // between the agent run and the channel write never loses the turn the
+    // user is about to read. Contract decision: if persistence fails we STILL
+    // send the real response (UX wins; the divergence is logged sanitized) —
+    // losing an expensive LLM response is worse than a logged disk divergence.
+    let persistFailed = false;
     try {
-      await this.sessions!.recordTurn(
-        chatId,
-        [
-          { role: 'user', content: agentInput },
-          ...result.trace,
-        ],
-      );
-      await this.debouncedReconcile(chatId);
+      await this.sessions!.recordTurn(chatId, [
+        { role: 'user', content: agentInput },
+        ...result.trace,
+      ]);
     } catch (e) {
-      console.error('[gateway] Post-send persistence/reconciliation error:', summarizeErrorForLog(e));
+      persistFailed = true;
+      console.error(
+        '[gateway] Pre-send persistence error (sending response anyway; logged divergence):',
+        summarizeErrorForLog(e),
+      );
+    }
+
+    try {
+      await this.channel!.send(chatId, { text: result.text });
+    } catch (e) {
+      console.error('[gateway] Send error:', summarizeErrorForLog(e));
+      try {
+        await this.channel!.send(chatId, { text: "I'm having trouble right now. Please try again in a moment." });
+      } catch (fallbackError) {
+        console.error('[gateway] Failed to send fallback response:', summarizeErrorForLog(fallbackError));
+      }
+      return;
+    }
+
+    if (!persistFailed) {
+      try {
+        await this.debouncedReconcile(chatId);
+      } catch (e) {
+        console.error('[gateway] Reconciliation error:', summarizeErrorForLog(e));
+      }
     }
   }
 

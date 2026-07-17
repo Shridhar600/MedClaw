@@ -66,6 +66,30 @@ export class HeartbeatScheduler {
     }
     this.tasks.clear();
     this.wakeupTimers.clear();
+    // RES-P2-3: no new cron ticks can fire (tasks stopped), but a job already
+    // executing executeJob must be allowed to finish before stop() resolves so
+    // callers (e.g. gateway.stop on SIGTERM) do not tear down the process
+    // while a heartbeat trigger is mid-flight. Bounded wait so a stuck job
+    // never blocks shutdown forever.
+    await this.drainInFlight(10_000);
+  }
+
+  private async drainInFlight(capMs = 10_000): Promise<void> {
+    const pollMs = 50;
+    const deadline = Date.now() + capMs;
+    while (this.inFlight.size > 0) {
+      if (Date.now() >= deadline) {
+        console.warn(
+          `[scheduler] stop() waited ${capMs}ms for inFlight jobs; ${this.inFlight.size} still running, giving up.`,
+        );
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, pollMs);
+        // Never keep the event loop alive solely for the drain poll.
+        t.unref?.();
+      });
+    }
   }
 
   async listJobs(): Promise<HeartbeatJob[]> {
