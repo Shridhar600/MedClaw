@@ -1,6 +1,7 @@
 import type { LLMProvider } from '../providers/types';
 import type { SearchResult, SearchStatus } from './types';
 import type { SqliteStore } from './sqlite-store';
+import { summarizeErrorForLog } from '../security';
 
 interface HybridWeights {
   vector: number;
@@ -46,7 +47,8 @@ export class MemorySearch {
       const float32 = new Float32Array(queryEmbedding);
       vectorResults = this.store.vectorSearch(float32, topK * 2);
     } catch (e) {
-      console.warn('[search] Vector search failed, falling back to keyword only:', e);
+      // Embed failure messages can echo the PHI-laden query — sanitized frame only.
+      console.warn('[search] Vector search failed, falling back to keyword only:', summarizeErrorForLog(e));
       vectorFailed = true;
     }
 

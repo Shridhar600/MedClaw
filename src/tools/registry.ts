@@ -1,5 +1,6 @@
 import type { Tool, ToolExecutionContext, ToolResult } from './types';
 import type { ToolsConfig } from '../config/types';
+import { summarizeErrorForLog } from '../security';
 
 export class ToolRegistry {
   private tools: Map<string, Tool> = new Map();
@@ -29,7 +30,10 @@ export class ToolRegistry {
       return await tool.execute(params, context);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      console.error(`[tool:${name}] Error:`, msg);
+      // Tool error messages can echo PHI (tool args carry health content) — log
+      // the tool name + sanitized frame only. The full error text is returned
+      // to the agent (persisted into the 0600 session JSONL, not stdout/stderr).
+      console.error(`[tool:${name}] Error:`, summarizeErrorForLog(e));
       return { content: [{ type: 'text', text: `Tool error: ${msg}` }], isError: true };
     }
   }

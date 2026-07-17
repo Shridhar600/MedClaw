@@ -49,4 +49,26 @@ more text`;
     const result = contentContainsCredentials(content);
     expect(result.matched).toBe(false);
   });
+
+  // SEC-M2a: a Cyrillic-homoglyph label must not bypass the scanner. The label
+  // 'аpi_key' (with Cyrillic а, U+0430) is visually identical to 'api_key' but
+  // ASCII-only — so the original regex missed it. Normalize lookalikes to ASCII
+  // before scanning.
+  it('rejects a Cyrillic-homoglyph label (аpi_key) by normalizing to ASCII before scanning', () => {
+    // 'а' below is Cyrillic small a (U+0430), NOT Latin a.
+    const content = 'аpi_key = abcdefghijklmnopqrstuvwxyz123456';
+    expect(content.charCodeAt(0)).toBe(0x0430); // sanity: really Cyrillic
+    const result = contentContainsCredentials(content);
+    expect(result.matched).toBe(true);
+  });
+
+  // SEC-M2b (scanner side): a label and a value separated by >8192 chars of
+  // non-alphanumeric padding must still be detected when the assembled file is
+  // scanned as a whole.
+  it('rejects a label and value separated by >8192 chars of padding when scanned as one assembled blob', () => {
+    const content = 'api_key = ' + '#'.repeat(8200) + 'abcdefghijklmnopqrstuvwxyz123456';
+    expect(content.length).toBeGreaterThan(8210);
+    const result = contentContainsCredentials(content);
+    expect(result.matched).toBe(true);
+  });
 });

@@ -1,8 +1,8 @@
 import type { AgentRunResult, LLMProvider, Message, ToolSchema } from '../providers/types';
 import type { ToolRegistry } from '../tools/registry';
 import { LLMSemaphore, type SemaphorePriority } from '../tools/semaphore';
+import { MEDICAL_DISCLAIMER, MEDICAL_DISCLAIMER_SENTINEL } from '../safety/medical-disclaimer';
 
-const MEDICAL_DISCLAIMER = '\n\n---\n*I am an AI health companion, not a doctor. Always consult a healthcare professional for medical advice.*';
 const MEDICAL_TOOLS = new Set(['medgemma_query', 'medgemma_analyze_report']);
 
 interface AgentConfig {
@@ -66,7 +66,7 @@ export class AgentLoop {
         const rawText = response.text;
         const isHealthRelated = this.config.disclaimerEnabled
           && this.isHealthResponse(userMessage, rawText, usedTools);
-        const alreadyHasDisclaimer = rawText.includes('I am an AI health companion, not a doctor');
+        const alreadyHasDisclaimer = rawText.includes(MEDICAL_DISCLAIMER_SENTINEL);
         const finalText = isHealthRelated && !alreadyHasDisclaimer ? rawText + MEDICAL_DISCLAIMER : rawText;
         trace.push({ role: 'assistant', content: finalText });
         return {

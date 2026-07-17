@@ -333,6 +333,106 @@ describe('TelegramChannel', () => {
     });
   });
 
+  // ── SEC-M1: handler errors must log a sanitized frame, never the raw PHI.
+  describe('SEC-M1 handler error PHI leak guard', () => {
+    const PHI = 'glucose-PHI-marker-telegram-142857';
+
+    it('text handler error logs a sanitized frame, never the PHI-bearing handler error', async () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
+      mockBotOn.mockImplementation((event: string, cb: (ctx: MockCtx) => Promise<void>) => {
+        if (event === 'message:text') {
+          handler = cb;
+        }
+      });
+      const channel = new TelegramChannel('test-token', '/tmp/test-workspace');
+      await channel.onMessage(async () => {
+        throw new Error(`telegram handler failed: ${PHI}`);
+      });
+      const mockCtx: MockCtx = {
+        message: { caption: 'x' } as MockCtx['message'],
+        chat: { id: 123 },
+        from: { id: 456 },
+      };
+      // The handler re-throws so grammY's boundary catches it; suppress the throw here.
+      await expect(handler?.(mockCtx)).rejects.toThrow();
+      const logged = errorSpy.mock.calls.flat().map(String).join('\n');
+      errorSpy.mockRestore();
+      expect(logged).not.toContain(PHI);
+      expect(logged).not.toContain('telegram handler failed');
+      expect(logged).toContain('Handler error');
+      expect(logged).toContain('Error');
+    });
+
+    it('document handler error logs a sanitized frame, never the PHI-bearing handler error', async () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
+      mockBotOn.mockImplementation((event: string, cb: (ctx: MockCtx) => Promise<void>) => {
+        if (event === 'message:document') {
+          handler = cb;
+        }
+      });
+      mockGetFile.mockResolvedValue({ file_path: 'documents/test.pdf' });
+      const mockFetch = jest.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        arrayBuffer: () => Promise.resolve(new ArrayBuffer(10)),
+      });
+      global.fetch = mockFetch;
+      const channel = new TelegramChannel('test-token', '/tmp/test-workspace');
+      await channel.onMessage(async () => {
+        throw new Error(`telegram handler failed: ${PHI}`);
+      });
+      const mockCtx: MockCtx = {
+        message: {
+          document: { file_id: 'doc123', file_name: 'report.pdf' },
+          caption: 'My report',
+        },
+        chat: { id: 123 },
+        from: { id: 456 },
+      };
+      await expect(handler?.(mockCtx)).rejects.toThrow();
+      const logged = errorSpy.mock.calls.flat().map(String).join('\n');
+      errorSpy.mockRestore();
+      expect(logged).not.toContain(PHI);
+      expect(logged).toContain('Handler error');
+    });
+
+    it('photo handler error logs a sanitized frame, never the PHI-bearing handler error', async () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
+      mockBotOn.mockImplementation((event: string, cb: (ctx: MockCtx) => Promise<void>) => {
+        if (event === 'message:photo') {
+          handler = cb;
+        }
+      });
+      mockGetFile.mockResolvedValue({ file_path: 'photos/photo_123.jpg' });
+      const mockFetch = jest.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        arrayBuffer: () => Promise.resolve(new ArrayBuffer(10)),
+      });
+      global.fetch = mockFetch;
+      const channel = new TelegramChannel('test-token', '/tmp/test-workspace');
+      await channel.onMessage(async () => {
+        throw new Error(`telegram handler failed: ${PHI}`);
+      });
+      const mockCtx: MockCtx = {
+        message: {
+          photo: [{ file_id: 'large', width: 800, height: 800 }],
+          caption: 'Check this out',
+        },
+        chat: { id: 123 },
+        from: { id: 456 },
+      };
+      await expect(handler?.(mockCtx)).rejects.toThrow();
+      const logged = errorSpy.mock.calls.flat().map(String).join('\n');
+      errorSpy.mockRestore();
+      expect(logged).not.toContain(PHI);
+      expect(logged).toContain('Handler error');
+    });
+  });
+
   // ── RES-P0-1: grammY error boundary installed in constructor ────────────
   describe('grammY error boundary (RES-P0-1)', () => {
     it('installs bot.catch handler during construction', () => {

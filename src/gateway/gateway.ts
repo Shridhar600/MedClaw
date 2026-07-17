@@ -37,6 +37,10 @@ const EMERGENCY_RESPONSE =
   'This may be an emergency. Please contact local emergency services now or go to the nearest emergency department. If you can, ask someone nearby to stay with you while you get help.';
 const UNRECOGNIZED_CHAT_RESPONSE =
   'This chat is not recognized. This is a private health assistant; new chats cannot be added over this channel.';
+// PROD-P1-6: an empty or whitespace-only text message with no media gets a
+// short canned reply — no agent run, no session write. Matches the test-cli's
+// existing empty-input guard so the dev web UI exercises the same boundary.
+const EMPTY_MESSAGE_RESPONSE = "I didn't catch any message. Send some text or an attachment and I'll take a look.";
 
 export class Gateway {
   private config: AppConfig;
@@ -190,6 +194,12 @@ export class Gateway {
   }
 
   async handleTestMessage(chatId: string, text: string): Promise<string> {
+    // PROD-P1-6: empty/whitespace-only text → short canned reply, no agent run,
+    // no session write (mirrors the channel path in handleMessage).
+    if (text.trim().length === 0) {
+      return EMPTY_MESSAGE_RESPONSE;
+    }
+
     const profileId = this.getProfileForChat(chatId);
     if (profileId === null) {
       // Refused chats still get emergency guidance (medical-safety rule; the
@@ -231,6 +241,18 @@ export class Gateway {
     console.log(
       `[gateway] Message from ${chatId}: ${text.length} chars${incoming.mediaPath ? ', media attached' : ''}`,
     );
+
+    // PROD-P1-6: empty/whitespace-only text with no media → short canned reply,
+    // no agent run, no session write. A media upload with empty caption still
+    // flows through the normal agent path below.
+    if (text.trim().length === 0 && !incoming.mediaPath && !incoming.mediaError) {
+      try {
+        await this.channel!.send(chatId, { text: EMPTY_MESSAGE_RESPONSE });
+      } catch (e) {
+        console.error('[gateway] Failed to send empty-message response:', summarizeErrorForLog(e));
+      }
+      return;
+    }
 
     const profileId = this.getProfileForChat(chatId);
     if (profileId === null) {

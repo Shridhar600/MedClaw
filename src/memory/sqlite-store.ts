@@ -301,7 +301,8 @@ export class SqliteStore {
         endLine: r.end_line,
       }));
     } catch (e) {
-      console.warn('[sqlite-store] Vector search error:', e);
+      // Vector search error object can echo the query embedding/content — sanitized frame only.
+      console.warn('[sqlite-store] Vector search error:', summarizeErrorForLog(e));
       return [];
     }
   }
@@ -351,7 +352,8 @@ export class SqliteStore {
       this.db.prepare("DELETE FROM chunks_vec0 WHERE chunk_id = ?").run(chunkId);
       this.db.prepare("INSERT INTO chunks_vec0(chunk_id, embedding) VALUES (?, ?)").run(chunkId, serializeFloat32(new Float32Array(embedding)));
     } catch (e) {
-      console.warn(`[sqlite-store] Failed to insert vec0 for ${chunkId}:`, e);
+      // vec0 insert error object can echo chunk content — sanitized frame only.
+      console.warn(`[sqlite-store] Failed to insert vec0 for ${chunkId}:`, summarizeErrorForLog(e));
     }
   }
 

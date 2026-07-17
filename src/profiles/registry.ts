@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID, createHash } from 'crypto';
-import { secureMkdir, secureWrite, secureCopyFile, secureChmodTree, tightenFile } from '../security';
+import { secureMkdir, secureWrite, secureCopyFile, secureChmodTree, tightenFile, summarizeErrorForLog } from '../security';
 import type { ProfileId, ProfileMeta } from './types';
 
 interface RegistryData {
@@ -113,7 +113,8 @@ export class ProfileRegistry {
           // before hardening could still be loose — re-tighten defensively.
           secureChmodTree(trashPath);
         } catch (err) {
-          console.error(`[profiles] Failed to move ${profileId} to .trash:`, err);
+          // fs error objects can carry the profile path (PHI-context recon) — sanitized frame only.
+          console.error(`[profiles] Failed to move ${profileId} to .trash:`, summarizeErrorForLog(err));
         }
       }
     }
@@ -325,7 +326,8 @@ export class ProfileRegistry {
       fs.renameSync(this.filePath, quarantinedPath);
       tightenFile(quarantinedPath);
     } catch (qerr) {
-      console.error(`[profiles] Failed to quarantine corrupt file:`, qerr);
+      // Quarantine (fs rename) error — sanitized frame only.
+      console.error(`[profiles] Failed to quarantine corrupt file:`, summarizeErrorForLog(qerr));
     }
     this.cache = { data: { profiles: [] }, mtimeMs: 0 };
     return { profiles: [] };
@@ -352,7 +354,8 @@ export class ProfileRegistry {
       secureWrite(sentinelPath, '');
       return sentinelPath;
     } catch (err) {
-      console.error(`[profiles] Failed to write migration sentinel:`, err);
+      // Sentinel (fs) write error — sanitized frame only.
+      console.error(`[profiles] Failed to write migration sentinel:`, summarizeErrorForLog(err));
       return null;
     }
   }

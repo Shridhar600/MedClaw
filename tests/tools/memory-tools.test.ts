@@ -137,5 +137,45 @@ describe('Memory Tools', () => {
       });
       expect(second.isError).toBeFalsy();
     });
+
+    // SEC-M2b: the exact review exploit — a credential is smuggled across two
+    // appends. Append 1 writes the label plus >8192 chars of '#' padding (no
+    // value, so the tail-window pre-scan sees no credential). Append 2 writes
+    // the value; the 8K tail window now contains only padding + value (label
+    // pushed out), so the pre-scan passes — but the assembled file reconstructs
+    // the credential. The fix re-reads the ENTIRE file after the append and, on
+    // match, rolls the append back to the pre-append content and rejects.
+    it('rejects the split-append exploit (label + >8192 # padding, then value) and restores the file', async () => {
+      const tool = tools.find(t => t.name === 'memory_write')!;
+
+      // Append 1: label + 8200 '#' padding. Not yet a credential.
+      const first = await tool.execute({
+        path: 'split.md',
+        content: 'api_key = ' + '#'.repeat(8200),
+        mode: 'append',
+      });
+      expect(first.isError).toBeFalsy();
+
+      const afterFirst = await engine.readFile('split.md');
+      expect(afterFirst).toContain('api_key =');
+      expect(afterFirst).not.toContain('abcdefghijklmnopqrstuvwxyz123456');
+
+      // Append 2: the value. The pre-scan sees only padding + value (no label)
+      // so it passes — but the post-write full re-scan catches the assembled
+      // credential, rolls the append back, and rejects.
+      const second = await tool.execute({
+        path: 'split.md',
+        content: 'abcdefghijklmnopqrstuvwxyz123456',
+        mode: 'append',
+      });
+      expect(second.isError).toBe(true);
+      expect(second.content[0].text).toContain('credential');
+
+      // The append was rolled back: the file content is unchanged from after
+      // the first append (the value is NOT on disk).
+      const afterSecond = await engine.readFile('split.md');
+      expect(afterSecond).toBe(afterFirst);
+      expect(afterSecond).not.toContain('abcdefghijklmnopqrstuvwxyz123456');
+    });
   });
 });

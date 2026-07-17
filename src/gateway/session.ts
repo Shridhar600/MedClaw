@@ -219,7 +219,8 @@ export class SessionManager {
           await this.toolRegistry.execute(flushResponse.toolCall.name, flushResponse.toolCall.arguments);
         }
       } catch (e) {
-        console.warn('[session] Flush turn failed:', e);
+        // Provider error messages can echo transcript PHI — sanitized frame only.
+        console.warn('[session] Flush turn failed:', summarizeErrorForLog(e));
       }
     }
 
@@ -252,7 +253,8 @@ Keep it concise and structured.`;
       await this.persistHistory(chatId, newHistory);
       session.history = newHistory;
     } catch (e) {
-      console.warn('[session] Compact turn failed:', e);
+      // Provider error messages can echo transcript PHI — sanitized frame only.
+      console.warn('[session] Compact turn failed:', summarizeErrorForLog(e));
       // Fallback: keep the recent turns. Persist FIRST, then assign — so a
       // crash during this fallback cannot leave in-memory state diverged from
       // disk. If even this persist fails, leave session.history unchanged and

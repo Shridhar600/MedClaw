@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { rotateFileIfNeeded } from './rotation';
-import { secureMkdir, secureAppend } from '../security';
+import { secureMkdir, secureAppend, summarizeErrorForLog } from '../security';
 import type {
   SchedulerAuditEvent,
   SchedulerAuditEventInput,
@@ -39,8 +39,10 @@ export class SchedulerAuditLog {
       try {
         rotateFileIfNeeded(this.filePath);
       } catch (error) {
-        // Rotation failures must never prevent the append itself.
-        console.warn('[audit-log] rotation check failed, continuing without rotation:', error);
+        // Rotation failures must never prevent the append itself. Sanitize the
+        // error frame (defense-in-depth: review noted this path as unreachable
+        // in practice, but the raw-object log was a PHI-leak surface).
+        console.warn('[audit-log] rotation check failed, continuing without rotation:', summarizeErrorForLog(error));
       }
     }
 

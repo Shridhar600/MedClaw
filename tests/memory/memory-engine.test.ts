@@ -61,6 +61,21 @@ describe('MemoryEngine', () => {
     await expect(engine.writeFile('../outside.txt', 'bad')).rejects.toThrow('Path traversal');
   });
 
+  // SEC-m1: absolute paths are explicitly rejected (defense-in-depth). path.join
+  // would otherwise normalize them inside the workspace, which is safe but
+  // surprising — callers expect absolute paths to be refused.
+  it('rejects reading an absolute path with a clear error', async () => {
+    await expect(engine.readFile('/etc/passwd')).rejects.toThrow('Absolute paths are not allowed');
+  });
+
+  it('rejects writing an absolute path with a clear error', async () => {
+    await expect(engine.writeFile('/etc/passwd', 'bad')).rejects.toThrow('Absolute paths are not allowed');
+  });
+
+  it('rejects appending an absolute path with a clear error', async () => {
+    await expect(engine.appendToFile('/etc/passwd', 'bad')).rejects.toThrow('Absolute paths are not allowed');
+  });
+
   describe('symlink guard (TOCTOU)', () => {
     it('rejects read through a symlink pointing outside workspace', async () => {
       const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-outside-'));

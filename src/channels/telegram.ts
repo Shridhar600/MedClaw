@@ -83,7 +83,11 @@ export class TelegramChannel implements Channel {
             : undefined,
         });
       } catch (e) {
-        console.error('[telegram] Handler error:', e);
+        // Handler errors propagate PHI-bearing user text through grammY's error
+        // boundary — log the sanitized frame only here (the boundary at
+        // construction also sanitizes). Token redaction is retained for the
+        // download-error logs below; handler errors carry no token URL.
+        console.error('[telegram] Handler error:', summarizeErrorForLog(e));
         throw e; // allow grammY to retry
       }
     });
@@ -116,7 +120,7 @@ export class TelegramChannel implements Channel {
             : undefined,
         });
       } catch (e) {
-        console.error('[telegram] Handler error:', e);
+        console.error('[telegram] Handler error:', summarizeErrorForLog(e));
         throw e; // allow grammY to retry
       }
     });
@@ -148,7 +152,7 @@ export class TelegramChannel implements Channel {
             : undefined,
         });
       } catch (e) {
-        console.error('[telegram] Handler error:', e);
+        console.error('[telegram] Handler error:', summarizeErrorForLog(e));
         throw e;
       }
     });

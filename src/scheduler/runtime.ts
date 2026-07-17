@@ -347,7 +347,8 @@ export class HeartbeatScheduler {
       await this.store.update(job.id, { enabled: false });
       await this.store.markError(job.id, message);
     } catch (updateError) {
-      console.error(`[scheduler] Failed to disable invalid heartbeat job (${job.id}):`, updateError);
+      // Storage update error — raw object could echo PHI context; sanitized frame only.
+      console.error(`[scheduler] Failed to disable invalid heartbeat job (${job.id}):`, summarizeErrorForLog(updateError));
     }
   }
 

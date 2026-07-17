@@ -4,6 +4,7 @@ import * as crypto from 'crypto';
 import type { LLMProvider } from '../providers/types';
 import type { SqliteStore } from './sqlite-store';
 import type { Chunk } from './types';
+import { summarizeErrorForLog } from '../security';
 
 const CHUNK_SIZE_TOKENS = 400;
 const OVERLAP_TOKENS = 80;
@@ -75,7 +76,8 @@ export class MemoryIndexer {
       try {
         chunk.embedding = await this.embeddingProvider.embed(chunk.content);
       } catch (e) {
-        console.warn(`[indexer] Failed to embed chunk ${chunk.id}:`, e);
+        // Embed failure messages can echo chunk PHI — sanitized frame only.
+        console.warn(`[indexer] Failed to embed chunk ${chunk.id}:`, summarizeErrorForLog(e));
         hadEmbeddingFailure = true;
       }
       preparedChunks.push(chunk);
