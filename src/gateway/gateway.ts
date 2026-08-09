@@ -212,6 +212,13 @@ export class Gateway {
       return this.buildBootStatusText();
     }
 
+    // forka #4: /new must reset the session here too (parity with the channel
+    // path in handleMessage). Previously it fell through to the agent loop.
+    if (text.trim() === '/new') {
+      await this.sessions!.resetSession(chatId);
+      return 'Starting fresh session. Your health memory is preserved.';
+    }
+
     const emergency = this.handleEmergencyInput(text);
     if (emergency) {
       await this.sessions?.recordTurn(chatId, [

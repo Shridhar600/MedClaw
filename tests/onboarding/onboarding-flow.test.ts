@@ -17,6 +17,40 @@ describe('OnboardingFlow', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
+  // forka #5: timezone answer validation — never store a raw phrase as the zone.
+  async function driveToTimezone(flow: OnboardingFlow, tzAnswer: string): Promise<string> {
+    await flow.handle('hello');   // -> name prompt
+    await flow.handle('Arjun');   // -> age prompt
+    await flow.handle('31');      // -> timezone prompt
+    await flow.handle(tzAnswer);  // timezone step
+    const store = new OnboardingStore(tmpDir);
+    return (await store.load()).answers.timezone ?? '';
+  }
+
+  it('recovers a valid IANA zone from a phrase answer (forka #5)', async () => {
+    const store = new OnboardingStore(tmpDir);
+    const flow = new OnboardingFlow(store, tmpDir, 'Asia/Kolkata');
+    expect(await driveToTimezone(flow, 'yes America/New_York is right')).toBe('America/New_York');
+  });
+
+  it('keeps the default timezone on an affirmative answer (forka #5)', async () => {
+    const store = new OnboardingStore(tmpDir);
+    const flow = new OnboardingFlow(store, tmpDir, 'Asia/Kolkata');
+    expect(await driveToTimezone(flow, 'yes')).toBe('Asia/Kolkata');
+  });
+
+  it('keeps the default when the answer has no valid zone (forka #5)', async () => {
+    const store = new OnboardingStore(tmpDir);
+    const flow = new OnboardingFlow(store, tmpDir, 'Asia/Kolkata');
+    expect(await driveToTimezone(flow, 'sounds good to me')).toBe('Asia/Kolkata');
+  });
+
+  it('accepts a bare valid IANA zone (forka #5)', async () => {
+    const store = new OnboardingStore(tmpDir);
+    const flow = new OnboardingFlow(store, tmpDir, 'Asia/Kolkata');
+    expect(await driveToTimezone(flow, 'Europe/London')).toBe('Europe/London');
+  });
+
   it('starts with disclaimer and persists restart-safe step progress', async () => {
     const store = new OnboardingStore(tmpDir);
     const flow = new OnboardingFlow(store, tmpDir, 'Asia/Kolkata');

@@ -253,6 +253,19 @@ describe('Gateway chat→profile pairing', () => {
     expect(defaultProfile!.chatIds).toContain('brand-new-chat');
   });
 
+  it('/new resets the session via handleTestMessage without running the agent (forka #4)', async () => {
+    const config = makeConfig(tmpDir);
+    const { gateway, sessions } = buildGatewayWithRegistry(config);
+    const resetSpy = jest.spyOn(sessions, 'resetSession').mockResolvedValue(undefined);
+
+    const reply = await gateway.handleTestMessage('owner-chat', '/new');
+
+    expect(reply).toBe('Starting fresh session. Your health memory is preserved.');
+    expect(resetSpy).toHaveBeenCalledWith('owner-chat');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((gateway as any).agentLoop.run).not.toHaveBeenCalled();
+  });
+
   it('refuses an unknown chat once another chat is already paired (auto-pair closes)', async () => {
     const config = makeConfig(tmpDir);
     const { gateway } = buildGatewayWithRegistry(config);

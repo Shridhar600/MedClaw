@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { loadConfig } from '../../src/config/config';
 import { validateConfig } from '../../src/config/validation';
-import { modelDefaultsForProvider, runServiceOnboarding, startDaemon } from '../../src/cli/service-onboarding';
+import { buildConfigFromArgs, modelDefaultsForProvider, runServiceOnboarding, startDaemon } from '../../src/cli/service-onboarding';
 
 describe('service onboarding init', () => {
   let tmpDir: string;
@@ -308,19 +308,46 @@ describe('service onboarding init', () => {
     expect(config.providers.main.model).toBe('gpt-4o-mini');
     expect(config.providers.main.apiKey).toBe('sk-test-secret');
     expect(config.providers.main.baseUrl).toBeUndefined();
-    expect(config.providers.medical.baseUrl).toBeUndefined();
+    // forka #11: medical defaults to on-device Ollama medgemma even when main is
+    // cloud, so it has an Ollama baseUrl (not undefined).
+    expect(config.providers.medical.type).toBe('ollama');
+    expect(config.providers.medical.baseUrl).toBe('http://localhost:11434/v1');
     expect(config.providers.embeddings.baseUrl).toBeUndefined();
   });
 
-  it('uses cloud defaults for anthropic and google instead of Ollama defaults', () => {
+  it('medical defaults to on-device medgemma even when main is OpenAI (forka #11)', () => {
+    const config = buildConfigFromArgs({ provider: 'openai', apiKey: 'sk-x', configPath: '/tmp/forka11/config.json' });
+    expect(config.providers.main.type).toBe('openai');
+    expect(config.providers.medical).toEqual({
+      type: 'ollama',
+      model: 'aadide/medgemma-1.5-4b-it-Q4_K_S:latest',
+      baseUrl: 'http://localhost:11434/v1',
+    });
+  });
+
+  it('opt-out: --medical-provider routes the medical model to the cloud (forka #11)', () => {
+    const config = buildConfigFromArgs({
+      provider: 'openai',
+      apiKey: 'sk-x',
+      medicalProvider: 'openai',
+      medicalModel: 'gpt-4o',
+      configPath: '/tmp/forka11b/config.json',
+    });
+    expect(config.providers.medical.type).toBe('openai');
+    expect(config.providers.medical.model).toBe('gpt-4o');
+    expect(config.providers.medical.apiKey).toBe('sk-x');
+  });
+
+  it('uses cloud defaults for anthropic and google but medical stays on-device medgemma (forka #11)', () => {
+    const medgemma = 'aadide/medgemma-1.5-4b-it-Q4_K_S:latest';
     expect(modelDefaultsForProvider('anthropic')).toEqual({
       main: 'gpt-4o-mini',
-      medical: 'gpt-4o-mini',
+      medical: medgemma,
       embeddings: 'text-embedding-3-small',
     });
     expect(modelDefaultsForProvider('google')).toEqual({
       main: 'gpt-4o-mini',
-      medical: 'gpt-4o-mini',
+      medical: medgemma,
       embeddings: 'text-embedding-3-small',
     });
   });
@@ -378,10 +405,11 @@ describe('service onboarding init', () => {
         model: 'gpt-4o-mini',
         apiKey: 'sk-interactive-secret',
       });
+      // forka #11: medical defaults to on-device Ollama medgemma, NOT the cloud provider.
       expect(config.providers.medical).toEqual({
-        type: 'openai',
-        model: 'gpt-4o-mini',
-        apiKey: 'sk-interactive-secret',
+        type: 'ollama',
+        model: 'aadide/medgemma-1.5-4b-it-Q4_K_S:latest',
+        baseUrl: 'http://localhost:11434/v1',
       });
       expect(config.providers.embeddings).toEqual({
         type: 'openai',
@@ -441,10 +469,11 @@ describe('service onboarding init', () => {
         model: 'gpt-4o-mini',
         apiKey: 'sk-prefilled-secret',
       });
+      // forka #11: medical defaults to on-device Ollama medgemma, NOT the cloud provider.
       expect(config.providers.medical).toEqual({
-        type: 'openai',
-        model: 'gpt-4o-mini',
-        apiKey: 'sk-prefilled-secret',
+        type: 'ollama',
+        model: 'aadide/medgemma-1.5-4b-it-Q4_K_S:latest',
+        baseUrl: 'http://localhost:11434/v1',
       });
       expect(config.providers.embeddings).toEqual({
         type: 'openai',

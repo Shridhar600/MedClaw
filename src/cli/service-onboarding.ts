@@ -20,6 +20,10 @@ export interface ServiceOnboardingArgs {
   provider?: ProviderConfig['type'];
   mainModel?: string;
   medicalModel?: string;
+  // forka #11: the medical model resolves INDEPENDENTLY of the main provider and
+  // defaults to on-device Ollama medgemma (privacy + health-specialized). Set
+  // --medical-provider to opt into a cloud medical model.
+  medicalProvider?: ProviderConfig['type'];
   embeddingModel?: string;
   ollamaUrl?: string;
   apiKey?: string;
@@ -90,6 +94,10 @@ function parseArgs(argv: string[]): ServiceOnboardingArgs {
         args.medicalModel = next;
         index += 1;
         break;
+      case '--medical-provider':
+        args.medicalProvider = next as ProviderConfig['type'];
+        index += 1;
+        break;
       case '--embedding-model':
         args.embeddingModel = next;
         index += 1;
@@ -130,50 +138,67 @@ function ensureParent(filePath: string): void {
   secureMkdir(path.dirname(filePath));
 }
 
+// forka #11: the default on-device medical model + Ollama URL, used whenever the
+// medical provider resolves to Ollama (which is the default, independent of the
+// main provider).
+const ONDEVICE_OLLAMA_URL = 'http://localhost:11434/v1';
+function defaultMedgemmaModel(): string {
+  return getDefaultConfig().providers.medical.model;
+}
+
 function applyProvider(
   config: AppConfig,
   providerType: ProviderConfig['type'],
   args: ServiceOnboardingArgs,
 ): void {
+  const ollamaUrl = args.ollamaUrl ?? config.providers.main.baseUrl ?? ONDEVICE_OLLAMA_URL;
+  const apiKey = args.apiKey?.trim() ? args.apiKey.trim() : undefined;
+
+  // Main + embeddings follow the chosen provider.
   if (providerType === 'ollama') {
-    const baseUrl = args.ollamaUrl ?? config.providers.main.baseUrl;
     config.providers.main = {
       type: 'ollama',
       model: args.mainModel ?? config.providers.main.model,
-      baseUrl,
-    };
-    config.providers.medical = {
-      type: 'ollama',
-      model: args.medicalModel ?? config.providers.medical.model,
-      baseUrl,
+      baseUrl: ollamaUrl,
     };
     config.providers.embeddings = {
       type: 'ollama',
       model: args.embeddingModel ?? config.providers.embeddings.model,
-      baseUrl,
+      baseUrl: ollamaUrl,
     };
-    return;
+  } else {
+    config.providers.main = {
+      type: providerType,
+      model: args.mainModel ?? 'gpt-4o-mini',
+      ...(args.ollamaUrl ? { baseUrl: args.ollamaUrl } : {}),
+      ...(apiKey ? { apiKey } : {}),
+    };
+    config.providers.embeddings = {
+      type: providerType,
+      model: args.embeddingModel ?? 'text-embedding-3-small',
+      ...(args.ollamaUrl ? { baseUrl: args.ollamaUrl } : {}),
+      ...(apiKey ? { apiKey } : {}),
+    };
   }
 
-  const apiKey = args.apiKey?.trim() ? args.apiKey.trim() : undefined;
-  config.providers.main = {
-    type: providerType,
-    model: args.mainModel ?? 'gpt-4o-mini',
-    ...(args.ollamaUrl ? { baseUrl: args.ollamaUrl } : {}),
-    ...(apiKey ? { apiKey } : {}),
-  };
-  config.providers.medical = {
-    type: providerType,
-    model: args.medicalModel ?? 'gpt-4o-mini',
-    ...(args.ollamaUrl ? { baseUrl: args.ollamaUrl } : {}),
-    ...(apiKey ? { apiKey } : {}),
-  };
-  config.providers.embeddings = {
-    type: providerType,
-    model: args.embeddingModel ?? 'text-embedding-3-small',
-    ...(args.ollamaUrl ? { baseUrl: args.ollamaUrl } : {}),
-    ...(apiKey ? { apiKey } : {}),
-  };
+  // forka #11: medical resolves INDEPENDENTLY of the main provider and defaults
+  // to on-device Ollama medgemma — the health-specialized model, kept local for
+  // the core privacy promise. Opt out with --medical-provider (+ --medical-model).
+  const medicalType = args.medicalProvider ?? 'ollama';
+  if (medicalType === 'ollama') {
+    config.providers.medical = {
+      type: 'ollama',
+      model: args.medicalModel ?? defaultMedgemmaModel(),
+      baseUrl: args.ollamaUrl ?? ONDEVICE_OLLAMA_URL,
+    };
+  } else {
+    config.providers.medical = {
+      type: medicalType,
+      model: args.medicalModel ?? 'gpt-4o-mini',
+      ...(args.ollamaUrl ? { baseUrl: args.ollamaUrl } : {}),
+      ...(apiKey ? { apiKey } : {}),
+    };
+  }
 }
 
 export function requiredCloudEnv(providerType: ProviderConfig['type']): string {
@@ -185,10 +210,13 @@ export function modelDefaultsForProvider(providerType: ProviderConfig['type']): 
   medical: string;
   embeddings: string;
 } {
+  // forka #11: medical defaults to on-device medgemma independent of the main
+  // provider, so it is the same for cloud and Ollama here.
+  const medical = getDefaultConfig().providers.medical.model;
   if (providerType === 'openai' || providerType === 'anthropic' || providerType === 'google') {
     return {
       main: 'gpt-4o-mini',
-      medical: 'gpt-4o-mini',
+      medical,
       embeddings: 'text-embedding-3-small',
     };
   }
@@ -196,7 +224,7 @@ export function modelDefaultsForProvider(providerType: ProviderConfig['type']): 
   const defaults = getDefaultConfig();
   return {
     main: defaults.providers.main.model,
-    medical: defaults.providers.medical.model,
+    medical,
     embeddings: defaults.providers.embeddings.model,
   };
 }
@@ -403,7 +431,22 @@ export function startDaemon(
       child.unref?.();
 
       timer = setTimeout(() => {
-        finish(true, `MedClaw started${child.pid ? ` (pid ${child.pid})` : ''}.`);
+        // forka #9: the daemon is detached (its own process group), so Ctrl-C in
+        // this wizard does NOT stop it. Write a pid file next to the config and
+        // tell the user exactly how to stop it, so a detached start is not a
+        // surprise.
+        let stopHint = '';
+        if (child.pid) {
+          const pidPath = path.join(path.dirname(configPath), 'redacted.pid');
+          try {
+            fs.writeFileSync(pidPath, `${child.pid}\n`, { mode: 0o600 });
+            fs.chmodSync(pidPath, 0o600);
+          } catch {
+            // best-effort; the stop hint below still works without the file
+          }
+          stopHint = ` It runs in the background — to stop it: kill ${child.pid}`;
+        }
+        finish(true, `MedClaw started${child.pid ? ` (pid ${child.pid})` : ''}.${stopHint}`);
       }, dependencies.startupWindowMs ?? 3000);
 
       child.on('error', (error: unknown) => {

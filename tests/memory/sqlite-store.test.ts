@@ -47,6 +47,18 @@ describe('SqliteStore', () => {
     expect(results.length).toBeGreaterThan(0);
     expect(results[0].path).toBe('a.md');
   });
+
+  it('creates search.db 0600, not world-readable (forka #2)', () => {
+    const dbPath = path.join(tmpDir, 'test.db');
+    store.upsertChunk({ id: 'z.md:0', path: 'z.md', content: 'PHI chunk content', embedding: [1, 0, 0], startLine: 1, endLine: 1 });
+    expect(fs.statSync(dbPath).mode & 0o777).toBe(0o600);
+    // WAL/SHM siblings (if present) must also be 0600 — no world-readable PHI.
+    for (const sib of [`${dbPath}-wal`, `${dbPath}-shm`]) {
+      if (fs.existsSync(sib)) {
+        expect(fs.statSync(sib).mode & 0o777).toBe(0o600);
+      }
+    }
+  });
 });
 
 // ── RES-P0-3: corrupt DB quarantine + fresh rebuild ──────────────────────

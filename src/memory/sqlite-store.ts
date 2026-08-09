@@ -47,6 +47,7 @@ export class SqliteStore {
       this.db = db;
       this.tryLoadVec(db);
       this.init();
+      this.hardenDbFiles(dbPath);
       return;
     } catch (e) {
       // Identify a SQLite corruption-class error in an identity-stable way.
@@ -97,6 +98,7 @@ export class SqliteStore {
           this.db = db;
           this.tryLoadVec(db);
           this.init();
+          this.hardenDbFiles(dbPath);
           return;
         } catch (reopenError) {
           lastReopenError = reopenError;
@@ -107,6 +109,16 @@ export class SqliteStore {
         }
       }
       throw lastReopenError;
+    }
+  }
+
+  // forka #2: better-sqlite3 creates search.db (and its -wal/-shm siblings)
+  // with default 0644 — world-readable PHI chunk content, bypassing secure-fs.
+  // Tighten all three to 0600 after open+init. The parent dir is already 0700,
+  // so this closes the last loose PHI file in the tree. Warn-and-continue.
+  private hardenDbFiles(dbPath: string): void {
+    for (const candidate of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+      tightenFile(candidate);
     }
   }
 
