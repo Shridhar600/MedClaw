@@ -3,6 +3,23 @@ import OpenAI from 'openai';
 import type { ImageAttachment, LLMProvider, LLMResponse, Message, ToolSchema } from './types';
 import type { ProviderConfig } from '../config/types';
 
+// OpenAI reasoning-class models (gpt-5 family, o1/o3/o4 families) reject
+// function tools on /v1/chat/completions unless reasoning_effort is 'none'
+// (otherwise: "Function tools with reasoning_effort are not supported ...
+// use /v1/responses or set reasoning_effort to 'none'"). The agent loop always
+// sends tools, so without this every turn 400s. Detected by name; 'none' also
+// keeps latency low, which suits a tool-calling health agent. (A fuller move to
+// the /v1/responses API is a separate decision — see forka-test-report #13.)
+function isReasoningModel(model: string): boolean {
+  return /^(?:gpt-5|o[1-9])/i.test(model);
+}
+
+// The installed OpenAI SDK (4.104.0) types ReasoningEffort as
+// 'low'|'medium'|'high'|null and has not caught up to the 'none' value the API
+// now accepts, so apply it via a typed extension rather than a bare cast.
+type ChatParamsWithReasoning =
+  Omit<OpenAI.Chat.ChatCompletionCreateParamsNonStreaming, 'reasoning_effort'> & { reasoning_effort?: 'none' };
+
 function resolveProviderApiKey(config: ProviderConfig): string | undefined {
   if (config.apiKey?.trim()) {
     return config.apiKey;
@@ -43,6 +60,9 @@ export class OpenAIProvider implements LLMProvider {
     if (tools && tools.length > 0) {
       params.tools = tools as OpenAI.Chat.ChatCompletionTool[];
     }
+    if (isReasoningModel(this.model)) {
+      (params as ChatParamsWithReasoning).reasoning_effort = 'none';
+    }
 
     const completion = await this.client.chat.completions.create(params);
     const message = completion.choices[0].message;
@@ -79,10 +99,14 @@ export class OpenAIProvider implements LLMProvider {
       })),
     ];
 
-    const completion = await this.client.chat.completions.create({
+    const imageParams: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming = {
       model: this.model,
       messages: formattedMessages as OpenAI.Chat.ChatCompletionMessageParam[],
-    });
+    };
+    if (isReasoningModel(this.model)) {
+      (imageParams as ChatParamsWithReasoning).reasoning_effort = 'none';
+    }
+    const completion = await this.client.chat.completions.create(imageParams);
     const message = completion.choices[0].message;
 
     if (message.tool_calls && message.tool_calls.length > 0) {
