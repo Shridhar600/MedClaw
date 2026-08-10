@@ -27,8 +27,9 @@ import { reconcilePolicyJobs } from '../scheduler/reconciler';
 import { OnboardingFlow } from '../onboarding/flow';
 import { OnboardingStore } from '../onboarding/store';
 import { ensureWorkspaceBootstrap } from '../workspace/bootstrap';
-import { checkSystemReadiness } from '../providers/healthcheck';
+import { checkSystemReadiness, probeChatCompletion } from '../providers/healthcheck';
 import type { ReadinessResult } from '../providers/healthcheck';
+import type { LLMProvider } from '../providers/types';
 import { checkProviderBindAddresses, verifyWorkspacePermissions, summarizeErrorForLog, secureMkdir } from '../security';
 
 const EMERGENCY_PATTERN =
@@ -52,6 +53,7 @@ export class Gateway {
   private profileRegistry?: ProfileRegistry;
   private resolvedMemoryWorkspace?: string;
   private bootHealth?: { providers: ReadinessResult[]; telegram: ReadinessResult };
+  private mainProvider?: LLMProvider;
   private securityWarnings: string[] = [];
   private reconcileTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 
@@ -110,6 +112,7 @@ export class Gateway {
 
     // Providers
     const mainProvider = createProvider(config.providers.main);
+    this.mainProvider = mainProvider; // #3: kept for the boot completion probe.
 
     // Tools
     const registry = new ToolRegistry(config.tools);
@@ -592,18 +595,20 @@ export class Gateway {
   }
 
   private async resolveStartupPolicyChatId(): Promise<string | undefined> {
+    // F11: only READ which chat to reconcile heartbeat policies for — never
+    // auto-pair here. Auto-pair is a first-CONTACT bridge (getProfileForChat on
+    // a real inbound message). Consuming it at boot for a stale session/job
+    // chatId (e.g. pairing data lost, session JSONL survived) would permanently
+    // close pairing before the owner's first message — and could hand a
+    // leaked-token stranger the default profile. reconcileHeartbeatPolicies and
+    // handleScheduledJob use the chatId directly / re-check pairing themselves.
     const sessionChatId = this.sessions?.getMostRecentChatId();
     if (sessionChatId) {
-      this.getProfileForChat(sessionChatId);
       return sessionChatId;
     }
 
     const jobs = await this.scheduler!.listJobs();
-    const persistedChatId = jobs.find((job) => job.chatId !== '__startup__')?.chatId;
-    if (persistedChatId) {
-      this.getProfileForChat(persistedChatId);
-    }
-    return persistedChatId;
+    return jobs.find((job) => job.chatId !== '__startup__')?.chatId;
   }
 
   private buildAgentInput(incoming: IncomingMessage): string {
@@ -757,6 +762,11 @@ export class Gateway {
   private async runBootHealthchecks(): Promise<void> {
     try {
       const healthResults = await checkSystemReadiness(this.config, { allowNetworkChecks: true });
+      // #3: config/reachability checks alone over-report OK — a key-present but
+      // subscription-blocked or tool-incapable main model still shows "OK". Fold
+      // a real, tool-bearing completion probe into the main-provider entry so
+      // /status reflects whether the model actually answers.
+      await this.probeMainCompletionInto(healthResults);
       this.bootHealth = healthResults;
       const allReady = healthResults.providers.every((p) => p.ready) && healthResults.telegram.ready;
       if (!allReady) {
@@ -774,6 +784,42 @@ export class Gateway {
       }
     } catch (error) {
       console.warn('[gateway] Boot healthcheck failed:', summarizeErrorForLog(error));
+    }
+  }
+
+  // #3: run the live completion probe on the MAIN provider only (it is the one
+  // that must support tool calling) and fold the result into its readiness
+  // entry. Skips when the config-level check already failed the main provider
+  // (nothing to probe) or the provider is unavailable. Never throws.
+  private async probeMainCompletionInto(
+    healthResults: { providers: ReadinessResult[]; telegram: ReadinessResult },
+  ): Promise<void> {
+    const idx = healthResults.providers.findIndex((p) => p.label === 'main provider');
+    if (idx < 0 || !this.mainProvider || !healthResults.providers[idx].ready) {
+      return;
+    }
+    const base = healthResults.providers[idx];
+    const completion = await probeChatCompletion(this.mainProvider, { label: 'main provider' });
+    if (!completion.ready) {
+      healthResults.providers[idx] = {
+        ...base,
+        ready: false,
+        status: 'fail',
+        details: [...base.details, ...completion.details],
+        reasonCode: completion.reasonCode,
+        actionHint: completion.actionHint,
+      };
+    } else if (completion.status === 'warn') {
+      healthResults.providers[idx] = {
+        ...base,
+        status: base.status === 'ok' ? 'warn' : base.status,
+        details: [...base.details, ...completion.details],
+        warnings: [...base.warnings, ...completion.warnings],
+        reasonCode: base.reasonCode ?? completion.reasonCode,
+        actionHint: base.actionHint ?? completion.actionHint,
+      };
+    } else {
+      healthResults.providers[idx] = { ...base, details: [...base.details, ...completion.details] };
     }
   }
 

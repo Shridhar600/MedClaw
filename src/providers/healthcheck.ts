@@ -1,5 +1,6 @@
 import type { AppConfig, ProviderConfig } from '../config/types';
 import { providerEnvVar } from '../config/provider-env';
+import type { LLMProvider, ToolSchema } from './types';
 
 export type ReadinessStatus = 'ok' | 'warn' | 'fail';
 
@@ -447,6 +448,91 @@ export async function checkTelegramReadiness(
   }
 
   return verifyTelegramToken(config.channels.telegram.botToken.trim(), options);
+}
+
+class ProbeTimeoutError extends Error {
+  constructor() {
+    super('completion probe timed out');
+    this.name = 'ProbeTimeoutError';
+  }
+}
+
+async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new ProbeTimeoutError()), ms);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// #3: config/reachability checks over-report OK — a key-present but
+// subscription-blocked, invalid, or tool-incapable model still looks "ready".
+// This makes ONE real, tool-bearing completion call and maps the outcome to a
+// ReadinessResult. It NEVER throws (a failed probe is a health signal, not a
+// crash) and NEVER surfaces the raw provider error (PHI posture — the reason is
+// a fixed string + reasonCode, the prompt carries no user content).
+export async function probeChatCompletion(
+  provider: Pick<LLMProvider, 'chat'>,
+  options: { timeoutMs?: number; label?: string } = {},
+): Promise<ReadinessResult> {
+  const label = options.label ?? 'main provider';
+  const timeoutMs = options.timeoutMs ?? 6000;
+  const probeTool: ToolSchema = {
+    type: 'function',
+    function: {
+      name: 'healthcheck_ack',
+      description: 'Acknowledge that the model is online and able to call tools.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  };
+
+  try {
+    const result = await withTimeout(
+      provider.chat(
+        [{ role: 'user', content: 'Health check: reply with a short acknowledgement.' }],
+        [probeTool],
+      ),
+      timeoutMs,
+    );
+    const toolVerified = result.type === 'tool_call';
+    return {
+      ready: true,
+      checked: true,
+      label,
+      status: 'ok',
+      details: [toolVerified ? 'live completion + tool-calling verified' : 'live completion verified'],
+      warnings: [],
+    };
+  } catch (error) {
+    if (error instanceof ProbeTimeoutError) {
+      return {
+        ready: true,
+        checked: true,
+        label,
+        status: 'warn',
+        details: ['live completion probe timed out'],
+        warnings: ['completion not verified within timeout'],
+        reasonCode: 'completion-timeout',
+        actionHint: 'The model was slow to respond; confirm it can complete requests.',
+      };
+    }
+    return {
+      ready: false,
+      checked: true,
+      label,
+      status: 'fail',
+      details: ['live completion request was rejected by the model'],
+      warnings: [],
+      reasonCode: 'completion-failed',
+      actionHint:
+        'The main model rejected a live tool-bearing request — check its subscription/API key and that it supports tool calling.',
+    };
+  }
 }
 
 export async function checkSystemReadiness(

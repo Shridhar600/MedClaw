@@ -11,8 +11,10 @@ jest.mock('../../src/memory/indexer', () => ({
 }));
 
 const mockCheckSystemReadiness = jest.fn();
+const mockProbeChatCompletion = jest.fn();
 jest.mock('../../src/providers/healthcheck', () => ({
   checkSystemReadiness: (...args: unknown[]) => mockCheckSystemReadiness(...args),
+  probeChatCompletion: (...args: unknown[]) => mockProbeChatCompletion(...args),
 }));
 
 const mockCheckProviderBindAddresses = jest.fn();
@@ -66,6 +68,13 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     mockVerifyWorkspacePermissions.mockReset();
     mockCheckProviderBindAddresses.mockReturnValue({ localhostOnly: true, warnings: [] });
     mockVerifyWorkspacePermissions.mockReturnValue({ secure: true, warnings: [] });
+    mockProbeChatCompletion.mockReset();
+    // Default: the live completion probe passes (isolates the config-check tests
+    // from the probe). Individual tests override it.
+    mockProbeChatCompletion.mockResolvedValue({
+      ready: true, checked: true, label: 'main provider', status: 'ok',
+      details: ['live completion verified'], warnings: [],
+    });
   });
 
   afterEach(() => {
@@ -129,6 +138,32 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
 
     const warnText = warn.mock.calls.flat().join('\n');
     expect(warnText).not.toContain('NOT ALL READY');
+
+    await gateway.stop();
+  });
+
+  it('#3: /status reflects a live completion failure even when config checks pass', async () => {
+    mockCheckSystemReadiness.mockResolvedValue(allReadyResult());
+    mockProbeChatCompletion.mockResolvedValue({
+      ready: false, checked: true, label: 'main provider', status: 'fail',
+      details: ['live completion request was rejected by the model'], warnings: [],
+      reasonCode: 'completion-failed', actionHint: 'Check subscription/API key.',
+    });
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    const gateway = new Gateway(makeConfig());
+
+    await gateway.start();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const bootHealth = (gateway as any).bootHealth;
+    const main = bootHealth.providers.find((p: ReadinessResult) => p.label === 'main provider');
+    expect(main.ready).toBe(false);
+    expect(main.reasonCode).toBe('completion-failed');
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const statusText = (gateway as any).buildBootStatusText();
+    expect(statusText).toContain('main provider: FAIL');
 
     await gateway.stop();
   });

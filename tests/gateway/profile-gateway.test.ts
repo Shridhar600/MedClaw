@@ -151,6 +151,30 @@ describe('Gateway chat→profile pairing', () => {
     expect(resolved!.profileId).toBe('default');
   });
 
+  it('F11: boot startup-policy resolution does NOT auto-pair a stale session chat', async () => {
+    const config = makeConfig(tmpDir);
+    const { gateway, registry, sessions } = buildGatewayWithRegistry(config);
+
+    // A persisted session exists for a chat that was NEVER paired (e.g. pairing
+    // data lost, session JSONL survived). getMostRecentChatId returns it.
+    await sessions.recordTurn('stale-chat', [
+      { role: 'user', content: 'old' },
+      { role: 'assistant', content: 'older' },
+    ]);
+    expect(registry.getProfileForChat('stale-chat')).toBeUndefined();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (gateway as any).resolveStartupPolicyChatId();
+
+    // The one-time first-contact auto-pair must NOT have been consumed at boot.
+    expect(registry.getProfileForChat('stale-chat')).toBeUndefined();
+
+    // The real owner's first inbound message can still claim the pairing.
+    await gateway.handleTestMessage('owner-chat', 'hi');
+    expect(registry.getProfileForChat('owner-chat')?.profileId).toBe('default');
+    expect(registry.getProfileForChat('stale-chat')).toBeUndefined();
+  });
+
   it('second message from the same chat reuses the pairing (no duplicate chatIds)', async () => {
     const config = makeConfig(tmpDir);
     const { gateway, registry } = buildGatewayWithRegistry(config);
