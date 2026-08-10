@@ -1,43 +1,374 @@
 import type { AppConfig, ProviderConfig } from '../config/types';
+import { providerEnvVar } from '../config/provider-env';
+import type { LLMProvider, ToolSchema } from './types';
+
+export type ReadinessStatus = 'ok' | 'warn' | 'fail';
 
 export interface ReadinessResult {
   ready: boolean;
   checked: boolean;
   label: string;
+  status: ReadinessStatus;
   details: string[];
   warnings: string[];
+  reasonCode?: string;
+  actionHint?: string;
 }
 
 export interface HealthcheckOptions {
   allowNetworkChecks?: boolean;
   timeoutMs?: number;
+  fetchImpl?: typeof fetch;
 }
 
-function safeUrl(value: string | undefined): string | undefined {
+export interface OllamaCatalogProbe {
+  checked: boolean;
+  reachable: boolean;
+  status: ReadinessStatus;
+  details: string[];
+  warnings: string[];
+  models: string[];
+  version?: string;
+  reasonCode?: string;
+  actionHint?: string;
+}
+
+interface JsonProbeResult {
+  ok: boolean;
+  status: number;
+  body?: unknown;
+  error?: string;
+}
+
+function getFetchImpl(options: HealthcheckOptions): typeof fetch | undefined {
+  return options.fetchImpl ?? (typeof fetch === 'function' ? fetch : undefined);
+}
+
+function safeUrl(value: string | undefined): URL | undefined {
   if (!value) return undefined;
   try {
-    return new URL(value).toString();
+    return new URL(value);
   } catch {
     return undefined;
   }
 }
 
-async function probeUrl(url: string, timeoutMs: number): Promise<boolean> {
-  if (typeof fetch !== 'function') {
-    return false;
+function deriveOllamaRoot(baseUrl: string): URL | undefined {
+  const parsed = safeUrl(baseUrl);
+  if (!parsed) {
+    return undefined;
   }
+  return new URL('/', parsed);
+}
+
+async function probeJson(url: string, options: HealthcheckOptions): Promise<JsonProbeResult> {
+  const fetchImpl = getFetchImpl(options);
+  if (!fetchImpl) {
+    return {
+      ok: false,
+      status: 0,
+      error: 'fetch unavailable',
+    };
+  }
+
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 1500);
     try {
-      const response = await fetch(url, { method: 'GET', signal: controller.signal });
-      return response.ok || response.status < 500;
+      const response = await fetchImpl(url, { method: 'GET', signal: controller.signal });
+      let body: unknown;
+      try {
+        body = await response.json();
+      } catch {
+        body = undefined;
+      }
+      return { ok: response.ok, status: response.status, body };
     } finally {
       clearTimeout(timeout);
     }
-  } catch {
-    return false;
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      error: redactTelegramTokens(error instanceof Error ? error.message : String(error)),
+    };
   }
+}
+
+function redactTelegramTokens(text: string): string {
+  return text.replace(/bot[^/\s]+/g, 'bot[REDACTED]');
+}
+
+function getOllamaModelNames(body: unknown): string[] {
+  if (!body || typeof body !== 'object') {
+    return [];
+  }
+
+  const models = (body as { models?: Array<{ name?: string }> }).models;
+  if (!Array.isArray(models)) {
+    return [];
+  }
+
+  return models
+    .map((model) => model?.name?.trim())
+    .filter((name): name is string => Boolean(name));
+}
+
+export async function probeOllamaCatalog(
+  baseUrl: string | undefined,
+  options: HealthcheckOptions = {},
+): Promise<OllamaCatalogProbe> {
+  const root = baseUrl ? deriveOllamaRoot(baseUrl) : undefined;
+  if (!root) {
+    return {
+      checked: false,
+      reachable: false,
+      status: 'fail',
+      details: ['invalid Ollama URL'],
+      warnings: [],
+      models: [],
+      reasonCode: 'invalid-url',
+      actionHint: 'Set a valid Ollama URL before continuing.',
+    };
+  }
+
+  const allowNetworkChecks = options.allowNetworkChecks ?? false;
+  if (!allowNetworkChecks) {
+    return {
+      checked: false,
+      reachable: false,
+      status: 'warn',
+      details: [`configured: ${root.toString().replace(/\/$/, '')}`],
+      warnings: ['network verification skipped'],
+      models: [],
+    };
+  }
+
+  const versionProbe = await probeJson(new URL('api/version', root).toString(), options);
+  const tagsProbe = await probeJson(new URL('api/tags', root).toString(), options);
+
+  if (versionProbe.error || tagsProbe.error) {
+    return {
+      checked: true,
+      reachable: false,
+      status: 'fail',
+      details: ['Ollama is not reachable'],
+      warnings: [],
+      models: [],
+      reasonCode: 'unreachable',
+      actionHint: 'Run `ollama serve` and retry.',
+    };
+  }
+
+  if (versionProbe.status === 404 || tagsProbe.status === 404) {
+    return {
+      checked: true,
+      reachable: false,
+      status: 'fail',
+      details: ['endpoint did not respond like Ollama'],
+      warnings: [],
+      models: [],
+      reasonCode: 'not-ollama',
+      actionHint: 'Check the Ollama URL and confirm the Ollama server is running.',
+    };
+  }
+
+  if (!versionProbe.ok || !tagsProbe.ok) {
+    return {
+      checked: true,
+      reachable: false,
+      status: 'fail',
+      details: [`unexpected response from Ollama (${tagsProbe.status || versionProbe.status})`],
+      warnings: [],
+      models: [],
+      reasonCode: 'bad-response',
+      actionHint: 'Check the Ollama server and configured URL.',
+    };
+  }
+
+  return {
+    checked: true,
+    reachable: true,
+    status: 'ok',
+    details: ['Ollama reachable'],
+    warnings: [],
+    models: getOllamaModelNames(tagsProbe.body),
+    version:
+      typeof versionProbe.body === 'object' &&
+      versionProbe.body !== null &&
+      'version' in versionProbe.body &&
+      typeof (versionProbe.body as { version?: unknown }).version === 'string'
+        ? (versionProbe.body as { version: string }).version
+        : undefined,
+  };
+}
+
+export async function verifyTelegramToken(
+  token: string,
+  options: HealthcheckOptions = {},
+): Promise<ReadinessResult> {
+  if (!token.trim()) {
+    return {
+      ready: false,
+      checked: false,
+      label: 'telegram',
+      status: 'fail',
+      details: ['missing bot token'],
+      warnings: [],
+      reasonCode: 'missing-token',
+      actionHint: 'Provide a Telegram bot token or disable Telegram.',
+    };
+  }
+
+  const allowNetworkChecks = options.allowNetworkChecks ?? false;
+  if (!allowNetworkChecks) {
+    return {
+      ready: true,
+      checked: false,
+      label: 'telegram',
+      status: 'warn',
+      details: ['token configured'],
+      warnings: ['verification skipped'],
+    };
+  }
+
+  const probe = await probeJson(`https://api.telegram.org/bot${token}/getMe`, options);
+  const body = probe.body as { ok?: boolean; description?: string; result?: { username?: string } } | undefined;
+
+  if (probe.error) {
+    return {
+      ready: true,
+      checked: true,
+      label: 'telegram',
+      status: 'warn',
+      details: ['token configured'],
+      warnings: ['network verification failed'],
+      reasonCode: 'network-error',
+      actionHint: 'Check your connection and retry Telegram verification.',
+    };
+  }
+
+  if (probe.status === 401 || body?.ok === false) {
+    const detail = body?.description?.trim() || 'token rejected by Telegram';
+    return {
+      ready: false,
+      checked: true,
+      label: 'telegram',
+      status: 'fail',
+      details: [redactTelegramTokens(detail)],
+      warnings: [],
+      reasonCode: 'invalid-token',
+      actionHint: 'Paste a valid Telegram bot token.',
+    };
+  }
+
+  if (!probe.ok || body?.ok !== true) {
+    return {
+      ready: true,
+      checked: true,
+      label: 'telegram',
+      status: 'warn',
+      details: ['token configured'],
+      warnings: ['verification returned an unexpected response'],
+      reasonCode: 'unexpected-response',
+      actionHint: 'Retry verification after checking the Telegram endpoint.',
+    };
+  }
+
+  const username = body.result?.username ? `@${body.result.username}` : 'bot verified';
+  return {
+    ready: true,
+    checked: true,
+    label: 'telegram',
+    status: 'ok',
+    details: [`verified: ${username}`],
+    warnings: [],
+  };
+}
+
+async function checkOllamaProviderReadiness(
+  label: string,
+  provider: ProviderConfig,
+  options: HealthcheckOptions = {},
+): Promise<ReadinessResult> {
+  const details: string[] = [];
+  const warnings: string[] = [];
+
+  if (!provider.model.trim()) {
+    return {
+      ready: false,
+      checked: false,
+      label,
+      status: 'fail',
+      details: ['missing model'],
+      warnings,
+      reasonCode: 'missing-model',
+      actionHint: 'Choose a model before continuing.',
+    };
+  }
+
+  if (!provider.baseUrl?.trim()) {
+    return {
+      ready: false,
+      checked: false,
+      label,
+      status: 'fail',
+      details: ['missing baseUrl'],
+      warnings,
+      reasonCode: 'missing-base-url',
+      actionHint: 'Provide an Ollama URL before continuing.',
+    };
+  }
+
+  const catalog = await probeOllamaCatalog(provider.baseUrl, options);
+  details.push(...catalog.details);
+  warnings.push(...catalog.warnings);
+
+  if (!catalog.checked) {
+    return {
+      ready: true,
+      checked: false,
+      label,
+      status: 'warn',
+      details: [...details, `model configured: ${provider.model}`],
+      warnings,
+    };
+  }
+
+  if (!catalog.reachable) {
+    return {
+      ready: false,
+      checked: catalog.checked,
+      label,
+      status: catalog.status,
+      details,
+      warnings,
+      reasonCode: catalog.reasonCode,
+      actionHint: catalog.actionHint,
+    };
+  }
+
+  if (!catalog.models.includes(provider.model)) {
+    return {
+      ready: false,
+      checked: catalog.checked,
+      label,
+      status: 'fail',
+      details: [...details, `model not installed: ${provider.model}`],
+      warnings,
+      reasonCode: 'missing-model',
+      actionHint: `Run \`ollama pull ${provider.model}\` and retry.`,
+    };
+  }
+
+  return {
+    ready: true,
+    checked: catalog.checked,
+    label,
+    status: warnings.length > 0 ? 'warn' : 'ok',
+    details: [...details, `model installed: ${provider.model}`],
+    warnings,
+  };
 }
 
 export async function checkProviderReadiness(
@@ -45,40 +376,58 @@ export async function checkProviderReadiness(
   provider: ProviderConfig,
   options: HealthcheckOptions = {},
 ): Promise<ReadinessResult> {
+  if (provider.type === 'ollama') {
+    return checkOllamaProviderReadiness(label, provider, options);
+  }
+
   const details: string[] = [];
   const warnings: string[] = [];
-  let ready = true;
 
   if (!provider.model.trim()) {
-    ready = false;
-    details.push('missing model');
+    return {
+      ready: false,
+      checked: false,
+      label,
+      status: 'fail',
+      details: ['missing model'],
+      warnings,
+      reasonCode: 'missing-model',
+      actionHint: 'Choose a model before continuing.',
+    };
   }
-  if (provider.type === 'ollama' && !provider.baseUrl?.trim()) {
-    ready = false;
-    details.push('missing baseUrl');
-  }
-  if (provider.type !== 'ollama' && !provider.apiKey?.trim()) {
+  const envVar = providerEnvVar(provider.type);
+  const hasApiKey = Boolean(provider.apiKey?.trim() || (envVar && process.env[envVar]?.trim()));
+  if (!hasApiKey) {
     warnings.push('apiKey is not configured');
+  } else {
+    details.push('api key configured');
   }
 
   const baseUrl = safeUrl(provider.baseUrl);
   const allowNetworkChecks = options.allowNetworkChecks ?? false;
-  if (allowNetworkChecks && baseUrl) {
-    const reachable = await probeUrl(baseUrl, options.timeoutMs ?? 1500);
-    if (!reachable) {
-      warnings.push('network probe skipped or failed');
-    }
-  } else if (allowNetworkChecks && provider.baseUrl && !baseUrl) {
-    warnings.push('baseUrl is not a valid URL');
-  } else {
-    warnings.push('network probe skipped');
+  if (allowNetworkChecks && provider.baseUrl && !baseUrl) {
+    return {
+      ready: false,
+      checked: true,
+      label,
+      status: 'fail',
+      details: ['baseUrl is not a valid URL'],
+      warnings,
+      reasonCode: 'invalid-url',
+      actionHint: 'Set a valid provider URL or leave it empty to use the default endpoint.',
+    };
+  }
+
+  if (!allowNetworkChecks) {
+    warnings.push('network verification skipped');
   }
 
   return {
-    ready,
+    ready: hasApiKey,
     checked: allowNetworkChecks,
     label,
-    details,
+    status: warnings.length > 0 ? 'warn' : 'ok',
+    details: details.length > 0 ? details : ['configured'],
     warnings,
   };
 }
@@ -87,41 +436,103 @@ export async function checkTelegramReadiness(
   config: AppConfig,
   options: HealthcheckOptions = {},
 ): Promise<ReadinessResult> {
-  const enabled = config.channels.telegram.enabled;
-  const token = config.channels.telegram.botToken.trim();
-  const details: string[] = [];
-  const warnings: string[] = [];
-  let ready = true;
-
-  if (!enabled) {
-    details.push('disabled');
-    return { ready: true, checked: false, label: 'telegram', details, warnings };
+  if (!config.channels.telegram.enabled) {
+    return {
+      ready: true,
+      checked: false,
+      label: 'telegram',
+      status: 'ok',
+      details: ['disabled'],
+      warnings: [],
+    };
   }
 
-  if (!token) {
-    ready = false;
-    details.push('missing bot token');
-    return { ready, checked: false, label: 'telegram', details, warnings };
-  }
+  return verifyTelegramToken(config.channels.telegram.botToken.trim(), options);
+}
 
-  const allowNetworkChecks = options.allowNetworkChecks ?? false;
-  if (allowNetworkChecks) {
-    const url = `https://api.telegram.org/bot${token}/getMe`;
-    const reachable = await probeUrl(url, options.timeoutMs ?? 1500);
-    if (!reachable) {
-      warnings.push('network probe skipped or failed');
-    }
-  } else {
-    warnings.push('network probe skipped');
+class ProbeTimeoutError extends Error {
+  constructor() {
+    super('completion probe timed out');
+    this.name = 'ProbeTimeoutError';
   }
+}
 
-  return {
-    ready,
-    checked: allowNetworkChecks,
-    label: 'telegram',
-    details,
-    warnings,
+async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new ProbeTimeoutError()), ms);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// #3: config/reachability checks over-report OK — a key-present but
+// subscription-blocked, invalid, or tool-incapable model still looks "ready".
+// This makes ONE real, tool-bearing completion call and maps the outcome to a
+// ReadinessResult. It NEVER throws (a failed probe is a health signal, not a
+// crash) and NEVER surfaces the raw provider error (PHI posture — the reason is
+// a fixed string + reasonCode, the prompt carries no user content).
+export async function probeChatCompletion(
+  provider: Pick<LLMProvider, 'chat'>,
+  options: { timeoutMs?: number; label?: string } = {},
+): Promise<ReadinessResult> {
+  const label = options.label ?? 'main provider';
+  const timeoutMs = options.timeoutMs ?? 6000;
+  const probeTool: ToolSchema = {
+    type: 'function',
+    function: {
+      name: 'healthcheck_ack',
+      description: 'Acknowledge that the model is online and able to call tools.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
   };
+
+  try {
+    const result = await withTimeout(
+      provider.chat(
+        [{ role: 'user', content: 'Health check: reply with a short acknowledgement.' }],
+        [probeTool],
+      ),
+      timeoutMs,
+    );
+    const toolVerified = result.type === 'tool_call';
+    return {
+      ready: true,
+      checked: true,
+      label,
+      status: 'ok',
+      details: [toolVerified ? 'live completion + tool-calling verified' : 'live completion verified'],
+      warnings: [],
+    };
+  } catch (error) {
+    if (error instanceof ProbeTimeoutError) {
+      return {
+        ready: true,
+        checked: true,
+        label,
+        status: 'warn',
+        details: ['live completion probe timed out'],
+        warnings: ['completion not verified within timeout'],
+        reasonCode: 'completion-timeout',
+        actionHint: 'The model was slow to respond; confirm it can complete requests.',
+      };
+    }
+    return {
+      ready: false,
+      checked: true,
+      label,
+      status: 'fail',
+      details: ['live completion request was rejected by the model'],
+      warnings: [],
+      reasonCode: 'completion-failed',
+      actionHint:
+        'The main model rejected a live tool-bearing request — check its subscription/API key and that it supports tool calling.',
+    };
+  }
 }
 
 export async function checkSystemReadiness(

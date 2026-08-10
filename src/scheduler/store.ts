@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
+import { secureMkdir, secureWriteViaTmp, tightenFile } from '../security';
 import type {
   CreateHeartbeatJobInput,
   HeartbeatJob,
@@ -9,7 +10,12 @@ import type {
 } from './types';
 
 export class HeartbeatStore {
-  constructor(private readonly filePath: string) {}
+  public lastCorruptionAt?: string;
+
+  constructor(
+    private readonly filePath: string,
+    private readonly profileId: string = 'default',
+  ) {}
 
   async list(): Promise<HeartbeatJob[]> {
     return this.readJobs();
@@ -146,8 +152,13 @@ export class HeartbeatStore {
       if (!Array.isArray(parsed)) {
         throw new Error('Heartbeat store payload must be an array.');
       }
+      this.lastCorruptionAt = undefined;
       return parsed.map((job) => this.normalizeJob(job));
     } catch (error) {
+      this.lastCorruptionAt = new Date().toISOString();
+      console.error(
+        `[scheduler] CORRUPTION DETECTED at ${this.lastCorruptionAt}`,
+      );
       const reason = error instanceof Error ? error.message : String(error);
       try {
         const quarantinedPath = this.quarantineCorruptFile();
@@ -165,16 +176,16 @@ export class HeartbeatStore {
   }
 
   private writeJobs(jobs: HeartbeatJob[]): void {
-    fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-    const tmpPath = `${this.filePath}.tmp`;
-    fs.writeFileSync(tmpPath, JSON.stringify(jobs, null, 2), 'utf8');
-    fs.renameSync(tmpPath, this.filePath);
+    secureWriteViaTmp(this.filePath, JSON.stringify(jobs, null, 2));
   }
 
   private quarantineCorruptFile(): string {
     const quarantinedPath = `${this.filePath}.corrupt-${Date.now()}`;
-    fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+    secureMkdir(path.dirname(this.filePath));
     fs.renameSync(this.filePath, quarantinedPath);
+    // The quarantined copy may inherit a loose mode; tighten so the corrupt
+    // PHI-bearing payload is not left world-readable.
+    tightenFile(quarantinedPath);
     return quarantinedPath;
   }
 

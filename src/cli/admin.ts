@@ -3,8 +3,11 @@ import * as path from 'path';
 import JSON5 from 'json5';
 import { getDefaultConfig, loadConfig, saveConfig } from '../config/config';
 import { redactConfig, validateConfig } from '../config/validation';
+import type { AppConfig } from '../config/types';
+import { providerEnvVar } from '../config/provider-env';
 import { HeartbeatStore } from '../scheduler/store';
 import { checkSystemReadiness } from '../providers/healthcheck';
+import type { ProviderConfig } from '../config/types';
 
 export interface AdminPaths {
   configPath?: string;
@@ -38,6 +41,11 @@ function formatLines(lines: string[]): string {
   return lines.filter((line) => line.length > 0).join('\n') + '\n';
 }
 
+function providerApiKeyConfigured(provider: ProviderConfig): boolean {
+  const envVar = providerEnvVar(provider.type);
+  return Boolean(provider.apiKey?.trim() || (envVar && process.env[envVar]?.trim()));
+}
+
 function parseConfigValue(raw: string): unknown {
   const trimmed = raw.trim();
   if (trimmed.length === 0) {
@@ -67,6 +75,11 @@ function setPathValue(target: Record<string, unknown>, dottedPath: string, value
   if (parts.length === 0) {
     throw new Error('Config path is required.');
   }
+  for (const part of parts) {
+    if (part === '__proto__' || part === 'prototype' || part === 'constructor') {
+      throw new Error(`Unsafe config path segment: ${part}`);
+    }
+  }
 
   let cursor: Record<string, unknown> = target;
   for (let index = 0; index < parts.length - 1; index += 1) {
@@ -83,7 +96,7 @@ function setPathValue(target: Record<string, unknown>, dottedPath: string, value
 
 export async function showConfig(paths: AdminPaths = {}): Promise<string> {
   const config = await loadConfig(paths.configPath);
-  return formatLines([JSON.stringify(redactConfig(config), null, 2)]);
+  return showRedactedConfigSummary(config);
 }
 
 export async function setConfigValue(
@@ -167,6 +180,86 @@ export async function listHeartbeats(paths: AdminPaths = {}): Promise<string> {
   return formatLines(jobs.map((job) => formatHeartbeatJob(job)));
 }
 
+export function showRedactedConfigSummary(config: AppConfig): string {
+  const redacted = redactConfig(config);
+  const lines = [
+    `workspace: ${redacted.memory.workspace}`,
+    `provider: ${redacted.providers.main.type}`,
+    `main model: ${redacted.providers.main.model}`,
+    `medical model: ${redacted.providers.medical.model}`,
+    `embedding model: ${redacted.providers.embeddings.model}`,
+  ];
+
+  if (redacted.providers.main.type === 'ollama') {
+    lines.push(`ollama url: ${redacted.providers.main.baseUrl ?? '(not set)'}`);
+  } else {
+    lines.push(`provider api key: ${providerApiKeyConfigured(config.providers.main) ? 'configured' : 'not set'}`);
+  }
+
+  lines.push(`telegram: ${redacted.channels.telegram.enabled ? 'enabled' : 'disabled'}`);
+  if (redacted.channels.telegram.enabled) {
+    lines.push(`telegram token: ${redacted.channels.telegram.botToken ? '[REDACTED]' : '(not set)'}`);
+  }
+  lines.push(`timezone: ${redacted.heartbeat.timezone}`);
+  lines.push(`heartbeats: ${redacted.heartbeat.enabled ? 'enabled' : 'disabled'}`);
+
+  return formatLines(lines);
+}
+
+export function buildReadinessSummaryLines(input: {
+  configPath?: string;
+  workspacePath: string;
+  validation: ReturnType<typeof validateConfig>;
+  readiness: Awaited<ReturnType<typeof checkSystemReadiness>>;
+  heartbeatCount?: number;
+}): string[] {
+  const runtimeReady =
+    input.readiness.providers.every((result) => result.ready) &&
+    input.readiness.telegram.ready;
+  const telegramLine = input.readiness.telegram.details.includes('disabled')
+    ? 'disabled'
+    : formatReadiness(input.readiness.telegram);
+  const lines = [
+    `status: ${input.validation.valid && runtimeReady ? 'ok' : 'degraded'}`,
+    `config: ${input.configPath ?? '(default)'}`,
+    `workspace: ${input.workspacePath}`,
+    `main provider: ${formatReadiness(input.readiness.providers[0])}`,
+    `medical provider: ${formatReadiness(input.readiness.providers[1])}`,
+    `embeddings provider: ${formatReadiness(input.readiness.providers[2])}`,
+    `telegram: ${telegramLine}`,
+  ];
+
+  if (input.heartbeatCount !== undefined) {
+    lines.push(`heartbeat jobs: ${input.heartbeatCount}`);
+  }
+
+  for (const result of [...input.readiness.providers, input.readiness.telegram]) {
+    if (result.status === 'ok' && result.warnings.length === 0) {
+      continue;
+    }
+    for (const detail of result.details) {
+      lines.push(`  ${result.label}: ${detail}`);
+    }
+    for (const warning of result.warnings) {
+      lines.push(`  ${result.label}: ${warning}`);
+    }
+    if (result.actionHint) {
+      lines.push(`  ${result.label} hint: ${result.actionHint}`);
+    }
+  }
+
+  if (input.validation.errors.length > 0) {
+    lines.push('', 'validation errors:');
+    lines.push(...input.validation.errors.map((error) => `- ${error}`));
+  }
+  if (input.validation.warnings.length > 0) {
+    lines.push('', 'validation warnings:');
+    lines.push(...input.validation.warnings.map((warning) => `- ${warning}`));
+  }
+
+  return lines;
+}
+
 export async function showStatus(paths: AdminPaths = {}): Promise<string> {
   const config = await loadConfig(paths.configPath);
   const workspacePath = paths.workspacePath ?? config.memory.workspace;
@@ -174,33 +267,22 @@ export async function showStatus(paths: AdminPaths = {}): Promise<string> {
   const health = await checkSystemReadiness(config, { allowNetworkChecks: false });
   const heartbeatCount = (await new HeartbeatStore(storePath).list()).length;
   const validation = validateConfig(config);
-
-  const lines = [
-    `status: ${validation.valid ? 'ok' : 'degraded'}`,
-    `config: ${paths.configPath ?? '(default)'}`,
-    `workspace: ${workspacePath}`,
-    `main provider: ${formatReadiness(health.providers[0])}`,
-    `medical provider: ${formatReadiness(health.providers[1])}`,
-    `embeddings provider: ${formatReadiness(health.providers[2])}`,
-    `telegram: ${config.channels.telegram.enabled ? formatReadiness(health.telegram) : 'disabled'}`,
-    `heartbeat jobs: ${heartbeatCount}`,
-  ];
-
-  if (validation.errors.length > 0) {
-    lines.push('', 'validation errors:');
-    lines.push(...validation.errors.map((error) => `- ${error}`));
-  }
-  if (validation.warnings.length > 0) {
-    lines.push('', 'validation warnings:');
-    lines.push(...validation.warnings.map((warning) => `- ${warning}`));
-  }
-
+  const lines = buildReadinessSummaryLines({
+    configPath: paths.configPath,
+    workspacePath,
+    validation,
+    readiness: health,
+    heartbeatCount,
+  });
   return formatLines(lines);
 }
 
-function formatReadiness(result: { ready: boolean; checked: boolean }): string {
+export function formatReadiness(result: { ready: boolean; checked: boolean }): string {
+  if ('status' in result && result.status === 'warn') {
+    return result.checked ? 'degraded' : 'configured';
+  }
   if (!result.ready) {
     return 'not ready';
   }
-  return result.checked ? 'ready' : 'configured (not checked)';
+  return result.checked ? 'ready' : 'configured';
 }

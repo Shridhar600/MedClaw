@@ -15,6 +15,8 @@ export interface Chunk {
   embedding?: number[];
 }
 
+export type SearchStatus = 'full' | 'keyword-only' | 'failed';
+
 export interface SearchResult {
   chunkId: string;
   path: string;
@@ -22,4 +24,5 @@ export interface SearchResult {
   score: number;
   startLine: number;
   endLine: number;
+  status?: SearchStatus;
 }

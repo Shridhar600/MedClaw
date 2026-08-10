@@ -9,5 +9,25 @@
     "@typescript-eslint/no-explicit-any": "error",
     "@typescript-eslint/explicit-function-return-type": "warn",
     "no-console": "off"
-  }
+  },
+  "overrides": [
+    {
+      "files": ["src/**/*.ts"],
+      "excludedFiles": ["src/profiles/**", "src/security/**"],
+      "rules": {
+        "no-restricted-imports": ["error", {
+          "patterns": [
+            {
+              "group": ["**/profiles/*"],
+              "message": "Import from the profiles barrel (src/profiles) — module internals are private (specs/16 §1)."
+            },
+            {
+              "group": ["**/security/*"],
+              "message": "Import from the security barrel (src/security) — module internals are private (specs/16 §1)."
+            }
+          ]
+        }]
+      }
+    }
+  ]
 }

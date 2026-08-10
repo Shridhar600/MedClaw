@@ -151,6 +151,74 @@ describe('MemorySearch', () => {
     });
   });
 
+  describe('SearchStatus', () => {
+    beforeEach(async () => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-search-status-'));
+      store = new SqliteStore(path.join(tmpDir, 'test.db'));
+    });
+
+    it('returns status "full" when vector search succeeds with results', async () => {
+      const mockProvider: LLMProvider = {
+        chat: jest.fn(),
+        embed: jest.fn().mockResolvedValue([1.0, 0.0, 0.0]),
+      };
+      const search = new MemorySearch(store, mockProvider, { vector: 0.7, keyword: 0.3 });
+      store.upsertChunk({ id: 'a.md:0', path: 'a.md', content: 'diabetes blood sugar control', embedding: [1.0, 0.0, 0.0], startLine: 1, endLine: 1 });
+
+      const results = await search.search('diabetes', 5);
+      expect(results.length).toBeGreaterThan(0);
+      for (const r of results) {
+        expect(r.status).toBe('full');
+      }
+    });
+
+    it('returns status "keyword-only" when vector fails but keyword succeeds', async () => {
+      jest.spyOn(console, 'warn').mockImplementation();
+      const mockProvider: LLMProvider = {
+        chat: jest.fn(),
+        embed: jest.fn().mockRejectedValue(new Error('embedder unavailable')),
+      };
+      const search = new MemorySearch(store, mockProvider, { vector: 0.7, keyword: 0.3 });
+      store.upsertChunk({ id: 'a.md:0', path: 'a.md', content: 'diabetes blood sugar control', embedding: [1.0, 0.0, 0.0], startLine: 1, endLine: 1 });
+
+      const results = await search.search('diabetes', 5);
+      expect(results.length).toBeGreaterThan(0);
+      for (const r of results) {
+        expect(r.status).toBe('keyword-only');
+      }
+    });
+
+    it('returns empty array and does not throw when both vector and keyword produce nothing', async () => {
+      jest.spyOn(console, 'warn').mockImplementation();
+      const mockProvider: LLMProvider = {
+        chat: jest.fn(),
+        embed: jest.fn().mockRejectedValue(new Error('embedder unavailable')),
+      };
+      const search = new MemorySearch(store, mockProvider, { vector: 0.7, keyword: 0.3 });
+      // No chunks inserted — keyword search returns nothing, vector fails
+
+      const results = await search.search('diabetes', 5);
+      expect(results).toEqual([]);
+      // Both vector and keyword failed; status 'failed' is computed internally but
+      // not surfacable on an empty array. The contract is: no crash, empty return.
+    });
+
+    it('returns status "full" when vector succeeds even if keyword returns nothing', async () => {
+      const mockProvider: LLMProvider = {
+        chat: jest.fn(),
+        embed: jest.fn().mockResolvedValue([1.0, 0.0, 0.0]),
+      };
+      const search = new MemorySearch(store, mockProvider, { vector: 0.7, keyword: 0.3 });
+      store.upsertChunk({ id: 'a.md:0', path: 'a.md', content: 'zzz random content', embedding: [1.0, 0.0, 0.0], startLine: 1, endLine: 1 });
+
+      const results = await search.search('zzz', 5);
+      expect(results.length).toBeGreaterThan(0);
+      for (const r of results) {
+        expect(r.status).toBe('full');
+      }
+    });
+  });
+
   describe('keyword ranking order', () => {
     beforeEach(async () => {
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-search-'));
@@ -210,6 +278,9 @@ describe('MemorySearch', () => {
         expect.stringContaining('[search] Vector search failed'),
         expect.anything(),
       );
+      for (const r of results) {
+        expect(r.status).toBe('keyword-only');
+      }
       warnSpy.mockRestore();
     });
 

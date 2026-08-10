@@ -83,11 +83,24 @@ export class OnboardingFlow {
         nextStep = 'timezone';
         response = `Please confirm your timezone. I have ${answers.timezone ?? this.defaultTimezone}.`;
         break;
-      case 'timezone':
-        answers.timezone = isAffirmative(answer) ? (answers.timezone ?? this.defaultTimezone) : answer || this.defaultTimezone;
+      case 'timezone': {
+        // forka #5: don't store the raw phrase as the timezone. Affirmative or
+        // empty → keep the offered default. Otherwise accept the answer only if
+        // it is a valid IANA zone; if it's a phrase like "yes Asia/Kolkata is
+        // right", recover the valid zone token from it; else keep the default.
+        const trimmed = answer.trim();
+        const fallback = answers.timezone ?? this.defaultTimezone;
+        if (isAffirmative(trimmed) || trimmed === '') {
+          answers.timezone = fallback;
+        } else if (isValidTimezone(trimmed)) {
+          answers.timezone = trimmed;
+        } else {
+          answers.timezone = trimmed.split(/\s+/).find(isValidTimezone) ?? fallback;
+        }
         nextStep = 'conditions';
         response = 'Any major health conditions I should remember?';
         break;
+      }
       case 'conditions':
         answers.conditions = answer;
         nextStep = 'medications';
@@ -180,4 +193,16 @@ function sanitizeOnboardingInput(input: string): string {
 
 function isAffirmative(input: string): boolean {
   return /^(yes|y|correct|confirm|ok|okay)$/i.test(input.trim());
+}
+
+// forka #5: validate an IANA timezone without a dependency — Intl throws a
+// RangeError for an unknown zone.
+function isValidTimezone(tz: string): boolean {
+  if (!tz || /\s/.test(tz)) return false;
+  try {
+    Intl.DateTimeFormat('en-US', { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
 }

@@ -95,6 +95,11 @@ export interface AgentConfig {
   disclaimerEnabled: boolean;
 }
 
+export interface ProfileConfig {
+  baseDir: string;
+  defaultProfileId: string;
+}
+
 export interface AppConfig {
   providers: {
     main: ProviderConfig;
@@ -107,4 +112,5 @@ export interface AppConfig {
   sessions: SessionsConfig;
   heartbeat: HeartbeatConfig;
   agent: AgentConfig;
+  profiles?: ProfileConfig;
 }

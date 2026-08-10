@@ -111,7 +111,9 @@ The result is a layered memory system:
 ├── medications/
 ├── reports/
 ├── goals/
-└── memory/
+├── memory/
+├── summaries/
+└── archive/
 ```
 
 ## Tech Stack
@@ -129,8 +131,9 @@ The result is a layered memory system:
 ### Prerequisites
 
 - Node.js installed
-- Ollama installed and running
-- Telegram bot token available
+- Ollama installed and running for the default local setup
+- Telegram bot token available if you want Telegram enabled
+- OpenAI API key only if you choose the OpenAI setup profile
 
 ### Install
 
@@ -147,9 +150,9 @@ ollama serve
 ### Pull models
 
 ```bash
-ollama pull llama3.1
-ollama pull aadide/medgemma-1.5-4b-it-Q4_K_S
-ollama pull nomic-embed-text
+ollama pull kimi-k2.5:cloud
+ollama pull aadide/medgemma-1.5-4b-it-Q4_K_S:latest
+ollama pull embeddinggemma:latest
 ```
 
 ### Initialize local config and workspace
@@ -157,13 +160,13 @@ ollama pull nomic-embed-text
 Run the service onboarding CLI before starting the daemon:
 
 ```bash
-npm run cli -- init
+npm run cli -- onboard
 ```
 
 For non-interactive local setup without Telegram:
 
 ```bash
-npm run cli -- init --yes --provider ollama --telegram-enabled false
+npm run cli -- onboard --yes --provider ollama --telegram-enabled false
 ```
 
 If Telegram is enabled, provide a token via the prompt, `--telegram-token`, or `TELEGRAM_BOT_TOKEN`. CLI output redacts secrets.
@@ -174,18 +177,17 @@ If Telegram is enabled, provide a token via the prompt, `--telegram-token`, or `
 2. Run `/newbot`
 3. Choose a bot name and username
 4. Copy the bot token
-5. Run `npm run cli -- init` and enable Telegram when prompted
+5. Run `npm run cli -- onboard` and enable Telegram when prompted
 
 Then start the daemon and send your bot a message. On a fresh workspace, first chat collects basic profile context and writes it locally to `USER.md`, `HEALTH_PROFILE.md`, and onboarding state.
 
 ### Run the project
 
 ```bash
-npm run build
-npm run dev
+npm run start
 ```
 
-The daemon requires an explicit config file. If `~/.redacted/config.json` is missing, initialize with `npm run cli -- init`.
+The daemon reads `REDACTED_CONFIG_PATH` when set; otherwise it uses `~/.redacted/config.json`. If the resolved config file is missing, initialize with `npm run cli -- onboard`. Use `npm run dev` for watch-mode development.
 
 ## Configuration
 
@@ -208,7 +210,7 @@ Admin CLI examples:
 ```bash
 npm run cli -- status
 npm run cli -- config show
-npm run cli -- config set providers.main.model llama3.1
+npm run cli -- config set providers.main.model kimi-k2.5:cloud
 npm run cli -- profile show
 npm run cli -- user summary
 npm run cli -- heartbeats list
@@ -217,12 +219,20 @@ npm run cli -- heartbeats list
 ## Useful Commands
 
 ```bash
+npm run start
 npm run dev
+npm run dev:cli
 npm run build
 npm run typecheck
 npm run lint
 npm run test
 npm run cli -- --help
+npm run cli -- status
+npm run cli -- config show
+npm run cli -- config set <path> <value>
+npm run cli -- profile show
+npm run cli -- user summary
+npm run cli -- heartbeats list
 ```
 
 ## Current MVP Scope
@@ -233,7 +243,7 @@ MedClaw is already usable as an MVP for:
 - memory-backed conversations
 - medical report ingestion for supported text, PDF, and image files
 - local health data organization
-- heartbeat reminders and scheduled check-ins
+- heartbeat reminders and scheduled check-ins when heartbeats and a delivery channel are enabled
 
 ## Current Limits
 
@@ -242,9 +252,9 @@ MedClaw is already usable as an MVP for:
 - External health-system integrations are not part of the current MVP yet.
 - The current admin surface is a local CLI, not a web dashboard.
 
-## Coming Soon
+## Deferred Future Scope
 
-Phase 4C+ is planned around integrations and platform upgrades:
+Deferred integration and platform work:
 
 - Open Wearables integration
 - FHIR integration

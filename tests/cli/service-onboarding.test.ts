@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { loadConfig } from '../../src/config/config';
 import { validateConfig } from '../../src/config/validation';
-import { runServiceOnboarding } from '../../src/cli/service-onboarding';
+import { buildConfigFromArgs, modelDefaultsForProvider, runServiceOnboarding, startDaemon } from '../../src/cli/service-onboarding';
 
 describe('service onboarding init', () => {
   let tmpDir: string;
@@ -31,9 +31,9 @@ describe('service onboarding init', () => {
         '--config', configPath,
         '--workspace', workspacePath,
         '--provider', 'ollama',
-        '--main-model', 'llama3.1',
-        '--medical-model', 'aadide/medgemma-1.5-4b-it-Q4_K_S',
-        '--embedding-model', 'nomic-embed-text',
+        '--main-model', 'kimi-k2.5:cloud',
+        '--medical-model', 'aadide/medgemma-1.5-4b-it-Q4_K_S:latest',
+        '--embedding-model', 'embeddinggemma:latest',
         '--ollama-url', 'http://localhost:11434/v1',
         '--telegram-enabled', 'false',
         '--timezone', 'Asia/Kolkata',
@@ -68,9 +68,9 @@ describe('service onboarding init', () => {
         '--config', configPath,
         '--workspace', workspacePath,
         '--provider', 'ollama',
-        '--main-model', 'llama3.1',
-        '--medical-model', 'aadide/medgemma-1.5-4b-it-Q4_K_S',
-        '--embedding-model', 'nomic-embed-text',
+        '--main-model', 'kimi-k2.5:cloud',
+        '--medical-model', 'aadide/medgemma-1.5-4b-it-Q4_K_S:latest',
+        '--embedding-model', 'embeddinggemma:latest',
         '--ollama-url', 'http://localhost:11434/v1',
         '--telegram-enabled', 'true',
         '--timezone', 'Asia/Kolkata',
@@ -134,9 +134,9 @@ describe('service onboarding init', () => {
         '--config', configPath,
         '--workspace', workspacePath,
         '--provider', 'ollama',
-        '--main-model', 'llama3.1',
-        '--medical-model', 'aadide/medgemma-1.5-4b-it-Q4_K_S',
-        '--embedding-model', 'nomic-embed-text',
+        '--main-model', 'kimi-k2.5:cloud',
+        '--medical-model', 'aadide/medgemma-1.5-4b-it-Q4_K_S:latest',
+        '--embedding-model', 'embeddinggemma:latest',
         '--ollama-url', 'http://localhost:11434/v1',
         '--telegram-enabled', 'false',
         '--timezone', 'Asia/Kolkata',
@@ -155,6 +155,96 @@ describe('service onboarding init', () => {
 
     expect(config.channels.telegram.enabled).toBe(false);
     expect(result.valid).toBe(true);
+  });
+
+  it('non-interactive init still writes config through the shared setup path', async () => {
+    const code = await runServiceOnboarding(
+      [
+        '--yes',
+        '--config', configPath,
+        '--workspace', workspacePath,
+        '--provider', 'ollama',
+        '--telegram-enabled', 'false',
+        '--timezone', 'Asia/Kolkata',
+        '--heartbeats-enabled', 'true',
+      ],
+      {
+        stdout: () => undefined,
+        stderr: () => undefined,
+        input: async () => {
+          throw new Error('prompt should not be called');
+        },
+      },
+    );
+
+    expect(code).toBe(0);
+    expect(fs.existsSync(configPath)).toBe(true);
+
+    const config = await loadConfig({ configPath, requireFile: true });
+    expect(config.memory.workspace).toBe(workspacePath);
+    expect(config.channels.telegram.enabled).toBe(false);
+    expect(config.heartbeat.timezone).toBe('Asia/Kolkata');
+    expect(config.heartbeat.enabled).toBe(true);
+  });
+
+  it('refuses to overwrite an existing config during non-interactive init without force', async () => {
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(configPath, '{"existing":true}\n', 'utf8');
+    const output: string[] = [];
+
+    const code = await runServiceOnboarding(
+      [
+        '--yes',
+        '--config', configPath,
+        '--workspace', workspacePath,
+        '--provider', 'ollama',
+        '--telegram-enabled', 'false',
+        '--timezone', 'Asia/Kolkata',
+        '--heartbeats-enabled', 'true',
+      ],
+      {
+        stdout: (text: string) => output.push(text),
+        stderr: (text: string) => output.push(text),
+        input: async () => {
+          throw new Error('prompt should not be called');
+        },
+      },
+    );
+
+    expect(code).toBe(1);
+    expect(output.join('')).toContain('already exists');
+    expect(output.join('')).toContain('--force');
+    expect(fs.readFileSync(configPath, 'utf8')).toBe('{"existing":true}\n');
+  });
+
+  it('overwrites an existing config during non-interactive init when force is provided', async () => {
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(configPath, '{"existing":true}\n', 'utf8');
+
+    const code = await runServiceOnboarding(
+      [
+        '--yes',
+        '--force',
+        '--config', configPath,
+        '--workspace', workspacePath,
+        '--provider', 'ollama',
+        '--telegram-enabled', 'false',
+        '--timezone', 'Asia/Kolkata',
+        '--heartbeats-enabled', 'true',
+      ],
+      {
+        stdout: () => undefined,
+        stderr: () => undefined,
+        input: async () => {
+          throw new Error('prompt should not be called');
+        },
+      },
+    );
+
+    expect(code).toBe(0);
+    const config = await loadConfig({ configPath, requireFile: true });
+    expect(config.memory.workspace).toBe(workspacePath);
+    expect(config.channels.telegram.enabled).toBe(false);
   });
 
   it('fails clearly for OpenAI provider without an API key', async () => {
@@ -218,8 +308,64 @@ describe('service onboarding init', () => {
     expect(config.providers.main.model).toBe('gpt-4o-mini');
     expect(config.providers.main.apiKey).toBe('sk-test-secret');
     expect(config.providers.main.baseUrl).toBeUndefined();
-    expect(config.providers.medical.baseUrl).toBeUndefined();
+    // forka #11: medical defaults to on-device Ollama medgemma even when main is
+    // cloud, so it has an Ollama baseUrl (not undefined).
+    expect(config.providers.medical.type).toBe('ollama');
+    expect(config.providers.medical.baseUrl).toBe('http://localhost:11434/v1');
     expect(config.providers.embeddings.baseUrl).toBeUndefined();
+  });
+
+  it('medical defaults to on-device medgemma even when main is OpenAI (forka #11)', () => {
+    const config = buildConfigFromArgs({ provider: 'openai', apiKey: 'sk-x', configPath: '/tmp/forka11/config.json' });
+    expect(config.providers.main.type).toBe('openai');
+    expect(config.providers.medical).toEqual({
+      type: 'ollama',
+      model: 'aadide/medgemma-1.5-4b-it-Q4_K_S:latest',
+      baseUrl: 'http://localhost:11434/v1',
+    });
+  });
+
+  it('opt-out: --medical-provider routes the medical model to the cloud (forka #11)', () => {
+    const config = buildConfigFromArgs({
+      provider: 'openai',
+      apiKey: 'sk-x',
+      medicalProvider: 'openai',
+      medicalModel: 'gpt-4o',
+      configPath: '/tmp/forka11b/config.json',
+    });
+    expect(config.providers.medical.type).toBe('openai');
+    expect(config.providers.medical.model).toBe('gpt-4o');
+    expect(config.providers.medical.apiKey).toBe('sk-x');
+  });
+
+  it('uses cloud defaults for anthropic and google but medical stays on-device medgemma (forka #11)', () => {
+    const medgemma = 'aadide/medgemma-1.5-4b-it-Q4_K_S:latest';
+    expect(modelDefaultsForProvider('anthropic')).toEqual({
+      main: 'gpt-4o-mini',
+      medical: medgemma,
+      embeddings: 'text-embedding-3-small',
+    });
+    expect(modelDefaultsForProvider('google')).toEqual({
+      main: 'gpt-4o-mini',
+      medical: medgemma,
+      embeddings: 'text-embedding-3-small',
+    });
+  });
+
+  it('rejects unsupported onboarding provider choices clearly', async () => {
+    const output: string[] = [];
+
+    const code = await runServiceOnboarding(
+      ['--yes', '--config', configPath, '--provider', 'anthropic'],
+      {
+        stdout: (text: string) => output.push(text),
+        stderr: (text: string) => output.push(text),
+      },
+    );
+
+    expect(code).toBe(1);
+    expect(output.join('')).toContain('Unsupported onboard provider');
+    expect(output.join('')).toContain('ollama, openai');
   });
 
   it('uses OpenAI defaults for interactive init when model prompts are accepted', async () => {
@@ -237,6 +383,8 @@ describe('service onboarding init', () => {
         'n',
         'Asia/Kolkata',
         'n',
+        '1',
+        '3',
       ];
       const prompts: string[] = [];
       const code = await runServiceOnboarding(['--config', configPath], {
@@ -249,7 +397,7 @@ describe('service onboarding init', () => {
       });
 
       expect(code).toBe(0);
-      expect(prompts).toContain('OpenAI API key ');
+      expect(prompts).toContain('• OpenAI API key\n  › ');
       expect(output.join('')).not.toContain('sk-interactive-secret');
       const config = await loadConfig({ configPath, requireFile: true });
       expect(config.providers.main).toEqual({
@@ -257,10 +405,11 @@ describe('service onboarding init', () => {
         model: 'gpt-4o-mini',
         apiKey: 'sk-interactive-secret',
       });
+      // forka #11: medical defaults to on-device Ollama medgemma, NOT the cloud provider.
       expect(config.providers.medical).toEqual({
-        type: 'openai',
-        model: 'gpt-4o-mini',
-        apiKey: 'sk-interactive-secret',
+        type: 'ollama',
+        model: 'aadide/medgemma-1.5-4b-it-Q4_K_S:latest',
+        baseUrl: 'http://localhost:11434/v1',
       });
       expect(config.providers.embeddings).toEqual({
         type: 'openai',
@@ -274,5 +423,89 @@ describe('service onboarding init', () => {
         process.env.OPENAI_API_KEY = original;
       }
     }
+  });
+
+  it('preserves a prefilled API key when Enter is pressed during interactive cloud setup', async () => {
+    const original = process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+    try {
+      const output: string[] = [];
+      const answers = [
+        workspacePath,
+        '',
+        '',
+        '',
+        '',
+        '',
+        'n',
+        '',
+        '',
+        '1',
+        '3',
+      ];
+
+      const code = await runServiceOnboarding(
+        [
+          '--config', configPath,
+          '--provider', 'openai',
+          '--api-key', 'sk-prefilled-secret',
+          '--telegram-enabled', 'false',
+          '--timezone', 'Asia/Kolkata',
+          '--heartbeats-enabled', 'true',
+        ],
+        {
+          stdout: (text: string) => output.push(text),
+          stderr: (text: string) => output.push(text),
+          input: async () => answers.shift() ?? '',
+        },
+      );
+
+      expect(code).toBe(0);
+      expect(output.join('')).not.toContain('sk-prefilled-secret');
+
+      const config = await loadConfig({ configPath, requireFile: true });
+      expect(config.providers.main).toEqual({
+        type: 'openai',
+        model: 'gpt-4o-mini',
+        apiKey: 'sk-prefilled-secret',
+      });
+      // forka #11: medical defaults to on-device Ollama medgemma, NOT the cloud provider.
+      expect(config.providers.medical).toEqual({
+        type: 'ollama',
+        model: 'aadide/medgemma-1.5-4b-it-Q4_K_S:latest',
+        baseUrl: 'http://localhost:11434/v1',
+      });
+      expect(config.providers.embeddings).toEqual({
+        type: 'openai',
+        model: 'text-embedding-3-small',
+        apiKey: 'sk-prefilled-secret',
+      });
+    } finally {
+      if (original === undefined) {
+        delete process.env.OPENAI_API_KEY;
+      } else {
+        process.env.OPENAI_API_KEY = original;
+      }
+    }
+  });
+
+  it('returns a structured failure when daemon spawn throws synchronously', async () => {
+    const result = await startDaemon(
+      configPath,
+      {},
+      {
+        projectRoot: '/repo',
+        existsSync: () => false,
+        spawnProcess: () => {
+          throw new Error('spawn sync failed');
+        },
+        startupWindowMs: 1,
+      },
+    );
+
+    expect(result).toEqual({
+      started: false,
+      message: 'Failed to start MedClaw: spawn sync failed',
+    });
   });
 });

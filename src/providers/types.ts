@@ -50,6 +50,7 @@ export interface ToolCallResponse {
 export type LLMResponse = TextResponse | ToolCallResponse;
 
 export interface LLMProvider {
+  readonly modelName?: string;
   chat(messages: Message[], tools?: ToolSchema[]): Promise<LLMResponse>;
   chatWithImages?(messages: Message[], images: ImageAttachment[]): Promise<LLMResponse>;
   embed(text: string): Promise<number[]>;

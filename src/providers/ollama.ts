@@ -3,12 +3,14 @@ import type { ImageAttachment, LLMProvider, LLMResponse, Message, ToolSchema } f
 import type { ProviderConfig } from '../config/types';
 
 export class OllamaProvider implements LLMProvider {
+  readonly modelName: string;
   private baseUrl: string;
   private model: string;
 
   constructor(config: ProviderConfig) {
     this.baseUrl = config.baseUrl ?? 'http://localhost:11434/v1';
     this.model = config.model;
+    this.modelName = config.model;
   }
 
   async chat(messages: Message[], tools?: ToolSchema[]): Promise<LLMResponse> {

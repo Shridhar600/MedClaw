@@ -81,7 +81,7 @@ async function firstChatOnboarding(): Promise<void> {
     throw new Error(`expected onboarding prompt, got: ${first}`);
   }
   for (const input of [
-    'Shridhar',
+    'Arjun',
     '31',
     'Asia/Kolkata',
     'Type 2 diabetes',
@@ -140,7 +140,7 @@ async function profileComplete(): Promise<void> {
   const { root, config, gateway } = await makeTestGateway('profile-');
   for (const input of [
     'hello',
-    'Shridhar',
+    'Arjun',
     '31',
     'Asia/Kolkata',
     'Type 2 diabetes',
@@ -154,7 +154,7 @@ async function profileComplete(): Promise<void> {
   }
   const user = fs.readFileSync(path.join(config.memory.workspace, 'USER.md'), 'utf8');
   const profile = fs.readFileSync(path.join(config.memory.workspace, 'HEALTH_PROFILE.md'), 'utf8');
-  if (!user.includes('Name: Shridhar') || !profile.includes('Active conditions: Type 2 diabetes')) {
+  if (!user.includes('Name: Arjun') || !profile.includes('Active conditions: Type 2 diabetes')) {
     throw new Error('profile files did not include completed onboarding data');
   }
   console.log(JSON.stringify({ mode: 'profile-complete', root, workspace: config.memory.workspace }, null, 2));
@@ -167,9 +167,9 @@ async function initInteractiveScripted(): Promise<void> {
   const input = [
     workspacePath,
     'ollama',
-    'llama3.1',
-    'aadide/medgemma-1.5-4b-it-Q4_K_S',
-    'nomic-embed-text',
+    'kimi-k2.5:cloud',
+    'aadide/medgemma-1.5-4b-it-Q4_K_S:latest',
+    'embeddinggemma:latest',
     'http://localhost:11434/v1',
     'n',
     'Asia/Kolkata',

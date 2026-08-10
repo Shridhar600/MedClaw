@@ -1,7 +1,8 @@
 import type { AgentRunResult, LLMProvider, Message, ToolSchema } from '../providers/types';
 import type { ToolRegistry } from '../tools/registry';
+import { LLMSemaphore, type SemaphorePriority } from '../tools/semaphore';
+import { MEDICAL_DISCLAIMER, MEDICAL_DISCLAIMER_SENTINEL } from '../safety/medical-disclaimer';
 
-const MEDICAL_DISCLAIMER = '\n\n---\n*I am an AI health companion, not a doctor. Always consult a healthcare professional for medical advice.*';
 const MEDICAL_TOOLS = new Set(['medgemma_query', 'medgemma_analyze_report']);
 
 interface AgentConfig {
@@ -11,6 +12,7 @@ interface AgentConfig {
 
 interface AgentRunContext {
   chatId?: string;
+  origin?: SemaphorePriority;
 }
 
 export class AgentLoop {
@@ -19,11 +21,25 @@ export class AgentLoop {
     private readonly registry: ToolRegistry,
     private readonly systemMessages: Message[],
     private readonly config: AgentConfig,
+    private readonly semaphore?: LLMSemaphore,
   ) {}
 
   async run(
     userMessage: string,
     conversationHistory: Message[] = [],
+    runContext?: AgentRunContext,
+  ): Promise<AgentRunResult> {
+    const exec = (): Promise<AgentRunResult> => this.runInternal(userMessage, conversationHistory, runContext);
+    if (this.semaphore) {
+      const priority: SemaphorePriority = runContext?.origin ?? 'user';
+      return this.semaphore.run(priority, exec);
+    }
+    return exec();
+  }
+
+  private async runInternal(
+    userMessage: string,
+    conversationHistory: Message[],
     runContext?: AgentRunContext,
   ): Promise<AgentRunResult> {
     const messages: Message[] = [
@@ -50,7 +66,7 @@ export class AgentLoop {
         const rawText = response.text;
         const isHealthRelated = this.config.disclaimerEnabled
           && this.isHealthResponse(userMessage, rawText, usedTools);
-        const alreadyHasDisclaimer = rawText.includes('I am an AI health companion, not a doctor');
+        const alreadyHasDisclaimer = rawText.includes(MEDICAL_DISCLAIMER_SENTINEL);
         const finalText = isHealthRelated && !alreadyHasDisclaimer ? rawText + MEDICAL_DISCLAIMER : rawText;
         trace.push({ role: 'assistant', content: finalText });
         return {
@@ -64,7 +80,9 @@ export class AgentLoop {
       // Tool call
       const { id, name, arguments: args } = response.toolCall;
       usedTools.push(name);
-      console.log(`[agent] Tool call: ${name}(${JSON.stringify(args)})`);
+      // Tool args routinely carry PHI (memory content, health queries, report
+      // paths) — log the tool name only, never the arguments.
+      console.log(`[agent] Tool call: ${name}`);
 
       // Append assistant's tool request to messages
       const toolRequestMessage: Message = {

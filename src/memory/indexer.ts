@@ -4,18 +4,24 @@ import * as crypto from 'crypto';
 import type { LLMProvider } from '../providers/types';
 import type { SqliteStore } from './sqlite-store';
 import type { Chunk } from './types';
+import { summarizeErrorForLog } from '../security';
 
 const CHUNK_SIZE_TOKENS = 400;
 const OVERLAP_TOKENS = 80;
 
 export class MemoryIndexer {
   private isIndexing = false;
+  private dimensionProbed = false;
+  private readonly embeddingModelName: string;
 
   constructor(
     private readonly store: SqliteStore,
     private readonly embeddingProvider: LLMProvider,
     private readonly workspacePath: string,
-  ) {}
+    private readonly profileId: string = 'default',
+  ) {
+    this.embeddingModelName = embeddingProvider.modelName ?? 'unknown';
+  }
 
   async indexAll(): Promise<void> {
     if (this.isIndexing) {
@@ -24,6 +30,12 @@ export class MemoryIndexer {
     }
     this.isIndexing = true;
     try {
+      if (!this.dimensionProbed) {
+        await this.probeAndEnsureDimension();
+        this.store.setEmbeddingModel(this.embeddingModelName);
+        this.dimensionProbed = true;
+      }
+
       const files = this.globMarkdown(this.workspacePath);
       const currentPaths = new Set(files.map(file => path.relative(this.workspacePath, file)));
       for (const indexedPath of this.store.listIndexedPaths()) {
@@ -33,37 +45,57 @@ export class MemoryIndexer {
         }
       }
       for (const file of files) {
-        await this.indexFile(file);
+        const relativePath = path.relative(this.workspacePath, file);
+        await this.indexFile(relativePath);
       }
     } finally {
       this.isIndexing = false;
     }
   }
 
-  private async indexFile(filePath: string): Promise<void> {
-    const relativePath = path.relative(this.workspacePath, filePath);
-    const content = fs.readFileSync(filePath, 'utf-8');
+  async indexFile(relativePath: string): Promise<void> {
+    if (!this.dimensionProbed) {
+      await this.probeAndEnsureDimension();
+      this.store.setEmbeddingModel(this.embeddingModelName);
+      this.dimensionProbed = true;
+    }
+    const absolutePath = path.join(this.workspacePath, relativePath);
+    const content = fs.readFileSync(absolutePath, 'utf-8');
     const hash = this.computeHash(content);
 
     const storedHash = this.store.getFileHash(relativePath);
-    if (storedHash === hash) {
+    const storedModel = this.store.getEmbeddingModel();
+    if (storedHash === hash && storedModel === this.embeddingModelName) {
       return;
     }
 
     const chunks = this.chunkContent(content, relativePath).filter(chunk => chunk.content.trim().length > 0);
     const preparedChunks: Chunk[] = [];
+    let hadEmbeddingFailure = false;
     for (const chunk of chunks) {
       try {
         chunk.embedding = await this.embeddingProvider.embed(chunk.content);
-        preparedChunks.push(chunk);
       } catch (e) {
-        console.warn(`[indexer] Failed to embed chunk ${chunk.id}:`, e);
-        return;
+        // Embed failure messages can echo chunk PHI — sanitized frame only.
+        console.warn(`[indexer] Failed to embed chunk ${chunk.id}:`, summarizeErrorForLog(e));
+        hadEmbeddingFailure = true;
       }
+      preparedChunks.push(chunk);
     }
 
-    this.store.replaceFileIndex(relativePath, preparedChunks, hash);
+    const indexHash = hadEmbeddingFailure ? `embedding-partial:${hash}` : hash;
+    this.store.replaceFileIndex(relativePath, preparedChunks, indexHash, this.embeddingModelName);
     console.log(`[indexer] Indexed ${relativePath} (${chunks.length} chunks)`);
+  }
+
+  private async probeAndEnsureDimension(): Promise<void> {
+    try {
+      const probe = await this.embeddingProvider.embed('test');
+      this.store.ensureVecTable(probe.length);
+    } catch {
+      console.warn('[indexer] Could not probe embedding dimension, using default');
+      this.store.ensureVecTable(768);
+    }
   }
 
   private chunkContent(content: string, relativePath: string): Chunk[] {

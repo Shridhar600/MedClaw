@@ -52,4 +52,68 @@ describe('MemoryEngine', () => {
     const files = await engine.listFiles('memory');
     expect(files).toHaveLength(2);
   });
+
+  it('rejects reading a path with ".." (traversal)', async () => {
+    await expect(engine.readFile('../outside.txt')).rejects.toThrow('Path traversal');
+  });
+
+  it('rejects writing a path with ".." (traversal)', async () => {
+    await expect(engine.writeFile('../outside.txt', 'bad')).rejects.toThrow('Path traversal');
+  });
+
+  // SEC-m1: absolute paths are explicitly rejected (defense-in-depth). path.join
+  // would otherwise normalize them inside the workspace, which is safe but
+  // surprising — callers expect absolute paths to be refused.
+  it('rejects reading an absolute path with a clear error', async () => {
+    await expect(engine.readFile('/etc/passwd')).rejects.toThrow('Absolute paths are not allowed');
+  });
+
+  it('rejects writing an absolute path with a clear error', async () => {
+    await expect(engine.writeFile('/etc/passwd', 'bad')).rejects.toThrow('Absolute paths are not allowed');
+  });
+
+  it('rejects appending an absolute path with a clear error', async () => {
+    await expect(engine.appendToFile('/etc/passwd', 'bad')).rejects.toThrow('Absolute paths are not allowed');
+  });
+
+  describe('symlink guard (TOCTOU)', () => {
+    it('rejects read through a symlink pointing outside workspace', async () => {
+      const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-outside-'));
+      try {
+        const outsideFile = path.join(outsideDir, 'secret.txt');
+        fs.writeFileSync(outsideFile, 'outside content', 'utf-8');
+        const symlinkPath = path.join(tmpDir, 'evil-link.txt');
+        fs.symlinkSync(outsideFile, symlinkPath);
+
+        await expect(engine.readFile('evil-link.txt')).rejects.toThrow('symlink outside workspace');
+      } finally {
+        fs.rmSync(outsideDir, { recursive: true });
+      }
+    });
+
+    it('rejects write through a directory symlink pointing outside workspace', async () => {
+      const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-outside-'));
+      try {
+        const symlinkPath = path.join(tmpDir, 'evil-dir');
+        fs.symlinkSync(outsideDir, symlinkPath, 'dir');
+
+        await expect(engine.writeFile('evil-dir/bad.md', 'bad')).rejects.toThrow('symlink outside workspace');
+      } finally {
+        fs.rmSync(outsideDir, { recursive: true });
+      }
+    });
+
+    it('allows read/write of normal nested paths (realpath on both sides)', async () => {
+      await engine.writeFile('conditions/diabetes.md', '# Diabetes');
+      const content = await engine.readFile('conditions/diabetes.md');
+      expect(content).toBe('# Diabetes');
+    });
+
+    it('allows write to a new path within workspace (parent exists)', async () => {
+      await engine.writeFile('conditions/knee.md', '# Knee pain');
+      const content = await engine.readFile('conditions/knee.md');
+      expect(content).toBe('# Knee pain');
+    });
+  });
+
 });

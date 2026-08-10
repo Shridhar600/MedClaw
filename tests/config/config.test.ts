@@ -27,7 +27,7 @@ describe('loadConfig', () => {
   it('fails with init guidance when config is required but missing', async () => {
     const cfgPath = path.join(tmpDir, 'missing.json');
     await expect(loadConfig({ configPath: cfgPath, requireFile: true })).rejects.toThrow(
-      /run `npm run cli -- init`/i,
+      /run `npm run cli -- onboard`/i,
     );
   });
 
@@ -36,7 +36,7 @@ describe('loadConfig', () => {
     first.providers.main.model = 'mutated-model';
 
     const second = getDefaultConfig();
-    expect(second.providers.main.model).toBe('llama3.1');
+    expect(second.providers.main.model).toBe('kimi-k2.5:cloud');
   });
 
   it('merges user config over defaults', async () => {
@@ -66,6 +66,30 @@ describe('loadConfig', () => {
     const raw = fs.readFileSync(cfgPath, 'utf8');
     expect(JSON.parse(raw).memory.workspace).toBe(path.join(tmpDir, 'workspace'));
     expect(fs.existsSync(`${cfgPath}.tmp`)).toBe(false);
+  });
+
+  it('saves new config files without group or world permissions', async () => {
+    const cfgPath = path.join(tmpDir, 'config.json');
+    const config = getDefaultConfig();
+    const oldUmask = process.umask(0o000);
+
+    try {
+      await saveConfig(cfgPath, config);
+    } finally {
+      process.umask(oldUmask);
+    }
+
+    expect(fs.statSync(cfgPath).mode & 0o777).toBe(0o600);
+  });
+
+  it('does not widen stricter existing owner-only config permissions', async () => {
+    const cfgPath = path.join(tmpDir, 'config.json');
+    const config = getDefaultConfig();
+    fs.writeFileSync(cfgPath, '{}', { mode: 0o400 });
+
+    await saveConfig(cfgPath, config);
+
+    expect(fs.statSync(cfgPath).mode & 0o777).toBe(0o400);
   });
 
   it('redacts provider api keys and telegram tokens', () => {

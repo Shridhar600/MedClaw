@@ -186,6 +186,8 @@ describe('HeartbeatStore', () => {
     const files = fs.readdirSync(path.dirname(storePath));
     expect(files.some((name) => name.startsWith('jobs.json.corrupt-'))).toBe(true);
     expect(fs.existsSync(storePath)).toBe(false);
+    expect(store.lastCorruptionAt).toBeDefined();
+    expect(store.lastCorruptionAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
   });
 
   it('degrades to empty store even when corrupt-file quarantine fails', async () => {
@@ -203,6 +205,8 @@ describe('HeartbeatStore', () => {
       await expect(store.list()).resolves.toEqual([]);
       expect(fs.existsSync(storePath)).toBe(true);
       expect(errorSpy).toHaveBeenCalled();
+      expect(store.lastCorruptionAt).toBeDefined();
+      expect(store.lastCorruptionAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
     } finally {
       errorSpy.mockRestore();
     }

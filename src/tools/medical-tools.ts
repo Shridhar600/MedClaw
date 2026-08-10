@@ -7,8 +7,8 @@ import type { MemorySearch } from '../memory/search';
 import type { LLMProvider, LLMResponse, Message } from '../providers/types';
 import type { ProviderConfig } from '../config/types';
 import { processReportFile, type ProcessedReport } from '../media/report-processor';
-
-const MEDICAL_DISCLAIMER = '\n\n---\n*I am an AI health companion, not a doctor. Consult a healthcare professional for medical advice.*';
+import { MEDICAL_DISCLAIMER } from '../safety/medical-disclaimer';
+import { summarizeErrorForLog } from '../security';
 
 /**
  * Assemble health context from memory for medical queries.
@@ -223,7 +223,9 @@ export function createMedicalTools(
         }
 
         // Graceful degradation only when the fallback provider is local.
-        console.warn('[medgemma_query] Medical provider failed, falling back to local main LLM:', error);
+        // Provider error messages can echo user health context (PHI) — log the
+        // sanitized frame only, never the raw error.
+        console.warn('[medgemma_query] Medical provider failed, falling back to local main LLM:', summarizeErrorForLog(error));
 
         try {
           const healthContext = await assembleHealthContext(memoryEngine, memorySearch, question);
@@ -236,7 +238,7 @@ export function createMedicalTools(
             };
           }
         } catch (fallbackError) {
-          console.error('[medgemma_query] Main provider also failed:', fallbackError);
+          console.error('[medgemma_query] Main provider also failed:', summarizeErrorForLog(fallbackError));
         }
 
         return {
@@ -333,7 +335,9 @@ export function createMedicalTools(
         }
 
         // Graceful degradation only when the fallback provider is local.
-        console.warn('[medgemma_analyze_report] Medical provider failed, falling back to local main LLM:', error);
+        // Provider error messages can echo user health context (PHI) — log the
+        // sanitized frame only, never the raw error.
+        console.warn('[medgemma_analyze_report] Medical provider failed, falling back to local main LLM:', summarizeErrorForLog(error));
 
         try {
           const healthContext = await assembleHealthContext(memoryEngine, memorySearch, report.contextQuery);
@@ -346,7 +350,7 @@ export function createMedicalTools(
             };
           }
         } catch (fallbackError) {
-          console.error('[medgemma_analyze_report] Main provider also failed:', fallbackError);
+          console.error('[medgemma_analyze_report] Main provider also failed:', summarizeErrorForLog(fallbackError));
         }
 
         return {

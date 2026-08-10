@@ -5,6 +5,7 @@ import * as path from 'path';
 import JSON5 from 'json5';
 import type { AppConfig } from './types';
 import { cloneDefaultConfig } from './defaults';
+import { secureMkdir } from '../security';
 
 export interface LoadConfigOptions {
   configPath?: string;
@@ -51,7 +52,7 @@ export async function loadConfig(input?: string | LoadConfigOptions): Promise<Ap
   if (!fs.existsSync(resolvedPath)) {
     if (options.requireFile) {
       throw new Error(
-        `Config file not found at ${resolvedPath}. Run \`npm run cli -- init\` to create one, or pass --config with an existing config path.`,
+        `Config file not found at ${resolvedPath}. Run \`npm run cli -- onboard\` to create one, or pass --config with an existing config path.`,
       );
     }
     console.warn(`[config] No config file at ${resolvedPath}, using defaults`);
@@ -67,6 +68,7 @@ export async function loadConfig(input?: string | LoadConfigOptions): Promise<Ap
   merged.memory.workspace = resolvePath(merged.memory.workspace);
   merged.heartbeat.storePath = resolvePath(merged.heartbeat.storePath);
   merged.heartbeat.audit!.path = resolvePath(merged.heartbeat.audit!.path);
+  merged.profiles!.baseDir = resolvePath(merged.profiles!.baseDir);
 
   return merged;
 }
@@ -82,8 +84,12 @@ function removeDefaultBaseUrlForCloudProviders(config: AppConfig, userConfig: Pa
 }
 
 export async function saveConfig(configPath: string, config: AppConfig): Promise<void> {
-  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  secureMkdir(path.dirname(configPath));
   const tmpPath = `${configPath}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tmpPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+  const existingMode = fs.existsSync(configPath) ? fs.statSync(configPath).mode & 0o777 : 0o600;
+  const finalMode = existingMode & 0o600;
+
+  fs.writeFileSync(tmpPath, `${JSON.stringify(config, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
   fs.renameSync(tmpPath, configPath);
+  fs.chmodSync(configPath, finalMode);
 }

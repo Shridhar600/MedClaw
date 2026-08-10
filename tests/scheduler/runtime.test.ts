@@ -38,6 +38,68 @@ describe('HeartbeatScheduler', () => {
     await scheduler.stop();
   });
 
+  it('a failing trigger persists a sanitized lastError (never the raw error message)', async () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const store = new HeartbeatStore(storePath);
+      const job = await store.create({
+        title: 'Failing check-in',
+        chatId: 'chat-1',
+        cron: '* * * * *',
+        prompt: 'Ask how the user is feeling.',
+        source: 'system',
+        kind: 'routine',
+        policyKey: 'defaults:morning-check-in',
+      });
+      // Provider/agent error messages can echo user health content (PHI).
+      const trigger = jest.fn().mockRejectedValue(new Error('glucose 300 spiking, chest pain reported'));
+      const scheduler = new HeartbeatScheduler(store, trigger);
+
+      await scheduler.start();
+      await scheduler.runNow(job.id);
+
+      const refreshed = await store.get(job.id);
+      expect(refreshed?.lastError).toBeTruthy();
+      expect(refreshed?.lastError).not.toContain('glucose');
+      expect(refreshed?.lastError).not.toContain('chest pain');
+      expect(refreshed?.lastError).toContain('Error');
+
+      const logged = errorSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+      expect(logged).not.toContain('glucose');
+      await scheduler.stop();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('a storage failure while recording a trigger failure does not escape executeJob', async () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const store = new HeartbeatStore(storePath);
+      const job = await store.create({
+        title: 'Failing check-in',
+        chatId: 'chat-1',
+        cron: '* * * * *',
+        prompt: 'Ask how the user is feeling.',
+        source: 'system',
+        kind: 'routine',
+        policyKey: 'defaults:morning-check-in',
+      });
+      const trigger = jest.fn().mockRejectedValue(new Error('send failed'));
+      const scheduler = new HeartbeatScheduler(store, trigger);
+      await scheduler.start();
+
+      // recordFailure's store.update now fails too — executeJob is invoked
+      // fire-and-forget from cron ticks, so nothing may escape it.
+      jest.spyOn(store, 'update').mockRejectedValue(new Error('disk full'));
+
+      await expect(scheduler.runNow(job.id)).resolves.toBeUndefined();
+      await scheduler.stop();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   it('pause prevents runNow from executing the callback', async () => {
     const store = new HeartbeatStore(storePath);
     const job = await store.create({
@@ -138,7 +200,7 @@ describe('HeartbeatScheduler', () => {
 
   it('automatically wakes retry-wait jobs when nextRetryAt is due', async () => {
     jest.useFakeTimers();
-    let now = new Date('2026-04-19T08:00:00.000Z');
+    jest.setSystemTime(new Date('2026-04-19T08:00:00.000Z'));
     try {
       const store = new HeartbeatStore(storePath);
       let attempts = 0;
@@ -154,7 +216,7 @@ describe('HeartbeatScheduler', () => {
         {
           defaultMaxRetries: 1,
           retryBackoffMinutes: 5,
-          now: () => now,
+          now: () => new Date(Date.now()),
         },
       );
       await scheduler.start();
@@ -171,7 +233,6 @@ describe('HeartbeatScheduler', () => {
       await scheduler.runNow(job.id);
       expect((await store.get(job.id))?.deliveryState).toBe('retry-wait');
 
-      now = new Date('2026-04-19T08:05:00.000Z');
       await jest.advanceTimersByTimeAsync(5 * 60 * 1000);
 
       expect(attempts).toBe(2);
@@ -185,11 +246,13 @@ describe('HeartbeatScheduler', () => {
 
   it('automatically wakes snoozed jobs when snoozedUntil is due', async () => {
     jest.useFakeTimers();
-    let now = new Date('2026-04-19T08:00:00.000Z');
+    jest.setSystemTime(new Date('2026-04-19T08:00:00.000Z'));
     try {
       const store = new HeartbeatStore(storePath);
       const trigger = jest.fn().mockResolvedValue(undefined);
-      const scheduler = new HeartbeatScheduler(store, trigger, 'UTC', { now: () => now });
+      const scheduler = new HeartbeatScheduler(store, trigger, 'UTC', {
+        now: () => new Date(Date.now()),
+      });
       await scheduler.start();
       const job = await scheduler.createJob({
         title: 'Snooze wakeup',
@@ -206,7 +269,6 @@ describe('HeartbeatScheduler', () => {
         snoozedUntil: '2026-04-19T08:10:00.000Z',
       });
 
-      now = new Date('2026-04-19T08:10:00.000Z');
       await jest.advanceTimersByTimeAsync(10 * 60 * 1000);
 
       expect(trigger).toHaveBeenCalledTimes(1);
@@ -219,13 +281,13 @@ describe('HeartbeatScheduler', () => {
 
   it('automatically wakes rate-limited jobs when deferredUntil is due', async () => {
     jest.useFakeTimers();
-    let now = new Date('2026-04-19T08:00:00.000Z');
+    jest.setSystemTime(new Date('2026-04-19T08:00:00.000Z'));
     try {
       const store = new HeartbeatStore(storePath);
       const trigger = jest.fn().mockResolvedValue(undefined);
       const scheduler = new HeartbeatScheduler(store, trigger, 'UTC', {
         maxGlobalTriggersPerMinute: 1,
-        now: () => now,
+        now: () => new Date(Date.now()),
       });
       await scheduler.start();
       const first = await scheduler.createJob({
@@ -251,7 +313,6 @@ describe('HeartbeatScheduler', () => {
       await scheduler.runNow(second.id);
       expect((await store.get(second.id))?.deliveryState).toBe('retry-wait');
 
-      now = new Date('2026-04-19T08:01:00.000Z');
       await jest.advanceTimersByTimeAsync(60 * 1000);
 
       expect(trigger).toHaveBeenCalledTimes(2);
@@ -259,6 +320,113 @@ describe('HeartbeatScheduler', () => {
       await scheduler.stop();
     } finally {
       jest.useRealTimers();
+    }
+  });
+
+  // ── CORR-M1: executeJob overlap guard ────────────────────────────────
+  it('overlapping executeJob calls for the same job run the trigger ONCE; markRun runs ONCE; state stays coherent', async () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      const store = new HeartbeatStore(storePath);
+      const job = await store.create({
+        title: 'Slow overlap job',
+        chatId: 'chat-1',
+        cron: '* * * * *',
+        prompt: 'Slow.',
+        source: 'system',
+        kind: 'routine',
+        policyKey: 'defaults:overlap',
+      });
+
+      let releaseTrigger!: () => void;
+      const triggerGate = new Promise<void>((resolve) => {
+        releaseTrigger = resolve;
+      });
+
+      const trigger = jest.fn().mockImplementation(async () => {
+        await triggerGate;
+      });
+
+      const markRunSpy = jest.spyOn(store, 'markRun');
+
+      const scheduler = new HeartbeatScheduler(store, trigger, 'UTC');
+      await scheduler.start();
+
+      const p1 = scheduler.runNow(job.id);
+      await Promise.resolve();
+      await Promise.resolve();
+      const p2 = scheduler.runNow(job.id);
+
+      releaseTrigger();
+      await p1;
+      await p2;
+
+      expect(trigger).toHaveBeenCalledTimes(1);
+      expect(markRunSpy).toHaveBeenCalledTimes(1);
+
+      const refreshed = await store.get(job.id);
+      expect(refreshed?.enabled).toBe(true);
+      expect(refreshed?.deliveryState).toBe('ready');
+      expect(refreshed?.lastRunAt).toBeTruthy();
+
+      await scheduler.stop();
+    } finally {
+      errorSpy.mockRestore();
+      logSpy.mockRestore();
+    }
+  });
+
+  // ── RES-P2-3: stop() drains inFlight ─────────────────────────────────
+  it('stop() waits for a blocked inFlight executeJob to finish before resolving', async () => {
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      const store = new HeartbeatStore(storePath);
+      const job = await store.create({
+        title: 'Drain job',
+        chatId: 'chat-1',
+        cron: '* * * * *',
+        prompt: 'drain.',
+        source: 'system',
+        kind: 'routine',
+        policyKey: 'defaults:drain',
+      });
+
+      let releaseTrigger!: () => void;
+      const triggerGate = new Promise<void>((resolve) => {
+        releaseTrigger = resolve;
+      });
+      const trigger = jest.fn().mockImplementation(async () => {
+        await triggerGate;
+      });
+
+      const scheduler = new HeartbeatScheduler(store, trigger, 'UTC');
+      await scheduler.start();
+
+      // Kick off an inFlight executeJob without awaiting it.
+      const runP = scheduler.runNow(job.id);
+      // Let executeJob enter the blocked trigger (await triggerGate).
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const stopP = scheduler.stop();
+
+      // While the job is still blocked, stop() must NOT resolve within 150ms.
+      await expect(
+        Promise.race([
+          stopP.then(() => 'resolved'),
+          new Promise<string>((resolve) => setTimeout(() => resolve('pending'), 150)),
+        ]),
+      ).resolves.toBe('pending');
+
+      // Now release the blocked trigger; executeJob settles, inFlight clears,
+      // and stop() resolves.
+      releaseTrigger();
+      await expect(runP).resolves.toBeUndefined();
+      await expect(stopP).resolves.toBeUndefined();
+      expect(trigger).toHaveBeenCalledTimes(1);
+    } finally {
+      logSpy.mockRestore();
     }
   });
 });

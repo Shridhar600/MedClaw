@@ -1,7 +1,14 @@
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import type { AppConfig } from '../../src/config/types';
 
 describe('Gateway media flow', () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
   function makeConfig(): AppConfig {
     return {
       providers: {
@@ -68,6 +75,8 @@ describe('Gateway media flow', () => {
     (gateway as any).agentLoop = { run };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).sessions = { prepareHistory, recordTurn, resetSession: jest.fn() };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({
@@ -84,6 +93,181 @@ describe('Gateway media flow', () => {
     expect(forwardedPrompt).toContain('reports/report.txt');
     expect(forwardedPrompt).toContain('42');
     expect(send).toHaveBeenCalledWith('chat-1', { text: 'processed' });
+  });
+
+  it('does not log user message text when handling incoming messages', async () => {
+    const gateway = new Gateway(makeConfig());
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    const send = jest.fn().mockResolvedValue(undefined);
+    const run = jest.fn().mockResolvedValue({
+      text: 'processed',
+      trace: [{ role: 'assistant', content: 'processed' }],
+      usedTools: [],
+      healthResponse: false,
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).channel = { send };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).agentLoop = { run };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).sessions = {
+      prepareHistory: jest.fn().mockResolvedValue([]),
+      recordTurn: jest.fn().mockResolvedValue(undefined),
+      resetSession: jest.fn(),
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (gateway as any).handleMessage({
+      chatId: 'chat-1',
+      userId: 'user-1',
+      text: 'My private glucose reading is 240 after lunch',
+    });
+
+    // console.log only logs character count, not message text
+    expect(logSpy.mock.calls.flat().join('\n')).not.toContain('glucose');
+  });
+
+  it('logs agent error name+location but never the sensitive message body', async () => {
+    const gateway = new Gateway(makeConfig());
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const send = jest.fn().mockResolvedValue(undefined);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).channel = { send };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).agentLoop = {
+      run: jest.fn().mockRejectedValue(new Error('private report sodium value 130')),
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).sessions = {
+      prepareHistory: jest.fn().mockResolvedValue([]),
+      recordTurn: jest.fn().mockResolvedValue(undefined),
+      resetSession: jest.fn(),
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (gateway as any).handleMessage({
+      chatId: 'chat-1',
+      userId: 'user-1',
+      text: 'Please analyze my report',
+    });
+
+    expect(errorSpy.mock.calls.flat().join('\n')).not.toContain('sodium');
+    expect(errorSpy.mock.calls.flat().join('\n')).toContain('Error (at ');
+  });
+
+  it('sends generic fallback and never logs sensitive session context when prepareHistory fails', async () => {
+    const gateway = new Gateway(makeConfig());
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const send = jest.fn().mockResolvedValue(undefined);
+    const run = jest.fn();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).channel = { send };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).agentLoop = { run };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).sessions = {
+      prepareHistory: jest.fn().mockRejectedValue(new Error('private session glucose context')),
+      recordTurn: jest.fn(),
+      resetSession: jest.fn(),
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await expect((gateway as any).handleMessage({
+      chatId: 'chat-1',
+      userId: 'user-1',
+      text: 'Can I eat rice?',
+    })).resolves.toBeUndefined();
+
+    expect(run).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith('chat-1', {
+      text: "I'm having trouble right now. Please try again in a moment.",
+    });
+    expect(errorSpy.mock.calls.flat().join('\n')).not.toContain('glucose');
+  });
+
+  it('does not send fallback nor log sensitive context when recordTurn fails after successful send', async () => {
+    const gateway = new Gateway(makeConfig());
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const send = jest.fn().mockResolvedValue(undefined);
+    const run = jest.fn().mockResolvedValue({
+      text: 'processed',
+      trace: [{ role: 'assistant', content: 'processed' }],
+      usedTools: [],
+      healthResponse: false,
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).channel = { send };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).agentLoop = { run };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).sessions = {
+      prepareHistory: jest.fn().mockResolvedValue([]),
+      recordTurn: jest.fn().mockRejectedValue(new Error('private persistence sodium context')),
+      resetSession: jest.fn(),
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).reconcileHeartbeatPolicies = jest.fn().mockResolvedValue(undefined);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await expect((gateway as any).handleMessage({
+      chatId: 'chat-1',
+      userId: 'user-1',
+      text: 'Please analyze my report',
+    })).resolves.toBeUndefined();
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith('chat-1', { text: 'processed' });
+    expect(errorSpy.mock.calls.flat().join('\n')).not.toContain('sodium');
+  });
+
+  it('closes the search store on stop', async () => {
+    const gateway = new Gateway(makeConfig());
+    const close = jest.fn();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).store = { close };
+
+    await gateway.stop();
+
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it('still closes the search store when channel disconnect fails during stop', async () => {
+    const gateway = new Gateway(makeConfig());
+    const close = jest.fn();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).store = { close };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).channel = { disconnect: jest.fn().mockRejectedValue(new Error('disconnect failed')) };
+
+    await expect(gateway.stop()).rejects.toThrow('disconnect failed');
+
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails startup bootstrap instead of silently continuing with an unusable workspace path', () => {
+    const tmpFile = path.join(os.tmpdir(), `redacted-bootstrap-file-${Date.now()}`);
+    fs.writeFileSync(tmpFile, 'not a directory', 'utf8');
+    const gateway = new Gateway(makeConfig());
+
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect(() => (gateway as any).bootstrapWorkspace(tmpFile)).toThrow('Workspace bootstrap failed');
+    } finally {
+      fs.rmSync(tmpFile, { force: true });
+    }
   });
 
   it('surfaces explicit error to user when media download fails', async () => {
@@ -212,6 +396,34 @@ describe('Gateway media flow', () => {
     });
   });
 
+  it('does not log raw send errors when mediaError response delivery fails', async () => {
+    const gateway = new Gateway(makeConfig());
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const send = jest.fn().mockRejectedValue(new Error('telegram response included private glucose context'));
+    const run = jest.fn();
+    const recordTurn = jest.fn();
+    const prepareHistory = jest.fn().mockResolvedValue([]);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).channel = { send };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).agentLoop = { run };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).sessions = { prepareHistory, recordTurn, resetSession: jest.fn() };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await expect((gateway as any).handleMessage({
+      chatId: 'chat-send-fail',
+      userId: 'user-1',
+      text: 'Uploaded report',
+      mediaError: 'Failed to download uploaded file report.pdf',
+    })).resolves.toBeUndefined();
+
+    expect(run).not.toHaveBeenCalled();
+    expect(recordTurn).not.toHaveBeenCalled();
+    expect(errorSpy.mock.calls.flat().join('\n')).not.toContain('glucose');
+  });
+
   it('still surfaces upload failure when prepareHistory fails', async () => {
     const gateway = new Gateway(makeConfig());
     const send = jest.fn().mockResolvedValue(undefined);
@@ -238,5 +450,160 @@ describe('Gateway media flow', () => {
     expect(send).toHaveBeenCalledWith('chat-session-fail', {
       text: 'Failed to download uploaded file report.pdf',
     });
+  });
+});
+
+// ── RES-P0-4: persist-before-send ordering (main agent path) ───────────────
+describe('Gateway persist-before-send (RES-P0-4)', () => {
+  function makeConfig(): AppConfig {
+    return {
+      providers: {
+        main: { type: 'ollama', model: 'qwen3.5:9b', baseUrl: 'http://localhost:11434/v1' },
+        medical: { type: 'ollama', model: 'qwen3.5:9b', baseUrl: 'http://localhost:11434/v1' },
+        embeddings: { type: 'ollama', model: 'embeddinggemma:latest', baseUrl: 'http://localhost:11434/v1' },
+      },
+      channels: { telegram: { enabled: false, botToken: '' } },
+      tools: { allow: ['*'], deny: [] },
+      memory: {
+        workspace: '/tmp/redacted-test',
+        search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
+        bootstrapMaxChars: 20000,
+      },
+      sessions: {
+        softResetAfterMinutes: 240,
+        hardResetAfterMinutes: 1440,
+        compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+      },
+      heartbeat: {
+        enabled: false,
+        timezone: 'Asia/Kolkata',
+        storePath: '/tmp/redacted-test/heartbeats/jobs.json',
+        recovery: { enabled: false, windowMinutes: 60 },
+        retry: { maxRetries: 3, backoffMinutes: 5 },
+        rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
+        audit: { path: '/tmp/redacted-test/heartbeats/audit.jsonl' },
+        policy: {
+          quietHours: { enabled: true, start: '22:00', end: '07:00' },
+          skipIfChatActiveWithinMinutes: 60,
+          defaults: {
+            morningCheckIn: { enabled: true, cron: '0 8 * * *', prompt: 'Morning check-in prompt.' },
+            eveningSummary: { enabled: true, cron: '0 21 * * *', prompt: 'Evening summary prompt.' },
+          },
+        },
+      },
+      agent: { maxIterations: 15, disclaimerEnabled: true },
+    };
+  }
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('records the turn BEFORE sending the agent response (happy path)', async () => {
+    const gateway = new Gateway(makeConfig());
+    const send = jest.fn().mockResolvedValue(undefined);
+    const run = jest.fn().mockResolvedValue({
+      text: 'processed',
+      trace: [{ role: 'assistant', content: 'processed' }],
+      usedTools: [],
+      healthResponse: false,
+    });
+    const prepareHistory = jest.fn().mockResolvedValue([]);
+    const recordTurn = jest.fn().mockResolvedValue(undefined);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).channel = { send };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).agentLoop = { run };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).sessions = { prepareHistory, recordTurn, resetSession: jest.fn() };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (gateway as any).handleMessage({
+      chatId: 'chat-order',
+      userId: 'user-1',
+      text: 'Please analyze my report',
+    });
+
+    expect(recordTurn).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledTimes(1);
+    // The persist call occurred strictly before the send call.
+    expect(recordTurn.mock.invocationCallOrder[0]).toBeLessThan(send.mock.invocationCallOrder[0]);
+    expect(send).toHaveBeenCalledWith('chat-order', { text: 'processed' });
+  });
+
+  it('still sends the real response when recordTurn fails pre-send, logs divergence sanitized (no fallback)', async () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const gateway = new Gateway(makeConfig());
+    const send = jest.fn().mockResolvedValue(undefined);
+    const run = jest.fn().mockResolvedValue({
+      text: 'processed',
+      trace: [{ role: 'assistant', content: 'processed' }],
+      usedTools: [],
+      healthResponse: false,
+    });
+    const recordTurn = jest.fn().mockRejectedValue(new Error('private persistence sodium context PHI'));
+    const prepareHistory = jest.fn().mockResolvedValue([]);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).channel = { send };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).agentLoop = { run };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).sessions = { prepareHistory, recordTurn, resetSession: jest.fn() };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).reconcileHeartbeatPolicies = jest.fn().mockResolvedValue(undefined);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (gateway as any).handleMessage({
+      chatId: 'chat-persist-fail',
+      userId: 'user-1',
+      text: 'Please analyze my report',
+    });
+
+    // The real response was still sent exactly once — no fallback.
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith('chat-persist-fail', { text: 'processed' });
+
+    // Persist-failure was logged sanitized; the PHI marker never leaked.
+    const logged = errorSpy.mock.calls.flat().map(String).join('\n');
+    expect(logged).toContain('Pre-send persistence error');
+    expect(logged).not.toContain('sodium');
+    expect(logged).not.toContain('PHI');
+  });
+
+  it('persists the emergency turn BEFORE sending emergency guidance', async () => {
+    const gateway = new Gateway(makeConfig());
+    const send = jest.fn().mockResolvedValue(undefined);
+    const run = jest.fn();
+    const recordTurn = jest.fn().mockResolvedValue(undefined);
+    const prepareHistory = jest.fn().mockResolvedValue([]);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).channel = { send };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).agentLoop = { run };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).sessions = { prepareHistory, recordTurn, resetSession: jest.fn() };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (gateway as any).handleMessage({
+      chatId: 'chat-emerg',
+      userId: 'user-1',
+      text: 'I have severe chest pain and cannot breathe',
+    });
+
+    expect(run).not.toHaveBeenCalled();
+    expect(recordTurn).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(recordTurn.mock.invocationCallOrder[0]).toBeLessThan(send.mock.invocationCallOrder[0]);
+    const sentText = (send.mock.calls[0][1] as { text: string }).text;
+    expect(sentText.toLowerCase()).toContain('emergency');
   });
 });

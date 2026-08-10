@@ -24,12 +24,12 @@ const pingTool: Tool = {
 
 describe('AgentLoop', () => {
   it('returns text response directly when no tool call needed', async () => {
-    const provider = makeProvider([{ type: 'text', text: 'Hello Shridhar!' }]);
+    const provider = makeProvider([{ type: 'text', text: 'Hello Arjun!' }]);
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
     const loop = new AgentLoop(provider, registry, [], { maxIterations: 15, disclaimerEnabled: false });
 
     const result = await loop.run('Hi there');
-    expect(result.text).toBe('Hello Shridhar!');
+    expect(result.text).toBe('Hello Arjun!');
   });
 
   it('executes a tool call then returns follow-up text', async () => {
@@ -63,6 +63,28 @@ describe('AgentLoop', () => {
     expect(result.trace[0].tool_calls[0].function.name).toBe('ping');
     expect(result.trace[1].tool_call_id).toBe('c1');
     expect(result.trace[1].content).toBe('pong');
+  });
+
+  it('never logs tool-call arguments (PHI guard)', async () => {
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      const provider = makeProvider([
+        { type: 'tool_call', toolCall: { id: 'c1', name: 'ping', arguments: { query: 'fasting glucose 180, chest pain history' } } },
+        { type: 'text', text: 'done' },
+      ]);
+      const registry = new ToolRegistry({ allow: ['*'], deny: [] });
+      registry.register(pingTool);
+      const loop = new AgentLoop(provider, registry, [], { maxIterations: 15, disclaimerEnabled: false });
+
+      await loop.run('check my glucose');
+
+      const logged = logSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+      expect(logged).toContain('[agent] Tool call: ping');
+      expect(logged).not.toContain('glucose');
+      expect(logged).not.toContain('chest pain');
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 
   it('sets healthResponse from health intent context even when response lacks health keywords', async () => {

@@ -10,6 +10,7 @@ export class ContextAssembler {
   constructor(
     private readonly memory: MemoryEngine,
     private readonly maxChars: number,
+    private readonly profileId: string = 'default',
   ) {}
 
   async buildSystemMessages(): Promise<Message[]> {

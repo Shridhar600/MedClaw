@@ -702,7 +702,10 @@ describe('Gateway heartbeat integration', () => {
 
     const refreshed = await scheduler.getStore().get(job.id);
     expect(refreshed?.deliveryState).toBe('dead-letter');
-    expect(refreshed?.deadLetterReason).toContain('send failed');
+    // lastError/deadLetterReason are persisted to disk and must be PHI-safe:
+    // summarizeErrorForLog keeps the error name but strips the message body.
+    expect(refreshed?.deadLetterReason).toContain('Error');
+    expect(refreshed?.deadLetterReason).not.toContain('send failed');
 
     const auditRaw = fs.readFileSync(config.heartbeat.audit.path, 'utf8');
     expect(auditRaw).toContain('"type":"dead_lettered"');

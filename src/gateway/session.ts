@@ -4,6 +4,8 @@ import * as os from 'os';
 import type { Message, ToolSchema } from '../providers/types';
 import type { LLMProvider } from '../providers/types';
 import type { ToolRegistry } from '../tools/registry';
+import { rotateFileIfNeeded, type RotationConfig } from '../scheduler/rotation';
+import { summarizeErrorForLog, secureMkdir, secureWrite, secureWriteViaTmp, secureAppend, tightenFile } from '../security';
 
 interface Session {
   chatId: string;
@@ -35,15 +37,107 @@ interface CompactionConfig {
 
 type ArchiveReason = 'manual-reset' | 'idle-hard-reset';
 
+const ROTATION_CHECK_INTERVAL = 100;
+
+// --- Compaction token-budget trigger (#15) --------------------------------
+// A cheap safety-margin trigger, NOT exact accounting. `estimateTokens` is a
+// chars/4 English heuristic (20-30% error is acceptable because we compact
+// well before the real context limit); no tokenizer and no new dependency.
+export function estimateTokens(messages: Message[]): number {
+  let chars = 0;
+  for (const m of messages) {
+    chars += m.content?.length ?? 0;
+    if (m.tool_calls) chars += JSON.stringify(m.tool_calls).length;
+  }
+  return Math.ceil(chars / 4);
+}
+
+// Conservative per-model context window. A miss returns 8192 (safe: triggers
+// compaction earlier rather than overflowing a small window).
+export function contextWindowFor(model?: string): number {
+  if (!model) return 8192;
+  const m = model.toLowerCase();
+  if (/^gpt-5/.test(m) || /^o[1-9]/.test(m)) return 128000;
+  if (m.includes('gpt-4o') || m.includes('gpt-4.1')) return 128000;
+  if (m.includes('llama3.2')) return 128000;
+  if (m.includes('kimi')) return 262144; // Kimi K2.5/K2.6/K2.7 — 256K (shipped default main model)
+  return 8192; // medgemma / unknown
+}
+
+// --- Tool-call group integrity (#16) --------------------------------------
+// OpenAI rejects any history where a `tool` message is not a response to a
+// preceding `assistant`+`tool_calls`, or where an `assistant`+`tool_calls`
+// is not immediately followed by its tool result(s). Compaction must never
+// produce such a history.
+
+// Is history[i] a clean place to START the kept (recent) slice? A `tool`
+// message is never clean (it would be orphaned from its parent). An assistant
+// is clean only when it does not continue a tool group (i.e. the previous
+// message is not a tool result). user / system are always clean.
+function isCleanBoundaryStart(history: Message[], i: number): boolean {
+  const msg = history[i];
+  if (!msg) return true;
+  if (msg.role === 'tool') return false;
+  if (msg.role === 'assistant') {
+    const prev = history[i - 1];
+    return !prev || prev.role !== 'tool';
+  }
+  return true;
+}
+
+// Compute the older/recent split index. Start at `length - keepRecent`, then
+// move EARLIER (keep MORE in recent) until the boundary is clean. Never move
+// later — that would drop content. Keeping a few extra recent turns is
+// harmless.
+export function computeCleanSplit(history: Message[], keepRecent: number): number {
+  let split = Math.max(0, history.length - keepRecent);
+  while (split > 0 && !isCleanBoundaryStart(history, split)) {
+    split--;
+  }
+  return split;
+}
+
+// Defensive sanitizer (belt-and-braces even after the boundary snap, and
+// protects any other provider call that replays a compacted history). Drops:
+// leading/orphan `tool` messages (no matching assistant+tool_calls parent) and
+// a trailing `assistant`+`tool_calls` with no following tool result.
+export function stripOrphanToolMessages(messages: Message[]): Message[] {
+  const out: Message[] = [];
+  for (const msg of messages) {
+    if (msg.role === 'tool') {
+      const prev = out[out.length - 1];
+      const inValidGroup =
+        !!prev &&
+        ((prev.role === 'assistant' && !!prev.tool_calls && prev.tool_calls.length > 0) ||
+          prev.role === 'tool');
+      if (inValidGroup) {
+        out.push(msg);
+      }
+      continue; // orphan tool -> drop
+    }
+    out.push(msg);
+  }
+  while (out.length > 0) {
+    const last = out[out.length - 1];
+    if (last.role === 'assistant' && last.tool_calls && last.tool_calls.length > 0) {
+      out.pop();
+    } else {
+      break;
+    }
+  }
+  return out;
+}
+
 export class SessionManager {
   private sessions: Map<string, Session> = new Map();
   private softResetMs: number;
   private hardResetMs: number;
   private sessionsPath: string;
-  private operationQueues: Map<string, Promise<void>> = new Map();
+  private operationQueues: Map<string, Array<() => Promise<void>>> = new Map();
   private readonly llmProvider?: LLMProvider;
   private readonly toolRegistry?: ToolRegistry;
   private readonly compactionConfig?: CompactionConfig;
+  private readonly rotationCounts: Map<string, number> = new Map();
 
   constructor(
     softResetMinutes: number,
@@ -52,6 +146,8 @@ export class SessionManager {
     llmProvider?: LLMProvider,
     toolRegistry?: ToolRegistry,
     compactionConfig?: CompactionConfig,
+    private readonly profileId: string = 'default',
+    private readonly rotationConfig?: Partial<RotationConfig>,
   ) {
     this.softResetMs = softResetMinutes * 60 * 1000;
     this.hardResetMs = hardResetMinutes * 60 * 1000;
@@ -59,7 +155,7 @@ export class SessionManager {
     this.llmProvider = llmProvider;
     this.toolRegistry = toolRegistry;
     this.compactionConfig = compactionConfig;
-    fs.mkdirSync(this.sessionsPath, { recursive: true });
+    secureMkdir(this.sessionsPath);
     this.loadActiveSessions();
   }
 
@@ -113,6 +209,19 @@ export class SessionManager {
         console.log(`[session:${chatId}] Soft reset after ${Math.round(idleMs / 60000)}m idle`);
         await this.runCompactionInternal(chatId);
         session.lastActiveAt = new Date();
+      } else if (
+        this.compactionConfig?.enabled !== false &&
+        this.exceedsTokenBudget(session.history) &&
+        this.canReduceByCompaction(session.history)
+      ) {
+        // #15: token-budget trigger for actively-growing (non-idle) sessions —
+        // compact before the running history overflows the model's context
+        // window, not only on idle. Guarded by canReduceByCompaction (F2) so an
+        // unshrinkable over-budget history does not rewrite itself every turn.
+        console.log(
+          `[session:${chatId}] Token-budget compaction (~${estimateTokens(session.history)} est. tokens)`,
+        );
+        await this.runCompactionInternal(chatId);
       }
 
       return [...(this.sessions.get(chatId)?.history ?? [])];
@@ -124,11 +233,15 @@ export class SessionManager {
       if (turnTrace.length === 0) {
         return;
       }
+      // Persist-first: append to the JSONL BEFORE mutating in-memory state.
+      // If the append/rotation throws, the enqueue promise rejects and the
+      // in-memory session.history never sees the turn — no memory/disk
+      // divergence.
+      await this.appendMessagesToJsonl(chatId, turnTrace);
       const session = this.getOrCreateSessionState(chatId);
       session.history.push(...turnTrace);
       session.lastActiveAt = new Date();
       this.sessions.set(chatId, session);
-      await this.appendMessagesToJsonl(chatId, turnTrace);
     });
   }
 
@@ -148,6 +261,31 @@ export class SessionManager {
     });
   }
 
+  // #15: cheap token-budget check. Rough by design (see estimateTokens) — a
+  // safety-margin trigger, not exact accounting. Never throws out (a check
+  // failure must not break message handling — resilience.md).
+  private exceedsTokenBudget(history: Message[]): boolean {
+    try {
+      const pct = this.compactionConfig?.triggerAtTokenPercent;
+      if (!pct || pct <= 0) return false;
+      const budget = (pct / 100) * contextWindowFor(this.llmProvider?.modelName);
+      return estimateTokens(history) > budget;
+    } catch (e) {
+      console.warn('[session] token-budget check failed, skipping token trigger:', summarizeErrorForLog(e));
+      return false;
+    }
+  }
+
+  // #15 (F2): a token-budget over-limit history is only worth compacting when a
+  // shrink is actually possible. On an unshrinkable history (e.g. a single
+  // message larger than the whole budget) computeCleanSplit is 0 → olderTurns
+  // empty → compaction would rewrite the identical history on every turn
+  // forever. Skip the token trigger in that case.
+  private canReduceByCompaction(history: Message[]): boolean {
+    const keepRecent = Math.max(1, this.compactionConfig?.keepRecentTurns ?? 10);
+    return computeCleanSplit(history, keepRecent) > 0;
+  }
+
   private async runCompactionInternal(chatId: string): Promise<void> {
     const session = this.sessions.get(chatId);
     if (!session) return;
@@ -156,17 +294,39 @@ export class SessionManager {
     const doFlush = this.compactionConfig?.memoryFlush ?? true;
 
     if (!this.llmProvider) {
-      session.history = session.history.slice(-keepRecent);
-      await this.persistHistory(chatId, session.history);
+      // #16: snap the boundary so we never start the kept slice on an orphan
+      // `tool` message, then sanitize as belt-and-braces.
+      const split = computeCleanSplit(session.history, keepRecent);
+      const newHistory = stripOrphanToolMessages(session.history.slice(split));
+      // Atomicity (RES-P1-2): persist FIRST; only mutate session.history once
+      // the on-disk write committed. Degrade like the summary path (F6): a
+      // persist failure must warn-and-continue, never reject the turn — leave
+      // the in-memory history untouched.
+      try {
+        await this.persistHistory(chatId, newHistory);
+        session.history = newHistory;
+      } catch (e) {
+        console.warn('[session] no-LLM compaction persist failed; history left unchanged:', summarizeErrorForLog(e));
+      }
       return;
     }
 
-    const recentTurns = session.history.slice(-keepRecent);
-    const olderTurns = session.history.slice(0, -keepRecent);
+    // #16: split on a CLEAN boundary (never mid tool-call group) so recentTurns
+    // does not start with a dangling `tool` and olderTurns does not end with an
+    // unmatched assistant+tool_calls.
+    const split = computeCleanSplit(session.history, keepRecent);
+    const recentTurns = session.history.slice(split);
+    const olderTurns = session.history.slice(0, split);
 
     if (olderTurns.length === 0) {
-      session.history = recentTurns;
-      await this.persistHistory(chatId, session.history);
+      const cleaned = stripOrphanToolMessages(recentTurns);
+      // F6: degrade on persist failure (matches the summary-path fallback).
+      try {
+        await this.persistHistory(chatId, cleaned);
+        session.history = cleaned;
+      } catch (e) {
+        console.warn('[session] compaction persist (no older turns) failed; history left unchanged:', summarizeErrorForLog(e));
+      }
       return;
     }
 
@@ -194,7 +354,9 @@ export class SessionManager {
         const flushResponse = await this.llmProvider.chat(
           [
             { role: 'system', content: flushPrompt },
-            ...olderTurns,
+            // #16: sanitize before sending — a clean split already prevents a
+            // trailing unmatched assistant+tool_calls, this is belt-and-braces.
+            ...stripOrphanToolMessages(olderTurns),
             { role: 'user', content: 'Persist what should be remembered before compaction.' },
           ],
           toolSchemas,
@@ -204,7 +366,8 @@ export class SessionManager {
           await this.toolRegistry.execute(flushResponse.toolCall.name, flushResponse.toolCall.arguments);
         }
       } catch (e) {
-        console.warn('[session] Flush turn failed:', e);
+        // Provider error messages can echo transcript PHI — sanitized frame only.
+        console.warn('[session] Flush turn failed:', summarizeErrorForLog(e));
       }
     }
 
@@ -223,20 +386,39 @@ Keep it concise and structured.`;
         { role: 'user', content: JSON.stringify(olderTurns) },
       ]);
 
-      if (summaryResponse.type === 'text' && summaryResponse.text.trim().length > 0) {
-        session.history = [
-          { role: 'system', content: `[Previous conversation summary]\n${summaryResponse.text.trim()}` },
+      const summaryText =
+        summaryResponse.type === 'text' && summaryResponse.text.trim().length > 0
+          ? summaryResponse.text.trim()
+          : null;
+      const assembled: Message[] = summaryText
+        ? [
+          { role: 'system', content: `[Previous conversation summary]\n${summaryText}` },
           ...recentTurns,
-        ];
-      } else {
-        session.history = recentTurns;
-      }
-
-      await this.persistHistory(chatId, session.history);
+        ]
+        : recentTurns;
+      // #16: sanitize the assembled history before it becomes the new session
+      // history (belt-and-braces after the clean split).
+      const newHistory = stripOrphanToolMessages(assembled);
+      // Persist FIRST, assign on success (RES-P1-2 atomicity).
+      await this.persistHistory(chatId, newHistory);
+      session.history = newHistory;
     } catch (e) {
-      console.warn('[session] Compact turn failed:', e);
-      session.history = recentTurns;
-      await this.persistHistory(chatId, session.history);
+      // Provider error messages can echo transcript PHI — sanitized frame only.
+      console.warn('[session] Compact turn failed:', summarizeErrorForLog(e));
+      // Fallback: keep the recent turns. Persist FIRST, then assign — so a
+      // crash during this fallback cannot leave in-memory state diverged from
+      // disk. If even this persist fails, leave session.history unchanged and
+      // log sanitized; the caller keeps the pre-compaction history.
+      try {
+        const cleaned = stripOrphanToolMessages(recentTurns);
+        await this.persistHistory(chatId, cleaned);
+        session.history = cleaned;
+      } catch (persistError) {
+        console.warn(
+          '[session] Fallback persist after failed compaction also failed; in-memory history left unchanged:',
+          summarizeErrorForLog(persistError),
+        );
+      }
     }
   }
 
@@ -259,21 +441,23 @@ Keep it concise and structured.`;
     const stamp = Date.now();
     const archiveDir = path.join(this.sessionsPath, 'archive');
     const summariesDir = path.join(this.sessionsPath, 'summaries');
-    fs.mkdirSync(archiveDir, { recursive: true });
-    fs.mkdirSync(summariesDir, { recursive: true });
+    secureMkdir(archiveDir);
+    secureMkdir(summariesDir);
 
     const archivePath = path.join(archiveDir, `${dateStr}-${chatId}-${stamp}.jsonl`);
     const summaryPath = path.join(summariesDir, `${dateStr}-${chatId}-${stamp}.md`);
 
     if (hasActiveFile) {
       fs.renameSync(activePath, archivePath);
+      // rename preserves mode; tighten in case the active file was loose.
+      tightenFile(archivePath);
     } else {
       const lines = history.map(msg => JSON.stringify(this.serializeEntry(chatId, msg, now.toISOString())));
-      fs.writeFileSync(archivePath, lines.join('\n') + (lines.length > 0 ? '\n' : ''));
+      secureWrite(archivePath, lines.join('\n') + (lines.length > 0 ? '\n' : ''));
     }
 
     const summaryContent = await this.generateSummary(chatId, history, reason, now);
-    fs.writeFileSync(summaryPath, summaryContent, 'utf-8');
+    secureWrite(summaryPath, summaryContent);
 
     this.sessions.delete(chatId);
     console.log(`[session:${chatId}] Archived to ${archivePath}`);
@@ -333,7 +517,8 @@ Use short bullet points grouped by section.`,
 ## Summary
 ${response.text.trim()}`;
     } catch (e) {
-      return fallback(`Provider call failed: ${String(e)}`);
+      // PHI: never persist raw error.message (it can echo transcript content).
+      return fallback(`Provider call failed: ${summarizeErrorForLog(e)}`);
     }
   }
 
@@ -347,14 +532,36 @@ ${response.text.trim()}`;
     }
 
     const now = new Date().toISOString();
+    this.maybeRotate(chatId);
     const lines = history.map(msg => JSON.stringify(this.serializeEntry(chatId, msg, now)));
-    fs.writeFileSync(activePath, lines.join('\n') + '\n', 'utf-8');
+    // Atomic write (tmp+rename): a crash mid-compaction must NOT truncate the
+    // on-disk JSONL to zero bytes (RES-P1-1). secureWriteViaTmp writes a tmp
+    // file at 0o600 then renames over the target; the original stays intact
+    // until rename succeeds.
+    secureWriteViaTmp(activePath, lines.join('\n') + '\n');
   }
 
   private async appendMessagesToJsonl(chatId: string, messages: Message[]): Promise<void> {
     const now = new Date().toISOString();
+    this.maybeRotate(chatId);
     const lines = messages.map(msg => JSON.stringify(this.serializeEntry(chatId, msg, now)));
-    fs.appendFileSync(this.activePath(chatId), lines.join('\n') + '\n', 'utf-8');
+    secureAppend(this.activePath(chatId), lines.join('\n') + '\n');
+  }
+
+  private maybeRotate(chatId: string): void {
+    const count = (this.rotationCounts.get(chatId) ?? 0) + 1;
+    this.rotationCounts.set(chatId, count);
+    if (count !== 1 && count % ROTATION_CHECK_INTERVAL !== 0) {
+      return;
+    }
+    try {
+      rotateFileIfNeeded(this.activePath(chatId), this.rotationConfig);
+    } catch (error) {
+      console.warn(
+        `[session:${chatId}] rotation check failed, continuing without rotation:`,
+        summarizeErrorForLog(error),
+      );
+    }
   }
 
   private serializeEntry(chatId: string, msg: Message, timestamp: string): JsonlEntry {
@@ -441,7 +648,14 @@ ${response.text.trim()}`;
     for (const file of files) {
       const chatId = file.replace('active-', '').replace('.jsonl', '');
       const filePath = path.join(this.sessionsPath, file);
-      const { history, lastTimestamp } = this.readHistoryFromJsonl(filePath);
+      const { history: rawHistory, lastTimestamp } = this.readHistoryFromJsonl(filePath);
+      // A torn append (a lost final `tool` line) can leave an OpenAI-invalid
+      // history on disk — a trailing assistant+tool_calls, or a leading orphan
+      // tool. Sanitize BEFORE it enters the live session map, so the first turn
+      // after restart is not a guaranteed provider 400. The #16 "never emit a
+      // rejectable history" property must hold at EVERY boundary, not only
+      // inside compaction. (Archiving still reads the raw file verbatim.)
+      const history = stripOrphanToolMessages(rawHistory);
       if (history.length === 0) {
         continue;
       }
@@ -459,15 +673,37 @@ ${response.text.trim()}`;
   }
 
   private enqueue<T>(chatId: string, operation: () => Promise<T>): Promise<T> {
-    const previous = this.operationQueues.get(chatId) ?? Promise.resolve();
-    const nextOperation = previous.catch(() => undefined).then(operation);
-    const settled = nextOperation.then(() => undefined, () => undefined);
-    this.operationQueues.set(chatId, settled);
-
-    return nextOperation.finally(() => {
-      if (this.operationQueues.get(chatId) === settled) {
-        this.operationQueues.delete(chatId);
+    return new Promise((resolve, reject) => {
+      const queue = this.operationQueues.get(chatId) ?? [];
+      queue.push(async () => {
+        try {
+          resolve(await operation());
+        } catch (e) {
+          reject(e);
+        }
+      });
+      this.operationQueues.set(chatId, queue);
+      if (queue.length === 1) {
+        void this.drainQueue(chatId);
       }
     });
+  }
+
+  private async drainQueue(chatId: string): Promise<void> {
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const queue = this.operationQueues.get(chatId);
+      if (!queue || queue.length === 0) {
+        this.operationQueues.delete(chatId);
+        return;
+      }
+      const job = queue[0];
+      try {
+        await job();
+      } catch {
+        // error propagated via reject in caller
+      }
+      queue.shift();
+    }
   }
 }
