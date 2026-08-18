@@ -13,3 +13,7 @@ export class CryptoIdGen implements IdGen {
     return randomUUID();
   }
 }
+
+/** Shared default instances. Both are stateless — one per process is enough. */
+export const systemClock = new SystemClock();
+export const uuidIdGen = new CryptoIdGen();

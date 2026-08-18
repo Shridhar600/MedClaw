@@ -113,6 +113,23 @@ function flattenFactForRender(fact: LedgerFact): string[] {
   if (fact.supersededBy) {
     lines.push(`- supersededBy: ${fact.supersededBy}`);
   }
+  // Cross-entity links + discontinue reason are top-level fields, so they need
+  // explicit render/parse (the generic `fields` fallback only covers `fields` keys).
+  if (fact.replaces) {
+    lines.push(`- replaces: ${fact.replaces}`);
+  }
+  if (fact.replacedBy) {
+    lines.push(`- replacedBy: ${fact.replacedBy}`);
+  }
+  if (fact.corrects) {
+    lines.push(`- corrects: ${fact.corrects}`);
+  }
+  if (fact.correctedBy) {
+    lines.push(`- correctedBy: ${fact.correctedBy}`);
+  }
+  if (fact.discontinuedReason) {
+    lines.push(`- discontinuedReason: ${fact.discontinuedReason}`);
+  }
 
   if (fact.createdAt) {
     lines.push(`- created_at: ${fact.createdAt}`);
@@ -214,6 +231,11 @@ function parseSingleVersionBlock(
   let visibility: 'private' | 'shareable-summary' | 'shareable-full' = 'private';
   let supersedes: string | undefined;
   let supersededByVal: string | undefined;
+  let replaces: string | undefined;
+  let replacedBy: string | undefined;
+  let corrects: string | undefined;
+  let correctedBy: string | undefined;
+  let discontinuedReason: string | undefined;
   let createdAt = new Date().toISOString();
 
   for (const line of lines) {
@@ -245,6 +267,16 @@ function parseSingleVersionBlock(
       supersedes = rawVal;
     } else if (key === 'supersededBy') {
       supersededByVal = rawVal;
+    } else if (key === 'replaces') {
+      replaces = rawVal;
+    } else if (key === 'replacedBy') {
+      replacedBy = rawVal;
+    } else if (key === 'corrects') {
+      corrects = rawVal;
+    } else if (key === 'correctedBy') {
+      correctedBy = rawVal;
+    } else if (key === 'discontinuedReason') {
+      discontinuedReason = rawVal;
     } else if (key === 'restartOf') {
       fields.restartOf = rawVal;
     } else if (key === 'created_at') {
@@ -272,6 +304,11 @@ function parseSingleVersionBlock(
     version,
     supersedes,
     supersededBy: supersededByVal,
+    replaces,
+    replacedBy,
+    corrects,
+    correctedBy,
+    discontinuedReason,
     status,
     fields: cleanFields,
     provenance: {

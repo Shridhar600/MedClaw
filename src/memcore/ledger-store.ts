@@ -3,7 +3,7 @@ import * as path from 'path';
 import { createHash } from 'crypto';
 import {
   AUTHORITY_RANK, ConfirmationToken, FactStatus, FactType, LedgerFact,
-  Provenance, RecordFactResult, RetractResult, StoredToken, TYPE_TO_FILE,
+  LedgerMutationResult, Provenance, RecordFactResult, RetractResult, StoredToken, TYPE_TO_FILE,
 } from './types';
 import { parseLedgerFile, renderLedgerFile } from './ledger-parser';
 import { secureMkdir, secureChmodFile } from '../security';
@@ -37,6 +37,11 @@ interface RecordFactParams {
   verbatim?: string;
   visibility?: string;
   resume?: boolean;
+  // Cross-entity links a new fact may declare (the tool/capture layer supplies target ids).
+  replaces?: string;
+  replacedBy?: string;
+  corrects?: string;
+  correctedBy?: string;
 }
 
 export class LedgerStore {
@@ -128,6 +133,10 @@ export class LedgerStore {
       type: params.type,
       version,
       supersedes: current?.id,
+      replaces: params.replaces,
+      replacedBy: params.replacedBy,
+      corrects: params.corrects,
+      correctedBy: params.correctedBy,
       status,
       fields,
       provenance: pf,
@@ -282,6 +291,177 @@ export class LedgerStore {
     return { kind: 'applied', fact };
   }
 
+  private latestDiscontinued(facts: LedgerFact[], entity: string): LedgerFact | null {
+    const d = facts.filter(f => f.entity === entity && f.status === 'discontinued');
+    if (d.length === 0) return null;
+    d.sort((a, b) => b.version - a.version);
+    return d[0];
+  }
+
+  private async applyDiscontinue(
+    allFacts: LedgerFact[], cur: LedgerFact, entity: string, type: FactType,
+    provenance: Provenance, opts?: { reason?: string; replacedBy?: string },
+  ): Promise<LedgerFact> {
+    const now = new Date().toISOString();
+    const v = this.nextVersion(allFacts, entity);
+    cur.status = 'superseded';
+    const fact: LedgerFact = {
+      id: `${entity}@v${v}`,
+      profileId: cur.profileId,
+      entity, type, version: v,
+      supersedes: cur.id,
+      replacedBy: opts?.replacedBy,
+      status: 'discontinued',
+      discontinuedReason: opts?.reason,
+      fields: { ...cur.fields },
+      provenance: { ...provenance, capturedAt: now },
+      safetyRelevant: cur.safetyRelevant,
+      episodeId: cur.episodeId,
+      language: cur.language,
+      verbatim: cur.verbatim,
+      visibility: cur.visibility,
+      createdAt: now,
+    };
+    allFacts.push(fact);
+    await this.writeFacts(type, allFacts);
+    return fact;
+  }
+
+  /**
+   * Discontinue the active version of an entity. Med/allergy discontinuation is
+   * a safety-critical change → NEEDS_CONFIRM (amendment A6 posture). Non-med types
+   * apply directly. No active version → idempotent noop.
+   */
+  async discontinue(
+    entity: string, type: FactType, provenance: Provenance,
+    opts?: { reason?: string; replacedBy?: string },
+  ): Promise<LedgerMutationResult> {
+    const allFacts = await this.readFacts(type);
+    const cur = this.activeVersion(allFacts, entity);
+    if (!cur) return { kind: 'noop', reason: 'no-active-version' };
+
+    if (isMedOrAllergy(type)) {
+      const changeHash = hash(`discontinue:${entity}:${type}`);
+      const token = makeToken(entity, changeHash);
+      this.tokens.set(token.uuid, {
+        token,
+        op: { kind: 'discontinue', entity, type, provenance, reason: opts?.reason, replacedBy: opts?.replacedBy },
+        used: false,
+      });
+      return { kind: 'needs-confirmation', fact: cur, token };
+    }
+
+    const fact = await this.applyDiscontinue(allFacts, cur, entity, type, provenance, opts);
+    return { kind: 'applied', fact };
+  }
+
+  private async applyRestart(
+    allFacts: LedgerFact[], discontinued: LedgerFact, entity: string, type: FactType,
+    provenance: Provenance, fields: Record<string, string | number | string[]>, restartOf: string,
+  ): Promise<LedgerFact> {
+    const now = new Date().toISOString();
+    const v = this.nextVersion(allFacts, entity);
+    const fact: LedgerFact = {
+      id: `${entity}@v${v}`,
+      profileId: discontinued.profileId,
+      entity, type, version: v,
+      supersedes: discontinued.id,
+      status: 'active',
+      fields: { ...fields, restartOf },
+      provenance: { ...provenance, capturedAt: now },
+      safetyRelevant: discontinued.safetyRelevant,
+      episodeId: discontinued.episodeId,
+      language: discontinued.language,
+      verbatim: discontinued.verbatim,
+      visibility: discontinued.visibility,
+      createdAt: now,
+    };
+    allFacts.push(fact);
+    await this.writeFacts(type, allFacts);
+    return fact;
+  }
+
+  /**
+   * Restart a previously discontinued entity as a NEW active version carrying
+   * `restartOf` = the discontinued version's id (amendment A6). Med/allergy →
+   * NEEDS_CONFIRM. Already-active or nothing-discontinued → idempotent noop.
+   */
+  async restart(
+    entity: string, type: FactType, provenance: Provenance,
+    fields: Record<string, string | number | string[]>,
+  ): Promise<LedgerMutationResult> {
+    const allFacts = await this.readFacts(type);
+    if (this.activeVersion(allFacts, entity)) return { kind: 'noop', reason: 'already-active' };
+    const discontinued = this.latestDiscontinued(allFacts, entity);
+    if (!discontinued) return { kind: 'noop', reason: 'no-discontinued-version' };
+
+    if (isMedOrAllergy(type)) {
+      const changeHash = hash(`restart:${entity}:${type}`);
+      const token = makeToken(entity, changeHash);
+      this.tokens.set(token.uuid, {
+        token,
+        op: { kind: 'restart', entity, type, provenance, fields: { ...fields }, restartOf: discontinued.id },
+        used: false,
+      });
+      return { kind: 'needs-confirmation', fact: discontinued, token };
+    }
+
+    const fact = await this.applyRestart(allFacts, discontinued, entity, type, provenance, { ...fields }, discontinued.id);
+    return { kind: 'applied', fact };
+  }
+
+  /**
+   * Pause the active version, carrying a `pre_pause_summary` (amendment A2). The
+   * A2 supersession-carry (recordFact on a paused entity) already works — this is
+   * the missing public entry point. No active version → idempotent noop.
+   */
+  async pause(
+    entity: string, type: FactType, provenance: Provenance,
+    opts: { prePauseSummary: string },
+  ): Promise<LedgerMutationResult> {
+    const allFacts = await this.readFacts(type);
+    const active = this.activeVersion(allFacts, entity);
+    if (!active) return { kind: 'noop', reason: 'no-active-version' };
+
+    const now = new Date().toISOString();
+    const v = this.nextVersion(allFacts, entity);
+    active.status = 'superseded';
+    const fact: LedgerFact = {
+      id: `${entity}@v${v}`,
+      profileId: active.profileId,
+      entity, type, version: v,
+      supersedes: active.id,
+      status: 'paused',
+      fields: { ...active.fields, pre_pause_summary: opts.prePauseSummary },
+      provenance: { ...provenance, capturedAt: now },
+      safetyRelevant: active.safetyRelevant,
+      episodeId: active.episodeId,
+      language: active.language,
+      verbatim: active.verbatim,
+      visibility: active.visibility,
+      createdAt: now,
+    };
+    allFacts.push(fact);
+    await this.writeFacts(type, allFacts);
+    return { kind: 'applied', fact };
+  }
+
+  /** All cross-entity link ids for an entity, deduped across its version chain. */
+  async getCrossLinks(entity: string, type: FactType): Promise<{
+    replaces: string[]; replacedBy: string[]; corrects: string[]; correctedBy: string[];
+  }> {
+    const allFacts = await this.readFacts(type);
+    const entityFacts = allFacts.filter(f => f.entity === entity);
+    const collect = (pick: (f: LedgerFact) => string | undefined): string[] =>
+      Array.from(new Set(entityFacts.map(pick).filter((x): x is string => Boolean(x))));
+    return {
+      replaces: collect(f => f.replaces),
+      replacedBy: collect(f => f.replacedBy),
+      corrects: collect(f => f.corrects),
+      correctedBy: collect(f => f.correctedBy),
+    };
+  }
+
   async confirm(tokenId: string, options?: { winningVersion?: number }): Promise<LedgerFact> {
     const stored = this.tokens.get(tokenId);
     if (!stored) throw new Error(`CONFIRM_REJECTED: token ${tokenId} not found`);
@@ -370,6 +550,21 @@ export class LedgerStore {
       loser.status = 'superseded';
       await this.writeFacts(op.type, allFacts);
       return winner;
+    }
+
+    if (op.kind === 'discontinue') {
+      // Re-read current state (the 15-min token window may have seen other writes).
+      const allFacts = await this.readFacts(op.type);
+      const cur = this.activeVersion(allFacts, op.entity);
+      if (!cur) throw new Error(`CONFIRM_REJECTED: no active version for ${op.entity}`);
+      return this.applyDiscontinue(allFacts, cur, op.entity, op.type, op.provenance, { reason: op.reason, replacedBy: op.replacedBy });
+    }
+
+    if (op.kind === 'restart') {
+      const allFacts = await this.readFacts(op.type);
+      const discontinued = allFacts.find(f => f.id === op.restartOf) ?? this.latestDiscontinued(allFacts, op.entity);
+      if (!discontinued) throw new Error(`CONFIRM_REJECTED: no discontinued version for ${op.entity}`);
+      return this.applyRestart(allFacts, discontinued, op.entity, op.type, op.provenance, { ...op.fields }, discontinued.id);
     }
 
     throw new Error(`CONFIRM_REJECTED: unknown op kind`);

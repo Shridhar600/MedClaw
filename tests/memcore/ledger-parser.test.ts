@@ -254,4 +254,21 @@ this is garbage that should not parse
       expect(parsed[0].visibility).toBe('shareable-summary');
     });
   });
+
+  describe('cross-entity + discontinue round-trip (Task 3)', () => {
+    it('round-trips replaces/replacedBy/corrects/correctedBy/discontinuedReason as top-level fields', () => {
+      const f = makeFact({
+        entity: 'naproxen', version: 2, status: 'discontinued',
+        replaces: 'ibuprofen@v1', replacedBy: 'aspirin@v1',
+        corrects: 'ibuprofen@v1', correctedBy: 'aspirin@v1',
+        discontinuedReason: 'doctor-discontinued',
+      });
+      const [parsed] = roundTrip([f]);
+      expect(parsed.replaces).toBe('ibuprofen@v1');
+      expect(parsed.replacedBy).toBe('aspirin@v1');
+      expect(parsed.corrects).toBe('ibuprofen@v1');
+      expect(parsed.correctedBy).toBe('aspirin@v1');
+      expect(parsed.discontinuedReason).toBe('doctor-discontinued');
+    });
+  });
 });

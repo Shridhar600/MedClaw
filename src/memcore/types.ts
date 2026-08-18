@@ -25,7 +25,16 @@ export interface LedgerFact {
   version: number;
   supersedes?: string;
   supersededBy?: string;
+  // Cross-ENTITY links (distinct from same-entity supersedes/supersededBy).
+  // replaces/replacedBy = clinical substitution (naproxen replaces ibuprofen, KNEE-04).
+  // corrects/correctedBy = mistaken-entity correction (DAD-10, spec-09 field names).
+  replaces?: string;
+  replacedBy?: string;
+  corrects?: string;
+  correctedBy?: string;
   status: FactStatus;
+  /** Set on a `discontinued` fact (spec-09 CONTRA-01 `reason` maps here). */
+  discontinuedReason?: string;
   fields: Record<string, string | number | string[]>;
   provenance: Provenance;
   safetyRelevant: boolean;
@@ -85,7 +94,19 @@ export interface CaptureEvent {
 export type PendingOp =
   | { kind: 'write'; entity: string; type: FactType; fields: Record<string, string | number | string[]>; provenance: Provenance; safetyRelevant?: boolean; episodeId?: string; language?: string; verbatim?: string; visibility?: string; resume?: boolean }
   | { kind: 'retract'; entity: string; type: FactType; provenance: Provenance }
-  | { kind: 'dispute'; entity: string; type: FactType; versionA: number; versionB: number };
+  | { kind: 'dispute'; entity: string; type: FactType; versionA: number; versionB: number }
+  | { kind: 'discontinue'; entity: string; type: FactType; provenance: Provenance; reason?: string; replacedBy?: string }
+  | { kind: 'restart'; entity: string; type: FactType; provenance: Provenance; fields: Record<string, string | number | string[]>; restartOf: string };
+
+/**
+ * Result of a lifecycle mutation (discontinue / restart / pause). `noop` is an
+ * idempotent no-change outcome (e.g. discontinue with no active version), so the
+ * tool layer can report it without a null-fact sentinel.
+ */
+export type LedgerMutationResult =
+  | { kind: 'applied'; fact: LedgerFact }
+  | { kind: 'needs-confirmation'; fact: LedgerFact; token: ConfirmationToken }
+  | { kind: 'noop'; reason: string };
 
 export interface StoredToken {
   token: ConfirmationToken;

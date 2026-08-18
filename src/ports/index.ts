@@ -7,3 +7,4 @@ export type { BlobStore } from './blob-store';
 export type { KVCache } from './kv-cache';
 export type { Clock } from './clock';
 export type { IdGen } from './id-gen';
+export { SystemClock, CryptoIdGen, systemClock, uuidIdGen } from './defaults';
