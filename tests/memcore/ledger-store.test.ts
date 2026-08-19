@@ -232,6 +232,7 @@ describe('LedgerStore', () => {
       });
       const result = await store.retract({ entity: 'penicillin', type: 'allergy', provenance: docProv });
       expect(result.kind).toBe('needs-confirmation');
+      if (result.kind !== 'needs-confirmation') return;
       expect(result.token).toBeDefined();
     });
 
@@ -242,6 +243,7 @@ describe('LedgerStore', () => {
       });
       const result = await store.retract({ entity: 'penicillin', type: 'allergy', provenance: docProv });
       expect(result.kind).toBe('needs-confirmation');
+      if (result.kind !== 'needs-confirmation') return;
       await store.confirm(result.token!.uuid);
       const active = await store.getActive('penicillin', 'allergy');
       expect(active).toBeNull();
@@ -314,12 +316,8 @@ describe('LedgerStore', () => {
       await store.recordFact({
         entity: 'metformin', type: 'medication', fields: { dose: '500mg' }, provenance: docProv,
       });
-
-      const data = await store['readFacts']('medication');
-      const v1 = data.find(f => f.entity === 'metformin' && f.version === 1)!;
-      v1.status = 'paused';
-      v1.fields.pre_pause_summary = 'Held for surgery' as unknown as string[];
-      await store['writeFacts']('medication', data);
+      // Build the paused state through the PUBLIC pause() API (no private-member hacking).
+      await store.pause('metformin', 'medication', docProv, { prePauseSummary: 'Held for surgery' });
 
       const result = await store.recordFact({
         entity: 'metformin', type: 'medication',
@@ -337,10 +335,7 @@ describe('LedgerStore', () => {
       await store.recordFact({
         entity: 'metformin', type: 'medication', fields: { dose: '500mg' }, provenance: docProv,
       });
-      const data = await store['readFacts']('medication');
-      const v1 = data.find(f => f.entity === 'metformin' && f.version === 1)!;
-      v1.status = 'paused';
-      await store['writeFacts']('medication', data);
+      await store.pause('metformin', 'medication', docProv, { prePauseSummary: 'Held for surgery' });
 
       const result = await store.recordFact({
         entity: 'metformin', type: 'medication',
@@ -350,31 +345,31 @@ describe('LedgerStore', () => {
       expect(result.kind).toBe('applied');
       if (result.kind !== 'applied') return;
       expect(result.fact.status).toBe('active');
-      expect(result.fact.version).toBe(2);
-      const after = await store.getChain('metformin', 'medication');
-      expect(after.find(f => f.version === 1)!.status).toBe('superseded');
       const activeNow = await store.getActive('metformin', 'medication');
-      expect(activeNow?.version).toBe(2);
+      expect(activeNow?.id).toBe(result.fact.id);
+      // no version remains paused after a resume
+      const chain = await store.getChain('metformin', 'medication');
+      expect(chain.filter(f => f.status === 'paused')).toHaveLength(0);
     });
   });
 
   describe('A6 — discontinued restart', () => {
-    it('restart of discontinued med creates new chain', async () => {
+    it('restart of a discontinued med creates a new active version carrying restartOf', async () => {
       await store.recordFact({
         entity: 'metformin', type: 'medication', fields: { dose: '500mg' }, provenance: docProv,
       });
-      const chain = await store.getChain('metformin', 'medication');
-      const lastId = chain[0].id;
+      // Actually discontinue (med-class → confirm), then actually restart() — the real contract.
+      const disc = await store.discontinue('metformin', 'medication', docProv);
+      expect(disc.kind).toBe('needs-confirmation');
+      if (disc.kind === 'needs-confirmation') await store.confirm(disc.token.uuid);
+      const discontinued = (await store.getChain('metformin', 'medication')).find(f => f.status === 'discontinued')!;
 
-      const result = await store.recordFact({
-        entity: 'metformin', type: 'medication',
-        fields: { dose: '500mg', restartOf: lastId },
-        provenance: docProv,
-      });
-      expect(result.kind).toBe('applied');
-      if (result.kind === 'applied') {
-        expect(result.fact.fields.restartOf).toBe(lastId);
-      }
+      const res = await store.restart('metformin', 'medication', docProv, { dose: '850mg' });
+      expect(res.kind).toBe('needs-confirmation');
+      if (res.kind !== 'needs-confirmation') return;
+      const fact = await store.confirm(res.token.uuid);
+      expect(fact.status).toBe('active');
+      expect(fact.fields.restartOf).toBe(discontinued.id);
     });
   });
 });

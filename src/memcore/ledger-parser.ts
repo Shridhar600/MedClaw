@@ -145,6 +145,13 @@ function flattenFactForRender(fact: LedgerFact): string[] {
       }
       continue;
     }
+    // Reserved names are rendered from their top-level `fact.*` field above; a
+    // `fields` entry with the same name must NOT also render (it would re-parse
+    // into the top-level slot and corrupt the round-trip). These names are
+    // therefore reserved and cannot be used as generic field keys.
+    if (RESERVED_TOP_LEVEL_FIELD_KEYS.has(key)) {
+      continue;
+    }
     if (Array.isArray(value)) {
       lines.push(`- ${key}: [${value.join(', ')}]`);
     } else {
@@ -154,6 +161,13 @@ function flattenFactForRender(fact: LedgerFact): string[] {
 
   return lines;
 }
+
+/** Field-key names that render as top-level `- key:` lines and re-parse into `fact.*`, never `fields`. */
+const RESERVED_TOP_LEVEL_FIELD_KEYS = new Set<string>([
+  'provenance', 'captured_at', 'safety_relevant', 'episode', 'lang',
+  'verbatim', 'visibility', 'supersedes', 'supersededBy',
+  'replaces', 'replacedBy', 'corrects', 'correctedBy', 'discontinuedReason', 'created_at',
+]);
 
 export function parseLedgerFile(md: string, options: { type: FactType; profileId: string }): LedgerFact[] {
   const facts: LedgerFact[] = [];
@@ -237,6 +251,7 @@ function parseSingleVersionBlock(
   let correctedBy: string | undefined;
   let discontinuedReason: string | undefined;
   let createdAt = new Date().toISOString();
+  let sawProvenance = false;
 
   for (const line of lines) {
     const colonIdx = line.indexOf(': ');
@@ -251,6 +266,7 @@ function parseSingleVersionBlock(
         provConfidence = parsed.confidence;
         provAnchor = parsed.anchor;
         provNote = parsed.note;
+        sawProvenance = true;
       }
     } else if (key === 'captured_at') {
       capturedAt = rawVal;
@@ -286,6 +302,13 @@ function parseSingleVersionBlock(
     } else {
       fields[key] = detectValue(rawVal);
     }
+  }
+
+  // A real version block always carries a valid `- provenance:` line (the renderer
+  // always emits one). Its absence means the block is corrupt → throw so the caller
+  // quarantines it instead of FABRICATING an active fact from defaulted values.
+  if (!sawProvenance) {
+    throw new Error(`missing provenance in ${entity}@v${version}`);
   }
 
   const finalCreatedAt = createdAt;

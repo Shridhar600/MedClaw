@@ -6,18 +6,20 @@ import {
   LedgerMutationResult, Provenance, RecordFactResult, RetractResult, StoredToken, TYPE_TO_FILE,
 } from './types';
 import { parseLedgerFile, renderLedgerFile } from './ledger-parser';
-import { secureMkdir, secureChmodFile } from '../security';
+import { secureWriteViaTmp, secureChmodFile, summarizeErrorForLog } from '../security';
+import type { Clock } from '../ports';
+import { systemClock } from '../ports';
 
 function hash(s: string): string {
   return createHash('sha256').update(s).digest('hex').slice(0, 16);
 }
 
-function makeToken(entity: string, changeHash: string): ConfirmationToken {
+function makeToken(entity: string, changeHash: string, nowMs: number): ConfirmationToken {
   return {
-    uuid: createHash('sha256').update(`${entity}:${changeHash}:${Date.now()}:${Math.random()}`).digest('hex').slice(0, 12),
+    uuid: createHash('sha256').update(`${entity}:${changeHash}:${nowMs}:${Math.random()}`).digest('hex').slice(0, 12),
     entityId: entity,
     changeHash,
-    expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+    expiresAt: new Date(nowMs + 15 * 60 * 1000).toISOString(),
     singleUse: true as const,
   };
 }
@@ -47,7 +49,7 @@ interface RecordFactParams {
 export class LedgerStore {
   private tokens = new Map<string, StoredToken>();
 
-  constructor(private rootDir: string) {}
+  constructor(private rootDir: string, private clock: Clock = systemClock) {}
 
   private filePath(type: FactType): string {
     const name = TYPE_TO_FILE[type];
@@ -56,27 +58,40 @@ export class LedgerStore {
 
   private async readFacts(type: FactType): Promise<LedgerFact[]> {
     const fp = this.filePath(type);
+    let content: string;
     try {
-      const content = await fs.promises.readFile(fp, 'utf-8');
-      return parseLedgerFile(content, { type, profileId: path.basename(this.rootDir) });
+      content = await fs.promises.readFile(fp, 'utf-8');
     } catch (err: unknown) {
       const nodeErr = err as NodeJS.ErrnoException;
       if (nodeErr.code === 'ENOENT') return [];
       throw err;
     }
+    const facts = parseLedgerFile(content, { type, profileId: path.basename(this.rootDir) });
+    // A non-empty file that parses to zero facts is corrupt (e.g. truncated
+    // mid-header). Quarantine the raw bytes to a sidecar BEFORE any later write
+    // can overwrite them — never treat a failed parse as an empty store.
+    if (facts.length === 0 && content.trim() !== '') {
+      this.quarantineCorruptFile(fp);
+      return [];
+    }
+    return facts;
+  }
+
+  /** Move an unparseable ledger file aside (rename → `*.corrupt-<stamp>`) so a fresh write cannot destroy it. */
+  private quarantineCorruptFile(fp: string): void {
+    try {
+      const sidecar = `${fp}.corrupt-${this.clock.now().getTime()}`;
+      fs.renameSync(fp, sidecar);
+      secureChmodFile(sidecar);
+      // PHI-safe: log the file basename (a type name) only, never the content.
+      console.warn(`[ledger-store] quarantined unparseable ledger file ${path.basename(fp)} to a .corrupt sidecar`);
+    } catch (err) {
+      console.warn(`[ledger-store] ledger quarantine failed: ${summarizeErrorForLog(err)}`);
+    }
   }
 
   private async writeFacts(type: FactType, facts: LedgerFact[]): Promise<void> {
-    const fp = this.filePath(type);
-    secureMkdir(path.dirname(fp));
-    const content = renderLedgerFile(facts);
-    const tmpPath = fp + '.tmp';
-    await fs.promises.writeFile(tmpPath, content, 'utf-8');
-    // tight tmp + chmod-after-rename defends against umask widening and a
-    // cross-filesystem rename fallback (copy+delete) that drops the temp mode.
-    secureChmodFile(tmpPath);
-    await fs.promises.rename(tmpPath, fp);
-    secureChmodFile(fp);
+    secureWriteViaTmp(this.filePath(type), renderLedgerFile(facts));
   }
 
   private nextVersion(facts: LedgerFact[], entity: string): number {
@@ -140,7 +155,10 @@ export class LedgerStore {
       status,
       fields,
       provenance: pf,
-      safetyRelevant: params.safetyRelevant ?? false,
+      // Medications and allergies are ALWAYS safety-relevant — the SAFETY.md net and
+      // the retract/discontinue confirmation must never depend on a caller/model flag
+      // (medical-safety). Other types honor the caller's flag as before.
+      safetyRelevant: isMedOrAllergy(params.type) ? true : (params.safetyRelevant ?? false),
       episodeId: params.episodeId,
       language: params.language || 'en',
       verbatim: params.verbatim,
@@ -153,7 +171,7 @@ export class LedgerStore {
     const allFacts = await this.readFacts(params.type);
     const active = this.activeVersion(allFacts, params.entity);
     const cur = active || this.pausedVersion(allFacts, params.entity);
-    const now = new Date().toISOString();
+    const now = this.clock.now().toISOString();
 
     if (!cur) {
       const fact = this.makeFact(params, 1, 'active', now);
@@ -171,7 +189,7 @@ export class LedgerStore {
       const v = this.nextVersion(allFacts, params.entity);
       const proposed = this.makeFact(params, v, 'paused', now, cur, fields);
       const changeHash = hash(`${params.entity}:${params.type}:${JSON.stringify(params.fields)}`);
-      const token = makeToken(params.entity, changeHash);
+      const token = makeToken(params.entity, changeHash, this.clock.now().getTime());
       this.tokens.set(token.uuid, { token, op: { kind: 'write', ...params, fields }, used: false });
       return { kind: 'needs-confirmation', token, current: cur, proposed };
     }
@@ -227,7 +245,7 @@ export class LedgerStore {
       allFacts.push(disputeA, disputeB);
       await this.writeFacts(params.type, allFacts);
       const changeHash = hash(`dispute:${params.entity}:${vA}:${vB}`);
-      const token = makeToken(params.entity, changeHash);
+      const token = makeToken(params.entity, changeHash, this.clock.now().getTime());
       this.tokens.set(token.uuid, {
         token,
         op: { kind: 'dispute', entity: params.entity, type: params.type, versionA: vA, versionB: vB },
@@ -240,7 +258,7 @@ export class LedgerStore {
       const v = this.nextVersion(allFacts, params.entity);
       const proposed = this.makeFact(params, v, 'active', now, active);
       const changeHash = hash(`${params.entity}:${params.type}:${JSON.stringify(params.fields)}`);
-      const token = makeToken(params.entity, changeHash);
+      const token = makeToken(params.entity, changeHash, this.clock.now().getTime());
       this.tokens.set(token.uuid, { token, op: { kind: 'write', ...params, fields: params.fields }, used: false });
       return { kind: 'needs-confirmation', token, current: active, proposed };
     }
@@ -254,13 +272,15 @@ export class LedgerStore {
     const allFacts = await this.readFacts(params.type);
     const cur = this.activeVersion(allFacts, params.entity);
     if (!cur) {
-      return { kind: 'applied', fact: null as unknown as LedgerFact };
+      return { kind: 'noop', reason: 'no-active-version' };
     }
 
-    const now = new Date().toISOString();
-    if (cur.safetyRelevant) {
+    const now = this.clock.now().toISOString();
+    // Safety-relevant facts AND all med/allergy facts require confirmation to retract,
+    // regardless of the flag (aligns with discontinue's type-based guard).
+    if (cur.safetyRelevant || isMedOrAllergy(cur.type)) {
       const changeHash = hash(`retract:${params.entity}:${params.type}`);
-      const token = makeToken(params.entity, changeHash);
+      const token = makeToken(params.entity, changeHash, this.clock.now().getTime());
       this.tokens.set(token.uuid, {
         token, op: { kind: 'retract', entity: params.entity, type: params.type, provenance: params.provenance }, used: false,
       });
@@ -302,7 +322,7 @@ export class LedgerStore {
     allFacts: LedgerFact[], cur: LedgerFact, entity: string, type: FactType,
     provenance: Provenance, opts?: { reason?: string; replacedBy?: string },
   ): Promise<LedgerFact> {
-    const now = new Date().toISOString();
+    const now = this.clock.now().toISOString();
     const v = this.nextVersion(allFacts, entity);
     cur.status = 'superseded';
     const fact: LedgerFact = {
@@ -342,7 +362,7 @@ export class LedgerStore {
 
     if (isMedOrAllergy(type)) {
       const changeHash = hash(`discontinue:${entity}:${type}`);
-      const token = makeToken(entity, changeHash);
+      const token = makeToken(entity, changeHash, this.clock.now().getTime());
       this.tokens.set(token.uuid, {
         token,
         op: { kind: 'discontinue', entity, type, provenance, reason: opts?.reason, replacedBy: opts?.replacedBy },
@@ -359,7 +379,7 @@ export class LedgerStore {
     allFacts: LedgerFact[], discontinued: LedgerFact, entity: string, type: FactType,
     provenance: Provenance, fields: Record<string, string | number | string[]>, restartOf: string,
   ): Promise<LedgerFact> {
-    const now = new Date().toISOString();
+    const now = this.clock.now().toISOString();
     const v = this.nextVersion(allFacts, entity);
     const fact: LedgerFact = {
       id: `${entity}@v${v}`,
@@ -397,7 +417,7 @@ export class LedgerStore {
 
     if (isMedOrAllergy(type)) {
       const changeHash = hash(`restart:${entity}:${type}`);
-      const token = makeToken(entity, changeHash);
+      const token = makeToken(entity, changeHash, this.clock.now().getTime());
       this.tokens.set(token.uuid, {
         token,
         op: { kind: 'restart', entity, type, provenance, fields: { ...fields }, restartOf: discontinued.id },
@@ -423,7 +443,7 @@ export class LedgerStore {
     const active = this.activeVersion(allFacts, entity);
     if (!active) return { kind: 'noop', reason: 'no-active-version' };
 
-    const now = new Date().toISOString();
+    const now = this.clock.now().toISOString();
     const v = this.nextVersion(allFacts, entity);
     active.status = 'superseded';
     const fact: LedgerFact = {
@@ -466,7 +486,7 @@ export class LedgerStore {
     const stored = this.tokens.get(tokenId);
     if (!stored) throw new Error(`CONFIRM_REJECTED: token ${tokenId} not found`);
     if (stored.used) throw new Error(`CONFIRM_REJECTED: token ${tokenId} already used`);
-    if (new Date(stored.token.expiresAt) < new Date()) {
+    if (new Date(stored.token.expiresAt) < this.clock.now()) {
       throw new Error(`CONFIRM_REJECTED: token ${tokenId} expired at ${stored.token.expiresAt}`);
     }
 
@@ -475,21 +495,23 @@ export class LedgerStore {
 
     if (op.kind === 'write') {
       const allFacts = await this.readFacts(op.type);
-      const cur = this.activeVersion(allFacts, op.entity);
-      if (!cur) throw new Error(`CONFIRM_REJECTED: no active version for ${op.entity}`);
-      const now = new Date().toISOString();
+      // Resolve the current version as active OR paused (a paused-entity update
+      // has no active version — mirrors recordFact). Without this the paused-carry
+      // branch below is unreachable and confirm() throws "no active version" (A2).
+      const cur = this.activeVersion(allFacts, op.entity) ?? this.pausedVersion(allFacts, op.entity);
+      if (!cur) throw new Error(`CONFIRM_REJECTED: no active or paused version for ${op.entity}`);
+      const now = this.clock.now().toISOString();
       const v = this.nextVersion(allFacts, op.entity);
-      let targetStatus: FactStatus = 'active';
+      const targetStatus: FactStatus = cur.status === 'paused' ? 'paused' : 'active';
       const writeFields = { ...op.fields };
 
-      if (cur.status === 'paused') {
-        targetStatus = 'paused';
-        if (cur.fields['pre_pause_summary'] !== undefined && !(writeFields.pre_pause_summary !== undefined)) {
-          writeFields.pre_pause_summary = cur.fields['pre_pause_summary'] as string;
-        }
-      } else {
-        cur.status = 'superseded';
+      if (cur.status === 'paused'
+        && cur.fields['pre_pause_summary'] !== undefined
+        && writeFields.pre_pause_summary === undefined) {
+        writeFields.pre_pause_summary = cur.fields['pre_pause_summary'] as string;
       }
+      // Supersede the prior version (active or paused) so the chain stays single-headed.
+      cur.status = 'superseded';
 
       const rp: RecordFactParams = {
         entity: op.entity,
@@ -513,7 +535,7 @@ export class LedgerStore {
       const allFacts = await this.readFacts(op.type);
       const cur = this.activeVersion(allFacts, op.entity);
       if (!cur) throw new Error(`CONFIRM_REJECTED: no active version for ${op.entity}`);
-      const now = new Date().toISOString();
+      const now = this.clock.now().toISOString();
       const v = this.nextVersion(allFacts, op.entity);
       cur.status = 'superseded';
       const fact: LedgerFact = {
@@ -562,6 +584,11 @@ export class LedgerStore {
 
     if (op.kind === 'restart') {
       const allFacts = await this.readFacts(op.type);
+      // Guard against a second restart token confirming into a SECOND active version
+      // (two coexisting restart tokens → double-active → the entity can never be retired).
+      if (this.activeVersion(allFacts, op.entity)) {
+        throw new Error(`CONFIRM_REJECTED: ${op.entity} is already active`);
+      }
       const discontinued = allFacts.find(f => f.id === op.restartOf) ?? this.latestDiscontinued(allFacts, op.entity);
       if (!discontinued) throw new Error(`CONFIRM_REJECTED: no discontinued version for ${op.entity}`);
       return this.applyRestart(allFacts, discontinued, op.entity, op.type, op.provenance, { ...op.fields }, discontinued.id);

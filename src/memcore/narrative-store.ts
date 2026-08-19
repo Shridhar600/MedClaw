@@ -13,7 +13,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { Clock } from '../ports';
 import { systemClock } from '../ports';
-import { secureWriteViaTmp, summarizeErrorForLog } from '../security';
+import { secureWriteViaTmp, summarizeErrorForLog, quarantineToSideFile } from '../security';
 
 export interface NarrativeAppendResult {
   date: string;
@@ -98,7 +98,8 @@ export class NarrativeStore {
       console.warn(`[narrative-store] degraded read for ${date}: ${summarizeErrorForLog(err)}`);
       const salvaged = this.salvageRaw(fp);
       const header = this.freshHeader(date);
-      if (salvaged) header.push(`<!-- PARSE-ERROR: preserved unreadable prior content -->`, salvaged);
+      // Salvaged bytes → 0600 side file; inline only a constant pointer (never the raw bytes).
+      if (salvaged) header.push(quarantineToSideFile(this.filePath(date), salvaged));
       return header;
     }
     const lines = raw.split('\n');

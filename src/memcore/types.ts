@@ -120,7 +120,8 @@ export type RecordFactResult =
   | { kind: 'disputed'; versions: [LedgerFact, LedgerFact]; disputeToken: ConfirmationToken };
 
 export type RetractResult =
-  | { kind: 'applied' | 'needs-confirmation'; fact: LedgerFact; token?: ConfirmationToken };
+  | { kind: 'applied' | 'needs-confirmation'; fact: LedgerFact; token?: ConfirmationToken }
+  | { kind: 'noop'; reason: string };
 
 export const TYPE_TO_FILE: Record<FactType, string> = {
   medication: 'medications.md',

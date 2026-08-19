@@ -4,4 +4,5 @@ export { verifyWorkspacePermissions } from './perms-check';
 export type { PermsCheckResult } from './perms-check';
 export { contentContainsCredentials } from './credential-rejection';
 export { summarizeErrorForLog } from './log';
+export { quarantineToSideFile, QUARANTINE_POINTER, QUARANTINE_POINTER_PREFIX } from './quarantine';
 export * from './secure-fs';

@@ -83,7 +83,7 @@ describe('ledger-parser', () => {
       expect(parsed).toEqual([]);
     });
 
-    it('handles corrupt block with PARSE-ERROR quarantine and still parses other entities', () => {
+    it('QUARANTINES a corrupt block (no provenance) instead of fabricating an active fact', () => {
       const md = `## metformin
 ### v2 (active)
 - dose: 850mg 1x/day
@@ -100,11 +100,14 @@ this is garbage that should not parse
 - provenance: user (1.00) · memory/2026-07-07.md#L15
 `;
       const parsed = parseLedgerFile(md, { type: 'medication', profileId: 'test' });
-      expect(parsed.length).toBeGreaterThanOrEqual(2);
-      const goodFacts = parsed.filter(f => f.fields._quarantine === undefined);
-      expect(goodFacts.length).toBeGreaterThanOrEqual(2);
+      // valid entities still parse
       expect(parsed.some(f => f.entity === 'metformin')).toBe(true);
       expect(parsed.some(f => f.entity === 'ibuprofen')).toBe(true);
+      // the broken block is preserved as a QUARANTINE fact, not silently fabricated
+      const quarantined = parsed.filter(f => f.fields._quarantine !== undefined);
+      expect(quarantined).toHaveLength(1);
+      // the garbage line NEVER becomes a real structured field on any fact
+      expect(parsed.some(f => f.fields._quarantine === undefined && f.fields.incomplete !== undefined)).toBe(false);
     });
 
     it('parses provenance note in quotes', () => {
