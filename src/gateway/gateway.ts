@@ -13,6 +13,13 @@ import { createMemoryTools } from '../tools/memory-tools';
 import { createMedicalTools } from '../tools/medical-tools';
 import { createCronManageTool } from '../tools/cron-manage';
 import { createHeartbeatManageTool } from '../tools/heartbeat-manage';
+import { createLedgerTools } from '../tools/ledger-tools';
+import { createEpisodeTools } from '../tools/episode-tools';
+import { createSafetyTools } from '../tools/safety-tools';
+import { WriteQueue, replayJournal } from '../profiles';
+import { LedgerStore, NarrativeStore, SafetyView, EpisodeStore, CuriosityQueue } from '../memcore';
+import { CapturePipeline } from '../capture';
+import type { SafetyRenderer } from '../capture';
 import { SqliteStore } from '../memory/sqlite-store';
 import { MemorySearch } from '../memory/search';
 import { createProvider } from '../providers/factory';
@@ -54,6 +61,8 @@ export class Gateway {
   private resolvedMemoryWorkspace?: string;
   private bootHealth?: { providers: ReadinessResult[]; telegram: ReadinessResult };
   private mainProvider?: LLMProvider;
+  // v2 capture pipeline for the active profile (per-turn narrative capture hook, Task 13.3).
+  private capturePipeline?: CapturePipeline;
   private securityWarnings: string[] = [];
   private reconcileTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 
@@ -143,6 +152,83 @@ export class Gateway {
       console.warn('[gateway] Medical tools unavailable; continuing without them:', summarizeErrorForLog(e));
     }
 
+    // v2 memory core (P1): per-profile stores + capture pipeline + the ledger/episode/safety
+    // tool groups + the per-turn narrative capture hook (Task 13). The stores share the
+    // resolved profile workspace as their root (ledger/ , memory/ , SAFETY.md), so the legacy
+    // assembler reads back what capture writes. Each block is individually try/caught (the P0
+    // pattern): a broken store disables its group and boot continues. CuratedMemory/ScratchStore
+    // land with their tools in a later phase — no P1 tool consumes them yet.
+    try {
+      const stateDir = path.join(memoryWorkspace, '.state');
+      secureMkdir(stateDir);
+      const journalPath = path.join(stateDir, 'write-queue.journal');
+      const writeQueue = new WriteQueue({ journalPath });
+      // A4 / 13.4: replay any ops journalled by a crash before serving (P1 logs stuck ops).
+      try {
+        await replayJournal(journalPath, (label) => {
+          console.warn('[gateway] stuck write-queue op recovered at boot (mirror rebuild is P2):', label);
+        });
+      } catch (e) {
+        console.warn('[gateway] write-queue journal replay failed:', summarizeErrorForLog(e));
+      }
+
+      const ledgerStore = new LedgerStore(memoryWorkspace);
+      const narrativeStore = new NarrativeStore(memoryWorkspace);
+      const safetyView = new SafetyView(memoryWorkspace);
+      const episodeStore = new EpisodeStore(memoryWorkspace);
+      const curiosityQueue = new CuriosityQueue(memoryWorkspace, undefined, undefined, profileId);
+      const safetyRenderer: SafetyRenderer = {
+        render: (facts) => safetyView.render(facts),
+        listSafetyRelevant: () => ledgerStore.listSafetyRelevant(),
+      };
+      const pipeline = new CapturePipeline({
+        queue: writeQueue,
+        ledger: ledgerStore,
+        narrative: narrativeStore,
+        safety: safetyRenderer,
+        curiosity: curiosityQueue,
+      });
+      this.capturePipeline = pipeline;
+
+      // DIAB-06 side-effect lookup: prefer on-device medgemma, fall back to main (resilience).
+      let sideEffectProvider: LLMProvider = mainProvider;
+      try {
+        sideEffectProvider = createProvider(config.providers.medical);
+      } catch (e) {
+        console.warn('[gateway] Medical provider for side-effect lookup unavailable; using main:', summarizeErrorForLog(e));
+      }
+
+      try {
+        for (const tool of createLedgerTools({
+          pipeline,
+          ledger: ledgerStore,
+          safety: safetyRenderer,
+          queue: writeQueue,
+          sideEffectLookup: (entity) => this.lookupSideEffects(sideEffectProvider, entity),
+        })) {
+          registry.register(tool);
+        }
+      } catch (e) {
+        console.warn('[gateway] Ledger tools unavailable; continuing without them:', summarizeErrorForLog(e));
+      }
+      try {
+        for (const tool of createEpisodeTools({ store: episodeStore, profileId })) {
+          registry.register(tool);
+        }
+      } catch (e) {
+        console.warn('[gateway] Episode tools unavailable; continuing without them:', summarizeErrorForLog(e));
+      }
+      try {
+        for (const tool of createSafetyTools({ safetyView })) {
+          registry.register(tool);
+        }
+      } catch (e) {
+        console.warn('[gateway] Safety tools unavailable; continuing without them:', summarizeErrorForLog(e));
+      }
+    } catch (e) {
+      console.warn('[gateway] Memory-core (v2) unavailable; continuing without ledger/episode/safety tools + per-turn capture:', summarizeErrorForLog(e));
+    }
+
     // Context
     const assembler = new ContextAssembler(memory, config.memory.bootstrapMaxChars, profileId);
     const systemMessages = await assembler.buildSystemMessages();
@@ -196,6 +282,55 @@ export class Gateway {
     console.log('[gateway] Redacted is running.');
   }
 
+  /**
+   * Per-turn narrative capture (Task 13.3 / F4 / CHAT-06). Raw user text is ALWAYS captured
+   * losslessly through the profile's CapturePipeline — deterministic, agent-independent.
+   * Structured ledger entries stay agent-initiated via tools. Capture never blocks the reply:
+   * a failure warns-and-continues (resilience). Empty text and media-only turns are skipped.
+   */
+  private async captureUserTurn(chatId: string, text: string): Promise<void> {
+    const pipeline = this.capturePipeline;
+    if (!pipeline || text.trim().length === 0) return;
+    try {
+      await pipeline.ingest({
+        profileId: (this.getProfileForChat(chatId) ?? 'default') as string,
+        source: 'chat',
+        kind: 'narrative-note',
+        payload: { text },
+      });
+    } catch (e) {
+      console.warn('[gateway] per-turn narrative capture failed (continuing):', summarizeErrorForLog(e));
+    }
+  }
+
+  /**
+   * DIAB-06 (D1): resolve a medication's known side effects via the medical provider before
+   * a ledger write. Fully guarded — any failure returns [] so the field is never absent, and
+   * the medication name (health content) is never logged.
+   */
+  private async lookupSideEffects(provider: LLMProvider, entity: string): Promise<string[]> {
+    try {
+      const prompt =
+        `List the well-known common side effects of the medication "${entity}" as a compact JSON ` +
+        `array of short lowercase strings (e.g. ["nausea","dizziness"]). If unsure, return []. ` +
+        `Output ONLY the JSON array.`;
+      const res = await provider.chat([{ role: 'user', content: prompt }]);
+      if (res.type !== 'text') return [];
+      const match = res.text.match(/\[[\s\S]*\]/);
+      if (!match) return [];
+      const parsed: unknown = JSON.parse(match[0]);
+      if (!Array.isArray(parsed)) return [];
+      return parsed
+        .filter((x): x is string => typeof x === 'string')
+        .map(s => s.trim())
+        .filter(Boolean)
+        .slice(0, 20);
+    } catch (e) {
+      console.warn('[gateway] side-effect lookup failed (falling back to []):', summarizeErrorForLog(e));
+      return [];
+    }
+  }
+
   async handleTestMessage(chatId: string, text: string): Promise<string> {
     // PROD-P1-6: empty/whitespace-only text → short canned reply, no agent run,
     // no session write (mirrors the channel path in handleMessage).
@@ -235,6 +370,9 @@ export class Gateway {
     if (onboarding) {
       return onboarding;
     }
+
+    // Lossless per-turn capture (F4) — always, before the agent run.
+    await this.captureUserTurn(chatId, text);
 
     const history = await this.sessions!.prepareHistory(chatId);
     const result = await this.agentLoop!.run(text, history, { chatId });
@@ -370,6 +508,9 @@ export class Gateway {
       }
       return;
     }
+
+    // Lossless per-turn capture (F4) — the RAW user text, always, before the agent run.
+    await this.captureUserTurn(chatId, text);
 
     let result: Awaited<ReturnType<AgentLoop['run']>>;
     try {

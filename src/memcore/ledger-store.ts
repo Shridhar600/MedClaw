@@ -613,4 +613,19 @@ export class LedgerStore {
     const allFacts = await this.readFacts(type);
     return allFacts.filter(f => f.status === 'active');
   }
+
+  /**
+   * Every safety-relevant fact currently shown on SAFETY.md — active OR resolved, across
+   * all types. This is the source the SafetyRenderer re-renders from on a D8 mutation
+   * (broader than listByType, which is active-only). Bounded to one read per type file.
+   */
+  async listSafetyRelevant(): Promise<LedgerFact[]> {
+    const out: LedgerFact[] = [];
+    for (const type of Object.keys(TYPE_TO_FILE) as FactType[]) {
+      for (const f of await this.readFacts(type)) {
+        if (f.safetyRelevant && (f.status === 'active' || f.status === 'resolved')) out.push(f);
+      }
+    }
+    return out;
+  }
 }
