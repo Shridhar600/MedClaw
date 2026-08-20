@@ -38,5 +38,6 @@ export type {
   ConfirmationToken, MetricPoint, NarrativeNote, CuriosityKind,
   CuriosityItem, CaptureEvent, PendingOp, StoredToken,
   RecordFactResult, RetractResult, LedgerMutationResult,
+  LedgerFactInput, NarrativeNoteInput, MetricPointInput, LedgerCorrectionInput,
 } from './types';
 export { AUTHORITY_RANK, TYPE_TO_FILE } from './types';

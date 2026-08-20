@@ -17,15 +17,19 @@ function detectValue(raw: string): string | number | string[] {
 }
 
 function parseProvenance(rawValue: string): { source: Authority; confidence: number; anchor: string; note?: string } | null {
-  const parts = rawValue.split(' · ');
-  if (parts.length < 2) return null;
+  // Split on the bare middot and trim each segment. An empty anchor is a legitimate
+  // state (a fact recorded before its narrative anchor is known), and the reader trims
+  // the renderer's trailing `· ` down to `·` — so tolerate a missing/empty anchor rather
+  // than rejecting the line (which silently quarantined the whole block and fabricated a
+  // v0 "active" fact on the next read).
+  const parts = rawValue.split('·').map(s => s.trim());
 
   const sourceMatch = parts[0].match(/^([a-zA-Z]+)\s*\(([\d.]+)\)/);
   if (!sourceMatch) return null;
 
   const source = sourceMatch[1] as Authority;
   const confidence = parseFloat(sourceMatch[2]);
-  const anchor = parts[1].trim();
+  const anchor = parts[1] ?? '';
   let note: string | undefined;
   if (parts.length > 2) {
     note = parts.slice(2).join(' · ').replace(/^"(.*)"$/, '$1');

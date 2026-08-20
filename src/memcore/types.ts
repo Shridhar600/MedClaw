@@ -84,12 +84,71 @@ export interface CuriosityItem {
   dueAt?: string;
 }
 
-export interface CaptureEvent {
+/**
+ * Input for a NEW ledger fact captured during a turn. The store assigns id/version/
+ * createdAt; the caller supplies the semantic content + provenance. Cross-entity link
+ * ids (`replaces`/`corrects`) are the TARGET fact ids the caller resolved. `text` is the
+ * human-readable narrative log line — omit it to log the entity name.
+ */
+export interface LedgerFactInput {
+  entity: string;
+  type: FactType;
+  fields: Record<string, string | number | string[]>;
+  provenance: Provenance;
+  safetyRelevant?: boolean;
+  episodeId?: string;
+  language?: string;
+  verbatim?: string;
+  replaces?: string;
+  corrects?: string;
+  text?: string;
+}
+
+/** Input for a narrative-only note (CHAT-06) — the lossless lane, no structured fact. */
+export interface NarrativeNoteInput {
+  text: string;
+  language?: string;
+  verbatim?: string;
+  date?: string;
+}
+
+/**
+ * Input for a metric reading (DIAB-02). Recorded as a `metric`-type ledger fact whose
+ * `fields` always carry a `date` (F19) plus a narrative note.
+ */
+export interface MetricPointInput {
+  entity: string;
+  fields: Record<string, string | number | string[]>;
+  date: string;
+  provenance: Provenance;
+  note?: string;
+  language?: string;
+  safetyRelevant?: boolean;
+}
+
+/** Input for a mistaken-entity correction (DAD-10): retract `wrong`, record `corrected`. */
+export interface LedgerCorrectionInput {
+  wrong: { entity: string; type: FactType };
+  corrected: LedgerFactInput;
+  /** Narrative line describing the correction. */
+  note: string;
+}
+
+interface CaptureEventBase {
   profileId: string;
-  kind: 'ledger-fact' | 'narrative-note' | 'curiosity-item' | 'metric-point';
-  payload: LedgerFact | NarrativeNote | CuriosityItem | MetricPoint;
   source: string;
 }
+
+/**
+ * A normalized inbound capture event, discriminated by `kind`. Each payload is an
+ * INPUT shape (not a stored record) — the pipeline resolves ids/anchors when it writes.
+ */
+export type CaptureEvent =
+  | (CaptureEventBase & { kind: 'ledger-fact'; payload: LedgerFactInput })
+  | (CaptureEventBase & { kind: 'narrative-note'; payload: NarrativeNoteInput })
+  | (CaptureEventBase & { kind: 'metric-point'; payload: MetricPointInput })
+  | (CaptureEventBase & { kind: 'curiosity-item'; payload: Omit<CuriosityItem, 'id' | 'profileId' | 'createdAt'> })
+  | (CaptureEventBase & { kind: 'ledger-correction'; payload: LedgerCorrectionInput });
 
 export type PendingOp =
   | { kind: 'write'; entity: string; type: FactType; fields: Record<string, string | number | string[]>; provenance: Provenance; safetyRelevant?: boolean; episodeId?: string; language?: string; verbatim?: string; visibility?: string; resume?: boolean }
