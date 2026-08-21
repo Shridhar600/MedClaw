@@ -2,6 +2,7 @@ import type { Tool, ToolResult } from './types';
 import type { MemoryEngine } from '../memory/memory-engine';
 import type { MemorySearch } from '../memory/search';
 import type { MemoryIndexer } from '../memory/indexer';
+import * as path from 'path';
 import { contentContainsCredentials, summarizeErrorForLog } from '../security';
 
 // --- Managed-lane write guard (Task 12.6 / G1) -------------------------------------------
@@ -29,10 +30,19 @@ const MANAGED_REJECT = {
   curiosity: 'Direct writes to curiosity.md are not allowed (owned by the curiosity queue).',
   state: 'Direct writes to .state/ are not allowed (owned by the scheduler/store internals).',
   scratch: 'Direct writes to scratch/ are not allowed via memory_write.',
+  traversal: 'Path traversal is not allowed.',
 } as const;
 
-function normalizeManagedPath(p: string): string {
-  return p.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
+/**
+ * Normalize a raw workspace-relative path to its RESOLVED form (PT / SB-1):
+ * backslashes → slashes, then `path.posix.normalize` collapses `.` and `..`
+ * segments. Returns null when `..` segments remain after normalization — the
+ * path escapes above the workspace root and is never classifiable.
+ */
+function normalizeManagedPath(p: string): string | null {
+  const s = path.posix.normalize(p.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, ''));
+  if (s.split('/').includes('..')) return null;
+  return s;
 }
 
 function rejection(text: string): ToolResult {
@@ -74,6 +84,8 @@ async function classifyManagedWrite(
   content: string,
 ): Promise<ToolResult | null> {
   const p = normalizeManagedPath(rawPath);
+  // Residual `..` after normalization = traversal above the workspace root.
+  if (p === null) return rejection(MANAGED_REJECT.traversal);
   const lower = p.toLowerCase();
 
   // Narrative lane stays writable (append-only, lossless). Checked first so a `memory/…`

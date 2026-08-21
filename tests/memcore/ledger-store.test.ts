@@ -77,18 +77,22 @@ describe('LedgerStore', () => {
   });
 
   describe('higher-authority supersede', () => {
-    it('doctor supersedes user fact with conflict', async () => {
+    // W-C/D fix pass (AR / C2): a conflicting MED change needs user confirmation
+    // regardless of authority rank — the old assertion here enshrined the
+    // authority-rank bypass the hostile panel flagged as CRITICAL.
+    it('doctor conflicting med change needs confirmation; confirm applies v2', async () => {
       await store.recordFact({
         entity: 'lisinopril', type: 'medication', fields: { dose: '10mg' }, provenance: userProv,
       });
       const result = await store.recordFact({
         entity: 'lisinopril', type: 'medication', fields: { dose: '20mg' }, provenance: docProv,
       });
-      expect(result.kind).toBe('applied');
-      if (result.kind === 'applied') {
-        expect(result.fact.version).toBe(2);
-        expect(result.fact.status).toBe('active');
-        expect(result.fact.fields.dose).toBe('20mg');
+      expect(result.kind).toBe('needs-confirmation');
+      if (result.kind === 'needs-confirmation') {
+        const fact = await store.confirm(result.token.uuid);
+        expect(fact.version).toBe(2);
+        expect(fact.status).toBe('active');
+        expect(fact.fields.dose).toBe('20mg');
       }
     });
 

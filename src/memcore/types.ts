@@ -151,9 +151,9 @@ export type CaptureEvent =
   | (CaptureEventBase & { kind: 'ledger-correction'; payload: LedgerCorrectionInput });
 
 export type PendingOp =
-  | { kind: 'write'; entity: string; type: FactType; fields: Record<string, string | number | string[]>; provenance: Provenance; safetyRelevant?: boolean; episodeId?: string; language?: string; verbatim?: string; visibility?: string; resume?: boolean }
+  | { kind: 'write'; entity: string; type: FactType; fields: Record<string, string | number | string[]>; provenance: Provenance; safetyRelevant?: boolean; episodeId?: string; language?: string; verbatim?: string; visibility?: string; resume?: boolean; /** Hash of the current fact at proposal time (CH): verified at confirm to reject stale-token clobbers. */ baselineCurHash?: string }
   | { kind: 'retract'; entity: string; type: FactType; provenance: Provenance }
-  | { kind: 'dispute'; entity: string; type: FactType; versionA: number; versionB: number }
+  | { kind: 'dispute'; entity: string; type: FactType; versionA: number; versionB: number; originalId: string }
   | { kind: 'discontinue'; entity: string; type: FactType; provenance: Provenance; reason?: string; replacedBy?: string }
   | { kind: 'restart'; entity: string; type: FactType; provenance: Provenance; fields: Record<string, string | number | string[]>; restartOf: string };
 
@@ -174,9 +174,9 @@ export interface StoredToken {
 }
 
 export type RecordFactResult =
-  | { kind: 'applied'; fact: LedgerFact }
-  | { kind: 'needs-confirmation'; token: ConfirmationToken; current: LedgerFact; proposed: LedgerFact }
-  | { kind: 'disputed'; versions: [LedgerFact, LedgerFact]; disputeToken: ConfirmationToken };
+  | { kind: 'applied'; fact: LedgerFact; /** CT (SB-2): set when a correction's companion retract needs user confirmation — the tool layer must relay it (DAD-10). */ pendingRetract?: ConfirmationToken }
+  | { kind: 'needs-confirmation'; token: ConfirmationToken; current: LedgerFact; proposed: LedgerFact; /** CT: relayed correction-retract token (may accompany a pending corrected arm too). */ pendingRetract?: ConfirmationToken }
+  | { kind: 'disputed'; versions: [LedgerFact, LedgerFact]; disputeToken: ConfirmationToken; /** CT: relayed correction-retract token. */ pendingRetract?: ConfirmationToken };
 
 export type RetractResult =
   | { kind: 'applied' | 'needs-confirmation'; fact: LedgerFact; token?: ConfirmationToken }

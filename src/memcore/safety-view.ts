@@ -27,6 +27,7 @@ import { systemClock } from '../ports';
 import { AppError } from '../shared/errors';
 import { secureWriteViaTmp, summarizeErrorForLog, quarantineToSideFile, QUARANTINE_POINTER_PREFIX } from '../security';
 import type { FactType, LedgerFact } from './types';
+import { sanitizeSingleLine } from './sanitize';
 
 /** Thrown when base SAFETY.md entry removal is attempted without user confirmation. */
 export class SafetyRemovalRefusedError extends AppError {
@@ -97,7 +98,7 @@ export class SafetyView {
    */
   async addCriticalEvent(ev: CriticalEvent): Promise<string> {
     const { items } = this.load();
-    const bullet = `- ${ev.summary}${ev.action ? ` — ${ev.action}` : ''}`;
+    const bullet = `- ${sanitizeSingleLine(ev.summary)}${ev.action ? ` — ${sanitizeSingleLine(ev.action)}` : ''}`;
     const events = items.find(i => i.kind === 'section' && i.heading === CRITICAL_EVENTS_HEADING);
     if (events) {
       events.lines.push(bullet);
@@ -148,7 +149,29 @@ export class SafetyView {
   // ---- internals ---------------------------------------------------------
 
   private renderMachineSections(facts: LedgerFact[]): ParsedItem[] {
-    const shown = facts.filter(f => f.safetyRelevant && (f.status === 'active' || f.status === 'resolved'));
+    // DS: `disputed` facts stay on SAFETY.md (marked) so a safety-relevant fact
+    // never silently leaves the always-injected net while its dispute is open.
+    const eligible = facts.filter(f =>
+      f.safetyRelevant && (f.status === 'active' || f.status === 'resolved' || f.status === 'disputed'));
+    // Exactly ONE bullet per TYPE+ENTITY (self-review CRITICAL-2: the same name
+    // can legally exist as both medication and allergy — keying by entity alone
+    // silently dropped one of them). Settled version wins; a disputed cluster is
+    // represented by its ORIGINAL (lowest version), marked as under dispute.
+    const byEntity = new Map<string, LedgerFact>();
+    for (const f of eligible) {
+      const key = `${f.type}::${f.entity}`;
+      const cur = byEntity.get(key);
+      if (!cur) {
+        byEntity.set(key, f);
+        continue;
+      }
+      const curSettled = cur.status === 'active' || cur.status === 'resolved';
+      const fSettled = f.status === 'active' || f.status === 'resolved';
+      if (!curSettled && fSettled) byEntity.set(key, f);
+      else if (!curSettled && !fSettled && f.version < cur.version) byEntity.set(key, f);
+    }
+
+    const shown = Array.from(byEntity.values());
     const byType = new Map<FactType, LedgerFact[]>();
     for (const f of shown) {
       const list = byType.get(f.type);
@@ -166,10 +189,11 @@ export class SafetyView {
 
   private renderFactBullet(f: LedgerFact): string {
     const dose = f.fields['dose'];
+    const disputeMark = f.status === 'disputed' ? ' — value under dispute' : '';
     if (f.type === 'medication' && dose !== undefined && dose !== '') {
-      return `- ${f.entity} — ${String(dose)}`;
+      return `- ${sanitizeSingleLine(f.entity)} — ${sanitizeSingleLine(String(dose))}${disputeMark}`;
     }
-    return `- ${f.entity}`;
+    return `- ${sanitizeSingleLine(f.entity)}${disputeMark}`;
   }
 
   private entityRegex(entity: string): RegExp {

@@ -19,7 +19,7 @@ import { createSafetyTools } from '../tools/safety-tools';
 import { WriteQueue, replayJournal } from '../profiles';
 import { LedgerStore, NarrativeStore, SafetyView, EpisodeStore, CuriosityQueue } from '../memcore';
 import { CapturePipeline } from '../capture';
-import type { SafetyRenderer } from '../capture';
+import { makeSafetyRenderer } from '../capture';
 import { SqliteStore } from '../memory/sqlite-store';
 import { MemorySearch } from '../memory/search';
 import { createProvider } from '../providers/factory';
@@ -177,10 +177,10 @@ export class Gateway {
       const safetyView = new SafetyView(memoryWorkspace);
       const episodeStore = new EpisodeStore(memoryWorkspace);
       const curiosityQueue = new CuriosityQueue(memoryWorkspace, undefined, undefined, profileId);
-      const safetyRenderer: SafetyRenderer = {
+      const safetyRenderer = makeSafetyRenderer({
         render: (facts) => safetyView.render(facts),
         listSafetyRelevant: () => ledgerStore.listSafetyRelevant(),
-      };
+      });
       const pipeline = new CapturePipeline({
         queue: writeQueue,
         ledger: ledgerStore,
@@ -189,6 +189,15 @@ export class Gateway {
         curiosity: curiosityQueue,
       });
       this.capturePipeline = pipeline;
+
+      // REC (SB-8): boot-time SAFETY reconciliation. One full re-render from the
+      // ledger closes the crash window between a ledger write and its render, and
+      // turns a corrupt-type-file degradation into a self-healing event.
+      try {
+        await safetyRenderer.render(await ledgerStore.listSafetyRelevant());
+      } catch (e) {
+        console.warn('[gateway] boot SAFETY reconciliation failed (continuing):', summarizeErrorForLog(e));
+      }
 
       // DIAB-06 side-effect lookup: prefer on-device medgemma, fall back to main (resilience).
       let sideEffectProvider: LLMProvider = mainProvider;
@@ -204,6 +213,7 @@ export class Gateway {
           ledger: ledgerStore,
           safety: safetyRenderer,
           queue: writeQueue,
+          narrative: narrativeStore,
           sideEffectLookup: (entity) => this.lookupSideEffects(sideEffectProvider, entity),
         })) {
           registry.register(tool);
@@ -359,6 +369,9 @@ export class Gateway {
 
     const emergency = this.handleEmergencyInput(text);
     if (emergency) {
+      // CAP (M5): emergency utterances are the highest-value health data —
+      // capture the raw text BEFORE the canned-response early-return.
+      await this.captureUserTurn(chatId, text);
       await this.sessions?.recordTurn(chatId, [
         { role: 'user', content: text },
         { role: 'assistant', content: emergency },
@@ -368,6 +381,9 @@ export class Gateway {
 
     const onboarding = await this.handleOnboarding(chatId, text);
     if (onboarding) {
+      // CAP (M6-sec): onboarding answers carry structured health facts (meds,
+      // conditions) — captured losslessly like every other turn.
+      await this.captureUserTurn(chatId, text);
       return onboarding;
     }
 
@@ -432,6 +448,9 @@ export class Gateway {
 
     const emergency = this.handleEmergencyInput(text);
     if (emergency) {
+      // CAP (M5): capture raw text before the early-return (parity with
+      // handleTestMessage). Emergency utterances are the highest-value data.
+      await this.captureUserTurn(chatId, text);
       // Persist-first (RES-P0-4): record the turn BEFORE sending so a crash
       // between the two never loses the turn. The emergency text is canned
       // and carries no PHI, but ordering still matters for transcript
@@ -482,6 +501,8 @@ export class Gateway {
 
     const onboarding = await this.handleOnboarding(chatId, text);
     if (onboarding) {
+      // CAP (M6-sec): parity with handleTestMessage — capture before the return.
+      await this.captureUserTurn(chatId, text);
       await this.channel!.send(chatId, { text: onboarding });
       return;
     }
@@ -489,6 +510,8 @@ export class Gateway {
     // Emergency check after onboarding completes
     const postOnboardingEmergency = this.handleEmergencyInput(text);
     if (postOnboardingEmergency) {
+      // CAP (M5): parity — raw text lands in the lossless lane here too.
+      await this.captureUserTurn(chatId, text);
       // Persist-first (RES-P0-4), mirroring the early emergency branch above.
       try {
         await this.sessions!.recordTurn(chatId, [

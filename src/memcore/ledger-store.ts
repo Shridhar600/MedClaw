@@ -3,9 +3,10 @@ import * as path from 'path';
 import { createHash } from 'crypto';
 import {
   AUTHORITY_RANK, ConfirmationToken, FactStatus, FactType, LedgerFact,
-  LedgerMutationResult, Provenance, RecordFactResult, RetractResult, StoredToken, TYPE_TO_FILE,
+  LedgerMutationResult, PendingOp, Provenance, RecordFactResult, RetractResult, StoredToken, TYPE_TO_FILE,
 } from './types';
-import { parseLedgerFile, renderLedgerFile } from './ledger-parser';
+import { parseLedgerFile, renderLedgerFile, canonicalFields } from './ledger-parser';
+import { TokenRejectedError } from './token-errors';
 import { secureWriteViaTmp, secureChmodFile, summarizeErrorForLog } from '../security';
 import type { Clock } from '../ports';
 import { systemClock } from '../ports';
@@ -115,10 +116,13 @@ export class LedgerStore {
   }
 
   private conflictsWith(cur: LedgerFact, fields: Record<string, string | number | string[]>): boolean {
+    // Compare CANONICAL forms (INJ-b): a stored number and its re-typed string
+    // twin are the same value after one Markdown round-trip — never a conflict.
+    const canonicalCur = canonicalFields(cur.fields);
     for (const [key, value] of Object.entries(fields)) {
-      if (key in cur.fields) {
-        const oldVal = cur.fields[key];
-        if (JSON.stringify(oldVal) !== JSON.stringify(value)) return true;
+      if (key in canonicalCur) {
+        const oldVal = canonicalCur[key];
+        if (JSON.stringify(oldVal) !== JSON.stringify(canonicalFields({ [key]: value })[key])) return true;
       }
     }
     return false;
@@ -188,9 +192,11 @@ export class LedgerStore {
       }
       const v = this.nextVersion(allFacts, params.entity);
       const proposed = this.makeFact(params, v, 'paused', now, cur, fields);
-      const changeHash = hash(`${params.entity}:${params.type}:${JSON.stringify(params.fields)}`);
+      const changeHash = hash(`${params.entity}:${params.type}:${JSON.stringify(canonicalFields(params.fields))}`);
+      // CH: snapshot the current fact so confirm() can detect state drift.
+      const baselineCurHash = hash(`${cur.id}:${JSON.stringify(canonicalFields(cur.fields))}`);
       const token = makeToken(params.entity, changeHash, this.clock.now().getTime());
-      this.tokens.set(token.uuid, { token, op: { kind: 'write', ...params, fields }, used: false });
+      this.tokens.set(token.uuid, { token, op: { kind: 'write', ...params, fields, baselineCurHash }, used: false });
       return { kind: 'needs-confirmation', token, current: cur, proposed };
     }
 
@@ -218,7 +224,10 @@ export class LedgerStore {
     const provRank = AUTHORITY_RANK[params.provenance.source];
     const curRank = AUTHORITY_RANK[active.provenance.source];
 
-    if (provRank > curRank) {
+    // AR / C2: authority-rank auto-apply NEVER applies to med/allergy facts — a
+    // conflicting change to a safety-class fact routes to needs-confirmation
+    // regardless of provenance rank (specs/13 A5/A6 posture; medical-safety).
+    if (provRank > curRank && !isMedOrAllergy(params.type)) {
       const v = this.nextVersion(allFacts, params.entity);
       active.status = 'superseded';
       const fact = this.makeFact(params, v, 'active', now, active);
@@ -231,14 +240,16 @@ export class LedgerStore {
       const vA = this.nextVersion(allFacts, params.entity);
       const vB = vA + 1;
       active.status = 'disputed';
-      const disputeA = this.makeFact(params, vA, 'disputed', now, active);
+      // DS (SB-3): the two heads must carry the two COMPETING values.
+      // Head A = the NEW claim, preserving prior fields (known_side_effects etc.).
+      const disputeA = this.makeFact(params, vA, 'disputed', now, active, { ...active.fields, ...params.fields });
+      // Head B = the OLD active claim re-presented — its OWN fields + provenance,
+      // so the user can restore it verbatim.
       const disputeB: LedgerFact = {
         ...active,
         id: `${params.entity}@v${vB}`,
         version: vB,
         status: 'disputed',
-        fields: { ...params.fields },
-        provenance: { ...params.provenance, capturedAt: now },
         createdAt: now,
         supersedes: active.id,
       };
@@ -248,7 +259,7 @@ export class LedgerStore {
       const token = makeToken(params.entity, changeHash, this.clock.now().getTime());
       this.tokens.set(token.uuid, {
         token,
-        op: { kind: 'dispute', entity: params.entity, type: params.type, versionA: vA, versionB: vB },
+        op: { kind: 'dispute', entity: params.entity, type: params.type, versionA: vA, versionB: vB, originalId: active.id },
         used: false,
       });
       return { kind: 'disputed', versions: [disputeA, disputeB], disputeToken: token };
@@ -257,9 +268,11 @@ export class LedgerStore {
     {
       const v = this.nextVersion(allFacts, params.entity);
       const proposed = this.makeFact(params, v, 'active', now, active);
-      const changeHash = hash(`${params.entity}:${params.type}:${JSON.stringify(params.fields)}`);
+      const changeHash = hash(`${params.entity}:${params.type}:${JSON.stringify(canonicalFields(params.fields))}`);
+      // CH: snapshot the current fact so confirm() can detect state drift.
+      const baselineCurHash = hash(`${active.id}:${JSON.stringify(canonicalFields(active.fields))}`);
       const token = makeToken(params.entity, changeHash, this.clock.now().getTime());
-      this.tokens.set(token.uuid, { token, op: { kind: 'write', ...params, fields: params.fields }, used: false });
+      this.tokens.set(token.uuid, { token, op: { kind: 'write', ...params, fields: params.fields, baselineCurHash }, used: false });
       return { kind: 'needs-confirmation', token, current: active, proposed };
     }
   }
@@ -482,24 +495,56 @@ export class LedgerStore {
     };
   }
 
+  /**
+   * Explicitly burn a token WITHOUT applying its op (user declined). The token
+   * becomes unusable immediately (MED-9/DT) instead of lingering for its full
+   * 15-minute window. Idempotent.
+   */
+  declineToken(tokenId: string): void {
+    const stored = this.tokens.get(tokenId);
+    if (!stored) return;
+    stored.used = true;
+  }
+
   async confirm(tokenId: string, options?: { winningVersion?: number }): Promise<LedgerFact> {
     const stored = this.tokens.get(tokenId);
-    if (!stored) throw new Error(`CONFIRM_REJECTED: token ${tokenId} not found`);
-    if (stored.used) throw new Error(`CONFIRM_REJECTED: token ${tokenId} already used`);
+    if (!stored) throw new TokenRejectedError('token-not-found');
+    if (stored.used) throw new TokenRejectedError('token-already-used');
     if (new Date(stored.token.expiresAt) < this.clock.now()) {
-      throw new Error(`CONFIRM_REJECTED: token ${tokenId} expired at ${stored.token.expiresAt}`);
+      throw new TokenRejectedError('token-expired');
     }
 
     const op = stored.op;
-    stored.used = true;
+    // TB (SB-12): the token is marked used only AFTER the op succeeds — a failed
+    // apply (transient IO, state drift) leaves it valid so the user can retry.
+    try {
+      const fact = await this.applyConfirmOp(op, options);
+      stored.used = true;
+      return fact;
+    } catch (e) {
+      if (!(e instanceof TokenRejectedError)) {
+        // Non-rejection failures are operational: log sanitized, keep token usable.
+        console.warn(`[ledger-store] confirm op for token ${tokenId} failed (token remains valid): ${summarizeErrorForLog(e)}`);
+      }
+      throw e;
+    }
+  }
 
+  /** Apply a confirmed op. Throws TokenRejectedError with PHI-free reasons on state mismatches. */
+  private async applyConfirmOp(op: PendingOp, options?: { winningVersion?: number }): Promise<LedgerFact> {
     if (op.kind === 'write') {
       const allFacts = await this.readFacts(op.type);
       // Resolve the current version as active OR paused (a paused-entity update
       // has no active version — mirrors recordFact). Without this the paused-carry
-      // branch below is unreachable and confirm() throws "no active version" (A2).
+      // branch below is unreachable and confirm() rejects (A2).
       const cur = this.activeVersion(allFacts, op.entity) ?? this.pausedVersion(allFacts, op.entity);
-      if (!cur) throw new Error(`CONFIRM_REJECTED: no active or paused version for ${op.entity}`);
+      if (!cur) throw new TokenRejectedError('no-active-version');
+      // CH (M2/M3-sec): reject a stale token whose target state moved since the
+      // proposal — confirming blind would clobber a newer legitimate change.
+      if (op.baselineCurHash !== undefined
+        && hash(`${cur.id}:${JSON.stringify(canonicalFields(cur.fields))}`) !== op.baselineCurHash) {
+        throw new TokenRejectedError('state-moved-since-proposal');
+      }
       const now = this.clock.now().toISOString();
       const v = this.nextVersion(allFacts, op.entity);
       const targetStatus: FactStatus = cur.status === 'paused' ? 'paused' : 'active';
@@ -534,7 +579,7 @@ export class LedgerStore {
     if (op.kind === 'retract') {
       const allFacts = await this.readFacts(op.type);
       const cur = this.activeVersion(allFacts, op.entity);
-      if (!cur) throw new Error(`CONFIRM_REJECTED: no active version for ${op.entity}`);
+      if (!cur) throw new TokenRejectedError('no-active-version');
       const now = this.clock.now().toISOString();
       const v = this.nextVersion(allFacts, op.entity);
       cur.status = 'superseded';
@@ -562,14 +607,25 @@ export class LedgerStore {
 
     if (op.kind === 'dispute') {
       const winningVersion = options?.winningVersion;
-      if (!winningVersion) throw new Error(`CONFIRM_REJECTED: dispute requires winningVersion`);
+      if (!winningVersion) throw new TokenRejectedError('dispute-incomplete');
       const allFacts = await this.readFacts(op.type);
+      // Self-review IMPORTANT-3: at mint time the pre-dispute fact was flipped to
+      // `disputed`, so ANY current active version means a third write landed in
+      // the window — resolving now would create a double-active entity.
+      if (allFacts.some(f => f.entity === op.entity && f.status === 'active')) {
+        throw new TokenRejectedError('state-moved-since-proposal');
+      }
       const loserVersion = winningVersion === op.versionA ? op.versionB : op.versionA;
       const winner = allFacts.find(f => f.entity === op.entity && f.version === winningVersion);
       const loser = allFacts.find(f => f.entity === op.entity && f.version === loserVersion);
-      if (!winner || !loser) throw new Error(`CONFIRM_REJECTED: dispute versions not found`);
+      if (!winner || !loser) throw new TokenRejectedError('dispute-incomplete');
       winner.status = 'active';
       loser.status = 'superseded';
+      // DS (SB-3): retire the ORIGINAL pre-dispute fact too — otherwise it stays
+      // a permanent `disputed` zombie in the chain. The dispute heads carry the
+      // full competing content, so nothing is lost by superseding it.
+      const original = allFacts.find(f => f.id === op.originalId && f.status === 'disputed' && f.version !== winner.version && f.version !== loser.version);
+      if (original) original.status = 'superseded';
       await this.writeFacts(op.type, allFacts);
       return winner;
     }
@@ -578,7 +634,7 @@ export class LedgerStore {
       // Re-read current state (the 15-min token window may have seen other writes).
       const allFacts = await this.readFacts(op.type);
       const cur = this.activeVersion(allFacts, op.entity);
-      if (!cur) throw new Error(`CONFIRM_REJECTED: no active version for ${op.entity}`);
+      if (!cur) throw new TokenRejectedError('no-active-version');
       return this.applyDiscontinue(allFacts, cur, op.entity, op.type, op.provenance, { reason: op.reason, replacedBy: op.replacedBy });
     }
 
@@ -587,14 +643,14 @@ export class LedgerStore {
       // Guard against a second restart token confirming into a SECOND active version
       // (two coexisting restart tokens → double-active → the entity can never be retired).
       if (this.activeVersion(allFacts, op.entity)) {
-        throw new Error(`CONFIRM_REJECTED: ${op.entity} is already active`);
+        throw new TokenRejectedError('entity-already-active');
       }
       const discontinued = allFacts.find(f => f.id === op.restartOf) ?? this.latestDiscontinued(allFacts, op.entity);
-      if (!discontinued) throw new Error(`CONFIRM_REJECTED: no discontinued version for ${op.entity}`);
+      if (!discontinued) throw new TokenRejectedError('no-active-version');
       return this.applyRestart(allFacts, discontinued, op.entity, op.type, op.provenance, { ...op.fields }, discontinued.id);
     }
 
-    throw new Error(`CONFIRM_REJECTED: unknown op kind`);
+    throw new TokenRejectedError('unknown-op');
   }
 
   async getActive(entity: string, type: FactType): Promise<LedgerFact | null> {
@@ -623,7 +679,10 @@ export class LedgerStore {
     const out: LedgerFact[] = [];
     for (const type of Object.keys(TYPE_TO_FILE) as FactType[]) {
       for (const f of await this.readFacts(type)) {
-        if (f.safetyRelevant && (f.status === 'active' || f.status === 'resolved')) out.push(f);
+        // DS: `disputed` facts stay visible to the SAFETY renderer (marked as
+        // under dispute) so a med/allergy never silently leaves the safety net
+        // while its dispute is unresolved.
+        if (f.safetyRelevant && (f.status === 'active' || f.status === 'resolved' || f.status === 'disputed')) out.push(f);
       }
     }
     return out;

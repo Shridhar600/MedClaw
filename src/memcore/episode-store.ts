@@ -14,6 +14,7 @@ import * as path from 'path';
 import type { Clock, IdGen } from '../ports';
 import { systemClock, uuidIdGen } from '../ports';
 import { secureWriteViaTmp, secureMkdir, summarizeErrorForLog } from '../security';
+import { sanitizeSingleLine } from './sanitize';
 
 export type EpisodeStatus = 'open' | 'resolving' | 'resolved' | 'reopened';
 
@@ -212,7 +213,7 @@ export class EpisodeStore {
   }
 
   private render(episode: Episode): string {
-    const lines: string[] = [`# ${episode.title}`];
+    const lines: string[] = [`# ${sanitizeSingleLine(episode.title)}`];
     lines.push(`- status: ${episode.status}`);
     lines.push(`- profileId: ${episode.profileId}`);
     lines.push(`- createdAt: ${episode.createdAt}`);

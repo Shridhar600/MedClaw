@@ -7,6 +7,7 @@
 
 import type { Tool, ToolResult } from './types';
 import type { SafetyView } from '../memcore';
+import { contentContainsCredentials } from '../security';
 
 export interface SafetyToolsDeps {
   safetyView: SafetyView;
@@ -41,10 +42,17 @@ export function createSafetyTools(deps: SafetyToolsDeps): Tool[] {
       if (action === 'add-critical-event') {
         const summary = params.summary as string | undefined;
         if (!summary) return err('safety_note add-critical-event needs a summary.');
+        const actionTaken = params.action_taken as string | undefined;
+        // CRED (SB-6): SAFETY.md is always-injected — the credential bar matches
+        // memory_write before anything lands on disk.
+        const credScan = contentContainsCredentials(`${summary}\n${actionTaken ?? ''}`);
+        if (credScan.matched) {
+          return err(`Write rejected: content matches credential pattern (${credScan.pattern}). Credentials must never be stored in SAFETY.md.`);
+        }
         await deps.safetyView.addCriticalEvent({
           date: (params.date as string) ?? '',
           summary,
-          action: params.action_taken as string | undefined,
+          action: actionTaken,
         });
         return ok(`Added critical event to SAFETY.md: ${summary}`);
       }
@@ -52,7 +60,7 @@ export function createSafetyTools(deps: SafetyToolsDeps): Tool[] {
       if (action === 'propose-removal') {
         const entity = (params.entity as string) ?? 'this entry';
         return err(
-          `Removing "${entity}" from SAFETY.md is refused here (CONTRA-03/04). SAFETY.md is a rendered view of the ledger — retract or discontinue "${entity}" via ledger_record, then confirm with ledger_update. SAFETY.md will update automatically (D8).`,
+          `Removing "${entity}" from SAFETY.md is refused here (CONTRA-03/04). SAFETY.md is a rendered view of the ledger — remove the fact with ledger_remove (entity="${entity}", type=<fact type>), which asks the user to confirm, then updates SAFETY.md automatically on confirm (D8).`,
         );
       }
 

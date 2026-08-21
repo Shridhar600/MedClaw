@@ -3,7 +3,14 @@
 
 // Ledger (versioned health facts)
 export { LedgerStore } from './ledger-store';
-export { parseLedgerFile, renderLedgerFile } from './ledger-parser';
+export { parseLedgerFile, renderLedgerFile, canonicalFieldValue, canonicalFields } from './ledger-parser';
+
+// Render-boundary sanitizer (INJ) — single-line discipline for embedded text
+export { sanitizeSingleLine } from './sanitize';
+
+// Typed confirmation-token rejections (PHI-free reasons)
+export { TokenRejectedError } from './token-errors';
+export type { TokenRejectionReason } from './token-errors';
 
 // Narrative lane (daily logs)
 export { NarrativeStore } from './narrative-store';

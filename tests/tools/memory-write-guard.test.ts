@@ -86,4 +86,38 @@ describe('memory_write managed-path guard (G1 / CONTRA-03)', () => {
     reject(await write.execute({ path: './ledger/conditions.md', content: 'x', mode: 'overwrite' }));
     reject(await write.execute({ path: 'ledger\\symptoms.md', content: 'x', mode: 'overwrite' }));
   });
+
+  // W-C/D fix pass (PT / SB-1): a raw path whose `..` segments RESOLVE INTO a managed
+  // lane must be classified by its normalized target — never slip through on the
+  // un-normalized prefix. Residual `..` above the root is refused outright.
+  describe('hostile paths — .. segment resolution (PT)', () => {
+    it.each([
+      ['memory/../ledger/medications.md', /ledger_record|ledger_update|ledger/i],
+      ['x/../ledger/allergies.md', /ledger_record|ledger_update|ledger/i],
+      ['memory/../MEMORY.md', /curated|budget|MEMORY/i],
+      ['episodes/../.state/scheduler.json', /\.state|scheduler/i],
+    ])('classifies %s by its resolved target', async (rawPath, msgRe) => {
+      const r = await write.execute({ path: rawPath, content: '## injected\nfake', mode: 'overwrite' });
+      reject(r);
+      expect(r.content[0].text).toMatch(msgRe);
+      expect(fs.existsSync(path.join(tmpDir, 'ledger', 'medications.md'))).toBe(false);
+      expect(fs.existsSync(path.join(tmpDir, 'ledger', 'allergies.md'))).toBe(false);
+      expect(fs.existsSync(path.join(tmpDir, '.state', 'scheduler.json'))).toBe(false);
+    });
+
+    it('refuses paths that traverse ABOVE the workspace root', async () => {
+      for (const rawPath of ['../outside.md', 'memory/../../outside.md', '..\\..\\ledger\\x.md', 'a/../b/../../../c.md']) {
+        const r = await write.execute({ path: rawPath, content: 'x', mode: 'overwrite' });
+        reject(r);
+        expect(r.content[0].text).toMatch(/traversal|\.\./i);
+      }
+    });
+
+    it('still allows clean nested narrative paths (no regression)', async () => {
+      ok(await write.execute({ path: 'memory/2026-08-12.md', content: '- ok\n', mode: 'append' }));
+      ok(await write.execute({ path: './memory/sub/dir/note.md', content: '# note', mode: 'overwrite' }));
+      ok(await write.execute({ path: 'memory/a/../b.md', content: '- resolved inside memory/\n', mode: 'overwrite' }));
+      expect(await engine.readFile('memory/b.md')).toContain('resolved inside');
+    });
+  });
 });

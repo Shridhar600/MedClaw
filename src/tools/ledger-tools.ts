@@ -8,9 +8,10 @@ import type { Tool, ToolResult } from './types';
 import type { CapturePipeline, QueuePort, SafetyRenderer } from '../capture';
 import type { LedgerStore } from '../memcore';
 import type { FactType, LedgerFact, RecordFactResult, Authority, Provenance } from '../memcore';
+import { TokenRejectedError, sanitizeSingleLine } from '../memcore';
 import type { Clock } from '../ports';
 import { systemClock } from '../ports';
-import { summarizeErrorForLog } from '../security';
+import { summarizeErrorForLog, contentContainsCredentials } from '../security';
 
 const FACT_TYPES: FactType[] = ['medication', 'condition', 'symptom', 'appointment', 'metric', 'goal', 'allergy'];
 const AUTHORITIES: Authority[] = ['doctor', 'lab', 'report', 'sensor', 'user', 'inference'];
@@ -23,6 +24,12 @@ export interface LedgerToolsDeps {
   clock?: Clock;
   /** DIAB-06: resolve a medication's side effects (LLM). Omit to always fall back to []. */
   sideEffectLookup?: (entity: string, fields: Record<string, string | number | string[]>) => Promise<string[]>;
+  /**
+   * BL (SB-11/M6): narrative anchor port — when supplied, the confirm path writes
+   * the KNEE-01 `## Ledger writes` back-link for the CONFIRMED fact (the initial
+   * applied record's anchor comes from the pipeline; confirms had none).
+   */
+  narrative?: { appendLedgerAnchor(date: string, entity: string, factId: string): Promise<string> };
 }
 
 function ok(text: string): ToolResult {
@@ -55,20 +62,31 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
     capturedAt: clock.now().toISOString(),
   });
 
+  function renderRetractRelay(result: RecordFactResult): string {
+    const token = (result as { pendingRetract?: { uuid: string } }).pendingRetract;
+    if (!token) return '';
+    return (
+      `\nAlso: the mistaken fact could not be auto-retracted and needs confirmation. ` +
+      `To finish the correction, call ledger_update with tokenId="${token.uuid}" and confirm=true.`
+    );
+  }
+
   function renderRecordResult(result: RecordFactResult | void, entity: string, type: FactType): ToolResult {
     if (!result) return ok(`Recorded a narrative note for ${entity}.`);
     if (result.kind === 'applied') {
-      return ok(`Recorded ${entity} (${type}) as ${result.fact.id}.`);
+      return ok(`Recorded ${entity} (${type}) as ${result.fact.id}.${renderRetractRelay(result)}`);
     }
     if (result.kind === 'needs-confirmation') {
       return ok(
         `This change to ${entity} needs your confirmation. To apply, call ledger_update with tokenId="${result.token.uuid}" and confirm=true; to decline, confirm=false.\n` +
-        `current: ${summarizeFields(result.current)}\nproposed: ${summarizeFields(result.proposed)}`,
+        `current: ${summarizeFields(result.current)}\nproposed: ${summarizeFields(result.proposed)}` +
+        renderRetractRelay(result),
       );
     }
     return ok(
       `${entity} is now disputed between two versions. Resolve with ledger_update tokenId="${result.disputeToken.uuid}", confirm=true, winningVersion=<n>.\n` +
-      result.versions.map(v => `v${v.version}: ${summarizeFields(v)}`).join('\n'),
+      result.versions.map(v => `v${v.version}: ${summarizeFields(v)}`).join('\n') +
+      renderRetractRelay(result),
     );
   }
 
@@ -98,6 +116,25 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       if (!FACT_TYPES.includes(type)) return err(`Unknown fact type "${type}".`);
       const fields = { ...((params.fields as Record<string, string | number | string[]>) ?? {}) };
 
+      // SBX-1: field keys are model-invented names, never health content. A key carrying
+      // newlines/# would forge `## entity` / `### vN (active)` structure into the line-oriented
+      // ledger on re-parse (fabricating active meds/allergies onto SAFETY.md with no confirmation).
+      // Reject illegal keys at the boundary; flattenFactForRender sanitizes keys as defense-in-depth.
+      for (const key of Object.keys(fields)) {
+        if (key === '' || /[\r\n\t#]/.test(key)) {
+          return err(`Write rejected: field key ${JSON.stringify(key.slice(0, 40))} contains illegal characters (newline, tab, or #). Field names must be simple identifiers.`);
+        }
+      }
+
+      // CRED (SB-6): the ledger lane carries the SAME credential-rejection bar as
+      // memory_write — scan every caller-controlled input before any write.
+      const credScan = contentContainsCredentials(
+        `${entity}\n${JSON.stringify(fields)}\n${(params.note as string) ?? ''}\n${(params.verbatim as string) ?? ''}`,
+      );
+      if (credScan.matched) {
+        return err(`Write rejected: content matches credential pattern (${credScan.pattern}). Credentials must never be stored in the health memory.`);
+      }
+
       // DIAB-06 (D1): a medication must never be stored with an ABSENT known_side_effects
       // field. Resolve it once BEFORE enqueue; on failure (or no resolver) fall back to [].
       if (type === 'medication' && fields.known_side_effects === undefined) {
@@ -105,7 +142,8 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
           try {
             fields.known_side_effects = await deps.sideEffectLookup(entity, fields);
           } catch (e) {
-            console.warn(`[ledger_record] side-effect lookup failed for ${entity}:`, summarizeErrorForLog(e));
+            // PHI: the medication name must never reach logs — sanitized frame only.
+            console.warn('[ledger_record] side-effect lookup failed:', summarizeErrorForLog(e));
             fields.known_side_effects = [];
           }
         } else {
@@ -155,7 +193,10 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       const winningVersion = params.winningVersion as number | undefined;
 
       if (confirm === false) {
-        return ok(`Change declined — token ${tokenId} was not applied and will expire unused.`);
+        // MED-9/DT: a decline BURNS the token — it can no longer be applied
+        // later in its window by a replayed or hallucinated confirm.
+        deps.ledger.declineToken(tokenId);
+        return ok(`Change declined — token ${tokenId} was burned and can no longer be applied.`);
       }
 
       try {
@@ -170,13 +211,88 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
             if (applied.safetyRelevant) {
               await deps.safety.render(await deps.safety.listSafetyRelevant());
             }
+            // BL: KNEE-01 back-link for the CONFIRMED fact — dispute resolutions
+            // and confirmed writes otherwise never appear in the daily log index.
+            if (deps.narrative) {
+              try {
+                const day = new Date(applied.provenance.capturedAt);
+                const dayStr = Number.isNaN(day.getTime())
+                  ? clock.now().toISOString().slice(0, 10)
+                  : day.toISOString().slice(0, 10);
+                await deps.narrative.appendLedgerAnchor(dayStr, applied.entity, applied.id);
+              } catch (anchorError) {
+                console.warn('[ledger_update] ledger-writes anchor failed (continuing):', summarizeErrorForLog(anchorError));
+              }
+            }
             return applied;
           },
         });
         return ok(`Confirmed: ${fact.entity} (${fact.type}) is now ${fact.status} as ${fact.id}.`);
       } catch (e) {
-        return err(`Could not apply confirmation: ${e instanceof Error ? e.message : String(e)}`);
+        // PPHI: raw provider/store errors can echo entity names (health content).
+        // Token rejections carry a fixed PHI-free reason; everything else is logged
+        // sanitized and reported generically.
+        if (e instanceof TokenRejectedError) {
+          return err(`Could not apply confirmation: ${e.message}`);
+        }
+        console.warn('[ledger_update] confirm failed:', summarizeErrorForLog(e));
+        return err('Could not apply confirmation. Please re-state the change to get a fresh proposal.');
       }
+    },
+  };
+
+  const ledgerRemove: Tool = {
+    name: 'ledger_remove',
+    group: 'group:ledger',
+    description: 'Remove a health fact (e.g. discontinue a medication the user no longer takes). Meds and allergies ALWAYS ask the user for confirmation before applying; SAFETY.md updates on confirm (D8/DAD-11).',
+    parameters: {
+      type: 'object',
+      properties: {
+        entity: { type: 'string', description: 'Entity to remove, e.g. "metformin"' },
+        type: { type: 'string', enum: FACT_TYPES, description: 'Fact type' },
+        reason: { type: 'string', description: 'Why it is being removed (stored on the discontinued version)' },
+      },
+      required: ['entity', 'type'],
+    },
+    async execute(params): Promise<ToolResult> {
+      const entity = params.entity as string;
+      const type = params.type as FactType;
+      if (!FACT_TYPES.includes(type)) return err(`Unknown fact type "${type}".`);
+      // CRED + INJ (self-review CRITICAL-1): the reason persists into a ledger
+      // type file — it passes the SAME credential bar and single-line discipline
+      // as every other caller-controlled input. A multi-line reason could
+      // otherwise forge version blocks (fake ACTIVE med facts) on re-parse.
+      let reason = (params.reason as string | undefined) ?? undefined;
+      if (reason !== undefined) {
+        const credScan = contentContainsCredentials(reason);
+        if (credScan.matched) {
+          return err(`Write rejected: content matches credential pattern (${credScan.pattern}). Credentials must never be stored in the health memory.`);
+        }
+        reason = sanitizeSingleLine(reason);
+        if (reason === '') reason = undefined;
+      }
+
+      // RM (H1/C1-arch): the agent-facing removal surface — routes through the
+      // ledger's discontinuation flow so med-class removal is user-confirmed
+      // and every version stays preserved (soft-delete law).
+      const result = await deps.queue.enqueue('turn', {
+        label: 'ledger_remove:discontinue',
+        run: () => deps.ledger.discontinue(entity, type, provenance('user', 0.9), { reason }),
+      });
+
+      if (result.kind === 'noop') {
+        return ok(`Nothing to remove: ${result.reason.replace(/-/g, ' ')}.`);
+      }
+      if (result.kind === 'needs-confirmation') {
+        return ok(
+          `Removing ${entity} needs your confirmation. To apply, call ledger_update with tokenId="${result.token.uuid}" and confirm=true; to decline, confirm=false.\n` +
+          `current: ${summarizeFields(result.fact)}`,
+        );
+      }
+      if (result.fact.safetyRelevant) {
+        await deps.safety.render(await deps.safety.listSafetyRelevant());
+      }
+      return ok(`Removed ${entity} (${type}) — now ${result.fact.status} as ${result.fact.id}.`);
     },
   };
 
@@ -220,5 +336,5 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
     },
   };
 
-  return [ledgerRecord, ledgerUpdate, ledgerQuery];
+  return [ledgerRecord, ledgerRemove, ledgerUpdate, ledgerQuery];
 }

@@ -15,6 +15,7 @@ import { systemClock } from '../ports';
 import type {
   LedgerFact,
   CaptureEvent,
+  ConfirmationToken,
   RecordFactResult,
   RetractResult,
   CuriosityItem,
@@ -25,7 +26,8 @@ import type {
   MetricPointInput,
   LedgerCorrectionInput,
 } from '../memcore';
-import { summarizeErrorForLog } from '../security';
+import { summarizeErrorForLog, contentContainsCredentials } from '../security';
+import { sanitizeSingleLine } from '../memcore';
 
 /** The single-writer queue seam (WriteQueue). Ops MUST be IO-only (B2). */
 export interface QueuePort {
@@ -97,6 +99,15 @@ export class CapturePipeline {
   }
 
   private route(event: CaptureEvent): Promise<RecordFactResult | void> {
+    // CRED (SB-6) defense-in-depth: every capture payload passes the credential
+    // bar before ANY lane is touched. Tool paths surface a clean rejection at
+    // the tool boundary; non-tool sources (per-turn chat capture) degrade to a
+    // sanitized warn + skip — never a crash, never a persisted credential.
+    const cred = contentContainsCredentials(JSON.stringify(event.payload));
+    if (cred.matched) {
+      console.warn(`[capture] event skipped: content matches credential pattern (${cred.pattern})`);
+      return Promise.resolve();
+    }
     switch (event.kind) {
       case 'ledger-fact':
         return this.ingestLedgerFact(event.payload);
@@ -145,8 +156,38 @@ export class CapturePipeline {
       await this.deps.narrative.appendLedgerAnchor(day, p.entity, result.fact.id);
       if (result.fact.safetyRelevant) await this.reRenderSafety();
       await this.emitEvent(result.fact);
+    } else if (result.kind === 'disputed') {
+      await this.enqueueDisputeCuriosity(result, p.provenance.capturedAt);
     }
     return result;
+  }
+
+  /**
+   * A1: a minted dispute creates a durable follow-up item (re-ask ~7d) so the
+   * conflict resurfaces until resolved. Critical iff the disputed fact is a
+   * med/allergy. Best-effort — a curiosity failure never fails the capture.
+   */
+  private async enqueueDisputeCuriosity(
+    result: Extract<RecordFactResult, { kind: 'disputed' }>,
+    capturedAt?: string,
+  ): Promise<void> {
+    const writer = this.deps.curiosity;
+    if (!writer) return;
+    const head = result.versions[0];
+    try {
+      const base = capturedAt && !Number.isNaN(new Date(capturedAt).getTime())
+        ? new Date(capturedAt)
+        : this.clock.now();
+      await writer.add({
+        kind: 'follow-up',
+        description: `Unresolved conflict about "${sanitizeSingleLine(head.entity)}" — ask the user which value is correct.`,
+        critical: head.type === 'medication' || head.type === 'allergy',
+        relatedEntity: head.entity,
+        dueAt: new Date(base.getTime() + 7 * 24 * 3600 * 1000).toISOString(),
+      });
+    } catch (e) {
+      console.warn(`[capture] dispute curiosity enqueue failed: ${summarizeErrorForLog(e)}`);
+    }
   }
 
   private async ingestNarrativeNote(p: NarrativeNoteInput): Promise<void> {
@@ -206,6 +247,7 @@ export class CapturePipeline {
     });
 
     let safetyTouched = false;
+    let pendingRetract: ConfirmationToken | undefined;
     if (corrected.kind === 'applied') {
       await this.deps.narrative.appendLedgerAnchor(day, p.corrected.entity, corrected.fact.id);
       safetyTouched = corrected.fact.safetyRelevant;
@@ -220,15 +262,22 @@ export class CapturePipeline {
     if (retract.kind === 'applied') {
       safetyTouched = safetyTouched || retract.fact.safetyRelevant;
     } else if (retract.kind === 'needs-confirmation') {
-      // The mistaken fact is safety-relevant; it stays active pending user confirmation,
-      // while the corrected fact is already recorded. The tool layer relays the token.
-      console.warn(`[capture] correction retract needs confirmation for "${p.wrong.entity}"; corrected fact recorded, mistaken fact retained pending confirmation`);
+      // CT (SB-2): the mistaken fact is safety-relevant; it stays active pending
+      // user confirmation while the corrected fact is already recorded. Surface
+      // the token on the result so the tool layer can ask the user (DAD-10).
+      // PHI: never interpolate the entity name into logs.
+      console.warn('[capture] correction retract needs confirmation; corrected fact recorded, mistaken fact retained pending confirmation');
+      pendingRetract = retract.token;
     }
 
     if (safetyTouched) await this.reRenderSafety();
-    return corrected;
+    // CT: the retract token rides the result on EVERY corrected-arm outcome —
+    // dropping it whenever the corrected fact itself went pending lost the only
+    // confirmation path for the mistaken safety-relevant fact.
+    return pendingRetract
+      ? ({ ...corrected, pendingRetract } as RecordFactResult)
+      : corrected;
   }
-
   // ---- helpers -----------------------------------------------------------
 
   /** Re-render SAFETY.md from the current safety-relevant set (D8). */

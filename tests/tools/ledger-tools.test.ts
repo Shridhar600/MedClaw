@@ -3,27 +3,15 @@ import * as path from 'path';
 import * as os from 'os';
 
 import { createLedgerTools } from '../../src/tools/ledger-tools';
-import {
-  LedgerStore, NarrativeStore, SafetyView, CuriosityQueue,
-  type FactType, type LedgerFact,
-} from '../../src/memcore';
-import { CapturePipeline, type QueuePort, type SafetyRenderer } from '../../src/capture';
+import { LedgerStore, NarrativeStore, SafetyView, CuriosityQueue } from '../../src/memcore';
+import { CapturePipeline, makeSafetyRenderer as makeSharedSafetyRenderer, type QueuePort } from '../../src/capture';
 import { mutableClock, seqIdGen } from '../helpers/memcore-fixtures';
 import type { Tool } from '../../src/tools/types';
 
 const DAY = '2026-08-20T10:00:00.000Z';
 
-function makeSafetyRenderer(view: SafetyView, ledger: LedgerStore): SafetyRenderer {
-  const TYPES: FactType[] = ['allergy', 'medication', 'condition', 'symptom', 'appointment', 'metric', 'goal'];
-  return {
-    render: facts => view.render(facts),
-    listSafetyRelevant: async () => {
-      const out: LedgerFact[] = [];
-      for (const t of TYPES) for (const f of await ledger.listByType(t)) if (f.safetyRelevant) out.push(f);
-      return out;
-    },
-  };
-}
+// W-C/D MED-15: the SAME adapter expression Gateway ships.
+const makeSafetyRenderer = makeSharedSafetyRenderer;
 
 describe('ledger tools (Task 12.1–12.3)', () => {
   let tmp: string;
@@ -38,7 +26,7 @@ describe('ledger tools (Task 12.1–12.3)', () => {
     const narrative = new NarrativeStore(tmp, clock);
     view = new SafetyView(tmp, clock);
     const curiosity = new CuriosityQueue(tmp, clock, seqIdGen('cur'), 'default');
-    const safety = makeSafetyRenderer(view, ledger);
+    const safety = makeSafetyRenderer({ render: (facts) => view.render(facts), listSafetyRelevant: () => ledger.listSafetyRelevant() });
     const queue: QueuePort = { enqueue: async (_p, op) => op.run() };
     const pipeline = new CapturePipeline({ queue, ledger, narrative, safety, curiosity });
     tools = createLedgerTools({ pipeline, ledger, safety, queue, clock, sideEffectLookup: opts.sideEffectLookup });
@@ -111,7 +99,12 @@ describe('ledger tools (Task 12.1–12.3)', () => {
     await byName('ledger_record').execute({ entity: 'metformin', type: 'medication', fields: { dose: '500mg' }, note: 'v1' });
     await byName('ledger_record').execute({ entity: 'metformin', type: 'medication', fields: { notes: 'took with food' } });
     const r = await byName('ledger_query').execute({ entity: 'metformin', type: 'medication', status: 'all' });
-    expect(r.content[0].text).toMatch(/v1|version 1/i);
-    expect(r.content[0].text).toMatch(/v2|version 2/i);
+    // W-C/D MED-15 (T3): assert the CHAIN SHAPE, not a regex over rendered text.
+    const chain = await ledger.getChain('metformin', 'medication');
+    expect(chain).toHaveLength(2);
+    expect(chain.map(f => f.version).sort()).toEqual([1, 2]);
+    // And the rendered text reflects both versions.
+    expect(r.content[0].text).toContain('v1');
+    expect(r.content[0].text).toContain('v2');
   });
 });

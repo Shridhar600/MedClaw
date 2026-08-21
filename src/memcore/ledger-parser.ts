@@ -1,4 +1,5 @@
 import { Authority, AUTHORITY_RANK, FactStatus, FactType, LedgerFact } from './types';
+import { sanitizeSingleLine } from './sanitize';
 
 function detectValue(raw: string): string | number | string[] {
   const trimmed = raw.trim();
@@ -14,6 +15,27 @@ function detectValue(raw: string): string | number | string[] {
   if (trimmed === 'true') return 'true' as unknown as number;
   if (trimmed === 'false') return 'false' as unknown as number;
   return trimmed;
+}
+
+/**
+ * The form a value takes after one Markdown round-trip (INJ-b): the parser's
+ * `detectValue` coercion is the single source of truth, so conflict detection
+ * and change hashes compare CANONICAL forms — a stored number vs its re-typed
+ * string twin must never read as a contradiction.
+ */
+export function canonicalFieldValue(value: string | number | string[]): string | number | string[] {
+  if (Array.isArray(value)) return value.map(v => String(v).trim());
+  const canonical = detectValue(String(value));
+  return typeof canonical === 'number' ? canonical : String(canonical).trim();
+}
+
+/** Canonicalize every field value of a record (for stable hashes + comparisons). */
+export function canonicalFields(
+  fields: Record<string, string | number | string[]>,
+): Record<string, string | number | string[]> {
+  const out: Record<string, string | number | string[]> = {};
+  for (const [k, v] of Object.entries(fields)) out[k] = canonicalFieldValue(v);
+  return out;
 }
 
 function parseProvenance(rawValue: string): { source: Authority; confidence: number; anchor: string; note?: string } | null {
@@ -72,7 +94,7 @@ export function renderLedgerFile(facts: LedgerFact[]): string {
   for (const entity of sortedEntities) {
     const versions = groups.get(entity)!;
     versions.sort((a, b) => b.version - a.version);
-    blocks.push(`## ${entity}`);
+    blocks.push(`## ${sanitizeSingleLine(entity)}`);
     for (const v of versions) {
       const headerDate = v.createdAt ? v.createdAt.slice(0, 10) : '';
       if (v.status === 'active') {
@@ -91,7 +113,7 @@ export function renderLedgerFile(facts: LedgerFact[]): string {
 function flattenFactForRender(fact: LedgerFact): string[] {
   const lines: string[] = [];
 
-  lines.push(`- provenance: ${fact.provenance.source} (${fact.provenance.confidence.toFixed(2)}) · ${fact.provenance.anchor}${fact.provenance.note ? ` · "${fact.provenance.note}"` : ''}`);
+  lines.push(`- provenance: ${fact.provenance.source} (${fact.provenance.confidence.toFixed(2)}) · ${sanitizeSingleLine(fact.provenance.anchor)}${fact.provenance.note ? ` · "${sanitizeSingleLine(fact.provenance.note)}"` : ''}`);
 
   if (fact.provenance.capturedAt) {
     lines.push(`- captured_at: ${fact.provenance.capturedAt}`);
@@ -106,7 +128,7 @@ function flattenFactForRender(fact: LedgerFact): string[] {
   }
 
   if (fact.verbatim !== undefined && fact.verbatim !== '') {
-    lines.push(`- verbatim: "${fact.verbatim}"`);
+    lines.push(`- verbatim: "${sanitizeSingleLine(fact.verbatim)}"`);
   }
   if (fact.visibility) {
     lines.push(`- visibility: ${fact.visibility}`);
@@ -132,7 +154,7 @@ function flattenFactForRender(fact: LedgerFact): string[] {
     lines.push(`- correctedBy: ${fact.correctedBy}`);
   }
   if (fact.discontinuedReason) {
-    lines.push(`- discontinuedReason: ${fact.discontinuedReason}`);
+    lines.push(`- discontinuedReason: ${sanitizeSingleLine(fact.discontinuedReason)}`);
   }
 
   if (fact.createdAt) {
@@ -142,7 +164,7 @@ function flattenFactForRender(fact: LedgerFact): string[] {
   for (const [key, value] of Object.entries(fact.fields)) {
     if (key === 'pre_pause_summary' || key === 'restartOf' || key === 'created_at') {
       if (key === 'pre_pause_summary') {
-        lines.push(`- pre_pause_summary: ${value}`);
+        lines.push(`- pre_pause_summary: ${sanitizeSingleLine(String(value))}`);
       }
       if (key === 'restartOf') {
         lines.push(`- restartOf: ${value}`);
@@ -156,10 +178,12 @@ function flattenFactForRender(fact: LedgerFact): string[] {
     if (RESERVED_TOP_LEVEL_FIELD_KEYS.has(key)) {
       continue;
     }
+    // SBX-1: sanitize the KEY too, not just the value — a key with embedded newlines/# would
+    // otherwise forge `## entity`/`### vN` structure at line start on the next parse.
     if (Array.isArray(value)) {
-      lines.push(`- ${key}: [${value.join(', ')}]`);
+      lines.push(`- ${sanitizeSingleLine(key)}: ${sanitizeSingleLine(`[${value.join(', ')}]`)}`);
     } else {
-      lines.push(`- ${key}: ${value}`);
+      lines.push(`- ${sanitizeSingleLine(key)}: ${sanitizeSingleLine(String(value))}`);
     }
   }
 

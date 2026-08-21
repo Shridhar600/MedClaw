@@ -4,6 +4,7 @@ import * as os from 'os';
 
 import {
   CapturePipeline,
+  makeSafetyRenderer as makeSharedSafetyRenderer,
   type QueuePort,
   type LedgerWriter,
   type NarrativeWriter,
@@ -16,8 +17,6 @@ import {
   SafetyView,
   CuriosityQueue,
   type Provenance,
-  type FactType,
-  type LedgerFact,
   type CaptureEvent,
 } from '../../src/memcore';
 import { WriteQueue } from '../../src/profiles';
@@ -31,20 +30,8 @@ function prov(capturedAt: string, source: Provenance['source'] = 'user'): Proven
   return { source, confidence: 0.9, anchor: '', capturedAt };
 }
 
-// A SafetyRenderer over SafetyView + the ledger — the shape Gateway (Task 13) injects.
-function makeSafetyRenderer(view: SafetyView, ledger: LedgerStore): SafetyRenderer {
-  const TYPES: FactType[] = ['allergy', 'medication', 'condition', 'symptom', 'appointment', 'metric', 'goal'];
-  return {
-    render: facts => view.render(facts),
-    listSafetyRelevant: async () => {
-      const out: LedgerFact[] = [];
-      for (const t of TYPES) {
-        for (const f of await ledger.listByType(t)) if (f.safetyRelevant) out.push(f);
-      }
-      return out;
-    },
-  };
-}
+// W-C/D MED-15: the SAME adapter expression Gateway ships — no hand-rolled divergence.
+const makeSafetyRenderer = makeSharedSafetyRenderer;
 
 describe('CapturePipeline (Task 10 — both-lane, cross-anchored, port-injected)', () => {
   let tmp: string;
@@ -64,7 +51,7 @@ describe('CapturePipeline (Task 10 — both-lane, cross-anchored, port-injected)
     narrative = new NarrativeStore(tmp, clock);
     view = new SafetyView(tmp, clock);
     curiosity = new CuriosityQueue(tmp, clock, seqIdGen('cur'), 'default');
-    safety = makeSafetyRenderer(view, ledger);
+    safety = makeSafetyRenderer({ render: (facts) => view.render(facts), listSafetyRelevant: () => ledger.listSafetyRelevant() });
 
     queueCalls = [];
     queue = {
@@ -84,7 +71,32 @@ describe('CapturePipeline (Task 10 — both-lane, cross-anchored, port-injected)
     const _c: CuriosityWriter = curiosity;
     const _q: QueuePort = new WriteQueue({ journalPath: path.join(tmp, 'wq.journal') });
     void _l; void _n; void _c; void _q;
-    expect(true).toBe(true);
+    // The structural satisfaction above IS the assertion — a mismatch fails at
+    // compile time. (The old `expect(true).toBe(true)` asserted nothing.)
+  });
+
+  // W-C/D MED-15: a RESOLVED safety fact must still render on SAFETY.md — the
+  // shared adapter sources from LedgerStore.listSafetyRelevant() (active +
+  // resolved + disputed), NOT listByType (active-only). RED under the old
+  // hand-rolled test adapter, which silently dropped resolved facts.
+  it('renders a resolved safety fact on SAFETY.md via the safety-relevant source', async () => {
+    await pipeline.ingest({
+      profileId: 'default',
+      source: 'chat',
+      kind: 'ledger-fact',
+      payload: {
+        entity: 'metformin',
+        type: 'medication',
+        fields: { dose: '500mg' },
+        provenance: prov(CAPTURED),
+      },
+    });
+    // Resolve the fact in place (P1 has no transition API yet — direct store file).
+    const fp = path.join(tmp, 'ledger', 'medications.md');
+    fs.writeFileSync(fp, fs.readFileSync(fp, 'utf-8').replace('(active)', '(resolved)'));
+
+    const rendered = await safety.render(await safety.listSafetyRelevant());
+    expect(rendered).toMatch(/^- metformin/gm);
   });
 
   it('ledger-fact writes BOTH lanes with cross-anchors and re-renders SAFETY when safety-relevant (KNEE-01 / D8)', async () => {
