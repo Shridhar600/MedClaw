@@ -1,0 +1,100 @@
+[
+  {
+    "name": "thyroid-fatigue",
+    "family": "thyroid",
+    "clock": "2026-10-01T00:00:00.000Z",
+    "query": "I've been really fatigued and cold all the time lately",
+    "facts": [
+      { "id": "levo@v1", "entity": "levothyroxine", "type": "medication", "status": "active", "safetyRelevant": true, "fields": { "dose": "50mcg" } }
+    ],
+    "chunks": [
+      { "id": "thy1", "content": "started levothyroxine for hypothyroidism, fatigue and cold intolerance", "lane": "episode", "createdAt": "2026-09-20T00:00:00.000Z", "cosine": 0.82, "bm25n": 0.5 },
+      { "id": "thy-d1", "content": "watched a documentary about the arctic winter", "lane": "narrative", "createdAt": "2026-09-25T00:00:00.000Z", "cosine": 0.28, "bm25n": 0.15 },
+      { "id": "thy-d2", "content": "grocery list milk eggs bread", "lane": "narrative", "createdAt": "2026-09-28T00:00:00.000Z", "cosine": 0.08, "bm25n": 0.05 }
+    ],
+    "expectedChunkIds": ["thy1"]
+  },
+  {
+    "name": "hypertension-bp",
+    "family": "hypertension",
+    "clock": "2026-10-01T00:00:00.000Z",
+    "query": "my blood pressure readings have been high this week",
+    "facts": [
+      { "id": "lis@v1", "entity": "lisinopril", "type": "medication", "status": "active", "safetyRelevant": true, "fields": { "dose": "10mg" } }
+    ],
+    "chunks": [
+      { "id": "bp1", "content": "logged blood pressure 150 over 95, will discuss lisinopril dose with doctor", "lane": "episode", "createdAt": "2026-09-27T00:00:00.000Z", "cosine": 0.83, "bm25n": 0.55 },
+      { "id": "bp-d1", "content": "the pressure at work has been intense lately", "lane": "narrative", "createdAt": "2026-09-26T00:00:00.000Z", "cosine": 0.3, "bm25n": 0.2 }
+    ],
+    "expectedChunkIds": ["bp1"]
+  },
+  {
+    "name": "anxiety-onedge",
+    "family": "mental-health",
+    "clock": "2026-10-01T00:00:00.000Z",
+    "query": "I've been feeling really anxious and on edge",
+    "facts": [],
+    "chunks": [
+      { "id": "anx1", "content": "anxiety attack episode with chest tightness, saw a therapist about it", "lane": "episode", "createdAt": "2026-09-15T00:00:00.000Z", "cosine": 0.8, "bm25n": 0.5 },
+      { "id": "anx-d1", "content": "on edge of the lake we had a picnic", "lane": "narrative", "createdAt": "2026-09-18T00:00:00.000Z", "cosine": 0.25, "bm25n": 0.2 }
+    ],
+    "expectedChunkIds": ["anx1"]
+  },
+  {
+    "name": "allergy-antibiotic",
+    "family": "allergy",
+    "clock": "2026-10-01T00:00:00.000Z",
+    "query": "the doctor wants to prescribe an antibiotic, anything I should flag",
+    "facts": [
+      { "id": "pen@v1", "entity": "penicillin", "type": "allergy", "status": "active", "safetyRelevant": true, "authority": "doctor", "createdAt": "2025-01-01T00:00:00.000Z", "fields": { "reaction": "hives" } }
+    ],
+    "chunks": [
+      { "id": "alg1", "content": "penicillin allergy documented, developed hives reaction as a child", "lane": "ledger", "createdAt": "2025-01-01T00:00:00.000Z", "cosine": 0.75, "bm25n": 0.5 },
+      { "id": "alg-d1", "content": "prescription sunglasses picked up from the optician", "lane": "narrative", "createdAt": "2026-09-20T00:00:00.000Z", "cosine": 0.2, "bm25n": 0.1 }
+    ],
+    "expectedChunkIds": ["alg1"]
+  },
+  {
+    "name": "sleep-insomnia",
+    "family": "sleep",
+    "clock": "2026-10-01T00:00:00.000Z",
+    "query": "I keep waking up at 3am and cannot fall back asleep",
+    "facts": [],
+    "chunks": [
+      { "id": "slp1", "content": "insomnia pattern waking around 3am, tried melatonin with limited effect", "lane": "episode", "createdAt": "2026-09-22T00:00:00.000Z", "cosine": 0.84, "bm25n": 0.6 },
+      { "id": "slp-d1", "content": "stayed up late finishing a great novel", "lane": "narrative", "createdAt": "2026-09-24T00:00:00.000Z", "cosine": 0.3, "bm25n": 0.2 }
+    ],
+    "expectedChunkIds": ["slp1"]
+  },
+  {
+    "name": "knee-dormant-workout",
+    "family": "knee",
+    "clock": "2026-10-01T00:00:00.000Z",
+    "query": "plan me a workout routine for this week",
+    "facts": [
+      { "id": "knee@v2", "entity": "knee-injury", "type": "condition", "status": "resolved", "safetyRelevant": true, "authority": "report", "fields": { "diagnosis": "MCL sprain" } }
+    ],
+    "chunks": [
+      { "id": "knee1", "content": "knee injury MCL sprain, residual precaution avoid heavy leg loading and pivoting", "lane": "ledger", "createdAt": "2026-07-01T00:00:00.000Z", "cosine": 0.8, "bm25n": 0.4 },
+      { "id": "knee-d1", "content": "did a great leg day three months ago felt strong", "lane": "narrative", "createdAt": "2026-07-01T00:00:00.000Z", "cosine": 0.7, "bm25n": 0.3 }
+    ],
+    "expectedChunkIds": ["knee1"],
+    "excludedChunkIds": ["knee-d1"]
+  },
+  {
+    "name": "diabetes-current-dose",
+    "family": "diabetes",
+    "clock": "2026-10-01T00:00:00.000Z",
+    "query": "what is my current metformin dose",
+    "facts": [
+      { "id": "met@v1", "entity": "metformin", "type": "medication", "version": 1, "status": "retracted", "safetyRelevant": true, "createdAt": "2026-09-10T00:00:00.000Z", "fields": { "dose": "500mg" } },
+      { "id": "met@v3", "entity": "metformin", "type": "medication", "version": 3, "status": "active", "safetyRelevant": true, "createdAt": "2026-09-28T00:00:00.000Z", "fields": { "dose": "1000mg" } }
+    ],
+    "chunks": [
+      { "id": "met-v1", "content": "metformin 500mg noted earlier", "lane": "narrative", "createdAt": "2026-09-10T00:00:00.000Z", "cosine": 0.85, "bm25n": 0.6 },
+      { "id": "met-v3", "content": "metformin 1000mg current dose", "lane": "narrative", "createdAt": "2026-09-28T00:00:00.000Z", "cosine": 0.85, "bm25n": 0.6 }
+    ],
+    "expectedChunkIds": ["met-v3"],
+    "excludedChunkIds": ["met-v1"]
+  }
+]

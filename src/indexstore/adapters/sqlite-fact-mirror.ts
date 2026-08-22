@@ -59,6 +59,35 @@ export class SqliteFactMirror implements FactMirror {
     }
   }
 
+  async *queryPaused(type?: string): AsyncIterable<FactRecord> {
+    // Paused head only; v0 quarantine sentinels never surface (M-5). KNEE-08 substrate.
+    let sql = "SELECT json FROM facts WHERE status = 'paused' AND version >= 1";
+    const params: unknown[] = [];
+    if (type !== undefined) {
+      sql += ' AND type = ?';
+      params.push(type);
+    }
+    const rows = this.db.prepare(sql).all(...params) as FactRow[];
+    for (const r of rows) {
+      const parsed = this.parseRow(r);
+      if (parsed) yield parsed;
+    }
+  }
+
+  async *queryEntityHeads(): AsyncIterable<FactRecord> {
+    // Max-version row per entity across all statuses (version >= 1 → excludes v0 sentinels, M-5).
+    // Correlated subquery over the small per-profile facts table (bounded — no full-table slurp).
+    const rows = this.db.prepare(`
+      SELECT f.json AS json FROM facts f
+      WHERE f.version >= 1
+        AND f.version = (SELECT MAX(f2.version) FROM facts f2 WHERE f2.entity = f.entity AND f2.version >= 1)
+    `).all() as FactRow[];
+    for (const r of rows) {
+      const parsed = this.parseRow(r);
+      if (parsed) yield parsed;
+    }
+  }
+
   async rebuild(all: FactRecord[]): Promise<void> {
     const clearAndFill = this.db.transaction((rows: FactRecord[]) => {
       this.db.prepare('DELETE FROM facts').run();

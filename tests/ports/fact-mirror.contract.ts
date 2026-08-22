@@ -120,5 +120,56 @@ export function runFactMirrorContract(makeMirror: MakeMirror): void {
       const rows = await collect(mirror.queryActive('medication'));
       expect(rows.map(f => f.entity).sort()).toEqual(['fresh1', 'fresh2']);
     });
+
+    // --- queryPaused (recall Stage 1, KNEE-08 paused-with-pre_pause_summary) --------------
+
+    it('queryPaused yields only paused facts and carries pre_pause_summary (KNEE-08)', async () => {
+      await mirror.upsert([
+        fact('gym-goal', { type: 'goal', status: 'paused', fields: { pre_pause_summary: '2x/week moderate' } }),
+        fact('metformin', { type: 'medication', status: 'active' }),
+        fact('old-goal', { type: 'goal', status: 'superseded' }),
+      ]);
+      const paused = await collect(mirror.queryPaused());
+      expect(paused.map(f => f.entity)).toEqual(['gym-goal']);
+      expect(paused[0].fields.pre_pause_summary).toBe('2x/week moderate');
+    });
+
+    it('queryPaused(type) filters by type and excludes v0 sentinels', async () => {
+      await mirror.upsert([
+        fact('gym-goal', { type: 'goal', status: 'paused' }),
+        fact('somemed', { type: 'medication', status: 'paused' }),
+        fact('ghost-goal', { type: 'goal', status: 'paused', version: 0 }),
+      ]);
+      const goals = await collect(mirror.queryPaused('goal'));
+      expect(goals.map(f => f.entity)).toEqual(['gym-goal']);
+    });
+
+    // --- queryEntityHeads (recall Stage 2 suppression CONTRA-10 + stale fail-closed KNEE-10) -
+
+    it('queryEntityHeads returns the max-version row per entity across all statuses', async () => {
+      await mirror.upsert([
+        fact('metformin@v1', { entity: 'metformin', version: 1, status: 'retracted', createdAt: '2026-01-01T00:00:00.000Z' }),
+        fact('metformin@v2', { entity: 'metformin', version: 2, status: 'superseded', createdAt: '2026-02-01T00:00:00.000Z' }),
+        fact('metformin@v3', { entity: 'metformin', version: 3, status: 'active', createdAt: '2026-03-01T00:00:00.000Z' }),
+        fact('naproxen@v1', { entity: 'naproxen', version: 1, status: 'active', createdAt: '2026-01-01T00:00:00.000Z' }),
+        fact('naproxen@v2', { entity: 'naproxen', version: 2, status: 'discontinued', createdAt: '2026-02-01T00:00:00.000Z' }),
+      ]);
+      const heads = await collect(mirror.queryEntityHeads());
+      const byEntity = Object.fromEntries(heads.map(h => [h.entity, h]));
+      expect(byEntity.metformin.version).toBe(3);
+      expect(byEntity.metformin.status).toBe('active');
+      expect(byEntity.metformin.createdAt).toBe('2026-03-01T00:00:00.000Z');
+      expect(byEntity.naproxen.version).toBe(2);
+      expect(byEntity.naproxen.status).toBe('discontinued');
+    });
+
+    it('queryEntityHeads excludes v0 quarantine sentinels', async () => {
+      await mirror.upsert([
+        fact('ghost@v0', { entity: 'ghost', version: 0, status: 'active' }),
+        fact('real@v1', { entity: 'real', version: 1, status: 'active' }),
+      ]);
+      const heads = await collect(mirror.queryEntityHeads());
+      expect(heads.map(h => h.entity).sort()).toEqual(['real']);
+    });
   });
 }
