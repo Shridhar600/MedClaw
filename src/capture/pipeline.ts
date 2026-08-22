@@ -27,7 +27,7 @@ import type {
   LedgerCorrectionInput,
 } from '../memcore';
 import { summarizeErrorForLog, contentContainsCredentials } from '../security';
-import { sanitizeSingleLine } from '../memcore';
+import { sanitizeSingleLine, TYPE_TO_FILE } from '../memcore';
 
 /** The single-writer queue seam (WriteQueue). Ops MUST be IO-only (B2). */
 export interface QueuePort {
@@ -68,6 +68,16 @@ export interface CuriosityWriter {
   add(item: Omit<CuriosityItem, 'id' | 'profileId' | 'createdAt'>): Promise<CuriosityItem>;
 }
 
+/**
+ * Post-write re-derivation seam (P2 A1.4/A2.4). Given the workspace-relative paths a capture
+ * op just wrote (ledger files + narrative day files), re-derive the SQLite mirror + reindex the
+ * changed chunks. Called OUT of the write-queue op (embeddings run off the single-writer lock —
+ * B2). Concrete injected by Gateway. Best-effort: a failure never fails the capture.
+ */
+export interface Rederiver {
+  rederive(relPaths: string[]): Promise<void>;
+}
+
 export interface CapturePipelineDeps {
   queue: QueuePort;
   ledger: LedgerWriter;
@@ -76,6 +86,13 @@ export interface CapturePipelineDeps {
   curiosity?: CuriosityWriter;
   events?: EventSink;
   clock?: Clock;
+  rederive?: Rederiver;
+}
+
+/** Internal route outcome: the caller-facing result + the workspace paths the op mutated. */
+interface RouteOutcome {
+  result: RecordFactResult | void;
+  changed: string[];
 }
 
 export class CapturePipeline {
@@ -92,13 +109,24 @@ export class CapturePipeline {
    * a needs-confirmation / disputed question); void for narrative-only kinds.
    */
   async ingest(event: CaptureEvent): Promise<RecordFactResult | void> {
-    return this.deps.queue.enqueue('turn', {
+    const outcome = await this.deps.queue.enqueue('turn', {
       label: `capture:${event.kind}`,
       run: () => this.route(event),
     });
+    // Out-of-op (B2): re-derive the mirror + reindex chunks for the changed files. This runs
+    // OUTSIDE the single-writer queue op so embedding latency never wedges the queue. Best-effort
+    // — a re-derive failure never fails the capture (the mirror is rebuildable + A4-healed).
+    if (this.deps.rederive && outcome.changed.length > 0) {
+      try {
+        await this.deps.rederive.rederive(outcome.changed);
+      } catch (e) {
+        console.warn(`[capture] rederive failed (mirror/index may lag until next write or boot): ${summarizeErrorForLog(e)}`);
+      }
+    }
+    return outcome.result;
   }
 
-  private route(event: CaptureEvent): Promise<RecordFactResult | void> {
+  private async route(event: CaptureEvent): Promise<RouteOutcome> {
     // CRED (SB-6) defense-in-depth: every capture payload passes the credential
     // bar before ANY lane is touched. Tool paths surface a clean rejection at
     // the tool boundary; non-tool sources (per-turn chat capture) degrade to a
@@ -106,7 +134,7 @@ export class CapturePipeline {
     const cred = contentContainsCredentials(JSON.stringify(event.payload));
     if (cred.matched) {
       console.warn(`[capture] event skipped: content matches credential pattern (${cred.pattern})`);
-      return Promise.resolve();
+      return { result: undefined, changed: [] };
     }
     switch (event.kind) {
       case 'ledger-fact':
@@ -122,14 +150,24 @@ export class CapturePipeline {
       default: {
         // Defensive: an untyped source could deliver an unknown kind. Warn, never throw.
         console.warn(`[capture] ignoring unknown event kind: ${String((event as { kind?: unknown }).kind)}`);
-        return Promise.resolve();
+        return { result: undefined, changed: [] };
       }
     }
   }
 
+  /** Workspace-relative path of the ledger file for a fact type. */
+  private ledgerPath(type: FactType): string {
+    return `ledger/${TYPE_TO_FILE[type]}`;
+  }
+
+  /** Workspace-relative path of a narrative day log. */
+  private narrativePath(day: string): string {
+    return `memory/${day}.md`;
+  }
+
   // ---- kinds -------------------------------------------------------------
 
-  private async ingestLedgerFact(p: LedgerFactInput): Promise<RecordFactResult> {
+  private async ingestLedgerFact(p: LedgerFactInput): Promise<RouteOutcome> {
     const day = this.dayOf(p.provenance.capturedAt);
     // Lossless narrative first, so the structured fact can anchor back to it (KNEE-01).
     const { anchor } = await this.deps.narrative.append({
@@ -150,16 +188,18 @@ export class CapturePipeline {
       replaces: p.replaces,
       corrects: p.corrects,
     });
-    // needs-confirmation / disputed: the narrative note stands, but there is no applied
-    // fact yet — do NOT write the cross-anchor and do NOT re-render SAFETY.
+    // The narrative note always lands → its day file changed. The ledger file changed only
+    // when a fact actually applied (needs-confirmation / disputed write nothing to the ledger).
+    const changed: string[] = [this.narrativePath(day)];
     if (result.kind === 'applied') {
       await this.deps.narrative.appendLedgerAnchor(day, p.entity, result.fact.id);
+      changed.push(this.ledgerPath(result.fact.type));
       if (result.fact.safetyRelevant) await this.reRenderSafety();
       await this.emitEvent(result.fact);
     } else if (result.kind === 'disputed') {
       await this.enqueueDisputeCuriosity(result, p.provenance.capturedAt);
     }
-    return result;
+    return { result, changed };
   }
 
   /**
@@ -190,11 +230,12 @@ export class CapturePipeline {
     }
   }
 
-  private async ingestNarrativeNote(p: NarrativeNoteInput): Promise<void> {
-    await this.deps.narrative.append({ text: p.text, language: p.language, verbatim: p.verbatim, date: p.date });
+  private async ingestNarrativeNote(p: NarrativeNoteInput): Promise<RouteOutcome> {
+    const { date } = await this.deps.narrative.append({ text: p.text, language: p.language, verbatim: p.verbatim, date: p.date });
+    return { result: undefined, changed: [this.narrativePath(date)] };
   }
 
-  private async ingestMetricPoint(p: MetricPointInput): Promise<RecordFactResult> {
+  private async ingestMetricPoint(p: MetricPointInput): Promise<RouteOutcome> {
     const day = this.dayOf(p.provenance.capturedAt);
     const { anchor } = await this.deps.narrative.append({
       text: p.note ?? `${p.entity} reading`,
@@ -210,26 +251,31 @@ export class CapturePipeline {
       safetyRelevant: p.safetyRelevant,
       language: p.language,
     });
+    const changed: string[] = [this.narrativePath(day)];
     if (result.kind === 'applied') {
       await this.deps.narrative.appendLedgerAnchor(day, p.entity, result.fact.id);
+      changed.push(this.ledgerPath(result.fact.type));
       if (result.fact.safetyRelevant) await this.reRenderSafety();
       await this.emitEvent(result.fact);
     }
-    return result;
+    return { result, changed };
   }
 
-  private async ingestCuriosity(p: Omit<CuriosityItem, 'id' | 'profileId' | 'createdAt'>): Promise<void> {
+  private async ingestCuriosity(p: Omit<CuriosityItem, 'id' | 'profileId' | 'createdAt'>): Promise<RouteOutcome> {
     const writer = this.deps.curiosity;
     if (!writer) {
       console.warn('[capture] curiosity-item dropped: no curiosity writer configured');
-      return;
+      return { result: undefined, changed: [] };
     }
     await writer.add(p);
+    // curiosity.md is not a recall lane — nothing to mirror or reindex.
+    return { result: undefined, changed: [] };
   }
 
-  private async ingestCorrection(p: LedgerCorrectionInput): Promise<RecordFactResult | void> {
+  private async ingestCorrection(p: LedgerCorrectionInput): Promise<RouteOutcome> {
     const day = this.dayOf(p.corrected.provenance.capturedAt);
     const { anchor } = await this.deps.narrative.append({ text: p.note, date: day });
+    const changed: string[] = [this.narrativePath(day)];
 
     // Record the corrected fact first (additive, safe), carrying the cross-link to the
     // mistaken fact. Then retract the mistaken one — both lanes in this one queue op.
@@ -250,6 +296,7 @@ export class CapturePipeline {
     let pendingRetract: ConfirmationToken | undefined;
     if (corrected.kind === 'applied') {
       await this.deps.narrative.appendLedgerAnchor(day, p.corrected.entity, corrected.fact.id);
+      changed.push(this.ledgerPath(corrected.fact.type));
       safetyTouched = corrected.fact.safetyRelevant;
       await this.emitEvent(corrected.fact);
     }
@@ -261,6 +308,7 @@ export class CapturePipeline {
     });
     if (retract.kind === 'applied') {
       safetyTouched = safetyTouched || retract.fact.safetyRelevant;
+      changed.push(this.ledgerPath(p.wrong.type));
     } else if (retract.kind === 'needs-confirmation') {
       // CT (SB-2): the mistaken fact is safety-relevant; it stays active pending
       // user confirmation while the corrected fact is already recorded. Surface
@@ -274,9 +322,10 @@ export class CapturePipeline {
     // CT: the retract token rides the result on EVERY corrected-arm outcome —
     // dropping it whenever the corrected fact itself went pending lost the only
     // confirmation path for the mistaken safety-relevant fact.
-    return pendingRetract
+    const result = pendingRetract
       ? ({ ...corrected, pendingRetract } as RecordFactResult)
       : corrected;
+    return { result, changed };
   }
   // ---- helpers -----------------------------------------------------------
 

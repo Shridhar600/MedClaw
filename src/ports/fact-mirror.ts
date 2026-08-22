@@ -9,6 +9,12 @@ export interface FactRecord {
   status: string;
   fields: Record<string, string | number | string[]>;
   safetyRelevant: boolean;
+  // v2-M-2 (specs/07 §4 DDL): first-class columns recall scoring needs.
+  // `authority` = provenance.source (drives D7 authorityRank); `confidence` = provenance.confidence.
+  // Kept as loose strings/number so the port stays decoupled from memcore's Authority enum.
+  authority: string;
+  confidence: number;
+  episodeId?: string;
   createdAt: string;
 }
 

@@ -17,7 +17,9 @@ import { createLedgerTools } from '../tools/ledger-tools';
 import { createEpisodeTools } from '../tools/episode-tools';
 import { createSafetyTools } from '../tools/safety-tools';
 import { WriteQueue, replayJournal } from '../profiles';
-import { LedgerStore, NarrativeStore, SafetyView, EpisodeStore, CuriosityQueue } from '../memcore';
+import { LedgerStore, NarrativeStore, SafetyView, EpisodeStore, CuriosityQueue, TYPE_TO_FILE } from '../memcore';
+import type { FactType } from '../memcore';
+import { SqliteFactMirror, SqliteEventSink, ledgerFactToRecord, isRemoteEmbeddingBaseUrl } from '../indexstore';
 import { CapturePipeline } from '../capture';
 import { makeSafetyRenderer } from '../capture';
 import { SqliteStore } from '../memory/sqlite-store';
@@ -57,6 +59,8 @@ export class Gateway {
   private sessions?: SessionManager;
   private scheduler?: HeartbeatScheduler;
   private store?: SqliteStore;
+  private factMirror?: SqliteFactMirror;
+  private eventSink?: SqliteEventSink;
   private profileRegistry?: ProfileRegistry;
   private resolvedMemoryWorkspace?: string;
   private bootHealth?: { providers: ReadinessResult[]; telegram: ReadinessResult };
@@ -116,6 +120,10 @@ export class Gateway {
     } catch (error) {
       console.warn('[gateway] Memory index unavailable; continuing with degraded search:', summarizeErrorForLog(error));
     }
+    // A3.1b (v2-BL-2 = B1): the recall latency budget assumes LOCAL embeddings.
+    if (isRemoteEmbeddingBaseUrl(config.providers.embeddings.baseUrl)) {
+      console.warn('[gateway] Embeddings provider is remote — the recall latency budget (p50<=300ms / p95<=800ms) assumes local embeddings; expect higher per-turn recall latency.');
+    }
 
     const search = new MemorySearch(store, embeddingProvider, config.memory.search.hybridWeights, profileId);
 
@@ -166,7 +174,9 @@ export class Gateway {
       // A4 / 13.4: replay any ops journalled by a crash before serving (P1 logs stuck ops).
       try {
         await replayJournal(journalPath, (label) => {
-          console.warn('[gateway] stuck write-queue op recovered at boot (mirror rebuild is P2):', label);
+          // A4: the SQLite mirror + search index are rebuilt from Markdown below (boot rebuild +
+          // indexAll), so a stuck op's derived state self-heals — Markdown is the source of truth.
+          console.warn('[gateway] stuck write-queue op recovered at boot (mirror/index rebuilt from Markdown):', label);
         });
       } catch (e) {
         console.warn('[gateway] write-queue journal replay failed:', summarizeErrorForLog(e));
@@ -181,12 +191,67 @@ export class Gateway {
         render: (facts) => safetyView.render(facts),
         listSafetyRelevant: () => ledgerStore.listSafetyRelevant(),
       });
+
+      // P2 A1/A2: the FactMirror (recall Stage 1 source) + the per-file re-derivation seam.
+      // The mirror opens its OWN connection to the SAME search.db (M-3). It is fully rebuildable
+      // from the ledger Markdown, so we rebuild it at boot (A4 self-heal — closes any crash window)
+      // and re-derive per changed file after each capture write (M-2). Re-derivation runs OUTSIDE
+      // the write-queue op (embeds off the single-writer lock — B2).
+      const factMirror = new SqliteFactMirror({ dbPath });
+      this.factMirror = factMirror;
+      // A3: the event store, populated on metric/fact writes (Stage-3 correlation source, P5).
+      const eventSink = new SqliteEventSink({ dbPath });
+      this.eventSink = eventSink;
+      const fileToType = new Map<string, FactType>(
+        (Object.entries(TYPE_TO_FILE) as [FactType, string][]).map(([t, f]) => [f, t]),
+      );
+      const rederive = {
+        rederive: async (relPaths: string[]): Promise<void> => {
+          for (const rel of relPaths) {
+            if (rel.startsWith('ledger/')) {
+              const type = fileToType.get(rel.slice('ledger/'.length));
+              if (type) {
+                try {
+                  const facts = await ledgerStore.listAllOfType(type);
+                  await factMirror.upsert(facts.map(ledgerFactToRecord));
+                } catch (e) {
+                  console.warn('[gateway] fact-mirror re-derive failed (rebuildable at boot):', summarizeErrorForLog(e));
+                }
+              }
+            }
+            // Reindex the changed searchable file (ledger + narrative) so fresh writes are found
+            // the SAME session (M-2). indexFile embeds; running it here (post-op) keeps embedding
+            // off the write-queue lock (B2). Best-effort — a stale index degrades search, never crashes.
+            try {
+              await indexer.indexFile(rel);
+            } catch (e) {
+              console.warn('[gateway] incremental reindex failed for a changed file:', summarizeErrorForLog(e));
+            }
+          }
+        },
+      };
+
+      // A4 (specs/13): rebuild the mirror from Markdown once at boot (parallels indexer.indexAll)
+      // so any crash between a ledger write and its mirror upsert self-heals.
+      try {
+        let records = [] as ReturnType<typeof ledgerFactToRecord>[];
+        for (const t of Object.keys(TYPE_TO_FILE) as FactType[]) {
+          records = records.concat((await ledgerStore.listAllOfType(t)).map(ledgerFactToRecord));
+        }
+        await factMirror.rebuild(records);
+        console.log(`[gateway] Fact mirror rebuilt from ledger (${records.length} facts)`);
+      } catch (e) {
+        console.warn('[gateway] Fact-mirror boot rebuild failed (recall Stage 1 may degrade):', summarizeErrorForLog(e));
+      }
+
       const pipeline = new CapturePipeline({
         queue: writeQueue,
         ledger: ledgerStore,
         narrative: narrativeStore,
         safety: safetyRenderer,
         curiosity: curiosityQueue,
+        events: eventSink,
+        rederive,
       });
       this.capturePipeline = pipeline;
 
@@ -840,6 +905,20 @@ export class Gateway {
       console.warn('[gateway] Failed to close memory store:', summarizeErrorForLog(error));
     } finally {
       this.store = undefined;
+    }
+    try {
+      this.factMirror?.close();
+    } catch (error) {
+      console.warn('[gateway] Failed to close fact mirror:', summarizeErrorForLog(error));
+    } finally {
+      this.factMirror = undefined;
+    }
+    try {
+      this.eventSink?.close();
+    } catch (error) {
+      console.warn('[gateway] Failed to close event sink:', summarizeErrorForLog(error));
+    } finally {
+      this.eventSink = undefined;
     }
   }
 

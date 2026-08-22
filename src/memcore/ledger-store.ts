@@ -696,6 +696,16 @@ export class LedgerStore {
   }
 
   /**
+   * EVERY fact of a type — all entities, all versions, all statuses (incl. superseded/
+   * retracted/v0 sentinels). The FactMirror re-derivation source (P2 A1.4): re-mirroring a
+   * changed ledger file must flip a now-superseded head off `active`, which listByType
+   * (active-only) cannot express. One read per type file.
+   */
+  async listAllOfType(type: FactType): Promise<LedgerFact[]> {
+    return this.readFacts(type);
+  }
+
+  /**
    * SB-3 / CONTRA-02: entity names of this type that currently have MORE THAN ONE active
    * version — a dual-active conflict the store did not auto-resolve (e.g. seeded/imported
    * state; the store never auto-produces `disputed` for med-class, A5). Surfaced to the agent
