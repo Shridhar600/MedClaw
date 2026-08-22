@@ -102,7 +102,9 @@ export class LedgerStore {
   }
 
   private activeVersion(facts: LedgerFact[], entity: string): LedgerFact | null {
-    const active = facts.filter(f => f.entity === entity && f.status === 'active');
+    // M-5: v0 facts are parse-error quarantine sentinels (createParseErrorFact) — never real
+    // active facts. Exclude them so a corrupt block cannot surface as a ghost active fact.
+    const active = facts.filter(f => f.entity === entity && f.status === 'active' && f.version >= 1);
     if (active.length === 0) return null;
     active.sort((a, b) => b.version - a.version);
     return active[0];
@@ -136,7 +138,13 @@ export class LedgerStore {
     current?: LedgerFact,
     fieldsOverride?: Record<string, string | number | string[]>,
   ): LedgerFact {
-    const fields = fieldsOverride || { ...params.fields };
+    // SB-2 (specs/07 §5 merge-update): a superseding version MERGES the prior active/paused
+    // fact's fields with the proposal — a non-conflicting add or a single-key change must never
+    // silently DROP carried fields (dose, known_side_effects, started). An explicit fieldsOverride
+    // (dispute head A, paused-carry, confirm-write) already carries the intended merged set.
+    const fields = fieldsOverride
+      ? fieldsOverride
+      : (current ? { ...current.fields, ...params.fields } : { ...params.fields });
     const pf: Provenance = {
       source: params.provenance.source,
       confidence: params.provenance.confidence,
@@ -201,7 +209,18 @@ export class LedgerStore {
     }
 
     if (!active) {
-      // cur is paused and resume was requested: supersede the paused version with an active one
+      // cur is paused and resume was requested: supersede the paused version with an active one.
+      // H-1: resuming a med/allergy STILL requires confirmation — the resume flag must never
+      // bypass the med-class gate (medical-safety), matching every other conflicting med path.
+      if (isMedOrAllergy(params.type)) {
+        const v = this.nextVersion(allFacts, params.entity);
+        const proposed = this.makeFact(params, v, 'active', now, cur);
+        const changeHash = hash(`resume:${params.entity}:${params.type}:${JSON.stringify(canonicalFields(params.fields))}`);
+        const baselineCurHash = hash(`${cur.id}:${JSON.stringify(canonicalFields(cur.fields))}`);
+        const token = makeToken(params.entity, changeHash, this.clock.now().getTime());
+        this.tokens.set(token.uuid, { token, op: { kind: 'write', ...params, baselineCurHash }, used: false });
+        return { kind: 'needs-confirmation', token, current: cur, proposed };
+      }
       const v = this.nextVersion(allFacts, params.entity);
       cur.status = 'superseded';
       const fact = this.makeFact(params, v, 'active', now, cur);
@@ -547,8 +566,13 @@ export class LedgerStore {
       }
       const now = this.clock.now().toISOString();
       const v = this.nextVersion(allFacts, op.entity);
-      const targetStatus: FactStatus = cur.status === 'paused' ? 'paused' : 'active';
-      const writeFields = { ...op.fields };
+      // A confirmed resume (op.resume) reactivates a paused fact → 'active'; a plain paused-entity
+      // update stays 'paused' (H-1: resume is gated for meds but still resumes on confirm).
+      const targetStatus: FactStatus = (cur.status === 'paused' && !op.resume) ? 'paused' : 'active';
+      // SB-2: merge the confirmed proposal onto the current fact's fields so the applied head
+      // retains carried fields (known_side_effects etc.) — the proposal's keys win. This also
+      // subsumes the paused pre_pause_summary carry (kept below as belt-and-braces).
+      const writeFields = { ...cur.fields, ...op.fields };
 
       if (cur.status === 'paused'
         && cur.fields['pre_pause_summary'] !== undefined
@@ -667,7 +691,23 @@ export class LedgerStore {
 
   async listByType(type: FactType): Promise<LedgerFact[]> {
     const allFacts = await this.readFacts(type);
-    return allFacts.filter(f => f.status === 'active');
+    // M-5: exclude v0 parse-error quarantine sentinels from active listings.
+    return allFacts.filter(f => f.status === 'active' && f.version >= 1);
+  }
+
+  /**
+   * SB-3 / CONTRA-02: entity names of this type that currently have MORE THAN ONE active
+   * version — a dual-active conflict the store did not auto-resolve (e.g. seeded/imported
+   * state; the store never auto-produces `disputed` for med-class, A5). Surfaced to the agent
+   * so it can ask the user to clarify, rather than silently masking one head via getActive.
+   */
+  async listActiveConflicts(type: FactType): Promise<string[]> {
+    const allFacts = await this.readFacts(type);
+    const counts = new Map<string, number>();
+    for (const f of allFacts) {
+      if (f.status === 'active' && f.version >= 1) counts.set(f.entity, (counts.get(f.entity) ?? 0) + 1);
+    }
+    return [...counts.entries()].filter(([, n]) => n > 1).map(([entity]) => entity);
   }
 
   /**

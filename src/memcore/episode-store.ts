@@ -218,11 +218,13 @@ export class EpisodeStore {
     lines.push(`- profileId: ${episode.profileId}`);
     lines.push(`- createdAt: ${episode.createdAt}`);
     lines.push(`- updatedAt: ${episode.updatedAt}`);
+    // M-4: sanitize each array element (like the title) — a newline in an element would otherwise
+    // forge a `- status:`/meta line at line start on the next parse (same class as SBX-1).
     if (episode.bodyRegions && episode.bodyRegions.length > 0) {
-      lines.push(`- bodyRegions: [${episode.bodyRegions.join(', ')}]`);
+      lines.push(`- bodyRegions: [${episode.bodyRegions.map(sanitizeSingleLine).join(', ')}]`);
     }
     if (episode.linkedFactIds && episode.linkedFactIds.length > 0) {
-      lines.push(`- linkedFactIds: [${episode.linkedFactIds.join(', ')}]`);
+      lines.push(`- linkedFactIds: [${episode.linkedFactIds.map(sanitizeSingleLine).join(', ')}]`);
     }
     if (episode.note) {
       lines.push('', episode.note);

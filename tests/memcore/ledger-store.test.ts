@@ -335,7 +335,10 @@ describe('LedgerStore', () => {
       }
     });
 
-    it('resume=true on paused entity produces active', async () => {
+    it('resume=true on a paused MEDICATION requires confirmation, then produces active (H-1)', async () => {
+      // H-1 (medical-safety): resuming a paused med/allergy must NOT bypass the confirmation gate.
+      // This test previously asserted an INSTANT `applied` — that was the bypass bug the P1-gate
+      // audit flagged. The intent (resume yields an active fact) is preserved via the confirm path.
       await store.recordFact({
         entity: 'metformin', type: 'medication', fields: { dose: '500mg' }, provenance: docProv,
       });
@@ -346,12 +349,13 @@ describe('LedgerStore', () => {
         fields: { dose: '500mg' },
         provenance: docProv, resume: true,
       });
-      expect(result.kind).toBe('applied');
-      if (result.kind !== 'applied') return;
-      expect(result.fact.status).toBe('active');
+      expect(result.kind).toBe('needs-confirmation');
+      if (result.kind !== 'needs-confirmation') return;
+      const fact = await store.confirm(result.token.uuid);
+      expect(fact.status).toBe('active');
       const activeNow = await store.getActive('metformin', 'medication');
-      expect(activeNow?.id).toBe(result.fact.id);
-      // no version remains paused after a resume
+      expect(activeNow?.id).toBe(fact.id);
+      // no version remains paused after the resume is confirmed
       const chain = await store.getChain('metformin', 'medication');
       expect(chain.filter(f => f.status === 'paused')).toHaveLength(0);
     });

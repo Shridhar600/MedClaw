@@ -314,6 +314,10 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       const status = (params.status as string) ?? 'active';
       if (type && !FACT_TYPES.includes(type)) return err(`Unknown fact type "${type}".`);
 
+      // SB-3 / CONTRA-02: surface any dual-active conflict so the agent asks the user to clarify,
+      // instead of silently masking a head (getActive returns only the max version).
+      const conflicts = type ? await deps.ledger.listActiveConflicts(type) : [];
+
       if (entity && type) {
         const facts = status === 'all'
           ? await deps.ledger.getChain(entity, type)
@@ -325,11 +329,17 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
         if (links.corrects.length) linkLines.push(`corrects: ${links.corrects.join(', ')}`);
         if (links.correctedBy.length) linkLines.push(`correctedBy: ${links.correctedBy.join(', ')}`);
         const linkText = linkLines.length ? `\ncross-links → ${linkLines.join(' · ')}` : '';
-        return ok(renderFacts(facts) + linkText);
+        const warn = conflicts.includes(entity)
+          ? `⚠️ CONFLICT: ${entity} has multiple active records — ask the user which is current.\n`
+          : '';
+        return ok(warn + renderFacts(facts) + linkText);
       }
 
       if (type) {
-        return ok(renderFacts(await deps.ledger.listByType(type)));
+        const warn = conflicts.length
+          ? `⚠️ CONFLICT: multiple active records exist for ${conflicts.join(', ')} — ask the user to clarify which is current.\n`
+          : '';
+        return ok(warn + renderFacts(await deps.ledger.listByType(type)));
       }
 
       return err('ledger_query needs at least a type (optionally with an entity).');

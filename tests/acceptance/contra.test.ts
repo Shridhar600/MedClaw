@@ -91,8 +91,12 @@ describe('CONTRA acceptance (specs/09 Suite C)', () => {
     expect(discontinued.discontinuedReason).toMatch(/took me off/);
   });
 
-  it('CONTRA-02 — a dual-active seed is surfaced to the agent (store never auto-disputes med-class; A5)', async () => {
-    // Seed a chain where v1 and v3 are BOTH active for the same entity (spec-09 permits seeding).
+  it('CONTRA-02 — a dual-active entity is DETECTED and surfaced to the agent as a conflict (SB-3)', async () => {
+    // MAPPING (G5 + SB-3): spec-09 asks for both heads flagged `disputed` + status:active returning
+    // neither + agent surfacing. The store never auto-produces `disputed` for med-class (A5), so P1's
+    // achievable, honest coverage is DETECTION + surfacing: a dual-active seed is caught by
+    // listActiveConflicts and ledger_query raises a conflict warning for the agent to clarify.
+    // Full disputed-flagging of dual-active med-class state is a P2 dispute-detection service.
     const day = '2026-07-01T09:00:00.000Z';
     const v1 = fact('metformin', 'medication', { version: 1, status: 'active', fields: { dose: '500mg' }, safetyRelevant: true, createdAt: day });
     const v2 = fact('metformin', 'medication', { version: 2, status: 'retracted', supersedes: 'metformin@v1', fields: { dose: '500mg' }, safetyRelevant: true, createdAt: day });
@@ -100,15 +104,13 @@ describe('CONTRA acceptance (specs/09 Suite C)', () => {
     fs.mkdirSync(path.join(tmp, 'ledger'), { recursive: true });
     fs.writeFileSync(path.join(tmp, 'ledger', 'medications.md'), renderLedgerFile([v1, v2, v3]));
 
-    // Tool-surfaced: listByType returns BOTH active versions so the agent can see the conflict.
-    const actives = await ledger.listByType('medication');
-    const metforminActives = actives.filter(f => f.entity === 'metformin');
-    expect(metforminActives).toHaveLength(2);
-    expect(metforminActives.map(f => f.version).sort()).toEqual([1, 3]);
+    // Store-level detector flags the dual-active entity.
+    expect(await ledger.listActiveConflicts('medication')).toContain('metformin');
 
-    // ledger_query type=medication renders both actives (the conflict is visible in the tool output).
+    // Tool-surfaced: ledger_query raises an explicit conflict warning naming the entity.
     const q = await byName('ledger_query').execute({ type: 'medication' });
-    expect(q.content[0].text.match(/metformin/g)!.length).toBeGreaterThanOrEqual(2);
+    expect(q.content[0].text).toMatch(/conflict/i);
+    expect(q.content[0].text).toMatch(/metformin/);
   });
 
   it('CONTRA-05 — doctor-sourced active is never auto-superseded by a lower-authority user statement (NEEDS_CONFIRM)', async () => {

@@ -5,6 +5,7 @@
 
 import type { Tool, ToolResult } from './types';
 import type { EpisodeStore, Episode, EpisodeStatus } from '../memcore';
+import { contentContainsCredentials } from '../security';
 
 const EPISODE_STATUSES: EpisodeStatus[] = ['open', 'resolving', 'resolved', 'reopened'];
 
@@ -18,6 +19,20 @@ function ok(text: string): ToolResult {
 }
 function err(text: string): ToolResult {
   return { content: [{ type: 'text', text }], isError: true };
+}
+
+/**
+ * SB-1: the episode lane persists caller-controlled text (title/note/regions/factIds) to a 0600
+ * health file — it carries the SAME credential-rejection bar as every other write path
+ * (memory_write, ledger_record, safety_note, capture). Returns a rejection or null.
+ */
+function scanEpisodeInputs(...fields: (string | string[] | undefined)[]): ToolResult | null {
+  const text = fields.flatMap(f => (f === undefined ? [] : Array.isArray(f) ? f : [f])).join('\n');
+  const cred = contentContainsCredentials(text);
+  if (cred.matched) {
+    return err(`Write rejected: content matches credential pattern (${cred.pattern}). Credentials must never be stored in the health memory.`);
+  }
+  return null;
 }
 
 function renderEpisode(e: Episode): string {
@@ -56,6 +71,8 @@ export function createEpisodeTools(deps: EpisodeToolsDeps): Tool[] {
         case 'create': {
           const title = params.title as string | undefined;
           if (!title) return err('episode_manage create needs a title.');
+          const credCreate = scanEpisodeInputs(title, params.note as string | undefined, params.bodyRegions as string[] | undefined);
+          if (credCreate) return credCreate;
           const episode = await deps.store.create({
             title,
             profileId: deps.profileId,
@@ -67,6 +84,8 @@ export function createEpisodeTools(deps: EpisodeToolsDeps): Tool[] {
         }
         case 'update': {
           if (!id) return err('episode_manage update needs an id.');
+          const credUpdate = scanEpisodeInputs(params.title as string | undefined, params.note as string | undefined, params.bodyRegions as string[] | undefined);
+          if (credUpdate) return credUpdate;
           const updated = await deps.store.update(id, {
             title: params.title as string | undefined,
             status: params.status as EpisodeStatus | undefined,
@@ -78,6 +97,8 @@ export function createEpisodeTools(deps: EpisodeToolsDeps): Tool[] {
         case 'link': {
           if (!id) return err('episode_manage link needs an id.');
           const factIds = (params.factIds as string[] | undefined) ?? [];
+          const credLink = scanEpisodeInputs(factIds);
+          if (credLink) return credLink;
           const linked = await deps.store.link(id, factIds);
           return linked ? ok(`Linked:\n${renderEpisode(linked)}`) : err(`Episode not found: ${id}`);
         }
