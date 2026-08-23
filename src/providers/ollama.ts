@@ -51,14 +51,13 @@ export class OllamaProvider implements LLMProvider {
     const message = data.choices[0].message;
 
     if (message.tool_calls && message.tool_calls.length > 0) {
-      const tc = message.tool_calls[0];
       return {
         type: 'tool_call',
-        toolCall: {
+        toolCalls: message.tool_calls.map((tc) => ({
           id: tc.id,
           name: tc.function.name,
           arguments: JSON.parse(tc.function.arguments) as Record<string, unknown>,
-        },
+        })),
       };
     }
 
@@ -100,17 +99,17 @@ export class OllamaProvider implements LLMProvider {
       };
     };
 
-    const toolCall = data.message.tool_calls?.[0];
-    if (toolCall) {
+    const visionToolCalls = data.message.tool_calls;
+    if (visionToolCalls && visionToolCalls.length > 0) {
       return {
         type: 'tool_call',
-        toolCall: {
-          id: toolCall.id ?? 'ollama_vision_tool_call',
-          name: toolCall.function.name,
-          arguments: typeof toolCall.function.arguments === 'string'
-            ? JSON.parse(toolCall.function.arguments) as Record<string, unknown>
-            : toolCall.function.arguments,
-        },
+        toolCalls: visionToolCalls.map((tc, i) => ({
+          id: tc.id ?? `ollama_vision_tool_call_${i}`,
+          name: tc.function.name,
+          arguments: typeof tc.function.arguments === 'string'
+            ? JSON.parse(tc.function.arguments) as Record<string, unknown>
+            : tc.function.arguments,
+        })),
       };
     }
 

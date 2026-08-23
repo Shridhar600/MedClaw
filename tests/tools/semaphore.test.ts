@@ -75,6 +75,31 @@ describe('LLMSemaphore', () => {
     expect(order).toEqual(['user-start', 'user-end', 'heartbeat-start']);
   });
 
+  it('drains background priority only after user AND heartbeat (F8)', async () => {
+    const order: string[] = [];
+    const blockerRunning = deferred();
+    const blockerDone = deferred();
+
+    const pBlock = sem.run('user', async () => {
+      order.push('block-start');
+      blockerRunning.resolve();
+      await blockerDone.promise;
+      order.push('block-end');
+    });
+    await blockerRunning.promise;
+
+    // Enqueue in reverse-priority order while the blocker holds the semaphore.
+    const pBg = sem.run('background', async () => { order.push('bg'); });
+    const pHb = sem.run('heartbeat', async () => { order.push('hb'); });
+    const pUser = sem.run('user', async () => { order.push('user2'); });
+
+    blockerDone.resolve();
+    await Promise.all([pBlock, pBg, pHb, pUser]);
+
+    // Priority order wins over enqueue order: user > heartbeat > background.
+    expect(order).toEqual(['block-start', 'block-end', 'user2', 'hb', 'bg']);
+  });
+
   it('serializes multiple heartbeat jobs', async () => {
     const order: string[] = [];
 

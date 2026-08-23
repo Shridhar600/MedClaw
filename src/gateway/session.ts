@@ -138,6 +138,20 @@ export class SessionManager {
   private readonly toolRegistry?: ToolRegistry;
   private readonly compactionConfig?: CompactionConfig;
   private readonly rotationCounts: Map<string, number> = new Map();
+  // F8: compaction LLM calls run at 'background' semaphore priority so they never starve or collide
+  // with user turns. Injected by the Gateway (setter — the semaphore is created alongside). When
+  // unset (tests / no semaphore), the call runs directly. prepareHistory always runs BEFORE the
+  // AgentLoop acquires the semaphore, so this background acquire cannot self-deadlock (v2-H-4).
+  private runBackground?: <T>(fn: () => Promise<T>) => Promise<T>;
+
+  /** Wire compaction LLM calls through the semaphore at background priority (F8). */
+  setBackgroundRunner(run: <T>(fn: () => Promise<T>) => Promise<T>): void {
+    this.runBackground = run;
+  }
+
+  private runLLM<T>(fn: () => Promise<T>): Promise<T> {
+    return this.runBackground ? this.runBackground(fn) : fn();
+  }
 
   constructor(
     softResetMinutes: number,
@@ -351,7 +365,7 @@ export class SessionManager {
           },
         }));
 
-        const flushResponse = await this.llmProvider.chat(
+        const flushResponse = await this.runLLM(() => this.llmProvider!.chat(
           [
             { role: 'system', content: flushPrompt },
             // #16: sanitize before sending — a clean split already prevents a
@@ -360,10 +374,12 @@ export class SessionManager {
             { role: 'user', content: 'Persist what should be remembered before compaction.' },
           ],
           toolSchemas,
-        );
+        ));
 
         if (flushResponse.type === 'tool_call') {
-          await this.toolRegistry.execute(flushResponse.toolCall.name, flushResponse.toolCall.arguments);
+          for (const c of flushResponse.toolCalls) {
+            await this.toolRegistry.execute(c.name, c.arguments);
+          }
         }
       } catch (e) {
         // Provider error messages can echo transcript PHI — sanitized frame only.
@@ -381,10 +397,10 @@ Preserve:
 Keep it concise and structured.`;
 
     try {
-      const summaryResponse = await this.llmProvider.chat([
+      const summaryResponse = await this.runLLM(() => this.llmProvider!.chat([
         { role: 'system', content: compactPrompt },
         { role: 'user', content: JSON.stringify(olderTurns) },
-      ]);
+      ]));
 
       const summaryText =
         summaryResponse.type === 'text' && summaryResponse.text.trim().length > 0
@@ -490,7 +506,7 @@ The raw session transcript is archived in JSONL and can be reviewed directly.`;
     }
 
     try {
-      const response = await this.llmProvider.chat([
+      const response = await this.runLLM(() => this.llmProvider!.chat([
         {
           role: 'system',
           content: `Produce a concise session summary.
@@ -506,7 +522,7 @@ Use short bullet points grouped by section.`,
           role: 'user',
           content: JSON.stringify(history),
         },
-      ]);
+      ]));
 
       if (response.type !== 'text' || response.text.trim().length === 0) {
         return fallback('Provider returned no text summary.');

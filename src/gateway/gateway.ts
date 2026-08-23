@@ -5,7 +5,10 @@ import type { ProfileId } from '../profiles';
 import type { Channel, IncomingMessage } from '../channels/types';
 import { TelegramChannel } from '../channels/telegram';
 import { AgentLoop } from '../agent/agent-loop';
+import type { PrepareSystem } from '../agent/agent-loop';
 import { ContextAssembler } from '../agent/context';
+import { ContextAssembler as ContextAssemblerV2 } from '../context2';
+import { RecallEngine, DEFAULT_RECALL_CONFIG } from '../recall';
 import { MemoryEngine } from '../memory/memory-engine';
 import { ToolRegistry } from '../tools/registry';
 import { LLMSemaphore, HeartbeatQueueFullError } from '../tools/semaphore';
@@ -19,7 +22,9 @@ import { createSafetyTools } from '../tools/safety-tools';
 import { WriteQueue, replayJournal } from '../profiles';
 import { LedgerStore, NarrativeStore, SafetyView, EpisodeStore, CuriosityQueue, TYPE_TO_FILE } from '../memcore';
 import type { FactType } from '../memcore';
-import { SqliteFactMirror, SqliteEventSink, ledgerFactToRecord, isRemoteEmbeddingBaseUrl } from '../indexstore';
+import { SqliteFactMirror, SqliteEventSink, SqliteVecIndex, SqliteKeywordIndex, SqliteChunkStats, ledgerFactToRecord, isRemoteEmbeddingBaseUrl } from '../indexstore';
+import type { EmbeddingPort } from '../ports';
+import { systemClock } from '../ports';
 import { CapturePipeline } from '../capture';
 import { makeSafetyRenderer } from '../capture';
 import { SqliteStore } from '../memory/sqlite-store';
@@ -160,6 +165,11 @@ export class Gateway {
       console.warn('[gateway] Medical tools unavailable; continuing without them:', summarizeErrorForLog(e));
     }
 
+    // P2 C3 — the per-turn system-prompt supplier (recall + v2 assembly, D9). Assigned inside the
+    // memcore block once the recall substrate is up; stays undefined (⇒ legacy boot-cached prompt)
+    // if any of it fails to construct (resilience — a degraded recall path must not break the chat).
+    let prepareSystem: PrepareSystem | undefined;
+
     // v2 memory core (P1): per-profile stores + capture pipeline + the ledger/episode/safety
     // tool groups + the per-turn narrative capture hook (Task 13). The stores share the
     // resolved profile workspace as their root (ledger/ , memory/ , SAFETY.md), so the legacy
@@ -264,6 +274,59 @@ export class Gateway {
         console.warn('[gateway] boot SAFETY reconciliation failed (continuing):', summarizeErrorForLog(e));
       }
 
+      // P2 C3 — recall + v2 assembler → the per-turn system-prompt supplier (D9). The recall READ
+      // adapters open their own connections to the same search.db (M-3: store is the sole chunk
+      // writer; these are read-mostly, chunk_stats excepted). A failure here degrades the CHAT path
+      // to the legacy boot-cached prompt but keeps ledger/episode/safety tools + capture working.
+      try {
+        let cachedDim: number | null = null;
+        const embeddingPort: EmbeddingPort = {
+          embed: (texts) => Promise.all(texts.map((t) => embeddingProvider.embed(t))),
+          dim: async () => {
+            if (cachedDim === null) cachedDim = (await embeddingProvider.embed('')).length;
+            return cachedDim;
+          },
+          modelId: async () => config.providers.embeddings.model,
+        };
+        const recallEngine = new RecallEngine({
+          embedding: embeddingPort,
+          vectorIndex: new SqliteVecIndex({ dbPath }),
+          keywordIndex: new SqliteKeywordIndex({ dbPath }),
+          factMirror,
+          chunkStats: new SqliteChunkStats({ dbPath }),
+          clock: systemClock,
+          config: DEFAULT_RECALL_CONFIG,
+        });
+        const v2Assembler = new ContextAssemblerV2({
+          reader: memory,
+          safety: safetyView,
+          maxChars: config.memory.bootstrapMaxChars,
+          clock: systemClock,
+        });
+        prepareSystem = async (mode, userMessage) => {
+          // Recall is best-effort: any failure degrades to no recall, never blocks the turn
+          // (resilience). Assembly is NOT guarded here — a SAFETY-invariant violation must abort the
+          // turn (medical-safety > resilience); the caller turns it into a safe fallback reply.
+          let recall = null as Awaited<ReturnType<typeof recallEngine.run>> | null;
+          try {
+            recall = await recallEngine.run({ profileId, userMessage });
+          } catch (e) {
+            console.warn('[gateway] recall failed (assembling without recall):', summarizeErrorForLog(e));
+            recall = null;
+          }
+          const report = await v2Assembler.assemble(profileId, mode, recall);
+          return {
+            messages: [{ role: 'system', content: report.content }],
+            recordUsed: recall
+              ? (ids) => recallEngine.recordUsage(ids, systemClock.now().toISOString())
+              : undefined,
+          };
+        };
+        console.log('[gateway] Per-turn recall + v2 context assembler ready (D9)');
+      } catch (e) {
+        console.warn('[gateway] Recall/v2-assembler unavailable; chat uses the boot-cached prompt:', summarizeErrorForLog(e));
+      }
+
       // DIAB-06 side-effect lookup: prefer on-device medgemma, fall back to main (resilience).
       let sideEffectProvider: LLMProvider = mainProvider;
       try {
@@ -304,13 +367,16 @@ export class Gateway {
       console.warn('[gateway] Memory-core (v2) unavailable; continuing without ledger/episode/safety tools + per-turn capture:', summarizeErrorForLog(e));
     }
 
-    // Context
+    // Context. The legacy assembler still runs once at boot: it fires the SAFETY non-omission
+    // invariant (a broken non-empty SAFETY.md aborts boot — medical-safety > resilience) and yields
+    // the fallback system prompt used when the v2 recall path is unavailable. The live chat path
+    // uses `prepareSystem` (per-turn recall + v2 assembly, D9) when it was constructed above.
     const assembler = new ContextAssembler(memory, config.memory.bootstrapMaxChars, profileId);
     const systemMessages = await assembler.buildSystemMessages();
 
     // Agent
     const semaphore = new LLMSemaphore();
-    this.agentLoop = new AgentLoop(mainProvider, registry, systemMessages, config.agent, semaphore);
+    this.agentLoop = new AgentLoop(mainProvider, registry, prepareSystem ?? systemMessages, config.agent, semaphore);
 
     // Sessions
     // Path resolution stays here (Gateway) rather than inside SessionManager
@@ -329,6 +395,9 @@ export class Gateway {
       config.sessions.compaction,
       profileId,
     );
+    // F8: run compaction LLM calls at 'background' priority (below user + heartbeat). prepareHistory
+    // (where compaction happens) runs before AgentLoop acquires the semaphore, so this never deadlocks.
+    this.sessions.setBackgroundRunner((fn) => semaphore.run('background', fn));
 
     // Channel
     if (config.channels.telegram.enabled) {
@@ -456,7 +525,7 @@ export class Gateway {
     await this.captureUserTurn(chatId, text);
 
     const history = await this.sessions!.prepareHistory(chatId);
-    const result = await this.agentLoop!.run(text, history, { chatId });
+    const result = await this.agentLoop!.run(text, history, { chatId, mode: 'chat' });
     await this.sessions!.recordTurn(chatId, [
       { role: 'user', content: text },
       ...result.trace,
@@ -603,7 +672,7 @@ export class Gateway {
     let result: Awaited<ReturnType<AgentLoop['run']>>;
     try {
       const history = await this.sessions!.prepareHistory(chatId);
-      result = await this.agentLoop!.run(agentInput, history, { chatId });
+      result = await this.agentLoop!.run(agentInput, history, { chatId, mode: 'chat' });
     } catch (e) {
       console.error('[gateway] Agent error:', summarizeErrorForLog(e));
       try {
@@ -742,7 +811,7 @@ export class Gateway {
     ].join('\n');
 
     try {
-      const result = await this.agentLoop!.run(input, history, { chatId: job.chatId, origin: 'heartbeat' });
+      const result = await this.agentLoop!.run(input, history, { chatId: job.chatId, origin: 'heartbeat', mode: 'heartbeat' });
       if (result.text === HEARTBEAT_NOOP) {
         await this.sessions!.recordTurn(job.chatId, [
           { role: 'user', content: input },

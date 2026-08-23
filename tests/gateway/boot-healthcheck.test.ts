@@ -217,7 +217,7 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({ chatId: 'chat-1', text: 'hi there' });
 
-    expect(run).toHaveBeenCalledWith('hi there', expect.any(Array), { chatId: 'chat-1' });
+    expect(run).toHaveBeenCalledWith('hi there', expect.any(Array), { chatId: 'chat-1', mode: 'chat' });
     expect(send).toHaveBeenCalledWith('chat-1', { text: 'hello from agent' });
 
     await gateway.stop();

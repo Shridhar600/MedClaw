@@ -109,7 +109,7 @@ describe('Gateway onboarding integration', () => {
     const response = await gateway.handleTestMessage('chat-1', 'Can I eat daal chawal?');
 
     expect(response).toBe('normal agent');
-    expect(run).toHaveBeenCalledWith('Can I eat daal chawal?', [], { chatId: 'chat-1' });
+    expect(run).toHaveBeenCalledWith('Can I eat daal chawal?', [], { chatId: 'chat-1', mode: 'chat' });
   });
 
   it('bypasses onboarding for urgent health messages without calling the agent loop', async () => {

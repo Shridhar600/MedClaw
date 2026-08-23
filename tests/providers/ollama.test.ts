@@ -49,8 +49,9 @@ describe('OllamaProvider', () => {
     const result = await provider.chat([{ role: 'user', content: 'What is my soul?' }]);
     expect(result.type).toBe('tool_call');
     if (result.type === 'tool_call') {
-      expect(result.toolCall.name).toBe('memory_get');
-      expect(result.toolCall.arguments).toEqual({ path: 'SOUL.md' });
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.toolCalls[0].name).toBe('memory_get');
+      expect(result.toolCalls[0].arguments).toEqual({ path: 'SOUL.md' });
     }
   });
 

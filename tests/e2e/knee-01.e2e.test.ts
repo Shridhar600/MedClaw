@@ -69,9 +69,9 @@ function makeConfig(tmpDir: string): AppConfig {
 }
 
 const KNEE_01_SCRIPT: LLMResponse[] = [
-  { type: 'tool_call', toolCall: { id: 'c1', name: 'ledger_record', arguments: { entity: 'knee-injury', type: 'condition', fields: { status: 'active' }, source: 'user', note: 'injured my knee on the trek, limping' } } },
-  { type: 'tool_call', toolCall: { id: 'c2', name: 'ledger_record', arguments: { entity: 'limping', type: 'symptom', fields: { related_to: 'knee-injury' }, source: 'user', note: 'limping' } } },
-  { type: 'tool_call', toolCall: { id: 'c3', name: 'ledger_record', arguments: { entity: 'ibuprofen', type: 'medication', fields: { dose: '400mg PRN' }, source: 'user', note: 'taking ibuprofen 400mg as needed' } } },
+  { type: 'tool_call', toolCalls: [{ id: 'c1', name: 'ledger_record', arguments: { entity: 'knee-injury', type: 'condition', fields: { status: 'active' }, source: 'user', note: 'injured my knee on the trek, limping' } }] },
+  { type: 'tool_call', toolCalls: [{ id: 'c2', name: 'ledger_record', arguments: { entity: 'limping', type: 'symptom', fields: { related_to: 'knee-injury' }, source: 'user', note: 'limping' } }] },
+  { type: 'tool_call', toolCalls: [{ id: 'c3', name: 'ledger_record', arguments: { entity: 'ibuprofen', type: 'medication', fields: { dose: '400mg PRN' }, source: 'user', note: 'taking ibuprofen 400mg as needed' } }] },
   { type: 'text', text: 'Sorry about your knee — rest, ice, and ibuprofen as needed. If it worsens, see a clinician.' },
 ];
 

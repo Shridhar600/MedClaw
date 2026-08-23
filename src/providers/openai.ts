@@ -68,14 +68,13 @@ export class OpenAIProvider implements LLMProvider {
     const message = completion.choices[0].message;
 
     if (message.tool_calls && message.tool_calls.length > 0) {
-      const tc = message.tool_calls[0];
       return {
         type: 'tool_call',
-        toolCall: {
+        toolCalls: message.tool_calls.map((tc) => ({
           id: tc.id,
           name: tc.function.name,
           arguments: JSON.parse(tc.function.arguments) as Record<string, unknown>,
-        },
+        })),
       };
     }
 
@@ -110,14 +109,13 @@ export class OpenAIProvider implements LLMProvider {
     const message = completion.choices[0].message;
 
     if (message.tool_calls && message.tool_calls.length > 0) {
-      const tc = message.tool_calls[0];
       return {
         type: 'tool_call',
-        toolCall: {
+        toolCalls: message.tool_calls.map((tc) => ({
           id: tc.id,
           name: tc.function.name,
           arguments: JSON.parse(tc.function.arguments) as Record<string, unknown>,
-        },
+        })),
       };
     }
 

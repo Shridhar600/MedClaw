@@ -12,7 +12,7 @@ function providerWith(chat: LLMProvider['chat']): Pick<LLMProvider, 'chat'> {
 describe('probeChatCompletion (#3 real completion probe)', () => {
   it('ok + tool-calling verified when the model returns a tool call', async () => {
     const provider = providerWith(
-      jest.fn().mockResolvedValue({ type: 'tool_call', toolCall: { id: 'x', name: 'healthcheck_ack', arguments: {} } }),
+      jest.fn().mockResolvedValue({ type: 'tool_call', toolCalls: [{ id: 'x', name: 'healthcheck_ack', arguments: {} }] }),
     );
     const r = await probeChatCompletion(provider);
     expect(r.ready).toBe(true);

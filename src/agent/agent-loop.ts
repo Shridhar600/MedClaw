@@ -2,6 +2,8 @@ import type { AgentRunResult, LLMProvider, Message, ToolSchema } from '../provid
 import type { ToolRegistry } from '../tools/registry';
 import { LLMSemaphore, type SemaphorePriority } from '../tools/semaphore';
 import { MEDICAL_DISCLAIMER, MEDICAL_DISCLAIMER_SENTINEL } from '../safety/medical-disclaimer';
+import { parseUsedTag } from '../recall';
+import type { AssemblerMode } from '../context2';
 
 const MEDICAL_TOOLS = new Set(['medgemma_query', 'medgemma_analyze_report']);
 
@@ -13,16 +15,36 @@ interface AgentConfig {
 interface AgentRunContext {
   chatId?: string;
   origin?: SemaphorePriority;
+  /** The assembler mode for this turn (Gateway owns the origin→mode mapping — H-4). */
+  mode?: AssemblerMode;
 }
 
+/** The per-turn system prompt + an optional feedback sink for the B7 <used> ids. */
+export interface PreparedSystem {
+  messages: Message[];
+  recordUsed?: (usedIds: string[]) => Promise<void>;
+}
+
+/** Builds the system prompt fresh for a turn (D9). Recall + assembly happen inside; SAFETY is
+ *  re-rendered every turn. A thrown InvariantViolationError aborts the turn (medical-safety). */
+export type PrepareSystem = (mode: AssemblerMode, userMessage: string) => Promise<PreparedSystem>;
+
 export class AgentLoop {
+  private readonly prepareSystem: PrepareSystem;
+
   constructor(
     private readonly provider: LLMProvider,
     private readonly registry: ToolRegistry,
-    private readonly systemMessages: Message[],
+    systemSource: Message[] | PrepareSystem,
     private readonly config: AgentConfig,
     private readonly semaphore?: LLMSemaphore,
-  ) {}
+  ) {
+    // A static Message[] (legacy/test construction) becomes a constant supplier; a function is used
+    // per turn. This replaces the boot-cached system prompt with per-turn assembly (D9).
+    this.prepareSystem = typeof systemSource === 'function'
+      ? systemSource
+      : async () => ({ messages: systemSource });
+  }
 
   async run(
     userMessage: string,
@@ -42,8 +64,13 @@ export class AgentLoop {
     conversationHistory: Message[],
     runContext?: AgentRunContext,
   ): Promise<AgentRunResult> {
+    // Per-turn system assembly (D9): SAFETY + recall are rebuilt for this turn. A SAFETY-invariant
+    // violation here throws and aborts THIS turn (medical-safety > resilience) — the Gateway's outer
+    // handler turns it into a safe fallback reply, the daemon never crashes.
+    const mode: AssemblerMode = runContext?.mode ?? 'chat';
+    const prepared = await this.prepareSystem(mode, userMessage);
     const messages: Message[] = [
-      ...this.systemMessages,
+      ...prepared.messages,
       ...conversationHistory,
       { role: 'user', content: userMessage },
     ];
@@ -63,7 +90,12 @@ export class AgentLoop {
       const response = await this.provider.chat(messages, tools);
 
       if (response.type === 'text') {
-        const rawText = response.text;
+        // B7 <used> tag is parsed + stripped BEFORE health-classification / disclaimer / persist /
+        // send (H-3); a missing/garbled tag is simply no signal, never an error.
+        const { ids: usedIds, stripped: rawText } = parseUsedTag(response.text);
+        if (usedIds.length > 0 && prepared.recordUsed) {
+          try { await prepared.recordUsed(usedIds); } catch { /* recordUsage is best-effort + guarded */ }
+        }
         const isHealthRelated = this.config.disclaimerEnabled
           && this.isHealthResponse(userMessage, rawText, usedTools);
         const alreadyHasDisclaimer = rawText.includes(MEDICAL_DISCLAIMER_SENTINEL);
@@ -77,30 +109,34 @@ export class AgentLoop {
         };
       }
 
-      // Tool call
-      const { id, name, arguments: args } = response.toolCall;
-      usedTools.push(name);
-      // Tool args routinely carry PHI (memory content, health queries, report
-      // paths) — log the tool name only, never the arguments.
-      console.log(`[agent] Tool call: ${name}`);
+      // Tool calls — execute ALL the model requested this turn (C4.1); never drop the tail. OpenAI
+      // strict ordering: ONE assistant message carrying every tool_call, then one `tool` result per
+      // call (in request order). Executed sequentially — the win is not silently dropping calls.
+      const calls = response.toolCalls;
+      for (const c of calls) usedTools.push(c.name);
+      // Tool args routinely carry PHI (memory content, health queries, report paths) — log the tool
+      // name(s) only, never the arguments.
+      console.log(`[agent] Tool call: ${calls.map(c => c.name).join(', ')}`);
 
-      // Append assistant's tool request to messages
       const toolRequestMessage: Message = {
         role: 'assistant',
         content: null,
-        tool_calls: [{ id, type: 'function', function: { name, arguments: JSON.stringify(args) } }],
+        tool_calls: calls.map(c => ({
+          id: c.id,
+          type: 'function',
+          function: { name: c.name, arguments: JSON.stringify(c.arguments) },
+        })),
       };
       messages.push(toolRequestMessage);
       trace.push(toolRequestMessage);
 
-      // Execute tool
-      const toolResult = await this.registry.execute(name, args, runContext);
-      const resultText = toolResult.content.map(c => c.text).join('\n');
-
-      // Append tool result
-      const toolResultMessage: Message = { role: 'tool', content: resultText, tool_call_id: id };
-      messages.push(toolResultMessage);
-      trace.push(toolResultMessage);
+      for (const c of calls) {
+        const toolResult = await this.registry.execute(c.name, c.arguments, runContext);
+        const resultText = toolResult.content.map(r => r.text).join('\n');
+        const toolResultMessage: Message = { role: 'tool', content: resultText, tool_call_id: c.id };
+        messages.push(toolResultMessage);
+        trace.push(toolResultMessage);
+      }
     }
 
     const cappedText = `I reached the maximum number of reasoning steps (${this.config.maxIterations}). Please try rephrasing your request.`;

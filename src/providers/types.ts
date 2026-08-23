@@ -38,13 +38,16 @@ export interface TextResponse {
   text: string;
 }
 
+export interface ToolCall {
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
 export interface ToolCallResponse {
   type: 'tool_call';
-  toolCall: {
-    id: string;
-    name: string;
-    arguments: Record<string, unknown>;
-  };
+  /** ALL tool calls the model requested this turn — parallel-safe (C4.1); never just the first. */
+  toolCalls: ToolCall[];
 }
 
 export type LLMResponse = TextResponse | ToolCallResponse;

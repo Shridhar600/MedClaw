@@ -34,7 +34,7 @@ describe('AgentLoop', () => {
 
   it('executes a tool call then returns follow-up text', async () => {
     const provider = makeProvider([
-      { type: 'tool_call', toolCall: { id: 'c1', name: 'ping', arguments: {} } },
+      { type: 'tool_call', toolCalls: [{ id: 'c1', name: 'ping', arguments: {} }] },
       { type: 'text', text: 'I called ping and got pong!' },
     ]);
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
@@ -47,7 +47,7 @@ describe('AgentLoop', () => {
 
   it('returns structured run result with trace, usedTools, and healthResponse for tool flow', async () => {
     const provider = makeProvider([
-      { type: 'tool_call', toolCall: { id: 'c1', name: 'ping', arguments: {} } },
+      { type: 'tool_call', toolCalls: [{ id: 'c1', name: 'ping', arguments: {} }] },
       { type: 'text', text: 'I called ping and got pong!' },
     ]);
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
@@ -69,7 +69,7 @@ describe('AgentLoop', () => {
     const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
     try {
       const provider = makeProvider([
-        { type: 'tool_call', toolCall: { id: 'c1', name: 'ping', arguments: { query: 'fasting glucose 180, chest pain history' } } },
+        { type: 'tool_call', toolCalls: [{ id: 'c1', name: 'ping', arguments: { query: 'fasting glucose 180, chest pain history' } }] },
         { type: 'text', text: 'done' },
       ]);
       const registry = new ToolRegistry({ allow: ['*'], deny: [] });
@@ -114,7 +114,7 @@ describe('AgentLoop', () => {
 
   it('stops after maxIterations to prevent infinite loop', async () => {
     // Provider always returns a tool call
-    const provider = makeProvider(Array(20).fill({ type: 'tool_call', toolCall: { id: 'c1', name: 'ping', arguments: {} } }));
+    const provider = makeProvider(Array(20).fill({ type: 'tool_call', toolCalls: [{ id: 'c1', name: 'ping', arguments: {} }] }));
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
     registry.register(pingTool);
     const loop = new AgentLoop(provider, registry, [], { maxIterations: 3, disclaimerEnabled: false });
@@ -125,7 +125,7 @@ describe('AgentLoop', () => {
 
   it('forwards run-context chatId to tool execution', async () => {
     const provider = makeProvider([
-      { type: 'tool_call', toolCall: { id: 'c1', name: 'ping', arguments: {} } },
+      { type: 'tool_call', toolCalls: [{ id: 'c1', name: 'ping', arguments: {} }] },
       { type: 'text', text: 'done' },
     ]);
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
