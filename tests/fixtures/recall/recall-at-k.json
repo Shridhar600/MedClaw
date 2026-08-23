@@ -91,10 +91,51 @@
       { "id": "met@v3", "entity": "metformin", "type": "medication", "version": 3, "status": "active", "safetyRelevant": true, "createdAt": "2026-09-28T00:00:00.000Z", "fields": { "dose": "1000mg" } }
     ],
     "chunks": [
-      { "id": "met-v1", "content": "metformin 500mg noted earlier", "lane": "narrative", "createdAt": "2026-09-10T00:00:00.000Z", "cosine": 0.85, "bm25n": 0.6 },
-      { "id": "met-v3", "content": "metformin 1000mg current dose", "lane": "narrative", "createdAt": "2026-09-28T00:00:00.000Z", "cosine": 0.85, "bm25n": 0.6 }
+      { "id": "met-v1", "content": "metformin 500mg noted earlier", "lane": "ledger", "createdAt": "2026-09-10T00:00:00.000Z", "cosine": 0.85, "bm25n": 0.6 },
+      { "id": "met-v3", "content": "metformin 1000mg current dose", "lane": "ledger", "createdAt": "2026-09-28T00:00:00.000Z", "cosine": 0.85, "bm25n": 0.6 }
     ],
     "expectedChunkIds": ["met-v3"],
     "excludedChunkIds": ["met-v1"]
+  },
+  {
+    "name": "sleep-degrade-keyword-only",
+    "family": "sleep",
+    "clock": "2026-10-01T00:00:00.000Z",
+    "query": "trouble sleeping insomnia",
+    "degrade": true,
+    "facts": [],
+    "chunks": [
+      { "id": "deg1", "content": "insomnia notes, waking through the night", "lane": "episode", "createdAt": "2026-09-25T00:00:00.000Z", "cosine": 0.0, "bm25n": 0.7 },
+      { "id": "deg-d1", "content": "a totally unrelated grocery reminder", "lane": "narrative", "createdAt": "2026-09-26T00:00:00.000Z", "cosine": 0.0, "bm25n": 0.2 }
+    ],
+    "expectedChunkIds": ["deg1"]
+  },
+  {
+    "name": "mental-health-competition",
+    "family": "mental-health",
+    "clock": "2026-10-01T00:00:00.000Z",
+    "query": "my anxiety and low mood have been rough",
+    "facts": [],
+    "chunks": [
+      { "id": "cmp1", "content": "anxiety spikes at work, racing thoughts", "lane": "episode", "createdAt": "2026-09-28T00:00:00.000Z", "cosine": 0.9, "bm25n": 0.6 },
+      { "id": "cmp2", "content": "low mood most mornings this month", "lane": "episode", "createdAt": "2026-09-27T00:00:00.000Z", "cosine": 0.86, "bm25n": 0.55 },
+      { "id": "cmp3", "content": "started journaling to manage stress", "lane": "episode", "createdAt": "2026-09-26T00:00:00.000Z", "cosine": 0.82, "bm25n": 0.5 },
+      { "id": "cmp4", "content": "therapist suggested breathing exercises", "lane": "episode", "createdAt": "2026-09-25T00:00:00.000Z", "cosine": 0.78, "bm25n": 0.45 }
+    ],
+    "expectedChunkIds": ["cmp1", "cmp2", "cmp3", "cmp4"],
+    "floor": 0.75
+  },
+  {
+    "name": "diabetes-adverse-event-survives",
+    "family": "diabetes",
+    "clock": "2026-10-01T00:00:00.000Z",
+    "query": "why do I feel shaky and sweaty sometimes",
+    "facts": [
+      { "id": "met2@v2", "entity": "metformin", "type": "medication", "version": 2, "status": "active", "safetyRelevant": true, "createdAt": "2026-09-20T00:00:00.000Z", "fields": { "dose": "1000mg" } }
+    ],
+    "chunks": [
+      { "id": "adv1", "content": "felt shaky and sweaty a couple hours after taking metformin", "lane": "narrative", "createdAt": "2026-06-01T00:00:00.000Z", "cosine": 0.85, "bm25n": 0.5 }
+    ],
+    "expectedChunkIds": ["adv1"]
   }
 ]

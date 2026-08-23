@@ -17,6 +17,17 @@ export interface SqliteFactMirrorConfig {
   dbPath: string;
 }
 
+/**
+ * Deterministic entity-head tiebreak (F11): higher version wins; on a version tie the later
+ * createdAt wins; on a createdAt tie the higher id wins. `cur` undefined ⇒ candidate wins.
+ */
+export function headWins(cand: FactRecord, cur: FactRecord | undefined): boolean {
+  if (!cur) return true;
+  if (cand.version !== cur.version) return cand.version > cur.version;
+  if (cand.createdAt !== cur.createdAt) return cand.createdAt > cur.createdAt;
+  return cand.id > cur.id;
+}
+
 interface FactRow {
   json: string;
 }
@@ -75,17 +86,21 @@ export class SqliteFactMirror implements FactMirror {
   }
 
   async *queryEntityHeads(): AsyncIterable<FactRecord> {
-    // Max-version row per entity across all statuses (version >= 1 → excludes v0 sentinels, M-5).
-    // Correlated subquery over the small per-profile facts table (bounded — no full-table slurp).
+    // ONE head per entity: max version across all statuses (version >= 1 → excludes v0 sentinels,
+    // M-5). The correlated MAX can match multiple rows on a version tie, so we resolve to a single
+    // deterministic head (latest createdAt, then highest id) — pinned by the contract (F11). Bounded
+    // by entity count (per-profile) — not a full-table slurp.
     const rows = this.db.prepare(`
       SELECT f.json AS json FROM facts f
       WHERE f.version >= 1
         AND f.version = (SELECT MAX(f2.version) FROM facts f2 WHERE f2.entity = f.entity AND f2.version >= 1)
     `).all() as FactRow[];
+    const byEntity = new Map<string, FactRecord>();
     for (const r of rows) {
       const parsed = this.parseRow(r);
-      if (parsed) yield parsed;
+      if (parsed && headWins(parsed, byEntity.get(parsed.entity))) byEntity.set(parsed.entity, parsed);
     }
+    for (const h of byEntity.values()) yield h;
   }
 
   async rebuild(all: FactRecord[]): Promise<void> {

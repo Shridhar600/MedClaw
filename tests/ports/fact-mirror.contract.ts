@@ -171,5 +171,15 @@ export function runFactMirrorContract(makeMirror: MakeMirror): void {
       const heads = await collect(mirror.queryEntityHeads());
       expect(heads.map(h => h.entity).sort()).toEqual(['real']);
     });
+
+    it('queryEntityHeads resolves a version tie to a single deterministic head (latest createdAt) (F11)', async () => {
+      await mirror.upsert([
+        fact('dup-a', { entity: 'dupe', version: 2, status: 'superseded', createdAt: '2026-01-01T00:00:00.000Z' }),
+        fact('dup-b', { entity: 'dupe', version: 2, status: 'active', createdAt: '2026-02-01T00:00:00.000Z' }),
+      ]);
+      const heads = (await collect(mirror.queryEntityHeads())).filter(h => h.entity === 'dupe');
+      expect(heads).toHaveLength(1);
+      expect(heads[0].id).toBe('dup-b'); // later createdAt wins the tie
+    });
   });
 }

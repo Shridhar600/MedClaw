@@ -32,9 +32,20 @@ export interface RecallConfig {
   finalTopK: number;
   preDecayFloor: number;
   healthLaneBoost: number;
+  /**
+   * The "health" lanes — triple-duty (kept as one set because all three uses are the
+   * ledger|episode health surface; split into separate keys if Wave E needs to tune them apart):
+   *   (1) safety-threshold gate: safety_relevant && lane∈healthLanes → 0.3 threshold (B5);
+   *   (2) CHAT-07 post-threshold content-type boost;
+   *   (3) B4 auto-mute exemption (ledger|episode never muted).
+   */
   healthLanes: string[];
+  /** Lanes carrying versioned ledger-fact statements — newer-active suppression is scoped here (F2). */
+  ledgerLanes: string[];
   ledgerTypes: string[];
   autoMuteInjectedThreshold: number;
+  /** Stage-3 side-effect correlation only considers meds started within this window (specs/07 §6). */
+  recentMedDays: number;
 }
 
 export const DEFAULT_RECALL_CONFIG: RecallConfig = {
@@ -48,11 +59,13 @@ export const DEFAULT_RECALL_CONFIG: RecallConfig = {
   embedTimeoutMs: 500, // v2-BL-2
   overfetchFactor: 3,
   finalTopK: 3,
-  preDecayFloor: 0.15, // specs/13 B6
+  preDecayFloor: 0.15, // specs/13 B6 (safety_relevant chunks are exempt — see stage2)
   healthLaneBoost: 1.5, // CHAT-07 content-type bias (post-threshold, H-4)
   healthLanes: ['ledger', 'episode'], // safety-threshold lanes (B5) + CHAT-07 boost + B4 mute-exempt
+  ledgerLanes: ['ledger'], // newer-active version suppression is scoped to ledger-fact chunks (F2)
   ledgerTypes: ['medication', 'condition', 'symptom', 'appointment', 'metric', 'goal', 'allergy'],
   autoMuteInjectedThreshold: 20, // specs/13 B7 (never applied to safety_relevant / ledger|episode, B4)
+  recentMedDays: 90, // specs/07 §6 Stage 3 "active + recent(90d) meds"
 };
 
 export interface RecallDeps {
@@ -84,12 +97,15 @@ export interface RecallHit {
 export interface RecallReport {
   ledger: string;
   ledgerTokens: number;
+  /** True when the Stage-1 budget dropped one or more active facts (safety rows are prioritized). */
+  ledgerTruncated: boolean;
   narrative: string;
   narrativeTokens: number;
   hits: RecallHit[];
   injectedChunkIds: string[];
   indexStatus: IndexStatus;
-  entity: string;
+  /** Stage-3 deterministic correlation output — `CHECK:` lines (was `entity`, F13 rename). */
+  checkNotes: string;
 }
 
 interface Stage2Result {
@@ -119,16 +135,27 @@ function fmtFieldValue(v: string | number | string[]): string {
 }
 
 function toWordSet(s: string): Set<string> {
-  return new Set(s.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
+  // Singularize so plural/inflected mentions still match entity words (F4 — "UTIs" → "uti").
+  return new Set(s.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).map(singular));
 }
 
-/** Heads whose entity words all appear in the chunk content (deterministic, no embeddings). */
+/** Heads whose entity words all appear in the chunk content (deterministic, morphology-tolerant). */
 function matchEntities(content: string, heads: FactRecord[]): FactRecord[] {
   const words = toWordSet(content);
   return heads.filter(h => {
-    const ew = h.entity.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+    const ew = h.entity.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).map(singular);
     return ew.length > 0 && ew.every(w => words.has(w));
   });
+}
+
+// Stage-1 ledger fill priority when the budget is tight (F3): safety rows first, then a clinical
+// ordering, so a critical allergy is never silently evicted by rowid-arbitrary order.
+const LEDGER_TYPE_PRIORITY: Record<string, number> = {
+  allergy: 0, medication: 1, condition: 2, symptom: 3, appointment: 4, metric: 5, goal: 6,
+};
+function ledgerRank(f: FactRecord): number {
+  const typeRank = LEDGER_TYPE_PRIORITY[f.type] ?? 7;
+  return (f.safetyRelevant ? 0 : 100) + typeRank; // safety_relevant always outranks non-safety
 }
 
 interface Candidate {
@@ -170,7 +197,7 @@ function renderCheck(entity: string, started: string, sideEffect: string, now: D
     const t = new Date(started).getTime();
     if (!Number.isNaN(t)) {
       const weeks = Math.round(Math.max(0, (now.getTime() - t) / MS_PER_DAY) / 7);
-      windowClause = `~${weeks} weeks`;
+      windowClause = weeks < 1 ? 'under 1 week' : `~${weeks} weeks`;
     }
   }
   const startedClause = started ? ` (started ${started})` : '';
@@ -197,12 +224,13 @@ export class RecallEngine {
     return {
       ledger: stage1.text,
       ledgerTokens: stage1.tokens,
+      ledgerTruncated: stage1.truncated,
       narrative: stage2.text,
       narrativeTokens: stage2.tokens,
       hits: stage2.hits,
       injectedChunkIds: stage2.injectedChunkIds,
       indexStatus: stage2.indexStatus,
-      entity: stage3,
+      checkNotes: stage3,
     };
   }
 
@@ -221,7 +249,7 @@ export class RecallEngine {
 
   // ---- Stage 1: active ledger + paused-with-summary --------------------------------------
 
-  private async stage1Ledger(): Promise<{ text: string; tokens: number }> {
+  private async stage1Ledger(): Promise<{ text: string; tokens: number; truncated: boolean }> {
     const { factMirror, config } = this.deps;
     try {
       // Active clinical facts, deduped by entity → highest version (CONTRA-07).
@@ -231,11 +259,16 @@ export class RecallEngine {
         const cur = byEntity.get(f.entity);
         if (!cur || f.version > cur.version) byEntity.set(f.entity, f);
       }
-      const lines: string[] = [];
-      for (const f of byEntity.values()) lines.push(RecallEngine.renderActive(f));
-      // Paused facts that carry a pre_pause_summary (KNEE-08).
+      // Priority order so a tight budget never silently evicts a safety row (F3): safety/allergy
+      // first, then the clinical ordering, stable tiebreak by entity.
+      const activeFacts = [...byEntity.values()].sort((a, b) =>
+        ledgerRank(a) - ledgerRank(b) || a.entity.localeCompare(b.entity));
+      const lines: string[] = activeFacts.map(f => RecallEngine.renderActive(f));
+      // Paused facts that carry a pre_pause_summary (KNEE-08) — skip entities that already have an
+      // active head (active wins; no double-render, F15).
       for await (const f of factMirror.queryPaused()) {
         if (!config.ledgerTypes.includes(f.type)) continue;
+        if (byEntity.has(f.entity)) continue;
         const summary = f.fields['pre_pause_summary'];
         if (summary === undefined) continue;
         lines.push(`- ${f.entity} (${f.type}) paused — ${fmtFieldValue(summary)}`);
@@ -243,7 +276,7 @@ export class RecallEngine {
       return RecallEngine.fitLines(lines, config.ledgerBudget);
     } catch (e) {
       console.warn('[recall] stage1 ledger failed:', summarizeErrorForLog(e));
-      return { text: '', tokens: 0 };
+      return { text: '', tokens: 0, truncated: false };
     }
   }
 
@@ -255,15 +288,16 @@ export class RecallEngine {
     return `- ${f.entity} (${f.type}) ${f.status}${fields ? ` — ${fields}` : ''}`;
   }
 
-  private static fitLines(lines: string[], budgetTokens: number): { text: string; tokens: number } {
+  private static fitLines(lines: string[], budgetTokens: number): { text: string; tokens: number; truncated: boolean } {
     const kept: string[] = [];
+    let truncated = false;
     for (const line of lines) {
       const candidate = [...kept, line].join('\n');
-      if (estimateTokens(candidate) > budgetTokens) break;
+      if (estimateTokens(candidate) > budgetTokens) { truncated = true; break; }
       kept.push(line);
     }
     const text = kept.join('\n');
-    return { text, tokens: estimateTokens(text) };
+    return { text, tokens: estimateTokens(text), truncated };
   }
 
   // ---- Stage 2: hybrid narrative recall --------------------------------------------------
@@ -281,22 +315,31 @@ export class RecallEngine {
       const scored: RecallHit[] = [];
       for (const c of candidates.values()) {
         const matched = matchEntities(c.content, heads);
-        if (RecallEngine.isSuppressed(matched, c.createdAt)) continue;
+        if (RecallEngine.isSuppressed(matched, c, config)) continue;
+
+        const safetyRelevant = matched.some(m => m.safetyRelevant);
 
         // On keyword-only degrade there is no cosine, so the keyword score stands in for the
         // semantic signal (full weight on the only signal we have) — otherwise a bm25-only chunk
         // caps at raw 0.3 and can never clear the 0.5 threshold, and degrade would return nothing.
         const effectiveCosine = indexStatus === 'keyword-only' ? c.bm25n : c.cosine;
         const base = 0.7 * effectiveCosine + 0.3 * c.bm25n;
-        if (base < config.preDecayFloor) continue; // B6 pre-decay floor
+        // B6 pre-decay floor — safety_relevant chunks are EXEMPT (specs/13 B6 "OR safety_relevant",
+        // v2-BL-1b: safety facts must stay surface-able). The floor must not run before this carve-out.
+        if (!safetyRelevant && base < config.preDecayFloor) continue;
 
-        const safetyRelevant = matched.some(m => m.safetyRelevant);
         const inHealthLane = config.healthLanes.includes(c.lane);
 
         // B4 auto-mute: a chunk injected ≫ used is noise — drop it, EXCEPT safety_relevant chunks
-        // or ledger|episode lanes, which are NEVER muted (specs/13 B4 / v2-H-1).
+        // or ledger|episode lanes, which are NEVER muted (specs/13 B4 / v2-H-1). The stat read is
+        // best-effort: a corrupt stats row must degrade to no-mute, never sink the turn (F8).
         if (!safetyRelevant && !inHealthLane) {
-          const stat = await this.deps.chunkStats.get(c.id);
+          let stat = null;
+          try {
+            stat = await this.deps.chunkStats.get(c.id);
+          } catch (e) {
+            console.warn('[recall] chunkStats read failed (no-mute):', summarizeErrorForLog(e));
+          }
           if (stat && stat.injectedCount >= config.autoMuteInjectedThreshold && stat.usedCount === 0) continue;
         }
 
@@ -327,35 +370,57 @@ export class RecallEngine {
     }
   }
 
-  /** Hybrid gather: embed (timeout-guarded) → vec KNN ∪ keyword match, merged by chunk id. */
+  /**
+   * Hybrid gather: embed (timeout-guarded) → vec KNN ∪ keyword match, merged by chunk id. Each arm
+   * is isolated (F8b) so one arm's failure never discards the other's candidates. PLAT-11 status:
+   * 'failed' only when BOTH arms are down; 'keyword-only' when the vector arm is unavailable.
+   */
   private async gatherCandidates(userMessage: string): Promise<{ candidates: Map<string, Candidate>; indexStatus: IndexStatus }> {
     const { config } = this.deps;
     const candidates = new Map<string, Candidate>();
-    let indexStatus: IndexStatus = 'full';
 
+    // --- vector arm: embed (timeout-guarded); empty or failed embedding ⇒ vec unavailable ---
     let embedding: number[] | null = null;
     try {
       const vecs = await this.embedWithTimeout(userMessage);
-      embedding = vecs[0] ?? null;
+      const v = vecs[0];
+      if (v && v.length > 0) embedding = v;
+      else console.warn('[recall] empty embedding → keyword-only (specs/13 B3)'); // F6
     } catch (e) {
       // Embed throw OR 500ms timeout ⇒ keyword-only degrade (PLAT-11, v2-BL-2).
       console.warn('[recall] embed failed → keyword-only:', summarizeErrorForLog(e));
-      indexStatus = 'keyword-only';
     }
 
+    let vecAvailable = false;
     if (embedding) {
-      const k = config.topKNarrative * config.overfetchFactor;
-      for await (const h of this.deps.vectorIndex.queryKnn(embedding, k)) {
-        const c = candidates.get(h.id) ?? RecallEngine.emptyCandidate(h);
-        c.cosine = Math.max(c.cosine, h.score);
-        candidates.set(h.id, c);
+      try {
+        const k = config.topKNarrative * config.overfetchFactor;
+        for await (const h of this.deps.vectorIndex.queryKnn(embedding, k)) {
+          const c = candidates.get(h.id) ?? RecallEngine.emptyCandidate(h);
+          c.cosine = Math.max(c.cosine, h.score);
+          candidates.set(h.id, c);
+        }
+        vecAvailable = true;
+      } catch (e) {
+        console.warn('[recall] vector query failed:', summarizeErrorForLog(e)); // keep the keyword arm
       }
     }
-    for await (const h of this.deps.keywordIndex.match(userMessage, config.topKKeyword)) {
-      const c = candidates.get(h.id) ?? RecallEngine.emptyCandidate(h);
-      c.bm25n = Math.max(c.bm25n, h.score);
-      candidates.set(h.id, c);
+
+    // --- keyword arm: independent try so a throw here preserves already-gathered vec candidates ---
+    let keywordAvailable = false;
+    try {
+      for await (const h of this.deps.keywordIndex.match(userMessage, config.topKKeyword)) {
+        const c = candidates.get(h.id) ?? RecallEngine.emptyCandidate(h);
+        c.bm25n = Math.max(c.bm25n, h.score);
+        candidates.set(h.id, c);
+      }
+      keywordAvailable = true;
+    } catch (e) {
+      console.warn('[recall] keyword query failed:', summarizeErrorForLog(e)); // keep vec candidates
     }
+
+    const indexStatus: IndexStatus = (!vecAvailable && !keywordAvailable) ? 'failed'
+      : (!vecAvailable ? 'keyword-only' : 'full');
     return { candidates, indexStatus };
   }
 
@@ -384,16 +449,25 @@ export class RecallEngine {
     }
   }
 
-  private static isSuppressed(matched: FactRecord[], chunkCreatedAt: string): boolean {
-    const chunkTs = new Date(chunkCreatedAt).getTime();
+  private static isSuppressed(matched: FactRecord[], chunk: Candidate, config: RecallConfig): boolean {
+    const chunkDay = RecallEngine.dayOf(chunk.createdAt);
+    const isLedgerLane = config.ledgerLanes.includes(chunk.lane);
     for (const m of matched) {
-      if (STALE_STATUSES.has(m.status)) return true; // stale fail-closed (KNEE-10)
-      if (m.status === 'active') {
-        const headTs = new Date(m.createdAt).getTime();
-        if (!Number.isNaN(headTs) && !Number.isNaN(chunkTs) && headTs > chunkTs) return true; // CONTRA-10
+      if (STALE_STATUSES.has(m.status)) return true; // stale fail-closed (KNEE-10) — all lanes
+      // Newer-active version suppression (CONTRA-10) is scoped to ledger-fact chunks (F2): a
+      // narrative adverse-event mention of an active med must NOT be dropped by a later dose update.
+      // Compared at DAY granularity so sub-day serialization drift can't flip the boundary (F5).
+      if (m.status === 'active' && isLedgerLane) {
+        const headDay = RecallEngine.dayOf(m.createdAt);
+        if (headDay !== null && chunkDay !== null && headDay > chunkDay) return true;
       }
     }
     return false;
+  }
+
+  private static dayOf(iso: string): number | null {
+    const t = new Date(iso).getTime();
+    return Number.isNaN(t) ? null : Math.floor(t / MS_PER_DAY);
   }
 
   private static emptyCandidate(h: { id: string; lane: string; content: string; createdAt: string }): Candidate {
@@ -438,7 +512,7 @@ export class RecallEngine {
   // the event store consumer respectively and are deferred (documented in the P2 plan).
 
   private async stage3Entity(input: RecallInput): Promise<string> {
-    const { factMirror, clock } = this.deps;
+    const { factMirror, clock, config } = this.deps;
     try {
       const msgWords = normalizeMessageWords(input.userMessage);
       const now = clock.now();
@@ -446,10 +520,13 @@ export class RecallEngine {
       for await (const med of factMirror.queryActive('medication')) {
         const sideEffects = med.fields['known_side_effects'];
         if (!Array.isArray(sideEffects)) continue;
+        const started = typeof med.fields['started'] === 'string' ? (med.fields['started'] as string) : '';
+        // Only recent(90d) meds correlate (specs/07 §6) — a long-standing med would fire CHECK on
+        // every mention and erode signal (F7). Fail-open for undated/unparseable starts.
+        if (!RecallEngine.isRecentMed(started, now, config.recentMedDays)) continue;
         for (const se of sideEffects) {
           if (typeof se !== 'string') continue;
           if (!sideEffectMatches(se, msgWords)) continue;
-          const started = typeof med.fields['started'] === 'string' ? (med.fields['started'] as string) : '';
           lines.push(renderCheck(med.entity, started, se, now));
         }
       }
@@ -458,5 +535,12 @@ export class RecallEngine {
       console.warn('[recall] stage3 entity correlation failed:', summarizeErrorForLog(e));
       return '';
     }
+  }
+
+  private static isRecentMed(started: string, now: Date, windowDays: number): boolean {
+    if (!started) return true; // undated → fail-open (recency unknown, correlate anyway)
+    const t = new Date(started).getTime();
+    if (Number.isNaN(t)) return true; // unparseable → fail-open
+    return (now.getTime() - t) / MS_PER_DAY <= windowDays;
   }
 }

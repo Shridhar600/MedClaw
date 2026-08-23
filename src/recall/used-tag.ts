@@ -10,12 +10,18 @@ export interface UsedTag {
   stripped: string;
 }
 
-const USED_TAG_RE = /\n?<used>([^<>\n]*)<\/used>\s*$/;
+// Match EVERY well-formed <used>…</used> occurrence, not just the trailing one (F14): if the model
+// emits the tag inline or more than once, none of it may reach the user or the session trace.
+const USED_TAG_RE = /<used>([^<>\n]*)<\/used>/g;
 
 export function parseUsedTag(text: string): UsedTag {
-  const m = text.match(USED_TAG_RE);
-  if (!m || m.index === undefined) return { ids: [], stripped: text };
-  const ids = m[1].split(',').map(s => s.trim()).filter(Boolean);
-  const stripped = text.slice(0, m.index).replace(/\s+$/, '');
-  return { ids, stripped };
+  const ids: string[] = [];
+  let found = false;
+  const stripped = text.replace(USED_TAG_RE, (_match, inner: string) => {
+    found = true;
+    for (const id of inner.split(',').map(s => s.trim()).filter(Boolean)) ids.push(id);
+    return '';
+  });
+  if (!found) return { ids: [], stripped: text }; // garbled/unclosed/no-tag ⇒ no signal, text intact
+  return { ids, stripped: stripped.replace(/[ \t]+\n/g, '\n').replace(/\s+$/, '') };
 }

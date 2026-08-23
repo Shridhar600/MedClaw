@@ -39,4 +39,18 @@ describe('parseUsedTag', () => {
     const { ids } = parseUsedTag('x\n<used> a , , b </used>');
     expect(ids).toEqual(['a', 'b']);
   });
+
+  it('strips an inline (non-trailing) tag so it never leaks to the user (F14)', () => {
+    const { ids, stripped } = parseUsedTag('I used <used>c1</used> that note, here is more.');
+    expect(ids).toEqual(['c1']);
+    expect(stripped).not.toContain('<used>');
+    expect(stripped).toContain('here is more');
+  });
+
+  it('collects ids from multiple tags and strips them all (F14)', () => {
+    const { ids, stripped } = parseUsedTag('answer <used>a</used> body <used>b,c</used>');
+    expect(ids).toEqual(['a', 'b', 'c']);
+    expect(stripped).not.toContain('<used>');
+    expect(stripped).not.toContain('</used>');
+  });
 });

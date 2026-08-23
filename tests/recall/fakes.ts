@@ -36,11 +36,15 @@ export class FakeFactMirror implements FactMirror {
   }
 
   async *queryEntityHeads(): AsyncIterable<FactRecord> {
+    // Deterministic head per entity (F11): version, then later createdAt, then higher id.
     const heads = new Map<string, FactRecord>();
     for (const r of this.records) {
       if (r.version < 1) continue;
       const cur = heads.get(r.entity);
-      if (!cur || r.version > cur.version) heads.set(r.entity, r);
+      const wins = !cur || r.version > cur.version
+        || (r.version === cur.version && r.createdAt > cur.createdAt)
+        || (r.version === cur.version && r.createdAt === cur.createdAt && r.id > cur.id);
+      if (wins) heads.set(r.entity, r);
     }
     for (const h of heads.values()) yield h;
   }
@@ -67,9 +71,10 @@ export class FakeVectorIndex implements VectorIndex {
 }
 
 export class FakeKeywordIndex implements KeywordIndex {
-  constructor(private hits: ChunkWithScore[] = []) {}
+  constructor(private hits: ChunkWithScore[] = [], private throwOnMatch = false) {}
   async index(): Promise<void> {}
   async *match(_query: string, k: number): AsyncIterable<ChunkWithScore> {
+    if (this.throwOnMatch) throw new Error('keyword match failed');
     let n = 0;
     for (const h of this.hits) {
       if (n++ >= k) break;
@@ -119,6 +124,13 @@ export class FakeChunkStats implements ChunkStatsWriter {
   seed(chunkId: string, injectedCount: number, usedCount: number): void {
     this.store.set(chunkId, { chunkId, injectedCount, usedCount });
   }
+}
+
+/** A ChunkStatsWriter whose reads throw — for the F8 resilience-granularity test. */
+export class ThrowingChunkStats implements ChunkStatsWriter {
+  async bumpInjected(): Promise<void> {}
+  async bumpUsed(): Promise<void> {}
+  async get(): Promise<ChunkStat | null> { throw new Error('stats read failed'); }
 }
 
 export function chunkHit(over: Partial<ChunkWithScore> & { id: string; score: number }): ChunkWithScore {

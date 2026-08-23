@@ -21,6 +21,8 @@ interface Fixture {
   expectedChunkIds: string[];
   excludedChunkIds?: string[];
   floor?: number;
+  /** When true, the embedding provider throws → keyword-only degrade path is exercised. */
+  degrade?: boolean;
 }
 
 const KNEE_DIAB = new Set(['knee', 'diabetes']);
@@ -55,7 +57,7 @@ describe('recall@k golden set (measurement minimum)', () => {
 
   it.each(fixtures.map(f => [f.name, f] as const))('%s — expected chunks in top-3', async (_name, f) => {
     const engine = new RecallEngine({
-      embedding: new FakeEmbedding({ vector: [0.1, 0.2, 0.3] }),
+      embedding: new FakeEmbedding(f.degrade ? { throwErr: true } : { vector: [0.1, 0.2, 0.3] }),
       vectorIndex: new FakeVectorIndex(f.chunks.map(c => toHit(c, c.cosine))),
       keywordIndex: new FakeKeywordIndex(f.chunks.map(c => toHit(c, c.bm25n))),
       factMirror: new FakeFactMirror(f.facts.map(frec)),
