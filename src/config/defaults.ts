@@ -36,6 +36,7 @@ export const DEFAULT_CONFIG: AppConfig = {
       hybridWeights: { vector: 0.7, keyword: 0.3 },
     },
     bootstrapMaxChars: 20000,
+    budgetRatios: { health: 0.6, life: 0.2, agent: 0.2 },
   },
   sessions: {
     softResetAfterMinutes: 240,

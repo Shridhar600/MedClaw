@@ -28,8 +28,15 @@ function sanitizeEntry(text: string): string {
 export type MemorySection = 'health' | 'life' | 'agent';
 
 export interface CuratedMemoryOptions {
-  /** Total MEMORY.md budget in characters; split 60/20/20 across the three sections. */
+  /** Total MEMORY.md budget in characters; split across the three sections by {@link budgetRatios}. */
   budgetChars: number;
+  /**
+   * Per-section share of `budgetChars` (E1.4 — sourced from `config.memory.budgetRatios`). Any
+   * missing or non-positive entry falls back to the 60/20/20 default. Changing the shares only
+   * resizes the per-section budgets — the no-cross-category + health-never-evicted invariants stay
+   * code-enforced (CHAT-02/05).
+   */
+  budgetRatios?: Partial<Record<MemorySection, number>>;
 }
 
 const SECTION_SHARE: Record<MemorySection, number> = { health: 0.6, life: 0.2, agent: 0.2 };
@@ -56,8 +63,20 @@ export class CuratedMemory {
     return path.join(this.rootDir, 'MEMORY.md');
   }
 
+  /** Effective share for a section: the configured ratio when finite and > 0, else the default. */
+  private sectionShare(section: MemorySection): number {
+    const r = this.opts.budgetRatios?.[section];
+    return typeof r === 'number' && Number.isFinite(r) && r > 0 ? r : SECTION_SHARE[section];
+  }
+
   private sectionBudget(section: MemorySection): number {
-    return Math.floor(this.opts.budgetChars * SECTION_SHARE[section]);
+    return Math.floor(this.opts.budgetChars * this.sectionShare(section));
+  }
+
+  /** The H1 budget-line ratio summary, rendered from the effective shares (e.g. "health 60% / …"). */
+  private ratioSummary(): string {
+    // Short section keys (health/life/agent) — matches the historic H1 label, not SECTION_DISPLAY.
+    return SECTION_ORDER.map(s => `${s} ${Math.round(this.sectionShare(s) * 100)}%`).join(' / ');
   }
 
   /**
@@ -170,7 +189,7 @@ export class CuratedMemory {
     }
     const preamble = items.find(i => i.kind === 'preamble');
     if (preamble && preamble.lines.length > 0 && preamble.lines[0].startsWith('# Memory')) {
-      preamble.lines[0] = `# Memory <!-- budget: ${fmt(this.opts.budgetChars)} chars · health 60% / life 20% / agent 20% -->`;
+      preamble.lines[0] = `# Memory <!-- budget: ${fmt(this.opts.budgetChars)} chars · ${this.ratioSummary()} -->`;
     }
   }
 
@@ -214,7 +233,7 @@ export class CuratedMemory {
   private freshItems(): ParsedItem[] {
     return [{
       kind: 'preamble',
-      lines: [`# Memory <!-- budget: ${fmt(this.opts.budgetChars)} chars · health 60% / life 20% / agent 20% -->`],
+      lines: [`# Memory <!-- budget: ${fmt(this.opts.budgetChars)} chars · ${this.ratioSummary()} -->`],
     }];
   }
 

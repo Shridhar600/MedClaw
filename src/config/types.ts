@@ -26,6 +26,8 @@ export interface MemoryConfig {
     hybridWeights: { vector: number; keyword: number };
   };
   bootstrapMaxChars: number;
+  /** MEMORY.md per-section budget shares (E1.4); defaults 0.6 / 0.2 / 0.2. */
+  budgetRatios?: { health: number; life: number; agent: number };
 }
 
 export interface SessionsConfig {
