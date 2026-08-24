@@ -16,6 +16,19 @@ export class NotImplementedError extends AppError {
 }
 
 /**
+ * A MedClaw-generated media/report validation error (unsupported file, extension/MIME mismatch,
+ * no renderable pages, provider not vision-capable, raw-media policy). Its message describes the
+ * FILE or CONFIG — never health content — so it is safe to echo to the user. This TYPE is how the
+ * medical tools tell a self-generated validation error (echo it) apart from a raw provider error
+ * (never echo — it can carry PHI from the prompt). See medical-tools `buildReportErrorMessage` (F-2).
+ */
+export class MediaValidationError extends AppError {
+  constructor(message: string) {
+    super(message);
+  }
+}
+
+/**
  * A corrupted block in a Markdown ledger file was quarantined with a
  * <!-- PARSE-ERROR --> comment. The store continued loading other blocks.
  */

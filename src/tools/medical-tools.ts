@@ -9,6 +9,7 @@ import type { ProviderConfig } from '../config/types';
 import { processReportFile, type ProcessedReport } from '../media/report-processor';
 import { MEDICAL_DISCLAIMER } from '../safety/medical-disclaimer';
 import { summarizeErrorForLog } from '../security';
+import { MediaValidationError } from '../shared/errors';
 
 /**
  * Assemble health context from memory for medical queries.
@@ -371,10 +372,10 @@ async function callMedicalVisionProvider(
   options: MedicalToolsOptions,
 ): Promise<LLMResponse> {
   if (!canSendRawMedicalMedia(options)) {
-    throw new Error('Raw medical image/PDF page analysis is only enabled for local Ollama providers unless allowRawMedicalMedia is explicitly true.');
+    throw new MediaValidationError('Raw medical image/PDF page analysis is only enabled for local Ollama providers unless allowRawMedicalMedia is explicitly true.');
   }
   if (!provider.chatWithImages) {
-    throw new Error('The configured medical provider does not support image input.');
+    throw new MediaValidationError('The configured medical provider does not support image input.');
   }
   return provider.chatWithImages(messages, report.images ?? []);
 }
@@ -422,16 +423,21 @@ function isLocalHostname(hostname: string): boolean {
 }
 
 function isImageOnlyFailure(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
+  // Only a MedClaw-generated media validation error can be an "image-only" failure — a raw provider
+  // error whose message happens to contain these words must NOT be misclassified (F-2).
+  if (!(error instanceof MediaValidationError)) return false;
   return error.message.includes('vision')
     || error.message.includes('image input')
     || error.message.includes('no pages could be rendered');
 }
 
 function buildReportErrorMessage(error: unknown, report: ProcessedReport | undefined): string {
-  const detail = error instanceof Error ? error.message : String(error);
+  // F-2 typed split: only echo a MedClaw-generated validation error's message (it describes the
+  // file/config, never health content). A raw provider error can echo the prompt (PHI), so it gets
+  // NO detail — just the canned framing.
+  const detail = error instanceof MediaValidationError ? ` ${error.message}` : '';
   if (!report) {
-    return `Error: Report processing failed. ${detail}`;
+    return `Error: Report processing failed.${detail}`;
   }
-  return `Error: MedGemma vision analysis failed. ${detail} Please ensure the configured medical provider is a local vision-capable model and try again.`;
+  return `Error: MedGemma vision analysis failed.${detail} Please ensure the configured medical provider is a local vision-capable model and try again.`;
 }

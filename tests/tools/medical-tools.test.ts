@@ -472,6 +472,27 @@ describe('Medical Tools', () => {
       expect(mockMainProvider.chat).not.toHaveBeenCalled();
     });
 
+    it('does not echo a raw provider error message into the analyze-report result (F-2 PHI split)', async () => {
+      const reportPath = path.join(tmpDir, 'reports');
+      fs.mkdirSync(reportPath, { recursive: true });
+      fs.writeFileSync(path.join(reportPath, 'photo.png'), Buffer.from('iVBORw0KGgo=', 'base64'));
+      const leakyVisionProvider: LLMProvider = {
+        chat: jest.fn().mockRejectedValue(new Error('PROVIDER-PHI-LEAK glucose 300 chest pain')),
+        chatWithImages: jest.fn().mockRejectedValue(new Error('PROVIDER-PHI-LEAK glucose 300 chest pain')),
+        embed: jest.fn(async () => [0.1, 0.2, 0.3]),
+      };
+      const tools: Tool[] = createMedicalTools(
+        engine, mockSearch, leakyVisionProvider, mockMainProvider, tmpDir, { medicalProviderType: 'ollama' },
+      );
+      const tool = tools.find((t: Tool) => t.name === 'medgemma_analyze_report')!;
+      const result = await tool.execute({ mediaPath: 'reports/photo.png' });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('vision analysis failed'); // canned framing stays
+      expect(result.content[0].text).not.toContain('PROVIDER-PHI-LEAK');
+      expect(result.content[0].text).not.toContain('glucose 300');
+    });
+
     it('blocks raw image reports for cloud medical providers unless explicitly opted in', async () => {
       const reportPath = path.join(tmpDir, 'reports');
       fs.mkdirSync(reportPath, { recursive: true });
