@@ -92,7 +92,36 @@ export class LedgerStore {
   }
 
   private async writeFacts(type: FactType, facts: LedgerFact[]): Promise<void> {
+    LedgerStore.reconcileReverseLinks(facts);
     secureWriteViaTmp(this.filePath(type), renderLedgerFile(facts));
+  }
+
+  /**
+   * M-6 reverse-link stamping (E1.2). For every fact that declares `replaces`/`corrects: <ref>`,
+   * stamp the reciprocal `replacedBy`/`correctedBy` on the TARGET fact. `ref` resolves by fact id
+   * first, else by entity name → that entity's current head (so the natural agent input "naproxen
+   * replaces ibuprofen" links both ways). Runs at the single write chokepoint, so applied + confirm
+   * + discontinue paths all get it. Idempotent + self-healing (re-derived on every write); last
+   * same-file source in array (append) order wins. TYPE-SCOPED: a target in another ledger file is
+   * not visible here — cross-type reverse links are a documented deferral.
+   */
+  private static reconcileReverseLinks(facts: LedgerFact[]): void {
+    const byId = new Map(facts.map(f => [f.id, f]));
+    const headByEntity = new Map<string, LedgerFact>();
+    for (const f of facts) {
+      const cur = headByEntity.get(f.entity);
+      if (!cur || f.version > cur.version) headByEntity.set(f.entity, f);
+    }
+    const resolve = (ref: string): LedgerFact | undefined => byId.get(ref) ?? headByEntity.get(ref);
+    const stamp = (ref: string | undefined, source: LedgerFact, field: 'replacedBy' | 'correctedBy'): void => {
+      if (!ref) return;
+      const target = resolve(ref);
+      if (target && target.id !== source.id) target[field] = source.id;
+    };
+    for (const f of facts) {
+      stamp(f.replaces, f, 'replacedBy');
+      stamp(f.corrects, f, 'correctedBy');
+    }
   }
 
   private nextVersion(facts: LedgerFact[], entity: string): number {
@@ -593,6 +622,10 @@ export class LedgerStore {
         verbatim: op.verbatim,
         visibility: op.visibility,
         resume: op.resume,
+        // E1.2: carry the cross-entity links so the confirmed fact keeps its forward link and the
+        // reverse link gets stamped on the target (writeFacts → reconcileReverseLinks).
+        replaces: op.replaces,
+        corrects: op.corrects,
       };
       const fact = this.makeFact(rp, v, targetStatus, now, cur, writeFields);
       allFacts.push(fact);

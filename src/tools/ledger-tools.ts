@@ -107,6 +107,8 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
         language: { type: 'string', description: 'Language of the verbatim quote (default en)' },
         source: { type: 'string', enum: AUTHORITIES, description: 'Provenance authority (default user)' },
         confidence: { type: 'number', description: 'Provenance confidence 0..1 (default 0.9)' },
+        replaces: { type: 'string', description: 'Fact id or entity name this fact clinically REPLACES (e.g. a new medication superseding an old one). The reverse replacedBy link is stamped automatically.' },
+        corrects: { type: 'string', description: 'Fact id or entity name this fact CORRECTS (a mistaken-entity fix). The reverse correctedBy link is stamped automatically.' },
       },
       required: ['entity', 'type'],
     },
@@ -167,6 +169,8 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
           language: params.language as string | undefined,
           verbatim: params.verbatim as string | undefined,
           text: params.note as string | undefined,
+          replaces: params.replaces as string | undefined,
+          corrects: params.corrects as string | undefined,
         },
       });
       return renderRecordResult(result, entity, type);
