@@ -30,6 +30,13 @@ export interface LedgerToolsDeps {
    * applied record's anchor comes from the pipeline; confirms had none).
    */
   narrative?: { appendLedgerAnchor(date: string, entity: string, factId: string): Promise<string> };
+  /**
+   * E2/CONTRA-09: re-derive the recall substrate (fact mirror + chunk index) for a fact TYPE after a
+   * state-changing confirm/remove. `ledger_record` re-derives via the capture pipeline, but the
+   * confirm (`ledger_update`) and direct-apply (`ledger_remove`) paths bypass it — without this hook a
+   * confirmed retraction/discontinuation keeps injecting the stale fact into the next turn's context.
+   */
+  afterLedgerMutation?: (type: FactType) => Promise<void>;
 }
 
 function ok(text: string): ToolResult {
@@ -54,6 +61,16 @@ function renderFacts(facts: LedgerFact[]): string {
 }
 
 export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
+  // Best-effort recall re-derive after a state-changing confirm/remove (mirror rebuilds at boot, so a
+  // failure degrades the next turn's recall, never the turn itself).
+  const afterMutation = async (type: FactType): Promise<void> => {
+    if (!deps.afterLedgerMutation) return;
+    try {
+      await deps.afterLedgerMutation(type);
+    } catch (e) {
+      console.warn('[ledger-tools] post-mutation recall re-derive failed (rebuilds at boot):', summarizeErrorForLog(e));
+    }
+  };
   const clock = deps.clock ?? systemClock;
   const provenance = (source: Authority, confidence: number): Provenance => ({
     source,
@@ -231,6 +248,9 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
             return applied;
           },
         });
+        // Re-derive the recall mirror/index so the confirmed change (supersession, retraction,
+        // discontinuation, dispute resolution) reaches the NEXT turn's context (CONTRA-09).
+        await afterMutation(fact.type);
         return ok(`Confirmed: ${fact.entity} (${fact.type}) is now ${fact.status} as ${fact.id}.`);
       } catch (e) {
         // PPHI: raw provider/store errors can echo entity names (health content).
@@ -296,6 +316,8 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       if (result.fact.safetyRelevant) {
         await deps.safety.render(await deps.safety.listSafetyRelevant());
       }
+      // A direct-applied (non-med) removal also bypasses the pipeline — re-derive so recall drops it.
+      await afterMutation(result.fact.type);
       return ok(`Removed ${entity} (${type}) — now ${result.fact.status} as ${result.fact.id}.`);
     },
   };

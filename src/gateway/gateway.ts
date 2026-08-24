@@ -351,6 +351,9 @@ export class Gateway {
           queue: writeQueue,
           narrative: narrativeStore,
           sideEffectLookup: (entity) => this.lookupSideEffects(sideEffectProvider, entity),
+          // CONTRA-09: confirm/remove bypass the capture pipeline — re-derive the recall mirror +
+          // index for the changed ledger file so a confirmed retraction leaves the next turn's context.
+          afterLedgerMutation: (type) => rederive.rederive([`ledger/${TYPE_TO_FILE[type]}`]),
         })) {
           registry.register(tool);
         }
