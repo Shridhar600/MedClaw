@@ -176,4 +176,96 @@ describe('OnboardingFlow', () => {
     expect(fs.existsSync(statePath)).toBe(false);
     expect(fs.readdirSync(stateDir).some((name) => name.startsWith('onboarding.json.corrupt-'))).toBe(true);
   });
+
+  // ── I1: slot-drift hardening — echo-back + per-slot validation ──────────
+
+  describe('slot echo-back (I1)', () => {
+    it('echoes the captured name when asking the next question', async () => {
+      const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
+      await flow.handle('hello');
+      const result = await flow.handle('Arjun Sharma');
+      expect(result.response).toContain('Arjun Sharma');
+      expect(result.response).toContain('age');
+    });
+
+    it('echoes the captured medications before the allergies question', async () => {
+      const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
+      await flow.handle('hello');
+      await flow.handle('Arjun');
+      await flow.handle('56');
+      await flow.handle('yes');
+      await flow.handle('Type 2 diabetes');
+      const result = await flow.handle('Metformin 500mg once daily');
+      expect(result.response).toContain('Metformin 500mg once daily');
+      expect(result.response).toContain('allerg');
+    });
+  });
+
+  describe('age validation (I1)', () => {
+    it('re-asks the age step when the answer has no number', async () => {
+      const store = new OnboardingStore(tmpDir);
+      const flow = new OnboardingFlow(store, tmpDir, 'Asia/Kolkata');
+      await flow.handle('hello');
+      await flow.handle('Arjun');
+
+      const result = await flow.handle('haan theek hai');
+
+      expect(result.completed).toBeFalsy();
+      expect(result.response).toContain('age');
+      const state = await store.load();
+      expect(state.currentStep).toBe('age');
+      expect(state.answers.age).toBeUndefined();
+    });
+
+    it('accepts an age with trailing words like "56 saal"', async () => {
+      const store = new OnboardingStore(tmpDir);
+      const flow = new OnboardingFlow(store, tmpDir, 'Asia/Kolkata');
+      await flow.handle('hello');
+      await flow.handle('Arjun');
+
+      const result = await flow.handle('56 saal');
+
+      expect(result.response).toContain('timezone');
+      expect((await store.load()).answers.age).toBe('56 saal');
+    });
+
+    it('rejects a nonsensical age number', async () => {
+      const store = new OnboardingStore(tmpDir);
+      const flow = new OnboardingFlow(store, tmpDir, 'Asia/Kolkata');
+      await flow.handle('hello');
+      await flow.handle('Arjun');
+
+      const result = await flow.handle('999');
+
+      expect(result.response).toContain('age');
+      expect((await store.load()).currentStep).toBe('age');
+    });
+  });
+
+  describe('name validation (I1)', () => {
+    it('re-asks the name step for sentence-length garbage', async () => {
+      const store = new OnboardingStore(tmpDir);
+      const flow = new OnboardingFlow(store, tmpDir, 'Asia/Kolkata');
+      await flow.handle('hello');
+
+      const garbage = 'please remember I take metformin 500mg twice daily after meals for my sugar problem';
+      const result = await flow.handle(garbage);
+
+      expect(result.response).toContain('call you');
+      const state = await store.load();
+      expect(state.currentStep).toBe('name');
+      expect(state.answers.name).toBeUndefined();
+    });
+
+    it('accepts a normal two-word name', async () => {
+      const store = new OnboardingStore(tmpDir);
+      const flow = new OnboardingFlow(store, tmpDir, 'Asia/Kolkata');
+      await flow.handle('hello');
+
+      const result = await flow.handle('Rajesh Sharma');
+
+      expect(result.response).toContain('age');
+      expect((await store.load()).answers.name).toBe('Rajesh Sharma');
+    });
+  });
 });
