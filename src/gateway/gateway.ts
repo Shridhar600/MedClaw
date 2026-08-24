@@ -533,8 +533,16 @@ export class Gateway {
     // Lossless per-turn capture (F4) — always, before the agent run.
     await this.captureUserTurn(chatId, text);
 
-    const history = await this.sessions!.prepareHistory(chatId);
-    const result = await this.agentLoop!.run(text, history, { chatId, mode: 'chat' });
+    // M-3: guard the agent run exactly like handleMessage — the CLI/e2e path must DEGRADE to the
+    // canned fallback, never throw out of the handler (mirror-sync law).
+    let result: Awaited<ReturnType<AgentLoop['run']>>;
+    try {
+      const history = await this.sessions!.prepareHistory(chatId);
+      result = await this.agentLoop!.run(text, history, { chatId, mode: 'chat' });
+    } catch (e) {
+      console.error('[gateway] Agent error (test path):', summarizeErrorForLog(e));
+      return "I'm having trouble right now. Please try again in a moment.";
+    }
     await this.sessions!.recordTurn(chatId, [
       { role: 'user', content: text },
       ...result.trace,
@@ -622,6 +630,9 @@ export class Gateway {
     }
 
     if (incoming.mediaError) {
+      // M-3 / F4 parity: this was the one branch that skipped lossless capture. Capture the raw
+      // caption first (no-ops on an empty caption) so a failed upload never loses the user's words.
+      await this.captureUserTurn(chatId, text);
       const failureTrace = [
         { role: 'user' as const, content: agentInput },
         { role: 'assistant' as const, content: `[Media upload failure]\n${incoming.mediaError}` },
