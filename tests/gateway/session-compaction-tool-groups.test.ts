@@ -532,6 +532,10 @@ describe('Session summary never persists a raw provider error (F9, PHI)', () => 
       memoryFlush: false,
       keepRecentTurns: 10,
     });
+    // I3 added bounded retries to summary calls; this test asserts log/file
+    // sanitization — use a single fast attempt (plain Error = non-transient,
+    // but keep the explicit policy so intent does not depend on that gate).
+    manager.setCompactionRetryPolicy({ attempts: 1 });
     const chatId = 'chat-f9';
     await manager.addTurn(chatId, { role: 'user', content: 'u0' }, { role: 'assistant', content: 'a0' });
 

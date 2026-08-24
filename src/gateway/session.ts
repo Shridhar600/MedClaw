@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import type { Message, ToolSchema } from '../providers/types';
-import type { LLMProvider } from '../providers/types';
+import type { LLMProvider, LLMResponse } from '../providers/types';
 import type { ToolRegistry } from '../tools/registry';
 import { rotateFileIfNeeded, type RotationConfig } from '../scheduler/rotation';
 import { summarizeErrorForLog, secureMkdir, secureWrite, secureWriteViaTmp, secureAppend, tightenFile } from '../security';
@@ -43,6 +43,14 @@ const ROTATION_CHECK_INTERVAL = 100;
 // A cheap safety-margin trigger, NOT exact accounting. `estimateTokens` is a
 // chars/4 English heuristic (20-30% error is acceptable because we compact
 // well before the real context limit); no tokenizer and no new dependency.
+// I3: retry only transient upstream conditions. OpenAI SDK errors carry a
+// numeric `status`; plain network failures (fetch TypeError) carry none.
+function isTransientLlmError(e: unknown): boolean {
+  const status = (e as { status?: unknown } | null)?.status;
+  if (typeof status !== 'number') return true; // no status ⇒ network-ish ⇒ transient
+  return status === 429 || status >= 500;
+}
+
 export function estimateTokens(messages: Message[]): number {
   let chars = 0;
   for (const m of messages) {
@@ -151,6 +159,39 @@ export class SessionManager {
 
   private runLLM<T>(fn: () => Promise<T>): Promise<T> {
     return this.runBackground ? this.runBackground(fn) : fn();
+  }
+
+  // I3: compaction LLM calls are the largest requests a session makes, so on
+  // shared-pool providers they hit transient upstream rate limits most often
+  // (live soak 2026-08-25: both attempts died on a 429 that passed seconds
+  // later). Bounded retry with linear backoff before the F6 degrade kicks in.
+  private compactionRetry = { attempts: 3, backoffMs: 1500 };
+
+  /** Test/ops hook: tune compaction LLM retry behavior. */
+  setCompactionRetryPolicy(policy: { attempts?: number; backoffMs?: number }): void {
+    this.compactionRetry = {
+      attempts: policy.attempts ?? this.compactionRetry.attempts,
+      backoffMs: policy.backoffMs ?? this.compactionRetry.backoffMs,
+    };
+  }
+
+  private async runLLMWithRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
+    const { attempts, backoffMs } = this.compactionRetry;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        return await this.runLLM(fn);
+      } catch (e) {
+        lastError = e;
+        // Deterministic failures (4xx: bad request, auth) will never succeed on
+        // retry — only transient upstream conditions are worth another attempt.
+        if (!isTransientLlmError(e) || attempt >= attempts) throw e;
+        // Sanitized frame only — transcript content can echo PHI.
+        console.warn(`[session] ${label} LLM call failed (attempt ${attempt}/${attempts}), retrying:`, summarizeErrorForLog(e));
+        await new Promise((resolve) => setTimeout(resolve, backoffMs * attempt));
+      }
+    }
+    throw lastError;
   }
 
   constructor(
@@ -365,7 +406,7 @@ export class SessionManager {
           },
         }));
 
-        const flushResponse = await this.runLLM(() => this.llmProvider!.chat(
+        const flushResponse = await this.runLLMWithRetry<LLMResponse>('compaction-flush', () => this.llmProvider!.chat(
           [
             { role: 'system', content: flushPrompt },
             // #16: sanitize before sending — a clean split already prevents a
@@ -397,7 +438,7 @@ Preserve:
 Keep it concise and structured.`;
 
     try {
-      const summaryResponse = await this.runLLM(() => this.llmProvider!.chat([
+      const summaryResponse = await this.runLLMWithRetry<LLMResponse>('compaction-summary', () => this.llmProvider!.chat([
         { role: 'system', content: compactPrompt },
         { role: 'user', content: JSON.stringify(olderTurns) },
       ]));
@@ -506,7 +547,7 @@ The raw session transcript is archived in JSONL and can be reviewed directly.`;
     }
 
     try {
-      const response = await this.runLLM(() => this.llmProvider!.chat([
+      const response = await this.runLLMWithRetry<LLMResponse>('archive-summary', () => this.llmProvider!.chat([
         {
           role: 'system',
           content: `Produce a concise session summary.
