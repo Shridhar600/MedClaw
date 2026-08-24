@@ -8,6 +8,8 @@ export function providerEnvVar(providerType: ProviderConfig['type']): string | u
       return 'ANTHROPIC_API_KEY';
     case 'google':
       return 'GOOGLE_API_KEY';
+    case 'openrouter':
+      return 'OPENROUTER_API_KEY';
     case 'ollama':
       return undefined;
   }

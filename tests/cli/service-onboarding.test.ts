@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { loadConfig } from '../../src/config/config';
 import { validateConfig } from '../../src/config/validation';
-import { buildConfigFromArgs, modelDefaultsForProvider, runServiceOnboarding, startDaemon } from '../../src/cli/service-onboarding';
+import { buildConfigFromArgs, modelDefaultsForProvider, runServiceOnboarding, startDaemon, SUPPORTED_ONBOARDING_PROVIDERS } from '../../src/cli/service-onboarding';
 
 describe('service onboarding init', () => {
   let tmpDir: string;
@@ -349,6 +349,49 @@ describe('service onboarding init', () => {
       main: 'gpt-4o-mini',
       medical: medgemma,
       embeddings: 'text-embedding-3-small',
+    });
+  });
+
+  it('offers openrouter as a supported onboarding provider', () => {
+    expect(SUPPORTED_ONBOARDING_PROVIDERS).toContain('openrouter');
+  });
+
+  it('defaults openrouter onboarding to stealth/ox-alpha at low reasoning effort', () => {
+    const medgemma = 'aadide/medgemma-1.5-4b-it-Q4_K_S:latest';
+    expect(modelDefaultsForProvider('openrouter')).toEqual({
+      main: 'stealth/ox-alpha',
+      medical: medgemma,
+      embeddings: 'openai/text-embedding-3-small',
+    });
+  });
+
+  it('builds an OpenRouter config: routed main, local medgemma medical, labeled embeddings', () => {
+    const config = buildConfigFromArgs({
+      provider: 'openrouter',
+      apiKey: 'or-x',
+      configPath: '/tmp/openrouter-onboard/config.json',
+    });
+    expect(config.providers.main).toEqual({
+      type: 'openrouter',
+      model: 'stealth/ox-alpha',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      reasoningEffort: 'low',
+      apiKey: 'or-x',
+    });
+    // Embeddings follow the chosen cloud provider per existing behavior; the boot
+    // latency warning fires (remote) — Shridhar's own profile keeps them on Ollama.
+    // No reasoningEffort here: it is a chat-completion concern, embeddings ignore it.
+    expect(config.providers.embeddings).toEqual({
+      type: 'openrouter',
+      model: 'openai/text-embedding-3-small',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'or-x',
+    });
+    // Medical resolves INDEPENDENTLY and defaults to on-device medgemma (#11).
+    expect(config.providers.medical).toEqual({
+      type: 'ollama',
+      model: 'aadide/medgemma-1.5-4b-it-Q4_K_S:latest',
+      baseUrl: 'http://localhost:11434/v1',
     });
   });
 

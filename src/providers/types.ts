@@ -38,6 +38,14 @@ export interface TextResponse {
   text: string;
 }
 
+/** Token consumption for the request (seam for the future eval/cost pipeline). */
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  reasoningTokens?: number;
+}
+
 export interface ToolCall {
   id: string;
   name: string;
@@ -50,7 +58,8 @@ export interface ToolCallResponse {
   toolCalls: ToolCall[];
 }
 
-export type LLMResponse = TextResponse | ToolCallResponse;
+/** Both response variants carry usage when the provider reports it (never required). */
+export type LLMResponse = (TextResponse | ToolCallResponse) & { usage?: TokenUsage };
 
 export interface LLMProvider {
   readonly modelName?: string;

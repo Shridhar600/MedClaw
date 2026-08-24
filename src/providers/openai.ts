@@ -1,6 +1,6 @@
 // src/providers/openai.ts
 import OpenAI from 'openai';
-import type { ImageAttachment, LLMProvider, LLMResponse, Message, ToolSchema } from './types';
+import type { ImageAttachment, LLMProvider, LLMResponse, Message, TokenUsage, ToolSchema } from './types';
 import type { ProviderConfig } from '../config/types';
 
 // OpenAI reasoning-class models (gpt-5 family, o1/o3/o4 families) reject
@@ -32,23 +32,55 @@ function resolveProviderApiKey(config: ProviderConfig): string | undefined {
       return process.env.ANTHROPIC_API_KEY;
     case 'google':
       return process.env.GOOGLE_API_KEY;
+    case 'openrouter':
+      return process.env.OPENROUTER_API_KEY;
     case 'ollama':
       return undefined;
   }
 }
 
+export const OPENROUTER_DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
+
+/** Map the OpenAI wire `usage` object onto our TokenUsage (undefined when absent). */
+function toTokenUsage(usage: OpenAI.CompletionUsage | undefined): TokenUsage | undefined {
+  if (!usage) return undefined;
+  return {
+    promptTokens: usage.prompt_tokens,
+    completionTokens: usage.completion_tokens,
+    totalTokens: usage.total_tokens,
+    reasoningTokens: usage.completion_tokens_details?.reasoning_tokens,
+  };
+}
+
 export class OpenAIProvider implements LLMProvider {
   readonly modelName: string;
+  /** Effective base URL (OpenRouter defaults to its own endpoint when unset). */
+  readonly baseUrl?: string;
   private client: OpenAI;
   private model: string;
+  private reasoningEffort: 'none' | 'minimal' | 'low' | 'medium' | 'high' | undefined;
 
   constructor(config: ProviderConfig) {
+    this.baseUrl = config.type === 'openrouter'
+      ? (config.baseUrl ?? OPENROUTER_DEFAULT_BASE_URL)
+      : config.baseUrl;
     this.client = new OpenAI({
       apiKey: resolveProviderApiKey(config),
-      baseURL: config.baseUrl,
+      baseURL: this.baseUrl,
     });
     this.model = config.model;
     this.modelName = config.model;
+    this.reasoningEffort = config.reasoningEffort;
+  }
+
+  private resolveReasoningEffort(): string | undefined {
+    // Explicit config wins (stealth/ox-alpha needs 'low'; it rejects 'none').
+    if (this.reasoningEffort !== undefined) {
+      return this.reasoningEffort;
+    }
+    // Name heuristic for gpt-5/o-series on chat/completions (#13): tools are
+    // rejected with any other effort, and the agent always sends tools.
+    return isReasoningModel(this.model) ? 'none' : undefined;
   }
 
   async chat(messages: Message[], tools?: ToolSchema[]): Promise<LLMResponse> {
@@ -60,12 +92,14 @@ export class OpenAIProvider implements LLMProvider {
     if (tools && tools.length > 0) {
       params.tools = tools as OpenAI.Chat.ChatCompletionTool[];
     }
-    if (isReasoningModel(this.model)) {
-      (params as ChatParamsWithReasoning).reasoning_effort = 'none';
+    const effort = this.resolveReasoningEffort();
+    if (effort !== undefined) {
+      (params as ChatParamsWithReasoning).reasoning_effort = effort as 'none';
     }
 
     const completion = await this.client.chat.completions.create(params);
     const message = completion.choices[0].message;
+    const usage = toTokenUsage(completion.usage);
 
     if (message.tool_calls && message.tool_calls.length > 0) {
       return {
@@ -75,10 +109,11 @@ export class OpenAIProvider implements LLMProvider {
           name: tc.function.name,
           arguments: JSON.parse(tc.function.arguments) as Record<string, unknown>,
         })),
+        usage,
       };
     }
 
-    return { type: 'text', text: message.content ?? '' };
+    return { type: 'text', text: message.content ?? '', usage };
   }
 
   async chatWithImages(messages: Message[], images: ImageAttachment[]): Promise<LLMResponse> {
@@ -102,11 +137,13 @@ export class OpenAIProvider implements LLMProvider {
       model: this.model,
       messages: formattedMessages as OpenAI.Chat.ChatCompletionMessageParam[],
     };
-    if (isReasoningModel(this.model)) {
-      (imageParams as ChatParamsWithReasoning).reasoning_effort = 'none';
+    const imageEffort = this.resolveReasoningEffort();
+    if (imageEffort !== undefined) {
+      (imageParams as ChatParamsWithReasoning).reasoning_effort = imageEffort as 'none';
     }
     const completion = await this.client.chat.completions.create(imageParams);
     const message = completion.choices[0].message;
+    const usage = toTokenUsage(completion.usage);
 
     if (message.tool_calls && message.tool_calls.length > 0) {
       return {
@@ -116,10 +153,11 @@ export class OpenAIProvider implements LLMProvider {
           name: tc.function.name,
           arguments: JSON.parse(tc.function.arguments) as Record<string, unknown>,
         })),
+        usage,
       };
     }
 
-    return { type: 'text', text: message.content ?? '' };
+    return { type: 'text', text: message.content ?? '', usage };
   }
 
   async embed(text: string): Promise<number[]> {

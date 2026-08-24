@@ -104,4 +104,39 @@ describe('OllamaProvider', () => {
 
     await expect(provider.chat([{ role: 'user', content: 'Hi' }])).rejects.toThrow('Ollama API error: 500');
   });
+
+  it('captures token usage when the compat endpoint reports it', async () => {
+    (global.fetch as jest.Mock).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { role: 'assistant', content: 'Hello!', tool_calls: undefined } }],
+        usage: {
+          prompt_tokens: 12,
+          completion_tokens: 5,
+          total_tokens: 17,
+          completion_tokens_details: { reasoning_tokens: 2 },
+        },
+      }),
+    });
+
+    const result = await provider.chat([{ role: 'user', content: 'Hi' }]);
+    expect(result.usage).toEqual({
+      promptTokens: 12,
+      completionTokens: 5,
+      totalTokens: 17,
+      reasoningTokens: 2,
+    });
+  });
+
+  it('omits usage when the compat endpoint does not report it', async () => {
+    (global.fetch as jest.Mock).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { role: 'assistant', content: 'Hello!', tool_calls: undefined } }],
+      }),
+    });
+
+    const result = await provider.chat([{ role: 'user', content: 'Hi' }]);
+    expect(result.usage).toBeUndefined();
+  });
 });

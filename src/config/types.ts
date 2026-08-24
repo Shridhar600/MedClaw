@@ -1,10 +1,17 @@
 // src/config/types.ts
 
 export interface ProviderConfig {
-  type: 'ollama' | 'openai' | 'anthropic' | 'google';
+  type: 'ollama' | 'openai' | 'anthropic' | 'google' | 'openrouter';
   baseUrl?: string;
   model: string;
   apiKey?: string;
+  /**
+   * Explicit reasoning-effort override sent to OpenAI-compatible endpoints.
+   * When unset, OpenAIProvider falls back to its name-based heuristic
+   * (gpt-5/o-series get 'none' with tools — forka #13). Explicit wins:
+   * e.g. stealth/ox-alpha REJECTS 'none' (reasoning is mandatory) and wants 'low'.
+   */
+  reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high';
   allowRawMedicalMedia?: boolean;
 }
 

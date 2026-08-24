@@ -1,6 +1,24 @@
 // src/providers/ollama.ts
-import type { ImageAttachment, LLMProvider, LLMResponse, Message, ToolSchema } from './types';
+import type { ImageAttachment, LLMProvider, LLMResponse, Message, TokenUsage, ToolSchema } from './types';
 import type { ProviderConfig } from '../config/types';
+
+/** Map the OpenAI-compat wire `usage` object onto our TokenUsage (undefined when absent). */
+function toTokenUsage(usage: {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  completion_tokens_details?: { reasoning_tokens?: number };
+} | undefined): TokenUsage | undefined {
+  if (!usage || usage.prompt_tokens === undefined || usage.completion_tokens === undefined) {
+    return undefined;
+  }
+  return {
+    promptTokens: usage.prompt_tokens,
+    completionTokens: usage.completion_tokens,
+    totalTokens: usage.total_tokens ?? usage.prompt_tokens + usage.completion_tokens,
+    reasoningTokens: usage.completion_tokens_details?.reasoning_tokens,
+  };
+}
 
 export class OllamaProvider implements LLMProvider {
   readonly modelName: string;
@@ -46,9 +64,16 @@ export class OllamaProvider implements LLMProvider {
           }>;
         };
       }>;
+      usage?: {
+        prompt_tokens?: number;
+        completion_tokens?: number;
+        total_tokens?: number;
+        completion_tokens_details?: { reasoning_tokens?: number };
+      };
     };
 
     const message = data.choices[0].message;
+    const usage = toTokenUsage(data.usage);
 
     if (message.tool_calls && message.tool_calls.length > 0) {
       return {
@@ -58,10 +83,11 @@ export class OllamaProvider implements LLMProvider {
           name: tc.function.name,
           arguments: JSON.parse(tc.function.arguments) as Record<string, unknown>,
         })),
+        usage,
       };
     }
 
-    return { type: 'text', text: message.content ?? '' };
+    return { type: 'text', text: message.content ?? '', usage };
   }
 
   async chatWithImages(messages: Message[], images: ImageAttachment[]): Promise<LLMResponse> {
