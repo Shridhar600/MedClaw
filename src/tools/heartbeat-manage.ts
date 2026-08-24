@@ -52,7 +52,7 @@ export function createHeartbeatManageTool(
   return {
     name: 'heartbeat_manage',
     group: 'group:automation',
-    description: 'Inspect, snooze, acknowledge, retry, resume, or review dead-letter heartbeat runtime state.',
+    description: 'Inspect, snooze, acknowledge, retry, resume, or review dead-letter heartbeat runtime state. For scheduling NEW recurring reminders or check-ins, use cron_manage instead — never just promise a reminder in words.',
     parameters: {
       type: 'object',
       properties: {

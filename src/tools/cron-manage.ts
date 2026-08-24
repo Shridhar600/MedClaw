@@ -19,7 +19,7 @@ export function createCronManageTool(
   return {
     name: 'cron_manage',
     group: 'group:automation',
-    description: 'Create, list, pause, resume, or delete proactive heartbeat jobs.',
+    description: 'Create, list, pause, resume, or delete proactive heartbeat jobs. USE THIS whenever the user asks for a reminder, check-in, or recurring nudge (e.g. "remind me to take my medicine daily") — never just promise a reminder in words; schedule it here so it actually fires.',
     parameters: {
       type: 'object',
       properties: {
