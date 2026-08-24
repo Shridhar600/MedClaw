@@ -85,6 +85,22 @@ describe('memory_search status filter (CONTRA-06/08)', () => {
     expect(r.content[0].text).toContain('metformin');
   });
 
+  it('M-2: warns (fail-open banner) when a status filter is requested but the mirror is unavailable', async () => {
+    const noMirror = await tool(undefined).execute({ query: 'metformin', status: 'active' });
+    expect(noMirror.content[0].text).toContain('fact-status: unavailable');
+
+    const throwing = await tool(makeMirror(staleHeads, { throws: true })).execute({ query: 'metformin', status: 'active' });
+    expect(throwing.content[0].text).toContain('fact-status: unavailable');
+  });
+
+  it('M-2: no banner when the filter was applied (working mirror) or not requested (status:all)', async () => {
+    const applied = await tool(makeMirror(staleHeads)).execute({ query: 'metformin', status: 'active' });
+    expect(applied.content[0].text).not.toContain('fact-status: unavailable');
+
+    const all = await tool(undefined).execute({ query: 'metformin', status: 'all' });
+    expect(all.content[0].text).not.toContain('fact-status: unavailable');
+  });
+
   it('degrades to no filtering (never crashes) when the mirror throws', async () => {
     const r = await tool(makeMirror(staleHeads, { throws: true })).execute({ query: 'metformin', status: 'active' });
     expect(r.isError).toBeFalsy();

@@ -99,23 +99,42 @@ export class LedgerStore {
   /**
    * M-6 reverse-link stamping (E1.2). For every fact that declares `replaces`/`corrects: <ref>`,
    * stamp the reciprocal `replacedBy`/`correctedBy` on the TARGET fact. `ref` resolves by fact id
-   * first, else by entity name → that entity's current head (so the natural agent input "naproxen
-   * replaces ibuprofen" links both ways). Runs at the single write chokepoint, so applied + confirm
-   * + discontinue paths all get it. Idempotent + self-healing (re-derived on every write); last
-   * same-file source in array (append) order wins. TYPE-SCOPED: a target in another ledger file is
-   * not visible here — cross-type reverse links are a documented deferral.
+   * first, else by entity name → the target entity's head AS OF the source fact's `createdAt`.
+   *
+   * H-2 (Wave E panel): the as-of anchor is what keeps this STABLE across re-runs. reconcile fires at
+   * every write, so a bare-name reverse link must always resolve to the same target — anchoring to the
+   * declaring fact's time means a version of the target created LATER (a discontinue/restart) can never
+   * become the target, so an unrelated later write can't migrate the link onto a fresh active head.
+   *
+   * Runs at the single write chokepoint, so applied/confirm/discontinue paths all get it. Idempotent
+   * + self-healing. TYPE-SCOPED (cross-type reverse links are a documented deferral). M-1: the reverse
+   * field is single-valued — when two facts both replace one target, the last same-file source in
+   * array (append) order wins (the forward links preserve the full graph; documented conscious choice).
    */
   private static reconcileReverseLinks(facts: LedgerFact[]): void {
     const byId = new Map(facts.map(f => [f.id, f]));
-    const headByEntity = new Map<string, LedgerFact>();
+    const byEntity = new Map<string, LedgerFact[]>();
     for (const f of facts) {
-      const cur = headByEntity.get(f.entity);
-      if (!cur || f.version > cur.version) headByEntity.set(f.entity, f);
+      const arr = byEntity.get(f.entity);
+      if (arr) arr.push(f); else byEntity.set(f.entity, [f]);
     }
-    const resolve = (ref: string): LedgerFact | undefined => byId.get(ref) ?? headByEntity.get(ref);
+    // Resolve a bare entity name to the highest-version fact of that entity NOT created after `source`
+    // (undated/unparseable timestamps fail open → the plain max-version head).
+    const resolveByName = (entity: string, source: LedgerFact): LedgerFact | undefined => {
+      const versions = byEntity.get(entity);
+      if (!versions) return undefined;
+      const asOf = new Date(source.createdAt).getTime();
+      let best: LedgerFact | undefined;
+      for (const v of versions) {
+        const t = new Date(v.createdAt).getTime();
+        if (!Number.isNaN(t) && !Number.isNaN(asOf) && t > asOf) continue; // created after the link declared
+        if (!best || v.version > best.version) best = v;
+      }
+      return best;
+    };
     const stamp = (ref: string | undefined, source: LedgerFact, field: 'replacedBy' | 'correctedBy'): void => {
       if (!ref) return;
-      const target = resolve(ref);
+      const target = byId.get(ref) ?? resolveByName(ref, source);
       if (target && target.id !== source.id) target[field] = source.id;
     };
     for (const f of facts) {

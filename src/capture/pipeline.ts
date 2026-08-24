@@ -188,8 +188,10 @@ export class CapturePipeline {
       replaces: p.replaces,
       corrects: p.corrects,
     });
-    // The narrative note always lands → its day file changed. The ledger file changed only
-    // when a fact actually applied (needs-confirmation / disputed write nothing to the ledger).
+    // The narrative note always lands → its day file changed. `applied` AND `disputed` both WRITE the
+    // ledger file (a dispute mint flips the prior active to disputed + appends both heads), so both must
+    // re-derive the recall mirror — otherwise Stage-1 keeps injecting the pre-dispute fact as ACTIVE
+    // (H-1 / CONTRA-09 class). `needs-confirmation` writes nothing (only mints a token).
     const changed: string[] = [this.narrativePath(day)];
     if (result.kind === 'applied') {
       await this.deps.narrative.appendLedgerAnchor(day, p.entity, result.fact.id);
@@ -197,6 +199,7 @@ export class CapturePipeline {
       if (result.fact.safetyRelevant) await this.reRenderSafety();
       await this.emitEvent(result.fact);
     } else if (result.kind === 'disputed') {
+      changed.push(this.ledgerPath(p.type));
       await this.enqueueDisputeCuriosity(result, p.provenance.capturedAt);
     }
     return { result, changed };
@@ -257,6 +260,9 @@ export class CapturePipeline {
       changed.push(this.ledgerPath(result.fact.type));
       if (result.fact.safetyRelevant) await this.reRenderSafety();
       await this.emitEvent(result.fact);
+    } else if (result.kind === 'disputed') {
+      // H-1: a disputed metric mint also wrote the ledger file → re-derive the mirror.
+      changed.push(this.ledgerPath('metric'));
     }
     return { result, changed };
   }
@@ -299,6 +305,9 @@ export class CapturePipeline {
       changed.push(this.ledgerPath(corrected.fact.type));
       safetyTouched = corrected.fact.safetyRelevant;
       await this.emitEvent(corrected.fact);
+    } else if (corrected.kind === 'disputed') {
+      // H-1: a disputed corrected-fact mint also wrote the ledger file → re-derive the mirror.
+      changed.push(this.ledgerPath(p.corrected.type));
     }
 
     const retract = await this.deps.ledger.retract({

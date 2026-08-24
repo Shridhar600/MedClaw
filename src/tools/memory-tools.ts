@@ -53,18 +53,20 @@ function rejection(text: string): ToolResult {
 
 /**
  * Load the current per-entity ledger heads for the `status:active` stale-drop (E1.1). Best-effort:
- * a missing mirror or a read failure yields `[]` (⇒ no filtering) — the search must never crash or
- * lose backward-compat because the fact mirror is degraded (resilience).
+ * a missing mirror or a read failure yields `available:false` (⇒ no filtering) — the search must never
+ * crash or lose backward-compat because the fact mirror is degraded (resilience). `available:false` is
+ * distinct from an empty-but-working mirror (empty ledger = nothing to filter, no warning owed) so the
+ * caller can honestly tell the model the filter could NOT be applied (M-2).
  */
-async function loadEntityHeads(mirror: FactMirror | undefined): Promise<FactRecord[]> {
-  if (!mirror) return [];
+async function loadEntityHeads(mirror: FactMirror | undefined): Promise<{ heads: FactRecord[]; available: boolean }> {
+  if (!mirror) return { heads: [], available: false };
   try {
     const heads: FactRecord[] = [];
     for await (const h of mirror.queryEntityHeads()) heads.push(h);
-    return heads;
+    return { heads, available: true };
   } catch (e) {
     console.warn('[memory-tools] entity-heads load failed (status filter skipped):', summarizeErrorForLog(e));
-    return [];
+    return { heads: [], available: false };
   }
 }
 
@@ -308,8 +310,15 @@ export function createMemoryTools(
       const fetchK = (prefix || willStatusFilter) ? Math.max(limit * 4, 20) : limit;
       let results = await search.search(params.query as string, fetchK);
       if (prefix) results = results.filter(r => r.path.startsWith(prefix));
+      // M-2: fail OPEN but not SILENT. If a status filter was requested but the fact-status substrate
+      // is unavailable (no mirror wired, or the heads read threw), we return unfiltered results AND
+      // tell the model the filter could not be applied — a medical answer must never assume active-only
+      // filtering happened when it did not. An empty-but-working mirror is NOT unavailable (nothing to
+      // filter), so it earns no banner.
+      let statusUnavailable = false;
       if (willStatusFilter) {
-        const heads = await loadEntityHeads(getMirror());
+        const { heads, available } = await loadEntityHeads(getMirror());
+        statusUnavailable = !available;
         if (heads.length > 0) {
           results = results.filter(r => !chunkHasStaleEntity(r.content, heads));
         }
@@ -320,7 +329,8 @@ export function createMemoryTools(
       }
       const quality = results[0].status ?? 'full';
       const qualityBanner = quality === 'full' ? '' : `[search-quality: ${quality}]\n`;
-      const text = qualityBanner + results
+      const statusBanner = statusUnavailable ? '[fact-status: unavailable — results NOT filtered by ledger status]\n' : '';
+      const text = statusBanner + qualityBanner + results
         .map(r => `## ${r.path} [${r.chunkId}] lines ${r.startLine}-${r.endLine} (score: ${r.score.toFixed(3)})\n${r.content}`)
         .join('\n\n---\n\n');
       return { content: [{ type: 'text', text }] };
