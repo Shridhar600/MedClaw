@@ -46,6 +46,43 @@ function err(text: string): ToolResult {
   return { content: [{ type: 'text', text }], isError: true };
 }
 
+// I2: shape-check model-supplied ledger_record args; a missing/mistyped field is
+// a clean, self-correctable tool error — never a deep TypeError.
+function validateRecordArgs(params: Record<string, unknown>): string | null {
+  const entity = params.entity;
+  if (typeof entity !== 'string' || entity.trim() === '') {
+    return 'Missing or invalid required field "entity" (a non-empty string naming the fact, e.g. "metformin").';
+  }
+  if (params.fields !== undefined) {
+    if (typeof params.fields !== 'object' || params.fields === null || Array.isArray(params.fields)) {
+      return 'Invalid field "fields": expected an object of simple values.';
+    }
+    for (const [key, value] of Object.entries(params.fields as Record<string, unknown>)) {
+      const ok = typeof value === 'string' || typeof value === 'number' ||
+        (Array.isArray(value) && value.every((v) => typeof v === 'string'));
+      if (!ok) {
+        return `Invalid field value for "${key}": expected a string, number, or array of strings.`;
+      }
+    }
+  }
+  for (const key of ['note', 'verbatim', 'language', 'replaces', 'corrects', 'episode_id'] as const) {
+    const v = params[key];
+    if (v !== undefined && typeof v !== 'string') {
+      return `Invalid field "${key}": expected a string.`;
+    }
+  }
+  if (params.confidence !== undefined && (typeof params.confidence !== 'number' || !Number.isFinite(params.confidence))) {
+    return 'Invalid field "confidence": expected a number between 0 and 1.';
+  }
+  if (params.source !== undefined && !AUTHORITIES.includes(params.source as Authority)) {
+    return `Invalid field "source": must be one of ${AUTHORITIES.join(', ')}.`;
+  }
+  if (params.safety_relevant !== undefined && typeof params.safety_relevant !== 'boolean') {
+    return 'Invalid field "safety_relevant": expected true or false.';
+  }
+  return null;
+}
+
 function summarizeFields(f: LedgerFact): string {
   const parts = Object.entries(f.fields).map(([k, v]) => `${k}=${Array.isArray(v) ? `[${v.join(',')}]` : v}`);
   return parts.length ? parts.join(', ') : '(no fields)';
@@ -130,6 +167,11 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       required: ['entity', 'type'],
     },
     async execute(params): Promise<ToolResult> {
+      // I2: model-supplied args are untrusted — validate shapes at the boundary and
+      // return a clean error the model can self-correct from, never a raw TypeError
+      // from deep inside render/sanitize code.
+      const argErr = validateRecordArgs(params);
+      if (argErr) return err(argErr);
       const entity = params.entity as string;
       const type = params.type as FactType;
       if (!FACT_TYPES.includes(type)) return err(`Unknown fact type "${type}".`);
@@ -209,6 +251,19 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       required: ['tokenId', 'confirm'],
     },
     async execute(params): Promise<ToolResult> {
+      // I2: same boundary rule as ledger_record — clean self-correctable errors.
+      if (typeof params.tokenId !== 'string' || params.tokenId.trim() === '') {
+        return err('Missing or invalid required field "tokenId" (the confirmation token id string from ledger_record).');
+      }
+      if (typeof params.confirm !== 'boolean') {
+        return err('Missing or invalid required field "confirm" (must be true or false).');
+      }
+      if (params.winningVersion !== undefined && typeof params.winningVersion !== 'number') {
+        return err('Invalid field "winningVersion": expected a number.');
+      }
+      if (params.reason !== undefined && typeof params.reason !== 'string') {
+        return err('Invalid field "reason": expected a string.');
+      }
       const tokenId = params.tokenId as string;
       const confirm = params.confirm as boolean;
       const winningVersion = params.winningVersion as number | undefined;
@@ -279,9 +334,17 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       required: ['entity', 'type'],
     },
     async execute(params): Promise<ToolResult> {
-      const entity = params.entity as string;
+      // I2: boundary validation — a non-string entity/reason would otherwise
+      // TypeError deep in sanitize/parse instead of self-correcting.
+      if (typeof params.entity !== 'string' || params.entity.trim() === '') {
+        return err('Missing or invalid required field "entity" (a non-empty string naming the fact to remove).');
+      }
       const type = params.type as FactType;
       if (!FACT_TYPES.includes(type)) return err(`Unknown fact type "${type}".`);
+      if (params.reason !== undefined && typeof params.reason !== 'string') {
+        return err('Invalid field "reason": expected a string.');
+      }
+      const entity = params.entity as string;
       // CRED + INJ (self-review CRITICAL-1): the reason persists into a ledger
       // type file — it passes the SAME credential bar and single-line discipline
       // as every other caller-controlled input. A multi-line reason could

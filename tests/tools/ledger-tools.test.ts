@@ -108,3 +108,110 @@ describe('ledger tools (Task 12.1–12.3)', () => {
     expect(r.content[0].text).toContain('v2');
   });
 });
+
+// ── I2: malformed model args must return a clean tool error, never a raw throw ──
+describe('ledger tools arg validation (I2)', () => {
+  let tmp: string;
+  let tools: Tool[];
+  const byName = (n: string): Tool => tools.find(t => t.name === n)!;
+  const build = (): void => {
+    const clock = mutableClock(DAY);
+    const ledger = new LedgerStore(tmp, clock);
+    const narrative = new NarrativeStore(tmp, clock);
+    const view = new SafetyView(tmp, clock);
+    const curiosity = new CuriosityQueue(tmp, clock, seqIdGen('cur'), 'default');
+    const safety = makeSafetyRenderer({ render: (facts) => view.render(facts), listSafetyRelevant: () => ledger.listSafetyRelevant() });
+    const queue: QueuePort = { enqueue: async (_p, op) => op.run() };
+    const pipeline = new CapturePipeline({ queue, ledger, narrative, safety, curiosity });
+    tools = createLedgerTools({ pipeline, ledger, safety, queue, clock });
+  };
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-ledgerarg-'));
+    build();
+  });
+  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  it('ledger_record with a MISSING entity returns a clean error naming the field', async () => {
+    const r = await byName('ledger_record').execute({ type: 'medication', fields: { dose: '500mg' } } as never);
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain('entity');
+  });
+
+  it('ledger_record with a NON-STRING entity returns a clean error, not a TypeError', async () => {
+    const r = await byName('ledger_record').execute({ entity: { name: 'metformin' }, type: 'medication' } as never);
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain('entity');
+  });
+
+  it('ledger_record with an OBJECT field value returns a clean error naming fields', async () => {
+    const r = await byName('ledger_record').execute({ entity: 'metformin', type: 'medication', fields: { dose: { mg: 500 } } } as never);
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain('dose');
+  });
+
+  it('ledger_update with a NON-STRING tokenId returns a clean error', async () => {
+    const r = await byName('ledger_update').execute({ tokenId: 12345, confirm: true } as never);
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain('tokenId');
+  });
+});
+
+// I2 review follow-ups: close the remaining TypeError/corruption vectors.
+describe('ledger tools arg validation — review findings (I2)', () => {
+  let tmp: string;
+  let ledger: LedgerStore;
+  let tools: Tool[];
+  const byName = (n: string): Tool => tools.find(t => t.name === n)!;
+  const build = (): void => {
+    const clock = mutableClock(DAY);
+    ledger = new LedgerStore(tmp, clock);
+    const narrative = new NarrativeStore(tmp, clock);
+    const view = new SafetyView(tmp, clock);
+    const curiosity = new CuriosityQueue(tmp, clock, seqIdGen('cur'), 'default');
+    const safety = makeSafetyRenderer({ render: (facts) => view.render(facts), listSafetyRelevant: () => ledger.listSafetyRelevant() });
+    const queue: QueuePort = { enqueue: async (_p, op) => op.run() };
+    const pipeline = new CapturePipeline({ queue, ledger, narrative, safety, curiosity });
+    tools = createLedgerTools({ pipeline, ledger, safety, queue, clock });
+  };
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-ledgerarg2-'));
+    build();
+  });
+  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  it('rejects a non-number confidence with a clean error (would TypeError at toFixed)', async () => {
+    const r = await byName('ledger_record').execute({ entity: 'metformin', type: 'medication', confidence: 'high' } as never);
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain('confidence');
+  });
+
+  it('rejects an unknown source authority (silent corruption vector)', async () => {
+    const r = await byName('ledger_record').execute({ entity: 'metformin', type: 'medication', source: 'not-an-authority' } as never);
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain('source');
+  });
+
+  it('rejects a non-boolean safety_relevant', async () => {
+    const r = await byName('ledger_record').execute({ entity: 'metformin', type: 'medication', safety_relevant: 'yes' } as never);
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain('safety_relevant');
+  });
+
+  it('ledger_remove with a NON-STRING reason returns a clean error, not a TypeError', async () => {
+    await byName('ledger_record').execute({ entity: 'metformin', type: 'medication' });
+    const r = await byName('ledger_remove').execute({ entity: 'metformin', type: 'medication', reason: 42 } as never);
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain('reason');
+  });
+
+  it('ledger_update with a NON-NUMBER winningVersion returns a clean error', async () => {
+    await ledger.recordFact({ entity: 'warfarin', type: 'medication', fields: { dose: '5mg' }, provenance: { source: 'user', confidence: 0.9, anchor: '', capturedAt: DAY } });
+    const rec = await byName('ledger_record').execute({ entity: 'warfarin', type: 'medication', fields: { dose: '10mg' } });
+    const tokenId = (rec.content[0].text.match(/[0-9a-f]{12}/) ?? [])[0]!;
+    const r = await byName('ledger_update').execute({ tokenId, confirm: true, winningVersion: 'two' } as never);
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain('winningVersion');
+  });
+});
