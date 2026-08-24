@@ -131,6 +131,13 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
     expect(sys).not.toContain('## MEMORY');
   });
 
+  it('reports per-turn prompt mode in /status when the recall path is wired (L-2)', async () => {
+    gateway = await startGateway(tmpDir);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const status = (gateway as any).buildBootStatusText();
+    expect(status).toContain('prompt: per-turn');
+  });
+
   it('completes a chat turn and injects SAFETY even with embeddings unavailable (recall degrades, no crash)', async () => {
     gateway = await startGateway(tmpDir);
     await registryOf().execute('ledger_record', {

@@ -134,15 +134,20 @@ export class SafetyView {
     return this.writeItems(items);
   }
 
-  /** Current on-disk content, or null when no SAFETY.md exists yet. */
+  /**
+   * Current on-disk SAFETY.md, or null when the file does not exist yet (ENOENT — an empty safety
+   * constitution is allowed, PLAT-04). ANY OTHER read error (EACCES/EISDIR/I/O) THROWS — this is the
+   * always-injected safety constitution, so it fails CLOSED: the caller (assembler) aborts the turn
+   * rather than shipping a prompt with no SAFETY (H-1; medical-safety > resilience).
+   */
   async read(): Promise<string | null> {
     try {
       return await fs.promises.readFile(this.filePath(), 'utf-8');
     } catch (err) {
       const nodeErr = err as NodeJS.ErrnoException;
       if (nodeErr.code === 'ENOENT') return null;
-      console.warn(`[safety-view] read failed: ${summarizeErrorForLog(err)}`);
-      return null;
+      console.warn(`[safety-view] read failed (failing closed): ${summarizeErrorForLog(err)}`);
+      throw err;
     }
   }
 

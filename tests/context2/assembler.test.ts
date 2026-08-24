@@ -159,10 +159,36 @@ describe('ContextAssembler v2 — chat-mode injection map (C1)', () => {
     expect(keys(report.sections).some(k => k.startsWith('memory/'))).toBe(false);
   });
 
+  it('never drops the RUNTIME date line under budget pressure (L-1)', async () => {
+    const bigSoul = 'X'.repeat(8000);
+    const report = await make({ ...FULL_FILES, 'SOUL.md': bigSoul }, SAFETY, 60).assemble('default', 'chat', RECALL);
+    const runtime = report.sections.find(s => s.key === 'runtime');
+    expect(runtime).toBeDefined();
+    expect(runtime!.content).toContain('2026-08-24');
+    expect(report.content).toContain('2026-08-24');
+  });
+
   it('reports totalTokens as ceil(totalChars/4)', async () => {
     const report = await make(FULL_FILES, SAFETY).assemble('default', 'chat', RECALL);
     expect(report.totalChars).toBe(report.content.length);
     expect(report.totalTokens).toBe(Math.ceil(report.content.length / 4));
+  });
+});
+
+describe('ContextAssembler v2 — SAFETY fails closed (H-1)', () => {
+  it('aborts the turn when a present SAFETY cannot be read (never ships a SAFETY-less prompt)', async () => {
+    const throwingSafety: SafetyReader = { async read() { throw new Error('EACCES: permission denied'); } };
+    const asm = new ContextAssembler({
+      reader: makeReader(FULL_FILES), safety: throwingSafety, maxChars: 100_000, clock: CLOCK,
+    });
+    await expect(asm.assemble('default', 'chat', RECALL)).rejects.toThrow();
+  });
+
+  it('still treats a genuinely absent/empty SAFETY as allowed (PLAT-04, no throw)', async () => {
+    const asm = new ContextAssembler({
+      reader: makeReader(FULL_FILES), safety: makeSafety(null), maxChars: 100_000, clock: CLOCK,
+    });
+    await expect(asm.assemble('default', 'chat', RECALL)).resolves.toBeDefined();
   });
 });
 

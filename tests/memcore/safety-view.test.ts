@@ -255,4 +255,12 @@ describe('SafetyView.read', () => {
     const md = await sv.read();
     expect(md).toBe(await fs.promises.readFile(safetyFile(), 'utf-8'));
   });
+
+  it('throws on a non-ENOENT read error — the always-injected constitution fails closed (H-1)', async () => {
+    const sv = new SafetyView(tmpDir);
+    // A present-but-unreadable SAFETY.md (EISDIR here, same class as EACCES) must NOT degrade to
+    // null — that would let a turn ship with no safety constitution. It must throw so the caller aborts.
+    fs.mkdirSync(safetyFile());
+    await expect(sv.read()).rejects.toThrow();
+  });
 });

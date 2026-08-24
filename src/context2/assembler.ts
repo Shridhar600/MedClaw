@@ -189,8 +189,10 @@ export class ContextAssembler {
       }
     }
 
-    // 4. Runtime line (volatile) — the ONLY place a clock/date value is composed in (H-2).
-    raw.push({ key: 'runtime', title: 'RUNTIME', layer: 3, cacheStable: false, content: this.runtimeLine(hitsShown) });
+    // 4. Runtime line (volatile) — the ONLY place a clock/date value is composed in (H-2). Marked
+    //    non-truncatable (L-1): the day date grounds health advice and must never be evicted by
+    //    budget pressure (it is tiny). Still below the cache boundary (cacheStable:false).
+    raw.push({ key: 'runtime', title: 'RUNTIME', layer: 3, cacheStable: false, content: this.runtimeLine(hitsShown), nonTruncatable: true });
 
     const { sections, content, truncated } = this.compose(raw);
 
@@ -284,14 +286,11 @@ export class ContextAssembler {
   }
 
   private async readSafety(): Promise<string | null> {
-    try {
-      return await this.deps.safety.read();
-    } catch {
-      // SAFETY read failure degrades to no SAFETY section; the invariant no-ops on empty content
-      // (a genuinely empty SAFETY is allowed, PLAT-04). A non-empty-but-unreadable file cannot be
-      // asserted, so this is the conservative degrade — boot healthchecks surface DB/file trouble.
-      return null;
-    }
+    // NO swallow (H-1): the SafetyReader returns null only for a genuinely absent/empty SAFETY
+    // (PLAT-04). A read error (EACCES/EISDIR/I/O) THROWS and must propagate — it aborts the turn to
+    // the caller's safe fallback rather than silently shipping a prompt with no safety constitution
+    // (medical-safety > resilience). This is the ONE place resilience does not apply.
+    return this.deps.safety.read();
   }
 
   private async readFile(relPath: string): Promise<string | null> {

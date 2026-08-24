@@ -115,6 +115,13 @@ export class SqliteVecIndex implements VectorIndex {
   }
 
   async *queryKnn(embedding: number[], k: number, filter?: Record<string, unknown>): AsyncIterable<ChunkWithScore> {
+    // Live-path lazy dimension adoption (C-1): the recall READ adapter is constructed without a
+    // dimension and never upserts (the P0 store is the sole chunk writer), so `this.dimension` would
+    // otherwise stay null and this method would silently yield zero rows forever. Adopt the query
+    // embedding's length — the existing chunks_vec0 (created by the store) is matched IF NOT EXISTS.
+    if (this.dimension === null && this.hasVec && embedding.length > 0) {
+      this.ensureVecTable(embedding.length);
+    }
     if (this.dimension !== null && embedding.length !== this.dimension) {
       throw new VectorDimensionMismatchError(
         `query embedding dimension ${embedding.length} != index dimension ${this.dimension}`,

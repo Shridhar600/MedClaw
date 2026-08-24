@@ -118,6 +118,32 @@ describe('AgentLoop — per-turn assembly + <used> feedback (C3)', () => {
     expect(toolMsgs.map((m) => m.tool_call_id)).toEqual(['a', 'b']);
   });
 
+  it('an unknown tool name in a parallel batch yields an error result, not a whole-turn abort (M-2)', async () => {
+    const pingTool: Tool = {
+      name: 'ping', group: 'group:test', description: 'ping',
+      parameters: { type: 'object', properties: {}, required: [] },
+      async execute() { return { content: [{ type: 'text', text: 'ping-result' }] }; },
+    };
+    const registry = new ToolRegistry({ allow: ['*'], deny: [] });
+    registry.register(pingTool);
+    const { provider, seen } = recordingProvider([
+      { type: 'tool_call', toolCalls: [{ id: 'a', name: 'ping', arguments: {} }, { id: 'b', name: 'nope', arguments: {} }] },
+      { type: 'text', text: 'handled both' },
+    ]);
+    const loop = new AgentLoop(provider, registry, [], CFG);
+
+    const result = await loop.run('call both');
+
+    expect(result.text).toBe('handled both');
+    expect(result.trace.map((m) => m.role)).toEqual(['assistant', 'tool', 'tool', 'assistant']);
+    expect(result.trace[1].tool_call_id).toBe('a');
+    expect(result.trace[1].content).toBe('ping-result');
+    expect(result.trace[2].tool_call_id).toBe('b');
+    expect(String(result.trace[2].content)).toMatch(/error|not found/i);
+    // The follow-up provider call still sees valid history: one tool result per tool_call_id, in order.
+    expect(seen[1].filter((m) => m.role === 'tool').map((m) => m.tool_call_id)).toEqual(['a', 'b']);
+  });
+
   it('still accepts a static Message[] (legacy/test construction) and reuses it each turn', async () => {
     const { provider, seen } = recordingProvider([{ type: 'text', text: 'ok' }]);
     const staticSys: Message[] = [{ role: 'system', content: 'STATIC' }];

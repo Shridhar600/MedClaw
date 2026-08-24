@@ -208,10 +208,16 @@ function renderCheck(entity: string, started: string, sideEffect: string, now: D
 export class RecallEngine {
   constructor(private deps: RecallDeps) {}
 
-  async run(input: RecallInput): Promise<RecallReport> {
+  async run(input: RecallInput, opts?: { narrative?: boolean }): Promise<RecallReport> {
+    // narrative:false (heartbeat/dream/subagent — modes that render no narrative hits) runs Stage-1
+    // ledger only: no embed, no Stage-2/3, no bumpInjected. This avoids poisoning B4 auto-mute with
+    // injected_count bumps for chunks that were never shown, and skips the embed budget (M-1).
+    const includeNarrative = opts?.narrative ?? true;
     const stage1 = await this.stage1Ledger();
-    const stage2 = await this.stage2Narrative(input);
-    const stage3 = await this.stage3Entity(input);
+    const stage2: Stage2Result = includeNarrative
+      ? await this.stage2Narrative(input)
+      : { text: '', tokens: 0, hits: [], injectedChunkIds: [], indexStatus: 'full' };
+    const stage3 = includeNarrative ? await this.stage3Entity(input) : '';
     // Stage 4a: record that these chunks were injected (used_count bumped later via recordUsage
     // when the model reports the <used> tag). Mirror-connection bookkeeping — never blocks the turn.
     if (stage2.injectedChunkIds.length > 0) {

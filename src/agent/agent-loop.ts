@@ -4,6 +4,7 @@ import { LLMSemaphore, type SemaphorePriority } from '../tools/semaphore';
 import { MEDICAL_DISCLAIMER, MEDICAL_DISCLAIMER_SENTINEL } from '../safety/medical-disclaimer';
 import { parseUsedTag } from '../recall';
 import type { AssemblerMode } from '../context2';
+import { summarizeErrorForLog } from '../security';
 
 const MEDICAL_TOOLS = new Set(['medgemma_query', 'medgemma_analyze_report']);
 
@@ -131,8 +132,18 @@ export class AgentLoop {
       trace.push(toolRequestMessage);
 
       for (const c of calls) {
-        const toolResult = await this.registry.execute(c.name, c.arguments, runContext);
-        const resultText = toolResult.content.map(r => r.text).join('\n');
+        // Per-call isolation (M-2): registry.execute THROWS for an unknown/denied tool name (a
+        // hallucinated name in a parallel batch). Catch it and surface an error result matched to
+        // THIS tool_call_id so every call still gets exactly one `tool` message (OpenAI ordering
+        // stays valid) and the good calls' work is not discarded by one bad name.
+        let resultText: string;
+        try {
+          const toolResult = await this.registry.execute(c.name, c.arguments, runContext);
+          resultText = toolResult.content.map(r => r.text).join('\n');
+        } catch (e) {
+          console.warn('[agent] tool call failed:', summarizeErrorForLog(e));
+          resultText = `Tool error: ${e instanceof Error ? e.message : String(e)}`;
+        }
         const toolResultMessage: Message = { role: 'tool', content: resultText, tool_call_id: c.id };
         messages.push(toolResultMessage);
         trace.push(toolResultMessage);

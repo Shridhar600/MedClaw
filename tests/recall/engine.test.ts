@@ -209,6 +209,39 @@ describe('RecallEngine — Stage 3 (deterministic side-effect correlation)', () 
   });
 });
 
+describe('RecallEngine — Wave C fix-pass (M-1: mode-gated narrative)', () => {
+  it('narrative:false skips embed + bumpInjected but still returns the Stage-1 ledger', async () => {
+    const embedding = new FakeEmbedding();
+    const embedSpy = jest.spyOn(embedding, 'embed');
+    const chunkStats = new FakeChunkStats();
+    const mirror = new FakeFactMirror([
+      frec({ id: 'metformin@v1', entity: 'metformin', status: 'active', fields: { dose: '500mg' } }),
+    ]);
+    const vectorIndex = new FakeVectorIndex([
+      chunkHit({ id: 'h1', score: 0.95, lane: 'ledger', content: 'metformin note that would score' }),
+    ]);
+
+    const r = await makeEngine({ embedding, chunkStats, factMirror: mirror, vectorIndex })
+      .run({ profileId: 'default', userMessage: 'metformin' }, { narrative: false });
+
+    expect(embedSpy).not.toHaveBeenCalled();
+    expect(chunkStats.injected).toEqual([]);
+    expect(r.hits).toEqual([]);
+    expect(r.narrative).toBe('');
+    expect(r.ledger).toContain('metformin');
+  });
+
+  it('narrative defaults to true (heartbeat opt-out only): a normal run still bumps injected', async () => {
+    const chunkStats = new FakeChunkStats();
+    const vectorIndex = new FakeVectorIndex([
+      chunkHit({ id: 'h1', score: 0.95, lane: 'ledger', content: 'a health note that scores fine', createdAt: '2026-10-01T00:00:00.000Z' }),
+    ]);
+    const r = await makeEngine({ chunkStats, vectorIndex }).run({ profileId: 'default', userMessage: 'health' });
+    expect(r.injectedChunkIds.length).toBeGreaterThan(0);
+    expect(chunkStats.injected.length).toBeGreaterThan(0);
+  });
+});
+
 describe('RecallEngine — Stage 4 (feedback + auto-mute)', () => {
   it('bumps injected_count for every injected chunk on run', async () => {
     const stats = new FakeChunkStats();

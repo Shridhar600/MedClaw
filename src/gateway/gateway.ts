@@ -69,6 +69,9 @@ export class Gateway {
   private profileRegistry?: ProfileRegistry;
   private resolvedMemoryWorkspace?: string;
   private bootHealth?: { providers: ReadinessResult[]; telegram: ReadinessResult };
+  // D9 observability (L-2): 'per-turn' when the recall + v2-assembler path is live; 'boot-cached'
+  // when it failed to construct and chat fell back to the frozen boot prompt (recall effectively off).
+  private promptMode: 'per-turn' | 'boot-cached' = 'boot-cached';
   private mainProvider?: LLMProvider;
   // v2 capture pipeline for the active profile (per-turn narrative capture hook, Task 13.3).
   private capturePipeline?: CapturePipeline;
@@ -309,7 +312,9 @@ export class Gateway {
           // turn (medical-safety > resilience); the caller turns it into a safe fallback reply.
           let recall = null as Awaited<ReturnType<typeof recallEngine.run>> | null;
           try {
-            recall = await recallEngine.run({ profileId, userMessage });
+            // Only chat renders narrative hits; heartbeat/dream/subagent get Stage-1 ledger only —
+            // running Stage-2 there would bump injected_count for chunks never shown (M-1).
+            recall = await recallEngine.run({ profileId, userMessage }, { narrative: mode === 'chat' });
           } catch (e) {
             console.warn('[gateway] recall failed (assembling without recall):', summarizeErrorForLog(e));
             recall = null;
@@ -377,6 +382,7 @@ export class Gateway {
     // Agent
     const semaphore = new LLMSemaphore();
     this.agentLoop = new AgentLoop(mainProvider, registry, prepareSystem ?? systemMessages, config.agent, semaphore);
+    this.promptMode = prepareSystem ? 'per-turn' : 'boot-cached';
 
     // Sessions
     // Path resolution stays here (Gateway) rather than inside SessionManager
@@ -1167,6 +1173,7 @@ export class Gateway {
       'System Health:',
       ...h.providers.map((p) => `  ${p.label}: ${p.ready ? 'OK' : 'FAIL'}`),
       `  telegram: ${h.telegram.ready ? 'OK' : 'FAIL'}`,
+      `  prompt: ${this.promptMode}${this.promptMode === 'boot-cached' ? ' (recall off — degraded)' : ''}`,
     ];
     // Security warnings carry config internals (provider baseUrls, workspace
     // filesystem paths) and must never reach a network channel — surface the
