@@ -148,6 +148,16 @@ function matchEntities(content: string, heads: FactRecord[]): FactRecord[] {
   });
 }
 
+/**
+ * True when `content` mentions an entity whose CURRENT HEAD is terminal
+ * (retracted/discontinued/superseded). This is the DRY form of the Stage-2 stale-drop
+ * ({@link RecallEngine.isSuppressed}), exported so `memory_search`'s `status:active` filter
+ * applies the identical rule (E1.1 / CONTRA-06/08). `heads` = `factMirror.queryEntityHeads()`.
+ */
+export function chunkHasStaleEntity(content: string, heads: FactRecord[]): boolean {
+  return matchEntities(content, heads).some(h => STALE_STATUSES.has(h.status));
+}
+
 // Stage-1 ledger fill priority when the budget is tight (F3): safety rows first, then a clinical
 // ordering, so a critical allergy is never silently evicted by rowid-arbitrary order.
 const LEDGER_TYPE_PRIORITY: Record<string, number> = {

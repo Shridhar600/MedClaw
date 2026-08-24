@@ -2,6 +2,8 @@ import type { Tool, ToolResult } from './types';
 import type { MemoryEngine } from '../memory/memory-engine';
 import type { MemorySearch } from '../memory/search';
 import type { MemoryIndexer } from '../memory/indexer';
+import type { FactMirror, FactRecord } from '../ports';
+import { chunkHasStaleEntity } from '../recall';
 import * as path from 'path';
 import { contentContainsCredentials, summarizeErrorForLog } from '../security';
 
@@ -47,6 +49,23 @@ function normalizeManagedPath(p: string): string | null {
 
 function rejection(text: string): ToolResult {
   return { content: [{ type: 'text', text }], isError: true };
+}
+
+/**
+ * Load the current per-entity ledger heads for the `status:active` stale-drop (E1.1). Best-effort:
+ * a missing mirror or a read failure yields `[]` (⇒ no filtering) — the search must never crash or
+ * lose backward-compat because the fact mirror is degraded (resilience).
+ */
+async function loadEntityHeads(mirror: FactMirror | undefined): Promise<FactRecord[]> {
+  if (!mirror) return [];
+  try {
+    const heads: FactRecord[] = [];
+    for await (const h of mirror.queryEntityHeads()) heads.push(h);
+    return heads;
+  } catch (e) {
+    console.warn('[memory-tools] entity-heads load failed (status filter skipped):', summarizeErrorForLog(e));
+    return [];
+  }
 }
 
 /** Entity names listed under SAFETY.md's `## Allergies` / `## Medications` sections, lower-cased. */
@@ -119,7 +138,18 @@ async function classifyManagedWrite(
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars -- profileId reserved for Task 8 (profile-scoped index metadata)
-export function createMemoryTools(engine: MemoryEngine, search?: MemorySearch, indexer?: MemoryIndexer, _profileId?: string): Tool[] {
+export function createMemoryTools(
+  engine: MemoryEngine,
+  search?: MemorySearch,
+  indexer?: MemoryIndexer,
+  _profileId?: string,
+  // E1.1: the fact mirror powers memory_search's `status:active` stale-drop. Accepts a lazy
+  // accessor because the gateway builds the mirror AFTER these tools register — the closure reads
+  // it at execute time (boot-complete), and `undefined` degrades to no filtering.
+  factMirror?: FactMirror | (() => FactMirror | undefined),
+): Tool[] {
+  const getMirror: () => FactMirror | undefined =
+    typeof factMirror === 'function' ? factMirror : () => factMirror;
   const memoryGet: Tool = {
     name: 'memory_get',
     group: 'group:memory',
@@ -258,7 +288,7 @@ export function createMemoryTools(engine: MemoryEngine, search?: MemorySearch, i
         query: { type: 'string', description: 'Search query' },
         limit: { type: 'number', description: 'Max results (default: 5)' },
         lane: { type: 'string', enum: Object.keys(LANE_PREFIX), description: 'Restrict results to one memory lane (path prefix)' },
-        status: { type: 'string', description: 'Fact status filter — accepted but a no-op in P1 (chunk index has no status); reserved for P2' },
+        status: { type: 'string', enum: ['active', 'all'], description: 'Fact-status filter: "active" (default) drops results whose ledger entity is stale (retracted/discontinued/superseded); "all" returns every version.' },
       },
       required: ['query'],
     },
@@ -269,16 +299,27 @@ export function createMemoryTools(engine: MemoryEngine, search?: MemorySearch, i
       const limit = (params.limit as number) ?? 5;
       const lane = params.lane as string | undefined;
       const prefix = lane ? LANE_PREFIX[lane] : undefined;
-      // Over-fetch when filtering so the lane still yields up to `limit` hits, then slice.
-      const fetchK = prefix ? Math.max(limit * 4, 20) : limit;
+      // `status:active` (default) drops chunks whose derived ledger entity head is stale — the same
+      // rule the recall engine applies in Stage-2 (chunkHasStaleEntity), so both paths agree
+      // (CONTRA-06/08). `all` disables it. Version ordering is a fact query — use ledger_query.
+      const factStatus = (params.status as string) ?? 'active';
+      const willStatusFilter = factStatus !== 'all';
+      // Over-fetch when a lane OR the status filter can drop rows, so we still surface up to `limit`.
+      const fetchK = (prefix || willStatusFilter) ? Math.max(limit * 4, 20) : limit;
       let results = await search.search(params.query as string, fetchK);
       if (prefix) results = results.filter(r => r.path.startsWith(prefix));
+      if (willStatusFilter) {
+        const heads = await loadEntityHeads(getMirror());
+        if (heads.length > 0) {
+          results = results.filter(r => !chunkHasStaleEntity(r.content, heads));
+        }
+      }
       results = results.slice(0, limit);
       if (results.length === 0) {
         return { content: [{ type: 'text', text: 'No results found' }] };
       }
-      const status = results[0].status ?? 'full';
-      const qualityBanner = status === 'full' ? '' : `[search-quality: ${status}]\n`;
+      const quality = results[0].status ?? 'full';
+      const qualityBanner = quality === 'full' ? '' : `[search-quality: ${quality}]\n`;
       const text = qualityBanner + results
         .map(r => `## ${r.path} [${r.chunkId}] lines ${r.startLine}-${r.endLine} (score: ${r.score.toFixed(3)})\n${r.content}`)
         .join('\n\n---\n\n');

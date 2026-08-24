@@ -145,7 +145,10 @@ export class Gateway {
     // one factory/dependency disables only that group and boot continues with
     // the remaining tools (resilience law: disable tool, log, continue).
     try {
-      for (const tool of createMemoryTools(memory, search, indexer, profileId)) {
+      // E1.1: pass a lazy accessor for the fact mirror (built later in the memcore block). memory_search's
+      // status:active filter reads it at execute time; if the memcore block never ran, it stays undefined
+      // and the search degrades to no status filtering (backward-compat).
+      for (const tool of createMemoryTools(memory, search, indexer, profileId, () => this.factMirror)) {
         registry.register(tool);
       }
     } catch (e) {

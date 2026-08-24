@@ -1,4 +1,4 @@
-export { RecallEngine, DEFAULT_RECALL_CONFIG } from './engine';
+export { RecallEngine, DEFAULT_RECALL_CONFIG, chunkHasStaleEntity } from './engine';
 export type {
   RecallConfig, RecallDeps, RecallInput, RecallReport, RecallHit, IndexStatus,
 } from './engine';
