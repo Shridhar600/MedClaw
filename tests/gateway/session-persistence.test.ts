@@ -21,18 +21,23 @@ describe('SessionManager JSONL Persistence', () => {
     fs.rmSync(tmpDir, { recursive: true });
   });
 
-  it('appends user and assistant turns to JSONL file', async () => {
+  // P2b/D1.6: turns are appended to the day-file archive (the active file is gone).
+  const dayFile = (): string => path.join(tmpDir, new Date().toISOString().slice(0, 10) + '.jsonl');
+
+  it('appends user and assistant turns to the day-file archive', async () => {
     await manager.addTurn('chat1', { role: 'user', content: 'Hello' }, { role: 'assistant', content: 'Hi there' });
-    const jsonlPath = path.join(tmpDir, 'active-chat1.jsonl');
-    expect(fs.existsSync(jsonlPath)).toBe(true);
-    const lines = fs.readFileSync(jsonlPath, 'utf-8').trim().split('\n');
+    expect(fs.existsSync(dayFile())).toBe(true);
+    const lines = fs.readFileSync(dayFile(), 'utf-8').trim().split('\n');
     expect(lines.length).toBe(2);
   });
 
-  it('reconstructs history from JSONL on startup', () => {
-    const jsonlPath = path.join(tmpDir, 'active-chat1.jsonl');
-    fs.writeFileSync(jsonlPath, JSON.stringify({ timestamp: new Date().toISOString(), role: 'user', content: 'Hello', chatId: 'chat1' }) + '\n');
-    fs.writeFileSync(jsonlPath, JSON.stringify({ timestamp: new Date().toISOString(), role: 'assistant', content: 'Hi there', chatId: 'chat1' }) + '\n', { flag: 'a' });
+  // P2b/D1.5: reconstruction now reads the day-file archive + window (not the active file). Round-trip
+  // through the real persist path (recordTurn writes both) rather than hand-crafting the on-disk file.
+  it('reconstructs history from the archive + window on startup', async () => {
+    await manager.recordTurn('chat1', [
+      { role: 'user', content: 'Hello' },
+      { role: 'assistant', content: 'Hi there' },
+    ]);
 
     const manager2 = new SessionManager(240, 1440, tmpDir);
     const history = manager2.getHistory('chat1');
@@ -52,13 +57,16 @@ describe('SessionManager JSONL Persistence', () => {
     expect(fs.existsSync(summariesDir)).toBe(true);
   });
 
-  it('active JSONL deleted after archive', async () => {
+  // P2b/D1.6: resetSession clears the in-memory session + the window, but the append-only day-file
+  // archive is PRESERVED (never deleted — DD1). (Was: "active JSONL deleted after archive".)
+  it('resetSession clears the session + window but preserves the day-file archive', async () => {
     await manager.addTurn('chat1', { role: 'user', content: 'Test' }, { role: 'assistant', content: 'Response' });
-    const jsonlPath = path.join(tmpDir, 'active-chat1.jsonl');
-    expect(fs.existsSync(jsonlPath)).toBe(true);
+    expect(fs.existsSync(dayFile())).toBe(true);
 
     await manager.resetSession('chat1');
-    expect(fs.existsSync(jsonlPath)).toBe(false);
+    expect(manager.getHistory('chat1')).toEqual([]);
+    expect(fs.existsSync(path.join(tmpDir, 'session-window.json'))).toBe(false);
+    expect(fs.existsSync(dayFile())).toBe(true);
   });
 
   describe('Phase 2.6 lifecycle semantics', () => {
@@ -69,9 +77,10 @@ describe('SessionManager JSONL Persistence', () => {
       };
     }
 
-    it('archives active JSONL on idle hard reset and removes active file', async () => {
+    // P2b/D1.4 (DD10): idle resets are RETIRED — the perpetual thread never hard-resets on idle.
+    // (Was: "archives active JSONL on idle hard reset and removes active file".)
+    it('does NOT hard-reset or archive on long idle (idle resets retired — DD10)', async () => {
       await manager.addTurn('chat-hard', { role: 'user', content: 'Hello' }, { role: 'assistant', content: 'Hi' });
-      const activePath = path.join(tmpDir, 'active-chat-hard.jsonl');
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const state = (manager as any).sessions.get('chat-hard');
@@ -79,25 +88,29 @@ describe('SessionManager JSONL Persistence', () => {
 
       const history = await manager.prepareHistory('chat-hard');
 
-      expect(history).toEqual([]);
-      expect(fs.existsSync(activePath)).toBe(false);
-      const archiveDir = path.join(tmpDir, 'archive');
-      expect(fs.existsSync(archiveDir)).toBe(true);
-      expect(fs.readdirSync(archiveDir).some(name => name.includes('chat-hard'))).toBe(true);
+      // The window is returned intact; nothing is archived; the day-file archive stays.
+      expect(history.map((m) => m.content)).toEqual(['Hello', 'Hi']);
+      expect(fs.existsSync(dayFile())).toBe(true);
+      expect(fs.existsSync(path.join(tmpDir, 'archive'))).toBe(false);
     });
 
-    it('restores lastActiveAt from last JSONL timestamp on reload', () => {
-      const staleTimestamp = new Date('2026-04-17T12:00:00.000Z').toISOString();
-      const jsonlPath = path.join(tmpDir, 'active-chat-reload.jsonl');
-      fs.writeFileSync(jsonlPath, JSON.stringify({ timestamp: staleTimestamp, role: 'user', content: 'Old', chatId: 'chat-reload' }) + '\n');
-      fs.writeFileSync(jsonlPath, JSON.stringify({ timestamp: staleTimestamp, role: 'assistant', content: 'Session', chatId: 'chat-reload' }) + '\n', { flag: 'a' });
+    // P2b/D1.5: lastActiveAt is restored from the last archive entry's timestamp on resume.
+    it('restores lastActiveAt from the last archive entry timestamp on reload', async () => {
+      jest.useFakeTimers();
+      const stale = new Date('2026-04-17T12:00:00.000Z');
+      jest.setSystemTime(stale);
+      await manager.recordTurn('chat-reload', [
+        { role: 'user', content: 'Old' },
+        { role: 'assistant', content: 'Session' },
+      ]);
+      jest.useRealTimers();
 
       const manager2 = new SessionManager(240, 1440, tmpDir);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const state = (manager2 as any).sessions.get('chat-reload');
 
       expect(state).toBeDefined();
-      expect(Math.abs(state.lastActiveAt.getTime() - new Date(staleTimestamp).getTime())).toBeLessThan(1000);
+      expect(Math.abs(state.lastActiveAt.getTime() - stale.getTime())).toBeLessThan(1000);
     });
 
     it('/new reset writes real summary content instead of placeholder text', async () => {
@@ -114,12 +127,17 @@ describe('SessionManager JSONL Persistence', () => {
       expect(summary).not.toContain('This session has been archived.');
     });
 
-    it('does not race compaction with live request history retrieval', async () => {
+    // P2b/D1.4 (DD10): idle soft-reset compaction is RETIRED. An under-budget, idle session is NOT
+    // compacted — the full verbatim window is returned, the provider is never called. (Token-budget
+    // compaction — the surviving auto-trigger — is covered by session-compaction-tool-groups.)
+    // (Was: "does not race compaction with live request history retrieval".)
+    it('does NOT run compaction on idle (soft reset retired — DD10)', async () => {
+      const provider = makeProvider('should not be produced on idle');
       const compactionManager = new SessionManager(
         1,
         1440,
         tmpDir,
-        makeProvider('Compaction summary for older turns.'),
+        provider,
         undefined,
         { enabled: true, triggerAtTokenPercent: 80, memoryFlush: false, keepRecentTurns: 2 },
       );
@@ -137,8 +155,9 @@ describe('SessionManager JSONL Persistence', () => {
       state.lastActiveAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
 
       const history = await compactionManager.prepareHistory('chat-race');
-      expect(history[0].role).toBe('system');
-      expect(history[0].content).toContain('[Previous conversation summary]');
+      expect(provider.chat as jest.Mock).not.toHaveBeenCalled();
+      expect(history.some((m) => m.role === 'system')).toBe(false);
+      expect(history).toHaveLength(12);
     });
 
     it('persists full turn trace to JSONL in user -> assistant(tool_request) -> tool -> assistant order', async () => {
@@ -159,33 +178,25 @@ describe('SessionManager JSONL Persistence', () => {
         { role: 'assistant', content: 'I called ping and got pong!' },
       ]);
 
-      const lines = fs.readFileSync(path.join(tmpDir, 'active-chat-trace.jsonl'), 'utf-8').trim().split('\n').map((line) => JSON.parse(line));
+      const lines = fs.readFileSync(dayFile(), 'utf-8').trim().split('\n').map((line) => JSON.parse(line));
       expect(lines.map((line) => line.role)).toEqual(['user', 'assistant', 'tool', 'assistant']);
       expect(lines[1].tool_calls[0].function.name).toBe('ping');
       expect(lines[2].tool_call_id).toBe('c1');
     });
 
+    // P2b/D1.5: tool_calls / tool_call_id survive the persist→resume round-trip through the day-file
+    // archive (written by recordTurn, replayed on construction).
     it('reload restores tool_calls and tool_call_id metadata in original order', async () => {
-      const jsonlPath = path.join(tmpDir, 'active-chat-trace-reload.jsonl');
-      const entries = [
-        { timestamp: new Date().toISOString(), role: 'user', content: 'Ping', chatId: 'chat-trace-reload' },
+      await manager.recordTurn('chat-trace-reload', [
+        { role: 'user', content: 'Ping' },
         {
-          timestamp: new Date().toISOString(),
           role: 'assistant',
           content: null,
-          chatId: 'chat-trace-reload',
           tool_calls: [{ id: 'c1', type: 'function', function: { name: 'ping', arguments: '{}' } }],
         },
-        {
-          timestamp: new Date().toISOString(),
-          role: 'tool',
-          content: 'pong',
-          chatId: 'chat-trace-reload',
-          tool_call_id: 'c1',
-        },
-        { timestamp: new Date().toISOString(), role: 'assistant', content: 'Done', chatId: 'chat-trace-reload' },
-      ];
-      fs.writeFileSync(jsonlPath, entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
+        { role: 'tool', content: 'pong', tool_call_id: 'c1' },
+        { role: 'assistant', content: 'Done' },
+      ]);
 
       const manager2 = new SessionManager(240, 1440, tmpDir);
       const history = await manager2.prepareHistory('chat-trace-reload');
@@ -195,9 +206,11 @@ describe('SessionManager JSONL Persistence', () => {
       expect(history[2].tool_call_id).toBe('c1');
     });
 
-    it('does not re-run soft-reset compaction on consecutive prepareHistory calls before recordTurn', async () => {
+    // P2b/D1.4 (DD10): idle never triggers compaction, even across repeated prepareHistory calls.
+    // (Was: "does not re-run soft-reset compaction on consecutive prepareHistory calls before recordTurn".)
+    it('idle never triggers compaction across repeated prepareHistory calls (soft reset retired)', async () => {
       const provider = {
-        chat: jest.fn().mockResolvedValue({ type: 'text', text: 'Compaction summary for older turns.' }),
+        chat: jest.fn().mockResolvedValue({ type: 'text', text: 'should not be produced on idle' }),
         embed: jest.fn().mockResolvedValue([0.1, 0.2, 0.3]),
       };
       const compactionManager = new SessionManager(
@@ -222,17 +235,11 @@ describe('SessionManager JSONL Persistence', () => {
       state.lastActiveAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
 
       const history1 = await compactionManager.prepareHistory('chat-repeat');
-      expect(history1[0].role).toBe('system');
-      expect(history1[0].content).toContain('[Previous conversation summary]');
-
-      const chatCallCountBefore = provider.chat.mock.calls.length;
       const history2 = await compactionManager.prepareHistory('chat-repeat');
-      const chatCallCountAfter = provider.chat.mock.calls.length;
 
-      expect(chatCallCountAfter).toBe(chatCallCountBefore);
-
-      const systemMessages = history2.filter((m: Message) => m.role === 'system');
-      expect(systemMessages).toHaveLength(1);
+      expect(provider.chat).not.toHaveBeenCalled();
+      expect(history1.some((m: Message) => m.role === 'system')).toBe(false);
+      expect(history2).toHaveLength(8);
     });
   });
 
@@ -256,10 +263,9 @@ describe('SessionManager JSONL Persistence', () => {
         // In-memory history must NOT contain the failed turn.
         expect(manager.getHistory('chat-m3')).toEqual([]);
 
-        // JSONL on disk must NOT contain the failed turn.
-        const jsonlPath = path.join(tmpDir, 'active-chat-m3.jsonl');
-        if (fs.existsSync(jsonlPath)) {
-          const raw = fs.readFileSync(jsonlPath, 'utf-8');
+        // The day-file archive must NOT contain the failed turn.
+        if (fs.existsSync(dayFile())) {
+          const raw = fs.readFileSync(dayFile(), 'utf-8');
           expect(raw).not.toContain('should not persist');
           expect(raw).not.toContain('also lost');
         }
@@ -269,15 +275,14 @@ describe('SessionManager JSONL Persistence', () => {
       }
     });
 
-    it('happy path: after recordTurn, the JSONL on disk actually contains the turn content', async () => {
+    it('happy path: after recordTurn, the day-file archive actually contains the turn content', async () => {
       await manager.recordTurn('chat-happy', [
         { role: 'user', content: 'persisted-ok' },
         { role: 'assistant', content: 'confirmed' },
       ]);
 
-      const jsonlPath = path.join(tmpDir, 'active-chat-happy.jsonl');
-      expect(fs.existsSync(jsonlPath)).toBe(true);
-      const lines = fs.readFileSync(jsonlPath, 'utf-8').trim().split('\n').map((l) => JSON.parse(l));
+      expect(fs.existsSync(dayFile())).toBe(true);
+      const lines = fs.readFileSync(dayFile(), 'utf-8').trim().split('\n').map((l) => JSON.parse(l));
       expect(lines).toHaveLength(2);
       expect(lines[0].content).toBe('persisted-ok');
       expect(lines[1].content).toBe('confirmed');

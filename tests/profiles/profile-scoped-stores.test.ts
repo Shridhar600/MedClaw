@@ -92,14 +92,15 @@ describe('Profile-scoped store isolation', () => {
         { role: 'assistant', content: 'A response' },
       ]);
 
-      const filesA = fs.readdirSync(sessA).filter(f => f.startsWith('active-'));
-      const filesB = fs.readdirSync(sessB).filter(f => f.startsWith('active-'));
+      // P2b/D1.6: the day-file archive replaces the active file. Registry mode ⇒ flat `<date>.jsonl`.
+      const dayFileName = new Date().toISOString().slice(0, 10) + '.jsonl';
+      const filesA = fs.readdirSync(sessA).filter(f => f.endsWith('.jsonl'));
+      const filesB = fs.readdirSync(sessB).filter(f => f.endsWith('.jsonl'));
 
-      expect(filesA.length).toBe(1);
-      expect(filesA[0]).toBe('active-chat-1.jsonl');
+      expect(filesA).toEqual([dayFileName]);
       expect(filesB.length).toBe(0);
 
-      const jsonlContent = fs.readFileSync(path.join(sessA, 'active-chat-1.jsonl'), 'utf8');
+      const jsonlContent = fs.readFileSync(path.join(sessA, dayFileName), 'utf8');
       expect(jsonlContent).toContain('A private data');
       expect(sessA).not.toBe(sessB);
     });
@@ -119,8 +120,9 @@ describe('Profile-scoped store isolation', () => {
         { role: 'assistant', content: 'B reply' },
       ]);
 
-      const contentA = fs.readFileSync(path.join(sessA, 'active-shared-chat.jsonl'), 'utf8');
-      const contentB = fs.readFileSync(path.join(sessB, 'active-shared-chat.jsonl'), 'utf8');
+      const dayFileName = new Date().toISOString().slice(0, 10) + '.jsonl';
+      const contentA = fs.readFileSync(path.join(sessA, dayFileName), 'utf8');
+      const contentB = fs.readFileSync(path.join(sessB, dayFileName), 'utf8');
 
       expect(contentA).toContain('Profile A context');
       expect(contentB).toContain('Profile B context');

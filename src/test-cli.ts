@@ -164,14 +164,14 @@ async function main(): Promise<void> {
   const agentLoop = new AgentLoop(mainProvider, registry, systemMessages, config.agent);
 
   const sessionsPath = path.join(process.env.HOME ?? '', '.redacted', 'sessions');
-  const sessions = new SessionManager(
-    config.sessions.softResetAfterMinutes,
-    config.sessions.hardResetAfterMinutes,
+  const sessions = new SessionManager({
     sessionsPath,
-    mainProvider,
-    registry,
-    config.sessions.compaction,
-  );
+    softResetMinutes: config.sessions.softResetAfterMinutes,
+    hardResetMinutes: config.sessions.hardResetAfterMinutes,
+    provider: mainProvider,
+    toolRegistry: registry,
+    compaction: config.sessions.compaction,
+  });
 
   const app = express();
   app.use(express.json());

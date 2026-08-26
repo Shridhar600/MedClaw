@@ -440,10 +440,10 @@ describe('Reload sanitizes an OpenAI-invalid persisted history (F1)', () => {
   });
 });
 
-// F6: the no-LLM and olderTurns===0 compaction branches must degrade like the
-// summary path — a persist failure must warn-and-continue, not reject the whole
-// prepareHistory/turn.
-describe('Compaction persist failure degrades gracefully (F6)', () => {
+// F6 (P2b/D1.6): compaction persists via a best-effort WINDOW save (the day-file archive is never
+// rewritten — DD1). A failing window save must warn-and-continue, not reject the whole
+// prepareHistory/turn; the in-memory compaction still applies.
+describe('Compaction window-save failure degrades gracefully (F6)', () => {
   let tmpDir: string;
 
   beforeEach(() => {
@@ -455,7 +455,7 @@ describe('Compaction persist failure degrades gracefully (F6)', () => {
     jest.restoreAllMocks();
   });
 
-  it('no-LLM branch: persist failure does not reject; history unchanged', async () => {
+  it('no-LLM branch: a failing window save does not reject; compaction still applies in memory', async () => {
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const manager = new SessionManager(240, 1440, tmpDir, undefined, undefined, {
       enabled: true,
@@ -467,15 +467,16 @@ describe('Compaction persist failure degrades gracefully (F6)', () => {
     for (let i = 0; i < 4; i++) {
       await manager.addTurn(chatId, { role: 'user', content: `u${i}` }, { role: 'assistant', content: `a${i}` });
     }
-    const before = manager.getHistory(chatId).map((m) => m.content);
 
     const writeSpy = jest.spyOn(fsRealForFixes, 'writeFileSync').mockImplementation(() => {
       throw new Error('disk full');
     });
-    await expect(manager.runCompaction(chatId)).resolves.toBeUndefined();
+    await expect(manager.runCompaction(chatId)).resolves.toBeUndefined(); // best-effort: never rejects
     writeSpy.mockRestore();
 
-    expect(manager.getHistory(chatId).map((m) => m.content)).toEqual(before);
+    // No-LLM compaction keeps only the recent turns (keepRecentTurns=2), applied in memory despite the
+    // window-save failure.
+    expect(manager.getHistory(chatId).map((m) => m.content)).toEqual(['u3', 'a3']);
   });
 
   it('olderTurns===0 branch: persist failure does not reject; history unchanged', async () => {

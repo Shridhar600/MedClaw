@@ -191,12 +191,12 @@ describe('PHI file modes', () => {
   describe('SessionManager', () => {
     const mkMsg = (role: 'user' | 'assistant', content: string) => ({ role, content });
 
-    it('sessions dir and active JSONL are 0o700 / 0o600', async () => {
+    it('sessions dir and day-file archive are 0o700 / 0o600', async () => {
       const sessionsPath = path.join(root, 'sessions');
       const sm = new SessionManager(60, 1440, sessionsPath, undefined, undefined, undefined, 'default');
       await sm.recordTurn('123', [mkMsg('user', 'my back hurts'), mkMsg('assistant', 'sorry to hear')]);
       expectDirMode(sessionsPath);
-      expectFileMode(path.join(sessionsPath, 'active-123.jsonl'));
+      expectFileMode(path.join(sessionsPath, new Date().toISOString().slice(0, 10) + '.jsonl'));
     });
 
     it('archive + summary dirs/files are 0o700 / 0o600 after reset', async () => {
@@ -222,16 +222,16 @@ describe('PHI file modes', () => {
       expect(fs.existsSync(path.join(sessionsPath, 'active-456.jsonl'))).toBe(false);
     });
 
-    it('append to a pre-existing loose active JSONL tightens it to 0o600', async () => {
+    it('append to a pre-existing loose day file tightens it to 0o600', async () => {
       const sessionsPath = path.join(root, 'sessions3');
       fs.mkdirSync(sessionsPath, 0o755);
-      const active = path.join(sessionsPath, 'active-789.jsonl');
-      fs.writeFileSync(active, '{"timestamp":"t","role":"user","content":"x","chatId":"789"}\n', { mode: 0o644 });
-      expect(modeOf(active)).toBe(0o644);
+      const day = path.join(sessionsPath, new Date().toISOString().slice(0, 10) + '.jsonl');
+      fs.writeFileSync(day, '{"timestamp":"t","role":"user","content":"x","chatId":"789"}\n', { mode: 0o644 });
+      expect(modeOf(day)).toBe(0o644);
 
       const sm = new SessionManager(60, 1440, sessionsPath, undefined, undefined, undefined, 'default');
       await sm.recordTurn('789', [mkMsg('assistant', 'ok')]);
-      expectFileMode(active);
+      expectFileMode(day);
       expectDirMode(sessionsPath);
     });
   });

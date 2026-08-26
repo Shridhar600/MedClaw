@@ -267,10 +267,10 @@ describe('Gateway profile migration + path derivation on startup', () => {
         { role: 'assistant', content: 'hi there' },
       ]);
 
-      const activeFile = path.join(expectedSessionsDir, 'active-chat-xyz.jsonl');
-      expect(fs.existsSync(activeFile)).toBe(true);
+      const dayFile = path.join(expectedSessionsDir, new Date().toISOString().slice(0, 10) + '.jsonl');
+      expect(fs.existsSync(dayFile)).toBe(true);
       const lines = fs
-        .readFileSync(activeFile, 'utf8')
+        .readFileSync(dayFile, 'utf8')
         .trim()
         .split('\n')
         .map((l) => JSON.parse(l));

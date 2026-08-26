@@ -119,7 +119,7 @@ describe('Gateway heartbeat integration', () => {
     await (gateway as any).handleScheduledJob(job);
 
     expect(send).toHaveBeenCalledWith('chat-1', { text: 'Heartbeat sent' });
-    const sessionJsonl = path.join(tmpDir, 'sessions', 'active-chat-1.jsonl');
+    const sessionJsonl = path.join(tmpDir, 'sessions', new Date().toISOString().slice(0, 10) + '.jsonl');
     const content = fs.readFileSync(sessionJsonl, 'utf8');
     expect(content).toContain('[Heartbeat Trigger]');
     expect(content).toContain('Job id: job-1');
@@ -304,7 +304,7 @@ describe('Gateway heartbeat integration', () => {
     expect(send).not.toHaveBeenCalled();
     const refreshed = await scheduler.getStore().get(job.id);
     expect(refreshed?.lastOutcome).toBe('noop');
-    const sessionJsonl = path.join(tmpDir, 'sessions', 'active-chat-1.jsonl');
+    const sessionJsonl = path.join(tmpDir, 'sessions', new Date().toISOString().slice(0, 10) + '.jsonl');
     const content = fs.readFileSync(sessionJsonl, 'utf8');
     expect(content).toContain('[Heartbeat Trigger]');
     expect(content).toContain('HEARTBEAT_NOOP');
@@ -481,7 +481,7 @@ describe('Gateway heartbeat integration', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await expect((gateway as any).handleScheduledJob(job)).rejects.toThrow('send failed');
 
-    const sessionJsonl = path.join(tmpDir, 'sessions', 'active-chat-1.jsonl');
+    const sessionJsonl = path.join(tmpDir, 'sessions', new Date().toISOString().slice(0, 10) + '.jsonl');
     expect(fs.existsSync(sessionJsonl)).toBe(false);
     const refreshed = await scheduler.getStore().get(job.id);
     expect(refreshed?.lastOutcome).toBe('error');

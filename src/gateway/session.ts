@@ -4,8 +4,23 @@ import * as os from 'os';
 import type { Message, ToolSchema } from '../providers/types';
 import type { LLMProvider, LLMResponse } from '../providers/types';
 import type { ToolRegistry } from '../tools/registry';
-import { rotateFileIfNeeded, type RotationConfig } from '../scheduler/rotation';
-import { summarizeErrorForLog, secureMkdir, secureWrite, secureWriteViaTmp, secureAppend, tightenFile } from '../security';
+import { type RotationConfig } from '../scheduler/rotation';
+import { summarizeErrorForLog, secureMkdir, secureWrite, secureWriteViaTmp, secureAppend } from '../security';
+import {
+  dateKey,
+  countDayFileLines,
+  listDayFiles,
+  walkBackAnchor,
+  readLinesAfter,
+  resolveWindow,
+  saveWindow,
+  type Anchor,
+  type SessionWindow,
+} from './session-window';
+
+// The system-message prefix that marks a compaction summary in the in-context history. Held as one
+// constant so compaction (write), the window snapshot (derive), and resume (render) agree byte-for-byte.
+const SUMMARY_PREFIX = '[Previous conversation summary]\n';
 
 interface Session {
   chatId: string;
@@ -35,9 +50,27 @@ interface CompactionConfig {
   keepRecentTurns: number;
 }
 
-type ArchiveReason = 'manual-reset' | 'idle-hard-reset';
+// A-M4: the new canonical constructor shape. Expand-contract — the legacy positional signature keeps
+// working during the P2b Wave D-1 cutover and is removed once every caller is migrated.
+export interface SessionManagerOptions {
+  sessionsPath?: string;
+  softResetMinutes?: number;
+  hardResetMinutes?: number;
+  provider?: LLMProvider;
+  toolRegistry?: ToolRegistry;
+  compaction?: CompactionConfig;
+  profileId?: string;
+  rotationConfig?: Partial<RotationConfig>;
+  /**
+   * D1.2/A-MF5: day-file archive namespacing. `false` (registry-backed, one thread per profile) →
+   * `<sessionsPath>/YYYY-MM-DD.jsonl`. `true` (no-registry / ad-hoc, per-chat isolation) →
+   * `<sessionsPath>/<chatId>/YYYY-MM-DD.jsonl`. The Gateway sets it from whether a ProfileRegistry
+   * is present.
+   */
+  perChatArchive?: boolean;
+}
 
-const ROTATION_CHECK_INTERVAL = 100;
+type ArchiveReason = 'manual-reset' | 'idle-hard-reset';
 
 // --- Compaction token-budget trigger (#15) --------------------------------
 // A cheap safety-margin trigger, NOT exact accounting. `estimateTokens` is a
@@ -145,7 +178,14 @@ export class SessionManager {
   private readonly llmProvider?: LLMProvider;
   private readonly toolRegistry?: ToolRegistry;
   private readonly compactionConfig?: CompactionConfig;
-  private readonly rotationCounts: Map<string, number> = new Map();
+  private readonly profileId: string;
+  private readonly rotationConfig?: Partial<RotationConfig>;
+  private readonly perChatArchive: boolean;
+  // D1.3 (A-H2): the current physical non-empty line count of each day file, keyed by full day-file
+  // path. Seeded FROM DISK on first touch this process (in-memory tracking is lost on restart and
+  // `secureAppend` does not fsync), then advanced as we append. Every anchor is computed from this
+  // count, so a fresh manager continues the numbering instead of restarting at 1.
+  private readonly dayFileLineCounts: Map<string, number> = new Map();
   // F8: compaction LLM calls run at 'background' semaphore priority so they never starve or collide
   // with user turns. Injected by the Gateway (setter — the semaphore is created alongside). When
   // unset (tests / no semaphore), the call runs directly. prepareHistory always runs BEFORE the
@@ -194,6 +234,7 @@ export class SessionManager {
     throw lastError;
   }
 
+  constructor(options?: SessionManagerOptions);
   constructor(
     softResetMinutes: number,
     hardResetMinutes: number,
@@ -201,17 +242,45 @@ export class SessionManager {
     llmProvider?: LLMProvider,
     toolRegistry?: ToolRegistry,
     compactionConfig?: CompactionConfig,
-    private readonly profileId: string = 'default',
-    private readonly rotationConfig?: Partial<RotationConfig>,
+    profileId?: string,
+    rotationConfig?: Partial<RotationConfig>,
+  );
+  constructor(
+    a?: SessionManagerOptions | number,
+    hardResetMinutes?: number,
+    sessionsPath?: string,
+    llmProvider?: LLMProvider,
+    toolRegistry?: ToolRegistry,
+    compactionConfig?: CompactionConfig,
+    profileId?: string,
+    rotationConfig?: Partial<RotationConfig>,
   ) {
-    this.softResetMs = softResetMinutes * 60 * 1000;
-    this.hardResetMs = hardResetMinutes * 60 * 1000;
-    this.sessionsPath = sessionsPath ?? path.join(os.homedir(), '.redacted', 'sessions');
-    this.llmProvider = llmProvider;
-    this.toolRegistry = toolRegistry;
-    this.compactionConfig = compactionConfig;
+    // A-M4 expand-contract: accept the new options object OR the legacy positional args.
+    const opts: SessionManagerOptions =
+      typeof a === 'object' && a !== null
+        ? a
+        : {
+            softResetMinutes: a,
+            hardResetMinutes,
+            sessionsPath,
+            provider: llmProvider,
+            toolRegistry,
+            compaction: compactionConfig,
+            profileId,
+            rotationConfig,
+          };
+    this.softResetMs = (opts.softResetMinutes ?? 240) * 60 * 1000;
+    this.hardResetMs = (opts.hardResetMinutes ?? 1440) * 60 * 1000;
+    this.sessionsPath = opts.sessionsPath ?? path.join(os.homedir(), '.redacted', 'sessions');
+    this.llmProvider = opts.provider;
+    this.toolRegistry = opts.toolRegistry;
+    this.compactionConfig = opts.compaction;
+    this.profileId = opts.profileId ?? 'default';
+    this.rotationConfig = opts.rotationConfig;
+    this.perChatArchive = opts.perChatArchive ?? false;
     secureMkdir(this.sessionsPath);
-    this.loadActiveSessions();
+    this.migrateLegacySessions();
+    this.resumeSessions();
   }
 
   getOrCreateSessionState(chatId: string): Session {
@@ -253,51 +322,56 @@ export class SessionManager {
         return [];
       }
 
-      const idleMs = Date.now() - session.lastActiveAt.getTime();
-      if (idleMs > this.hardResetMs) {
-        console.log(`[session:${chatId}] Hard reset after ${Math.round(idleMs / 60000)}m idle`);
-        await this.archiveSessionInternal(chatId, 'idle-hard-reset');
-        return [];
-      }
-
-      if (idleMs > this.softResetMs && this.compactionConfig?.enabled !== false) {
-        console.log(`[session:${chatId}] Soft reset after ${Math.round(idleMs / 60000)}m idle`);
-        await this.runCompactionInternal(chatId);
-        session.lastActiveAt = new Date();
-      } else if (
+      // P2b/D1.4 (DD10): the perpetual thread NEVER idle-resets — the soft/hard idle-reset branches
+      // are retired. Only real growth compacts. The token-budget trigger (#15) stays as the sole
+      // auto-compaction: compact before the running history overflows the model's context window.
+      // Guarded by canReduceByCompaction (F2) so an unshrinkable over-budget history does not rewrite
+      // itself every turn. (D3 replaces this chars/4 heuristic with real-token prune/compact/emergency.)
+      if (
         this.compactionConfig?.enabled !== false &&
         this.exceedsTokenBudget(session.history) &&
         this.canReduceByCompaction(session.history)
       ) {
-        // #15: token-budget trigger for actively-growing (non-idle) sessions —
-        // compact before the running history overflows the model's context
-        // window, not only on idle. Guarded by canReduceByCompaction (F2) so an
-        // unshrinkable over-budget history does not rewrite itself every turn.
         console.log(
           `[session:${chatId}] Token-budget compaction (~${estimateTokens(session.history)} est. tokens)`,
         );
         await this.runCompactionInternal(chatId);
+        this.saveWindowFor(chatId); // D1.5: compaction moved verbatimFrom / set the summary
       }
 
-      return [...(this.sessions.get(chatId)?.history ?? [])];
+      // DD2: the returned history IS the window — the summary system message (if any) followed by the
+      // verbatim tail — sanitized so this boundary never emits an OpenAI-rejectable history (#16).
+      return stripOrphanToolMessages([...(this.sessions.get(chatId)?.history ?? [])]);
     });
   }
 
-  async recordTurn(chatId: string, turnTrace: Message[]): Promise<void> {
-    await this.enqueue(chatId, async () => {
+  async recordTurn(chatId: string, turnTrace: Message[]): Promise<Anchor[]> {
+    return this.enqueue(chatId, async () => {
       if (turnTrace.length === 0) {
-        return;
+        return [];
       }
       // Persist-first: append to the JSONL BEFORE mutating in-memory state.
       // If the append/rotation throws, the enqueue promise rejects and the
       // in-memory session.history never sees the turn — no memory/disk
       // divergence.
-      await this.appendMessagesToJsonl(chatId, turnTrace);
+      const anchors = await this.appendMessagesToJsonl(chatId, turnTrace);
       const session = this.getOrCreateSessionState(chatId);
       session.history.push(...turnTrace);
       session.lastActiveAt = new Date();
       this.sessions.set(chatId, session);
+      // D1.5: persist the window snapshot so a restart resumes this tail from the day-file archive.
+      this.saveWindowFor(chatId);
+      return anchors;
     });
+  }
+
+  /**
+   * D1.3: the current EOF anchor of `chatId`'s day file for `now` — `{file: <day-file basename>,
+   * line: <physical non-empty line count>}`. Line count is re-derived from disk on first touch this
+   * process (A-H2). Used by `/new` (window archive at EOF, DD9) and compaction (`verbatimFrom`, D3).
+   */
+  currentDayFileAnchor(chatId: string, now: Date = new Date()): Anchor {
+    return { file: `${dateKey(now)}.jsonl`, line: this.dayFileLineCount(this.dayFilePath(chatId, now)) };
   }
 
   async addTurn(chatId: string, userMsg: Message, assistantMsg: Message): Promise<void> {
@@ -307,12 +381,22 @@ export class SessionManager {
   async resetSession(chatId: string): Promise<void> {
     await this.enqueue(chatId, async () => {
       await this.archiveSessionInternal(chatId, 'manual-reset');
+      // D1.5: drop the window so a restart does not resume the reset session from a stale snapshot.
+      // (The append-only day-file archive is untouched — it stays searchable. D3.6/DD9 replaces this
+      // with proper window-archive `/new` semantics.)
+      try {
+        const wp = this.windowPath(chatId);
+        if (fs.existsSync(wp)) fs.unlinkSync(wp);
+      } catch (e) {
+        console.warn(`[session:${chatId}] window state clear failed, continuing:`, summarizeErrorForLog(e));
+      }
     });
   }
 
   async runCompaction(chatId: string): Promise<void> {
     await this.enqueue(chatId, async () => {
       await this.runCompactionInternal(chatId);
+      this.saveWindowFor(chatId); // D1.5: persist the post-compaction window snapshot
     });
   }
 
@@ -349,20 +433,10 @@ export class SessionManager {
     const doFlush = this.compactionConfig?.memoryFlush ?? true;
 
     if (!this.llmProvider) {
-      // #16: snap the boundary so we never start the kept slice on an orphan
-      // `tool` message, then sanitize as belt-and-braces.
+      // #16: snap the boundary so we never start the kept slice on an orphan `tool` message, then
+      // sanitize belt-and-braces. D1.6: in-memory-only — the day-file archive is untouched (DD1).
       const split = computeCleanSplit(session.history, keepRecent);
-      const newHistory = stripOrphanToolMessages(session.history.slice(split));
-      // Atomicity (RES-P1-2): persist FIRST; only mutate session.history once
-      // the on-disk write committed. Degrade like the summary path (F6): a
-      // persist failure must warn-and-continue, never reject the turn — leave
-      // the in-memory history untouched.
-      try {
-        await this.persistHistory(chatId, newHistory);
-        session.history = newHistory;
-      } catch (e) {
-        console.warn('[session] no-LLM compaction persist failed; history left unchanged:', summarizeErrorForLog(e));
-      }
+      session.history = stripOrphanToolMessages(session.history.slice(split));
       return;
     }
 
@@ -374,14 +448,7 @@ export class SessionManager {
     const olderTurns = session.history.slice(0, split);
 
     if (olderTurns.length === 0) {
-      const cleaned = stripOrphanToolMessages(recentTurns);
-      // F6: degrade on persist failure (matches the summary-path fallback).
-      try {
-        await this.persistHistory(chatId, cleaned);
-        session.history = cleaned;
-      } catch (e) {
-        console.warn('[session] compaction persist (no older turns) failed; history left unchanged:', summarizeErrorForLog(e));
-      }
+      session.history = stripOrphanToolMessages(recentTurns);
       return;
     }
 
@@ -449,49 +516,30 @@ Keep it concise and structured.`;
           : null;
       const assembled: Message[] = summaryText
         ? [
-          { role: 'system', content: `[Previous conversation summary]\n${summaryText}` },
+          { role: 'system', content: `${SUMMARY_PREFIX}${summaryText}` },
           ...recentTurns,
         ]
         : recentTurns;
-      // #16: sanitize the assembled history before it becomes the new session
-      // history (belt-and-braces after the clean split).
-      const newHistory = stripOrphanToolMessages(assembled);
-      // Persist FIRST, assign on success (RES-P1-2 atomicity).
-      await this.persistHistory(chatId, newHistory);
-      session.history = newHistory;
+      // #16: sanitize the assembled history before it becomes the new session history (belt-and-braces
+      // after the clean split). D1.6: compaction mutates only the in-memory window — the day-file archive
+      // is append-only and NEVER rewritten (DD1); the caller persists the window snapshot (saveWindowFor).
+      session.history = stripOrphanToolMessages(assembled);
     } catch (e) {
       // Provider error messages can echo transcript PHI — sanitized frame only.
       console.warn('[session] Compact turn failed:', summarizeErrorForLog(e));
-      // Fallback: keep the recent turns. Persist FIRST, then assign — so a
-      // crash during this fallback cannot leave in-memory state diverged from
-      // disk. If even this persist fails, leave session.history unchanged and
-      // log sanitized; the caller keeps the pre-compaction history.
-      try {
-        const cleaned = stripOrphanToolMessages(recentTurns);
-        await this.persistHistory(chatId, cleaned);
-        session.history = cleaned;
-      } catch (persistError) {
-        console.warn(
-          '[session] Fallback persist after failed compaction also failed; in-memory history left unchanged:',
-          summarizeErrorForLog(persistError),
-        );
-      }
+      // Fallback: keep the recent turns — the LLM summary failed, but never lose the thread.
+      session.history = stripOrphanToolMessages(recentTurns);
     }
   }
 
   private async archiveSessionInternal(chatId: string, reason: ArchiveReason): Promise<void> {
-    const activePath = this.activePath(chatId);
+    // D1.6: the in-memory window IS the source of truth (no active file). Archive it verbatim.
     const session = this.sessions.get(chatId);
-    const hasActiveFile = fs.existsSync(activePath);
-
-    if (!hasActiveFile && !session) {
+    if (!session) {
       this.sessions.delete(chatId);
       return;
     }
-
-    const { history } = hasActiveFile
-      ? this.readHistoryFromJsonl(activePath)
-      : { history: session?.history ?? [] };
+    const history = session.history;
 
     const now = new Date();
     const dateStr = now.toISOString().split('T')[0];
@@ -504,14 +552,8 @@ Keep it concise and structured.`;
     const archivePath = path.join(archiveDir, `${dateStr}-${chatId}-${stamp}.jsonl`);
     const summaryPath = path.join(summariesDir, `${dateStr}-${chatId}-${stamp}.md`);
 
-    if (hasActiveFile) {
-      fs.renameSync(activePath, archivePath);
-      // rename preserves mode; tighten in case the active file was loose.
-      tightenFile(archivePath);
-    } else {
-      const lines = history.map(msg => JSON.stringify(this.serializeEntry(chatId, msg, now.toISOString())));
-      secureWrite(archivePath, lines.join('\n') + (lines.length > 0 ? '\n' : ''));
-    }
+    const lines = history.map(msg => JSON.stringify(this.serializeEntry(chatId, msg, now.toISOString())));
+    secureWrite(archivePath, lines.join('\n') + (lines.length > 0 ? '\n' : ''));
 
     const summaryContent = await this.generateSummary(chatId, history, reason, now);
     secureWrite(summaryPath, summaryContent);
@@ -579,46 +621,44 @@ ${response.text.trim()}`;
     }
   }
 
-  private async persistHistory(chatId: string, history: Message[]): Promise<void> {
-    const activePath = this.activePath(chatId);
-    if (history.length === 0) {
-      if (fs.existsSync(activePath)) {
-        fs.unlinkSync(activePath);
-      }
-      return;
-    }
-
-    const now = new Date().toISOString();
-    this.maybeRotate(chatId);
-    const lines = history.map(msg => JSON.stringify(this.serializeEntry(chatId, msg, now)));
-    // Atomic write (tmp+rename): a crash mid-compaction must NOT truncate the
-    // on-disk JSONL to zero bytes (RES-P1-1). secureWriteViaTmp writes a tmp
-    // file at 0o600 then renames over the target; the original stays intact
-    // until rename succeeds.
-    secureWriteViaTmp(activePath, lines.join('\n') + '\n');
-  }
-
-  private async appendMessagesToJsonl(chatId: string, messages: Message[]): Promise<void> {
-    const now = new Date().toISOString();
-    this.maybeRotate(chatId);
+  private async appendMessagesToJsonl(chatId: string, messages: Message[]): Promise<Anchor[]> {
+    const nowDate = new Date();
+    const now = nowDate.toISOString();
     const lines = messages.map(msg => JSON.stringify(this.serializeEntry(chatId, msg, now)));
-    secureAppend(this.activePath(chatId), lines.join('\n') + '\n');
+    const block = lines.join('\n') + '\n';
+    const dayFilePath = this.dayFilePath(chatId, nowDate);
+    // D1.3: assign each appended message a stable {file, line} anchor from the re-derived count. The
+    // first appended message takes line `count+1`; the file basename is the anchor's `file`.
+    const startLine = this.dayFileLineCount(dayFilePath);
+    const dayFile = `${dateKey(nowDate)}.jsonl`;
+    const anchors: Anchor[] = messages.map((_msg, i) => ({ file: dayFile, line: startLine + i + 1 }));
+    // D1.6: the append-only day-file archive is the SOLE store (DD1) — the legacy active-file dual-write
+    // is ended, and day files are NEVER size-rotated (DD8; anchors must stay stable). Persist-first still
+    // holds: a failed append rejects the enqueue and `recordTurn` never mutates in-memory state.
+    secureAppend(dayFilePath, block);
+    this.dayFileLineCounts.set(dayFilePath, startLine + lines.length);
+    return anchors;
   }
 
-  private maybeRotate(chatId: string): void {
-    const count = (this.rotationCounts.get(chatId) ?? 0) + 1;
-    this.rotationCounts.set(chatId, count);
-    if (count !== 1 && count % ROTATION_CHECK_INTERVAL !== 0) {
-      return;
+  // D1.3 (A-H2): the day file's current physical non-empty line count, seeded FROM DISK on first
+  // touch this process (never trusted across a restart — no fsync), then advanced in memory on append.
+  private dayFileLineCount(dayFilePath: string): number {
+    let count = this.dayFileLineCounts.get(dayFilePath);
+    if (count === undefined) {
+      count = countDayFileLines(dayFilePath);
+      this.dayFileLineCounts.set(dayFilePath, count);
     }
-    try {
-      rotateFileIfNeeded(this.activePath(chatId), this.rotationConfig);
-    } catch (error) {
-      console.warn(
-        `[session:${chatId}] rotation check failed, continuing without rotation:`,
-        summarizeErrorForLog(error),
-      );
-    }
+    return count;
+  }
+
+  // D1.2/A-MF5: the append-only archive path for `chatId` on the day of `now`. Flat per profile
+  // (registry mode) or namespaced per chat (no-registry mode). Day boundaries use the shared UTC
+  // `dateKey` (A-H3) so a turn after local midnight lands in the correct file.
+  private dayFilePath(chatId: string, now: Date): string {
+    const day = `${dateKey(now)}.jsonl`;
+    return this.perChatArchive
+      ? path.join(this.sessionsPath, chatId, day)
+      : path.join(this.sessionsPath, day);
   }
 
   private serializeEntry(chatId: string, msg: Message, timestamp: string): JsonlEntry {
@@ -635,40 +675,6 @@ ${response.text.trim()}`;
       entry.tool_calls = msg.tool_calls;
     }
     return entry;
-  }
-
-  private readHistoryFromJsonl(filePath: string): { history: Message[]; lastTimestamp?: Date } {
-    const history: Message[] = [];
-    if (!fs.existsSync(filePath)) {
-      return { history };
-    }
-
-    const raw = fs.readFileSync(filePath, 'utf-8').trim();
-    if (raw.length === 0) {
-      return { history };
-    }
-
-    const lines = raw.split('\n').filter((l) => l.length > 0);
-    let lastTimestamp: Date | undefined;
-
-    for (const line of lines) {
-      try {
-        const entry = JSON.parse(line) as JsonlEntry;
-        const message = this.entryToMessage(entry);
-        if (!message) {
-          continue;
-        }
-        history.push(message);
-        const parsedTs = new Date(entry.timestamp);
-        if (!Number.isNaN(parsedTs.getTime())) {
-          lastTimestamp = parsedTs;
-        }
-      } catch {
-        console.warn(`[session] Failed to parse JSONL line in ${filePath}`);
-      }
-    }
-
-    return { history, lastTimestamp };
   }
 
   private entryToMessage(entry: JsonlEntry): Message | null {
@@ -693,40 +699,202 @@ ${response.text.trim()}`;
     return message;
   }
 
-  private activePath(chatId: string): string {
-    return path.join(this.sessionsPath, `active-${chatId}.jsonl`);
+  // D1.5/A-MF5: the per-chat window state file. Registry mode = one per-profile window; no-registry
+  // mode = per-chat so distinct ad-hoc chats never share a window (N-2). Lives inside sessionsPath
+  // (test-isolated; the day-file scan ignores it — it is not a `YYYY-MM-DD.jsonl`).
+  private windowPath(chatId: string): string {
+    return this.perChatArchive
+      ? path.join(this.sessionsPath, `session-window.${chatId}.json`)
+      : path.join(this.sessionsPath, 'session-window.json');
   }
 
-  private loadActiveSessions(): void {
+  // D1.5/A-MF5: the day-file archive directory for `chatId` — flat per profile (registry) or namespaced
+  // per chat (no-registry). Mirrors `dayFilePath`.
+  private archiveDir(chatId: string): string {
+    return this.perChatArchive ? path.join(this.sessionsPath, chatId) : this.sessionsPath;
+  }
+
+  // D1.5: the window as a DERIVED snapshot of the in-memory history + the archive position. summaryBlock
+  // = the leading compaction summary (if any); verbatimFrom = the archive EOF walked back by the verbatim
+  // tail length. This holds because every non-summary message in `history` is exactly the last-K lines of
+  // the append-only day archive (compaction never rewrites day files — DD1).
+  private deriveWindow(chatId: string): SessionWindow {
+    const history = this.sessions.get(chatId)?.history ?? [];
+    const first = history[0];
+    const hasSummary =
+      !!first && first.role === 'system' && typeof first.content === 'string' && first.content.startsWith(SUMMARY_PREFIX);
+    const summaryBlock = hasSummary ? (first.content as string).slice(SUMMARY_PREFIX.length) : '';
+    const realTailLength = history.length - (hasSummary ? 1 : 0);
+    return { summaryBlock, verbatimFrom: walkBackAnchor(this.archiveDir(chatId), realTailLength) };
+  }
+
+  // D1.5: persist the window snapshot (best-effort — a save failure must never break the turn, per
+  // resilience.md; the archive on disk remains the source of truth).
+  private saveWindowFor(chatId: string): void {
+    try {
+      saveWindow(this.windowPath(chatId), this.deriveWindow(chatId));
+    } catch (e) {
+      console.warn(`[session:${chatId}] window state save failed, continuing:`, summarizeErrorForLog(e));
+    }
+  }
+
+  // D1.5: resume from the window + day-file archive (NOT the legacy active file). Registry mode has one
+  // flat archive whose chatId(s) come from the entries; no-registry mode has one archive subdirectory per
+  // chatId. Absent/corrupt window ⇒ a fresh empty window at the latest-day EOF (A-L6). Never throws.
+  private resumeSessions(): void {
     if (!fs.existsSync(this.sessionsPath)) return;
 
-    const files = fs.readdirSync(this.sessionsPath).filter((f) => f.startsWith('active-') && f.endsWith('.jsonl'));
+    if (this.perChatArchive) {
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(this.sessionsPath, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        if (e.isDirectory() && listDayFiles(this.archiveDir(e.name)).length > 0) {
+          this.resumeChat(e.name);
+        }
+      }
+    } else {
+      const chatIds = new Set<string>();
+      for (const l of readLinesAfter(this.sessionsPath, { file: '', line: 0 })) {
+        const cid = this.chatIdOfRaw(l.raw);
+        if (cid) chatIds.add(cid);
+      }
+      for (const chatId of chatIds) this.resumeChat(chatId);
+    }
 
-    for (const file of files) {
-      const chatId = file.replace('active-', '').replace('.jsonl', '');
-      const filePath = path.join(this.sessionsPath, file);
-      const { history: rawHistory, lastTimestamp } = this.readHistoryFromJsonl(filePath);
-      // A torn append (a lost final `tool` line) can leave an OpenAI-invalid
-      // history on disk — a trailing assistant+tool_calls, or a leading orphan
-      // tool. Sanitize BEFORE it enters the live session map, so the first turn
-      // after restart is not a guaranteed provider 400. The #16 "never emit a
-      // rejectable history" property must hold at EVERY boundary, not only
-      // inside compaction. (Archiving still reads the raw file verbatim.)
-      const history = stripOrphanToolMessages(rawHistory);
-      if (history.length === 0) {
-        continue;
+    if (this.sessions.size > 0) {
+      console.log(`[session] Resumed ${this.sessions.size} session(s) from the window + day-file archive`);
+    }
+  }
+
+  // D1.5: rebuild one chat's in-memory history = [summary system message?, ...verbatim tail], where the
+  // tail is the day-file lines after `verbatimFrom`. Sanitize torn appends (#16). Skip empty sessions.
+  private resumeChat(chatId: string): void {
+    const window = resolveWindow(this.windowPath(chatId), this.archiveDir(chatId));
+    const tail: Message[] = [];
+    let lastTimestamp: Date | undefined;
+    for (const line of readLinesAfter(this.archiveDir(chatId), window.verbatimFrom)) {
+      let entry: JsonlEntry;
+      try {
+        entry = JSON.parse(line.raw) as JsonlEntry;
+      } catch {
+        continue; // malformed physical slot — skip when reconstructing (A-H2)
+      }
+      if (entry.chatId !== chatId) continue; // registry mode: only this chat's entries
+      const message = this.entryToMessage(entry);
+      if (!message) continue;
+      tail.push(message);
+      const ts = new Date(entry.timestamp);
+      if (!Number.isNaN(ts.getTime())) lastTimestamp = ts;
+    }
+
+    const rendered: Message[] = [
+      ...(window.summaryBlock ? [{ role: 'system' as const, content: SUMMARY_PREFIX + window.summaryBlock }] : []),
+      ...tail,
+    ];
+    const history = stripOrphanToolMessages(rendered);
+    if (history.length === 0) return;
+
+    this.sessions.set(chatId, { chatId, history, lastActiveAt: lastTimestamp ?? new Date() });
+  }
+
+  private chatIdOfRaw(raw: string): string | undefined {
+    try {
+      return (JSON.parse(raw) as JsonlEntry).chatId;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // D1.6/A-MF2: one-time migration of legacy `active-<chatId>.jsonl` files into the append-only day-file
+  // archive, sentinel-gated by `<sessionsPath>/.migrated`. Each day file is built ATOMICALLY (tmp+rename)
+  // and WRITE-IF-ABSENT (never a blind overwrite), so a retry after a crash — or after live turns already
+  // appended to today's day file — can never destroy live-recorded data (N-1). Registry mode pools all
+  // sources into shared root day files; no-registry mode buckets each source into its own `<chatId>/`
+  // subdir (A-MF5/N-3). Best-effort: any failure logs sanitized and leaves the sentinel UNWRITTEN so the
+  // migration retries next boot; the daemon never crashes.
+  private migrateLegacySessions(): void {
+    const sentinel = path.join(this.sessionsPath, '.migrated');
+    try {
+      if (fs.existsSync(sentinel)) return;
+      const legacy = fs.readdirSync(this.sessionsPath).filter((f) => f.startsWith('active-') && f.endsWith('.jsonl'));
+      if (legacy.length === 0) {
+        secureWrite(sentinel, new Date().toISOString());
+        return;
       }
 
-      this.sessions.set(chatId, {
-        chatId,
-        history,
-        lastActiveAt: lastTimestamp ?? new Date(),
-      });
-    }
+      // Parse every legacy entry, preserving source-file order (sorted) then in-file order — the tie-break
+      // for entries sharing a timestamp. Malformed / invalid-timestamp lines are skipped with a sanitized
+      // (content-free) warn.
+      interface Row { chatId: string; day: string; ts: number; order: number; raw: string }
+      const rows: Row[] = [];
+      let order = 0;
+      for (const file of legacy.sort()) {
+        const chatId = file.replace(/^active-/, '').replace(/\.jsonl$/, '');
+        const lines = fs.readFileSync(path.join(this.sessionsPath, file), 'utf-8').split('\n').filter((l) => l.length > 0);
+        for (const raw of lines) {
+          let entry: JsonlEntry;
+          try {
+            entry = JSON.parse(raw) as JsonlEntry;
+          } catch {
+            console.warn(`[session] migration: skipping a malformed line in ${file}`);
+            continue;
+          }
+          const ts = new Date(entry.timestamp).getTime();
+          if (Number.isNaN(ts)) {
+            console.warn(`[session] migration: skipping an entry with an invalid timestamp in ${file}`);
+            continue;
+          }
+          rows.push({ chatId, day: dateKey(new Date(ts)), ts, order: order++, raw });
+        }
+      }
 
-    if (files.length > 0) {
-      console.log(`[session] Loaded ${files.length} active session(s) from disk`);
+      // Bucket by target day file, sort each day stably by (timestamp, then source order for ties), and
+      // write it WRITE-IF-ABSENT. The raw serialized line is preserved verbatim (no re-serialization).
+      const buckets = new Map<string, Row[]>();
+      for (const r of rows) {
+        const targetDir = this.perChatArchive ? path.join(this.sessionsPath, r.chatId) : this.sessionsPath;
+        const key = `${targetDir} ${r.day}`;
+        (buckets.get(key) ?? buckets.set(key, []).get(key)!).push(r);
+      }
+      const archiveDirs = new Set<string>();
+      for (const [key, arr] of buckets) {
+        const sep = key.indexOf(' ');
+        const targetDir = key.slice(0, sep);
+        const day = key.slice(sep + 1);
+        arr.sort((x, y) => x.ts - y.ts || x.order - y.order); // Array.sort is stable ⇒ ties keep source order
+        const dayPath = path.join(targetDir, `${day}.jsonl`);
+        if (!fs.existsSync(dayPath)) {
+          secureMkdir(targetDir);
+          secureWriteViaTmp(dayPath, arr.map((r) => r.raw).join('\n') + '\n');
+        }
+        archiveDirs.add(targetDir);
+      }
+
+      // Seed the window(s) to the last keepRecentTurns verbatim (DD12), write-if-absent. Registry = one
+      // window; no-registry = per-chat.
+      const keepRecent = Math.max(1, this.compactionConfig?.keepRecentTurns ?? 10);
+      if (this.perChatArchive) {
+        for (const targetDir of archiveDirs) {
+          this.seedWindowIfAbsent(this.windowPath(path.basename(targetDir)), targetDir, keepRecent);
+        }
+      } else {
+        this.seedWindowIfAbsent(this.windowPath(''), this.sessionsPath, keepRecent);
+      }
+
+      secureWrite(sentinel, new Date().toISOString()); // LAST — commits the migration
+    } catch (e) {
+      // Boot-failure policy (A-MF2): warn sanitized, sentinel left UNWRITTEN (retry next boot), never crash.
+      console.warn('[session] legacy migration failed, will retry next boot:', summarizeErrorForLog(e));
     }
+  }
+
+  private seedWindowIfAbsent(windowPath: string, archiveDir: string, keepRecent: number): void {
+    if (fs.existsSync(windowPath)) return;
+    saveWindow(windowPath, { summaryBlock: '', verbatimFrom: walkBackAnchor(archiveDir, keepRecent) });
   }
 
   private enqueue<T>(chatId: string, operation: () => Promise<T>): Promise<T> {

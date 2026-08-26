@@ -40,7 +40,7 @@ describe('SessionManager Enqueue Fix', () => {
   it('preserves message order for concurrent recordTurn calls', async () => {
     const chatId = 'chat-order';
 
-    const promises: Promise<void>[] = [];
+    const promises: Promise<unknown>[] = [];
     for (let i = 0; i < 10; i++) {
       promises.push(
         manager.recordTurn(chatId, [
@@ -61,7 +61,7 @@ describe('SessionManager Enqueue Fix', () => {
   it('queue map is empty after all concurrent operations complete', async () => {
     const chatId = 'chat-cleanup';
 
-    const promises: Promise<void>[] = [];
+    const promises: Promise<unknown>[] = [];
     for (let i = 0; i < 5; i++) {
       promises.push(
         manager.recordTurn(chatId, [

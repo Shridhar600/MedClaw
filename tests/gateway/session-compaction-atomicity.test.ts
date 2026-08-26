@@ -3,21 +3,26 @@ import * as path from 'path';
 import * as os from 'os';
 import type { LLMProvider } from '../../src/providers/types';
 import { SessionManager } from '../../src/gateway/session';
+import { dateKey } from '../../src/gateway/session-window';
 
 // The raw CJS module object so writeFileSync can be spied reliably.
 const fsReal = jest.requireActual<typeof import('fs')>('fs');
 
-// RES-P1-1/P1-2: a persist throw mid-compaction must NOT corrupt the on-disk
-// JSONL (atomic write) NOR mutate in-memory session.history before disk
-// commits.
-describe('Compaction atomicity (RES-P1-1/P1-2)', () => {
+// P2b/D1.6 (DD1): compaction mutates ONLY the in-memory window — it NEVER rewrites the append-only
+// day-file archive. The window snapshot is saved best-effort, so even a failing window save cannot
+// corrupt the durable archive nor reject the turn. (Replaces the old persist-first active-file
+// atomicity contract; the active file no longer exists.)
+describe('Compaction disk-preservation (DD1)', () => {
   let tmpDir: string;
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-compaction-atomic-'));
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-08-26T12:00:00.000Z'));
   });
 
   afterEach(() => {
+    jest.useRealTimers();
     fs.rmSync(tmpDir, { recursive: true, force: true });
     jest.restoreAllMocks();
   });
@@ -29,17 +34,14 @@ describe('Compaction atomicity (RES-P1-1/P1-2)', () => {
     } as unknown as LLMProvider;
   }
 
-  it('persistHistory throw mid-compaction leaves session.history unchanged and on-disk JSONL parseable with old content', async () => {
+  it('compaction never rewrites the day-file archive; a failing window save degrades without corrupting it', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
 
-    const manager = new SessionManager(
-      240,
-      1440,
-      tmpDir,
-      makeProvider('Compaction summary for older turns — PHI marker glucose 300.'),
-      undefined,
-      { enabled: true, triggerAtTokenPercent: 80, memoryFlush: false, keepRecentTurns: 2 },
-    );
+    const manager = new SessionManager({
+      sessionsPath: tmpDir,
+      provider: makeProvider('Compaction summary for older turns — PHI marker glucose 300.'),
+      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: false, keepRecentTurns: 2 },
+    });
 
     const chatId = 'chat-atom';
     for (let i = 0; i < 6; i++) {
@@ -50,41 +52,29 @@ describe('Compaction atomicity (RES-P1-1/P1-2)', () => {
       );
     }
 
-    const jsonlPath = path.join(tmpDir, `active-${chatId}.jsonl`);
-    const seededRaw = fs.readFileSync(jsonlPath, 'utf-8');
-    // Sanity: the seeded JSONL has 12 parseable lines (6 user/assistant pairs).
-    const seededLines = seededRaw.trim().split('\n');
-    expect(seededLines.length).toBe(12);
+    const dayFile = path.join(tmpDir, `${dateKey(new Date())}.jsonl`);
+    const seededRaw = fs.readFileSync(dayFile, 'utf-8');
+    expect(seededRaw.trim().split('\n').length).toBe(12); // 6 user/assistant pairs, append-only
 
-    // Make secureWriteViaTmp's tmp write fail for the duration of compaction.
-    // This intercepts BOTH persistHistory attempts (summary + fallback), so
-    // session.history must remain the original seeded history.
+    // Fail every atomic write (the window save) for the duration of compaction.
     const writeSpy = jest.spyOn(fsReal, 'writeFileSync').mockImplementation(() => {
       throw new Error('disk full mid-write');
     });
-
-    // Compaction must not throw out of runCompaction (the inner catch absorbs
-    // the fallback persist failure and just logs).
+    // Compaction must not throw out — the window save is best-effort (warn-and-continue).
     await expect(manager.runCompaction(chatId)).resolves.toBeUndefined();
-
     writeSpy.mockRestore();
 
-    // In-memory history is UNCHANGED — still the 12 seeded messages.
+    // The append-only day-file archive is BYTE-IDENTICAL — compaction never touched it (DD1). The
+    // summary text never reached the durable archive.
+    expect(fs.readFileSync(dayFile, 'utf-8')).toBe(seededRaw);
+    expect(seededRaw).not.toContain('Compaction summary');
+    expect(seededRaw).not.toContain('glucose');
+
+    // In-memory compaction still applied (best-effort window save; resume stays lossless from the
+    // un-advanced anchor).
     const history = manager.getHistory(chatId);
-    expect(history.length).toBe(12);
-    expect(history[0].content).toBe('Seed user 0');
-    expect(history[11].content).toBe('Seed assistant 5');
-
-    // On-disk JSONL is intact and parseable — atomic write never truncated it.
-    expect(fs.existsSync(jsonlPath)).toBe(true);
-    const afterRaw = fs.readFileSync(jsonlPath, 'utf-8');
-    expect(afterRaw).toBe(seededRaw);
-    const afterLines = afterRaw.trim().split('\n').map((l) => JSON.parse(l));
-    expect(afterLines.length).toBe(12);
-
-    // The compaction summary text never reached disk nor memory.
-    expect(afterRaw).not.toContain('Compaction summary');
-    expect(afterRaw).not.toContain('glucose');
+    expect(history[0].role).toBe('system');
+    expect(history[0].content).toContain('Previous conversation summary');
 
     warnSpy.mockRestore();
   });

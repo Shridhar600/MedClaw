@@ -398,15 +398,18 @@ export class Gateway {
     // derived when a profiles config was actually supplied; otherwise
     // SessionManager keeps its own legacy default.
     const sessionsPath = this.profileRegistry ? this.profileRegistry.profileSessions(profileId) : undefined;
-    this.sessions = new SessionManager(
-      config.sessions.softResetAfterMinutes,
-      config.sessions.hardResetAfterMinutes,
+    this.sessions = new SessionManager({
       sessionsPath,
-      mainProvider,
-      registry,
-      config.sessions.compaction,
+      softResetMinutes: config.sessions.softResetAfterMinutes,
+      hardResetMinutes: config.sessions.hardResetAfterMinutes,
+      provider: mainProvider,
+      toolRegistry: registry,
+      compaction: config.sessions.compaction,
       profileId,
-    );
+      // A-MF5: registry-backed installs are one thread per profile (flat archive); the no-registry
+      // legacy/ad-hoc path keeps per-chat isolation (namespaced archive) to avoid cross-chat bleed.
+      perChatArchive: !this.profileRegistry,
+    });
     // F8: run compaction LLM calls at 'background' priority (below user + heartbeat). prepareHistory
     // (where compaction happens) runs before AgentLoop acquires the semaphore, so this never deadlocks.
     this.sessions.setBackgroundRunner((fn) => semaphore.run('background', fn));
