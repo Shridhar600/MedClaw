@@ -71,7 +71,7 @@ describe('Compaction LLM retry (I3)', () => {
     warnSpy.mockRestore();
   });
 
-  it('degrades gracefully after exhausting retries (history falls back to recent turns)', async () => {
+  it('keeps the old window intact after exhausting retries (spec 14 §4 — never loses the thread)', async () => {
     let calls = 0;
     const provider: LLMProvider = {
       chat: jest.fn().mockImplementation(() => {
@@ -97,10 +97,11 @@ describe('Compaction LLM retry (I3)', () => {
 
     expect(calls).toBe(3); // exhausted all attempts, no infinite loop
     const history = manager.getHistory('chat-fail');
-    // Fallback keeps ONLY recent turns (older dropped unsummarized) — same as pre-I3 degrade.
+    // spec 14 §4: a failed compaction keeps the OLD window — the 6 seed turns (12 messages) are all
+    // retained and no summary is added. (Previously this degraded to recent-only; the new model never
+    // drops older turns from the window without a summary, so the thread is never lost.)
     expect(history.every((m) => m.role !== 'system')).toBe(true);
-    expect(history.length).toBeGreaterThan(0);
-    expect(history.length).toBeLessThan(12);
+    expect(history.length).toBe(12);
 
     warnSpy.mockRestore();
   });

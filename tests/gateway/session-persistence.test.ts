@@ -45,17 +45,10 @@ describe('SessionManager JSONL Persistence', () => {
     expect(history[0].content).toBe('Hello');
   });
 
-  it('archives session on resetSession and creates summary', async () => {
-    await manager.addTurn('chat1', { role: 'user', content: 'Test' }, { role: 'assistant', content: 'Response' });
-    await manager.resetSession('chat1');
-
-    const archiveDir = path.join(tmpDir, 'archive');
-    expect(fs.existsSync(archiveDir)).toBe(true);
-    expect(fs.readdirSync(archiveDir).length).toBeGreaterThan(0);
-
-    const summariesDir = path.join(tmpDir, 'summaries');
-    expect(fs.existsSync(summariesDir)).toBe(true);
-  });
+  // P2b/D3.6 (DD9): the archive/ + summaries/ side-files + generateSummary are RETIRED — /new is now a
+  // window-archive (empty context at the day-file EOF, disk log continues). The DD9 behavior (no archive
+  // dirs, contiguous line numbers, empty-context resume) is covered by session-new-window.test.ts.
+  // (Was: "archives session on resetSession and creates summary".)
 
   // P2b/D1.6: resetSession clears the in-memory session + the window, but the append-only day-file
   // archive is PRESERVED (never deleted — DD1). (Was: "active JSONL deleted after archive".)
@@ -113,19 +106,9 @@ describe('SessionManager JSONL Persistence', () => {
       expect(Math.abs(state.lastActiveAt.getTime() - stale.getTime())).toBeLessThan(1000);
     });
 
-    it('/new reset writes real summary content instead of placeholder text', async () => {
-      const summaryManager = new SessionManager(240, 1440, tmpDir, makeProvider('Health facts: user tracks fasting glucose and knee pain.'));
-      await summaryManager.addTurn('chat-summary', { role: 'user', content: 'Summarize me' }, { role: 'assistant', content: 'Noted' });
-      await summaryManager.resetSession('chat-summary');
-
-      const summariesDir = path.join(tmpDir, 'summaries');
-      const summaryFiles = fs.readdirSync(summariesDir);
-      const summaryPath = path.join(summariesDir, summaryFiles[0]);
-      const summary = fs.readFileSync(summaryPath, 'utf-8');
-
-      expect(summary).toContain('Health facts: user tracks fasting glucose and knee pain.');
-      expect(summary).not.toContain('This session has been archived.');
-    });
+    // P2b/D3.6 (DD9): the /new archive-summary feature (summaries/ + generateSummary) is RETIRED — the
+    // compaction pipeline copies its summary to the daily log via the summary sink (PHI-safe narrative
+    // store), and /new just archives the window. (Was: "/new reset writes real summary content".)
 
     // P2b/D1.4 (DD10): idle soft-reset compaction is RETIRED. An under-budget, idle session is NOT
     // compacted — the full verbatim window is returned, the provider is never called. (Token-budget

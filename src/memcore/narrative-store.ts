@@ -23,6 +23,7 @@ export interface NarrativeAppendResult {
 
 const LOG_HEADING = '## Log';
 const LEDGER_HEADING = '## Ledger writes';
+const SESSION_SUMMARY_HEADING = '## Session summary';
 
 export class NarrativeStore {
   constructor(private readonly rootDir: string, private readonly clock: Clock = systemClock) {}
@@ -58,6 +59,22 @@ export class NarrativeStore {
   async appendLedgerAnchor(date: string, entity: string, factId: string): Promise<string> {
     const entryLine = `- ${entity} → ${factId}`;
     const { lines, lineStart } = this.insertIntoLedgerSection(this.readLines(date), date, entryLine);
+    return this.write(date, lines, lineStart);
+  }
+
+  /**
+   * Append a compaction summary block under `## Session summary` (spec 14 §4 step 4). The bullets carry
+   * `sessions/<file>#L<n>` anchors, so the daily log is searchable + dreamable and points back at the
+   * verbatim day-file lines. Reuses the heading if it already exists that day.
+   */
+  async appendSessionSummary(date: string, summary: string): Promise<string> {
+    const entryLines = summary.split('\n').filter((l) => l.length > 0);
+    const lines = this.readLines(date);
+    if (!lines.includes(SESSION_SUMMARY_HEADING)) {
+      lines.push(SESSION_SUMMARY_HEADING);
+    }
+    const lineStart = lines.length + 1;
+    lines.push(...entryLines);
     return this.write(date, lines, lineStart);
   }
 

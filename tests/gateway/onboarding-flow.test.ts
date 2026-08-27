@@ -88,6 +88,7 @@ describe('Gateway onboarding integration', () => {
     (gateway as any).sessions = {
       prepareHistory: jest.fn().mockResolvedValue([]),
       recordTurn: jest.fn().mockResolvedValue(undefined),
+      recordPromptUsage: jest.fn().mockResolvedValue(undefined),
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).reconcileHeartbeatPolicies = jest.fn().mockResolvedValue(undefined);

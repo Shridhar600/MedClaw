@@ -67,7 +67,7 @@ describe('PROD-P1-6 empty/whitespace message guard', () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (gateway as any).agentLoop = { run };
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (gateway as any).sessions = { prepareHistory, recordTurn, resetSession: jest.fn() };
+      (gateway as any).sessions = { prepareHistory, recordTurn, recordPromptUsage: jest.fn().mockResolvedValue(undefined), resetSession: jest.fn() };
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
       return { run, send, prepareHistory, recordTurn };
@@ -134,7 +134,7 @@ describe('PROD-P1-6 empty/whitespace message guard', () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (gateway as any).agentLoop = { run };
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (gateway as any).sessions = { prepareHistory, recordTurn, resetSession: jest.fn() };
+      (gateway as any).sessions = { prepareHistory, recordTurn, recordPromptUsage: jest.fn().mockResolvedValue(undefined), resetSession: jest.fn() };
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
       return { run, prepareHistory, recordTurn };

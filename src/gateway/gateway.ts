@@ -24,6 +24,7 @@ import { LedgerStore, NarrativeStore, SafetyView, EpisodeStore, CuriosityQueue, 
 import type { FactType } from '../memcore';
 import { SqliteFactMirror, SqliteEventSink, SqliteVecIndex, SqliteKeywordIndex, SqliteChunkStats, SqliteSessionIndex, ledgerFactToRecord, isRemoteEmbeddingBaseUrl } from '../indexstore';
 import { createSessionTools } from '../tools/session-tools';
+import { deprecatedSessionWarnings } from '../config/deprecations';
 import type { EmbeddingPort } from '../ports';
 import { systemClock } from '../ports';
 import { CapturePipeline } from '../capture';
@@ -68,6 +69,9 @@ export class Gateway {
   private factMirror?: SqliteFactMirror;
   private eventSink?: SqliteEventSink;
   private sessionIndex?: SqliteSessionIndex;
+  // D3.4 (spec 14 §4 step 4): copies each compaction summary to today's daily log. Built in the memcore
+  // block (needs the NarrativeStore + WriteQueue), wired into the SessionManager after it is constructed.
+  private sessionSummarySink?: (anchoredSummary: string) => Promise<void>;
   private profileRegistry?: ProfileRegistry;
   private resolvedMemoryWorkspace?: string;
   private bootHealth?: { providers: ReadinessResult[]; telegram: ReadinessResult };
@@ -90,6 +94,12 @@ export class Gateway {
     const profileId = (profilesConfig?.defaultProfileId ?? 'default') as ProfileId;
 
     console.log('[gateway] Starting Redacted...');
+
+    // P2b DD10 / D3.7: warn once at boot for any retired idle-reset config key still set to a
+    // non-default value (they no longer trigger anything).
+    for (const warning of deprecatedSessionWarnings(config.sessions)) {
+      console.warn(`[gateway] Deprecated config: ${warning}`);
+    }
 
     // Bootstrap workspace with template files on first run
     this.bootstrapWorkspace(config.memory.workspace);
@@ -209,6 +219,19 @@ export class Gateway {
         render: (facts) => safetyView.render(facts),
         listSafetyRelevant: () => ledgerStore.listSafetyRelevant(),
       });
+
+      // D3.4 (spec 14 §4 step 4 / A-M2): the compaction-summary → daily-log sink. The write goes through
+      // the single-writer WriteQueue (background priority); the LLM that produced the summary already ran
+      // outside the queue (B2). Best-effort — the SessionManager wraps the call so a failure never fails
+      // compaction. Searchable/dreamable: the bullets (with their sessions/<file>#L<n> anchors) land in the
+      // narrative daily log, read directly by dreaming and indexed on the next reconcile/boot.
+      this.sessionSummarySink = async (anchoredSummary: string): Promise<void> => {
+        const day = new Date().toISOString().slice(0, 10);
+        await writeQueue.enqueue('background', {
+          label: 'session-summary',
+          run: () => narrativeStore.appendSessionSummary(day, anchoredSummary),
+        });
+      };
 
       // P2 A1/A2: the FactMirror (recall Stage 1 source) + the per-file re-derivation seam.
       // The mirror opens its OWN connection to the SAME search.db (M-3). It is fully rebuildable
@@ -407,6 +430,9 @@ export class Gateway {
       provider: mainProvider,
       toolRegistry: registry,
       compaction: config.sessions.compaction,
+      // P2b spec 14 §3: real-token window triggers + the model's context window (DD4).
+      window: config.sessions.window,
+      contextWindow: config.providers.main.contextWindow,
       profileId,
       // A-MF5: registry-backed installs are one thread per profile (flat archive); the no-registry
       // legacy/ad-hoc path keeps per-chat isolation (namespaced archive) to avoid cross-chat bleed.
@@ -415,6 +441,11 @@ export class Gateway {
     // F8: run compaction LLM calls at 'background' priority (below user + heartbeat). prepareHistory
     // (where compaction happens) runs before AgentLoop acquires the semaphore, so this never deadlocks.
     this.sessions.setBackgroundRunner((fn) => semaphore.run('background', fn));
+    // D3.4 (spec 14 §4 step 4): copy each compaction summary to the daily log (if the memcore block wired
+    // the sink; absent ⇒ compaction still runs, just without the daily-log copy).
+    if (this.sessionSummarySink) {
+      this.sessions.setSummarySink(this.sessionSummarySink);
+    }
 
     // Wave D-2 (PLAT-20): session_search FTS over the append-only day-file archive — the losslessness
     // substrate for prune (D3). The index opens its OWN connection to the profile search.db (M-3) and
@@ -535,6 +566,12 @@ export class Gateway {
       return 'Starting fresh session. Your health memory is preserved.';
     }
 
+    // P2b DD9: /compact forces the spec-14 §4 compaction pipeline on demand.
+    if (text.trim() === '/compact') {
+      await this.sessions!.runCompaction(chatId);
+      return 'Compacted the conversation. Older turns are summarized; recent context is kept. Nothing is lost — ask me to look anything up.';
+    }
+
     const emergency = this.handleEmergencyInput(text);
     if (emergency) {
       // CAP (M5): emergency utterances are the highest-value health data —
@@ -572,6 +609,8 @@ export class Gateway {
       { role: 'user', content: text },
       ...result.trace,
     ]);
+    // Spec 14 §3: feed the real window-fill signal back so the NEXT turn's prepareHistory can trigger.
+    await this.sessions!.recordPromptUsage(chatId, result.lastPromptTokens);
     await this.debouncedReconcile(chatId);
     return result.text;
   }
@@ -619,6 +658,13 @@ export class Gateway {
     if (text.trim() === '/new') {
       await this.sessions!.resetSession(chatId);
       await this.channel!.send(chatId, { text: 'Starting fresh session. Your health memory is preserved.' });
+      return;
+    }
+
+    // P2b DD9: /compact forces the spec-14 §4 compaction pipeline on demand.
+    if (text.trim() === '/compact') {
+      await this.sessions!.runCompaction(chatId);
+      await this.channel!.send(chatId, { text: 'Compacted the conversation. Older turns are summarized; recent context is kept. Nothing is lost — ask me to look anything up.' });
       return;
     }
 
@@ -739,6 +785,8 @@ export class Gateway {
         { role: 'user', content: agentInput },
         ...result.trace,
       ]);
+      // Spec 14 §3: feed the real window-fill signal back so the NEXT turn's prepareHistory can trigger.
+      await this.sessions!.recordPromptUsage(chatId, result.lastPromptTokens);
     } catch (e) {
       persistFailed = true;
       console.error(
@@ -862,6 +910,7 @@ export class Gateway {
           { role: 'user', content: input },
           ...result.trace,
         ]);
+        await this.sessions!.recordPromptUsage(job.chatId, result.lastPromptTokens);
         await this.scheduler?.recordOutcome(job.id, 'noop');
         await this.reconcileHeartbeatPolicies(job.chatId);
         return;
@@ -872,6 +921,7 @@ export class Gateway {
         { role: 'user', content: input },
         ...result.trace,
       ]);
+      await this.sessions!.recordPromptUsage(job.chatId, result.lastPromptTokens);
       await this.scheduler?.recordOutcome(job.id, 'sent');
       await this.reconcileHeartbeatPolicies(job.chatId);
     } catch (error) {

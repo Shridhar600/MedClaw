@@ -73,4 +73,10 @@ export interface AgentRunResult {
   trace: Message[];
   usedTools: string[];
   healthResponse: boolean;
+  /**
+   * P2b A-MF1 / spec 14 §3 — the LAST provider call's `usage.promptTokens` this turn (a ReAct turn
+   * makes N calls; the final call carries the full accumulated context ⇒ the correct window-fill
+   * signal). `undefined` when the provider omitted usage ⇒ the Gateway falls back to a chars/4 estimate.
+   */
+  lastPromptTokens?: number;
 }

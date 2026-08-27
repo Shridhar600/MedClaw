@@ -17,6 +17,8 @@ function makeConfig(tmpDir: string): AppConfig {
     },
     channels: { telegram: { enabled: false, botToken: '' } },
     tools: { allow: ['*'], deny: [] },
+    // Registry-scoped so sessions land under tmpDir (isolated) rather than the shared ~/.redacted/sessions.
+    profiles: { baseDir: path.join(tmpDir, 'profiles-base'), defaultProfileId: 'default' },
     memory: {
       workspace: path.join(tmpDir, 'workspace'),
       search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
@@ -88,5 +90,19 @@ describe('Gateway session_search wiring (Wave D-2)', () => {
     expect(res.isError).toBeFalsy();
     expect(res.content[0].text).toContain('metformin 500mg twice daily');
     expect(res.content[0].text).toContain('#L1');
+  });
+
+  it('the /compact command forces a compaction and confirms (DD9)', async () => {
+    gateway = new Gateway(makeConfig(tmpDir));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    await gateway.start();
+    warn.mockRestore();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const spy = jest.spyOn((gateway as any).sessions, 'runCompaction');
+    const reply = await gateway.handleTestMessage('chat-c', '/compact');
+
+    expect(spy).toHaveBeenCalledWith('chat-c');
+    expect(reply.toLowerCase()).toContain('compacted');
   });
 });

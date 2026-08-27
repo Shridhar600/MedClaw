@@ -47,6 +47,12 @@ export const DEFAULT_CONFIG: AppConfig = {
       memoryFlush: true,
       keepRecentTurns: 10,
     },
+    window: {
+      pruneAtPercent: 35,
+      compactAtPercent: 50,
+      emergencyAtPercent: 80,
+      keepRecentTurns: 10,
+    },
   },
   heartbeat: {
     enabled: true,

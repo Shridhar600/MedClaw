@@ -199,27 +199,23 @@ describe('PHI file modes', () => {
       expectFileMode(path.join(sessionsPath, new Date().toISOString().slice(0, 10) + '.jsonl'));
     });
 
-    it('archive + summary dirs/files are 0o700 / 0o600 after reset', async () => {
+    // P2b/D3.6 (DD9): /new is a window-archive — the archive/ + summaries/ side-files are retired. The
+    // day-file archive is preserved 0600 and continues; the window snapshot is dropped. (Was: "archive +
+    // summary dirs/files are 0o700 / 0o600 after reset".)
+    it('reset preserves the day-file archive 0600 and drops the window (no archive/summaries side-files)', async () => {
       const sessionsPath = path.join(root, 'sessions2');
       const sm = new SessionManager(60, 1440, sessionsPath, undefined, undefined, undefined, 'default');
       await sm.recordTurn('456', [mkMsg('user', 'hi'), mkMsg('assistant', 'hello')]);
       await sm.resetSession('456');
 
-      const archiveDir = path.join(sessionsPath, 'archive');
-      const summariesDir = path.join(sessionsPath, 'summaries');
-      expectDirMode(archiveDir);
-      expectDirMode(summariesDir);
+      // The retired side-files are never created.
+      expect(fs.existsSync(path.join(sessionsPath, 'archive'))).toBe(false);
+      expect(fs.existsSync(path.join(sessionsPath, 'summaries'))).toBe(false);
 
-      const archives = listFiles(archiveDir).filter((p) => p.endsWith('.jsonl'));
-      expect(archives.length).toBe(1);
-      expectFileMode(archives[0]);
-
-      const summaries = listFiles(summariesDir).filter((p) => p.endsWith('.md'));
-      expect(summaries.length).toBe(1);
-      expectFileMode(summaries[0]);
-
-      // The active file must have been moved away.
-      expect(fs.existsSync(path.join(sessionsPath, 'active-456.jsonl'))).toBe(false);
+      // The append-only day file is preserved at 0600 (searchable), the window snapshot is dropped.
+      expectDirMode(sessionsPath);
+      expectFileMode(path.join(sessionsPath, new Date().toISOString().slice(0, 10) + '.jsonl'));
+      expect(fs.existsSync(path.join(sessionsPath, 'session-window.json'))).toBe(false);
     });
 
     it('append to a pre-existing loose day file tightens it to 0o600', async () => {

@@ -87,3 +87,31 @@ describe('NarrativeStore.append', () => {
     expect(await s.read('2026-01-01')).toBeNull();
   });
 });
+
+describe('NarrativeStore.appendSessionSummary (spec 14 §4 step 4)', () => {
+  it('appends a compaction summary under a ## Session summary heading and returns an anchor', async () => {
+    const store = new NarrativeStore(tmpDir);
+    const anchor = await store.appendSessionSummary(
+      '2026-08-27',
+      '- knee pain noted (sessions/2026-08-27.jsonl#L3)\n- started metformin (sessions/2026-08-27.jsonl#L5)',
+    );
+
+    const content = await store.read('2026-08-27');
+    expect(content).toContain('## Session summary');
+    expect(content).toContain('knee pain noted');
+    expect(content).toContain('started metformin');
+    expect(anchor).toMatch(/^memory\/2026-08-27\.md#L\d+$/);
+  });
+
+  it('is 0600 and reuses the same heading across two summaries the same day', async () => {
+    const store = new NarrativeStore(tmpDir);
+    await store.appendSessionSummary('2026-08-27', '- first summary point');
+    await store.appendSessionSummary('2026-08-27', '- second summary point');
+    const content = (await store.read('2026-08-27')) ?? '';
+    expect(content.match(/## Session summary/g)?.length).toBe(1);
+    expect(content).toContain('first summary point');
+    expect(content).toContain('second summary point');
+    const mode = fs.statSync(path.join(tmpDir, 'memory', '2026-08-27.md')).mode & 0o777;
+    expect(mode).toBe(0o600);
+  });
+});

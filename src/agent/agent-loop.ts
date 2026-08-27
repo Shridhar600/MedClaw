@@ -77,6 +77,9 @@ export class AgentLoop {
     ];
     const trace: Message[] = [];
     const usedTools: string[] = [];
+    // A-MF1: the last provider call's promptTokens is the window-fill signal. Overwritten each call so
+    // the FINAL call (full accumulated context) is the value surfaced on the result.
+    let lastPromptTokens: number | undefined;
 
     const tools: ToolSchema[] = this.registry.getAvailable().map(t => ({
       type: 'function',
@@ -89,6 +92,7 @@ export class AgentLoop {
 
     for (let iteration = 0; iteration < this.config.maxIterations; iteration++) {
       const response = await this.provider.chat(messages, tools);
+      if (response.usage) lastPromptTokens = response.usage.promptTokens;
 
       if (response.type === 'text') {
         // B7 <used> tag is parsed + stripped BEFORE health-classification / disclaimer / persist /
@@ -107,6 +111,7 @@ export class AgentLoop {
           trace,
           usedTools: [...new Set(usedTools)],
           healthResponse: isHealthRelated,
+          lastPromptTokens,
         };
       }
 
@@ -157,6 +162,7 @@ export class AgentLoop {
       trace,
       usedTools: [...new Set(usedTools)],
       healthResponse: false,
+      lastPromptTokens,
     };
   }
 

@@ -310,14 +310,14 @@ describe('Token-budget compaction trigger (#15)', () => {
     expect(contextWindowFor(undefined)).toBe(8192);
   });
 
-  it('prepareHistory compacts an over-budget session with no idle', async () => {
+  it('prepareHistory emergency-compacts an over-budget (≥80%) session synchronously (spec 14 §3)', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
-    // model undefined -> 8192 window; pct=1 -> budget ~= 81.92 tokens ~= 327 chars.
+    // model undefined -> 8192 context window. A real reading of 7000 tokens ~= 85% ⇒ emergency (sync).
     const provider = makeStrictProvider('compacted summary', undefined);
     const manager = new SessionManager(240, 1440, tmpDir, provider, undefined, {
       enabled: true,
-      triggerAtTokenPercent: 1,
+      triggerAtTokenPercent: 80,
       memoryFlush: false,
       keepRecentTurns: 2,
     });
@@ -330,6 +330,7 @@ describe('Token-budget compaction trigger (#15)', () => {
     }
     const before = manager.getHistory(chatId).length;
     expect(before).toBe(16);
+    await manager.recordPromptUsage(chatId, 7000); // ≥80% of the 8192 window → emergency
 
     const prepared = await manager.prepareHistory(chatId);
 
@@ -502,50 +503,8 @@ describe('Compaction window-save failure degrades gracefully (F6)', () => {
   });
 });
 
-// F9: generateSummary persists its fallback into a .md file; a provider error
-// there must go through summarizeErrorForLog (name+frame), never raw
-// error.message which can echo transcript PHI.
-describe('Session summary never persists a raw provider error (F9, PHI)', () => {
-  let tmpDir: string;
-
-  beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-summary-phi-'));
-  });
-
-  afterEach(() => {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-    jest.restoreAllMocks();
-  });
-
-  it('sanitizes a provider error in the fallback summary', async () => {
-    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const marker = 'glucose-300-SECRETMARKER';
-    const throwingProvider = {
-      modelName: 'gpt-5.6-luna',
-      chat: jest.fn(async () => {
-        throw new Error(`upstream failure ${marker}`);
-      }),
-      embed: jest.fn(async () => [0.1]),
-    } as unknown as LLMProvider;
-    const manager = new SessionManager(240, 1440, tmpDir, throwingProvider, undefined, {
-      enabled: true,
-      triggerAtTokenPercent: 80,
-      memoryFlush: false,
-      keepRecentTurns: 10,
-    });
-    // I3 added bounded retries to summary calls; this test asserts log/file
-    // sanitization — use a single fast attempt (plain Error = non-transient,
-    // but keep the explicit policy so intent does not depend on that gate).
-    manager.setCompactionRetryPolicy({ attempts: 1 });
-    const chatId = 'chat-f9';
-    await manager.addTurn(chatId, { role: 'user', content: 'u0' }, { role: 'assistant', content: 'a0' });
-
-    await manager.resetSession(chatId);
-
-    const summariesDir = path.join(tmpDir, 'summaries');
-    const files = fs.readdirSync(summariesDir);
-    expect(files.length).toBeGreaterThan(0);
-    const content = fs.readFileSync(path.join(summariesDir, files[0]), 'utf-8');
-    expect(content).not.toContain('SECRETMARKER');
-  });
-});
+// P2b/D3.6 (DD9): the F9 archive-summary PHI test is RETIRED with its feature — generateSummary +
+// the summaries/ side-file no longer exist. The surviving compaction pipeline never PERSISTS error
+// text: a summary failure keeps the old window (nothing written), and the daily-log summary copy runs
+// only on success (a real summary, no error). PHI-in-logs stays enforced by summarizeErrorForLog at
+// every compaction catch. (Was: "Session summary never persists a raw provider error".)
