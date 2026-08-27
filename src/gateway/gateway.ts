@@ -22,7 +22,8 @@ import { createSafetyTools } from '../tools/safety-tools';
 import { WriteQueue, replayJournal } from '../profiles';
 import { LedgerStore, NarrativeStore, SafetyView, EpisodeStore, CuriosityQueue, TYPE_TO_FILE } from '../memcore';
 import type { FactType } from '../memcore';
-import { SqliteFactMirror, SqliteEventSink, SqliteVecIndex, SqliteKeywordIndex, SqliteChunkStats, ledgerFactToRecord, isRemoteEmbeddingBaseUrl } from '../indexstore';
+import { SqliteFactMirror, SqliteEventSink, SqliteVecIndex, SqliteKeywordIndex, SqliteChunkStats, SqliteSessionIndex, ledgerFactToRecord, isRemoteEmbeddingBaseUrl } from '../indexstore';
+import { createSessionTools } from '../tools/session-tools';
 import type { EmbeddingPort } from '../ports';
 import { systemClock } from '../ports';
 import { CapturePipeline } from '../capture';
@@ -66,6 +67,7 @@ export class Gateway {
   private store?: SqliteStore;
   private factMirror?: SqliteFactMirror;
   private eventSink?: SqliteEventSink;
+  private sessionIndex?: SqliteSessionIndex;
   private profileRegistry?: ProfileRegistry;
   private resolvedMemoryWorkspace?: string;
   private bootHealth?: { providers: ReadinessResult[]; telegram: ReadinessResult };
@@ -413,6 +415,23 @@ export class Gateway {
     // F8: run compaction LLM calls at 'background' priority (below user + heartbeat). prepareHistory
     // (where compaction happens) runs before AgentLoop acquires the semaphore, so this never deadlocks.
     this.sessions.setBackgroundRunner((fn) => semaphore.run('background', fn));
+
+    // Wave D-2 (PLAT-20): session_search FTS over the append-only day-file archive — the losslessness
+    // substrate for prune (D3). The index opens its OWN connection to the profile search.db (M-3) and
+    // rebuilds from the day files when empty (post-migration / dropped table, A-MF4). It is injected into
+    // the SessionManager for incremental per-turn indexing and exposed as the session_search tool. The
+    // AgentLoop reads the registry live each turn, so registering here (after its construction) is fine.
+    // Individually wrapped (RES-P2-1): any failure disables search and boot continues with the rest.
+    try {
+      const sessionIndex = new SqliteSessionIndex({ dbPath, sessionsDir: this.sessions.sessionsDir });
+      this.sessionIndex = sessionIndex;
+      this.sessions.setTurnIndex(sessionIndex);
+      for (const tool of createSessionTools({ index: sessionIndex })) {
+        registry.register(tool);
+      }
+    } catch (e) {
+      console.warn('[gateway] session_search unavailable; continuing without it:', summarizeErrorForLog(e));
+    }
 
     // Channel
     if (config.channels.telegram.enabled) {
@@ -1014,6 +1033,13 @@ export class Gateway {
       console.warn('[gateway] Failed to close event sink:', summarizeErrorForLog(error));
     } finally {
       this.eventSink = undefined;
+    }
+    try {
+      this.sessionIndex?.close();
+    } catch (error) {
+      console.warn('[gateway] Failed to close session index:', summarizeErrorForLog(error));
+    } finally {
+      this.sessionIndex = undefined;
     }
   }
 

@@ -72,6 +72,16 @@ export interface SessionManagerOptions {
 
 type ArchiveReason = 'manual-reset' | 'idle-hard-reset';
 
+/**
+ * D2.5: the minimal seam by which the SessionManager feeds each appended archive line to the
+ * `session_search` FTS index (incremental indexing). Kept structural — NOT an import of the concrete
+ * indexstore adapter — so session.ts (gateway-tier) has no dependency on the index implementation.
+ * Best-effort: the caller wraps every call so an index failure degrades and never blocks a turn.
+ */
+export interface SessionTurnIndexer {
+  indexTurn(file: string, line: number, role: string, ts: string, content: string): void;
+}
+
 // --- Compaction token-budget trigger (#15) --------------------------------
 // A cheap safety-margin trigger, NOT exact accounting. `estimateTokens` is a
 // chars/4 English heuristic (20-30% error is acceptable because we compact
@@ -191,10 +201,23 @@ export class SessionManager {
   // unset (tests / no semaphore), the call runs directly. prepareHistory always runs BEFORE the
   // AgentLoop acquires the semaphore, so this background acquire cannot self-deadlock (v2-H-4).
   private runBackground?: <T>(fn: () => Promise<T>) => Promise<T>;
+  // D2.5: the session_search FTS index. When wired, recordTurn feeds each appended archive line to it
+  // (best-effort). Optional — no index ⇒ no incremental indexing (session_search unavailable / degraded).
+  private turnIndex?: SessionTurnIndexer;
 
   /** Wire compaction LLM calls through the semaphore at background priority (F8). */
   setBackgroundRunner(run: <T>(fn: () => Promise<T>) => Promise<T>): void {
     this.runBackground = run;
+  }
+
+  /** Wire the session_search FTS index for incremental per-turn indexing (D2.5). */
+  setTurnIndex(index: SessionTurnIndexer): void {
+    this.turnIndex = index;
+  }
+
+  /** The resolved day-file archive root — the Gateway builds the search index over this same directory. */
+  get sessionsDir(): string {
+    return this.sessionsPath;
   }
 
   private runLLM<T>(fn: () => Promise<T>): Promise<T> {
@@ -637,6 +660,22 @@ ${response.text.trim()}`;
     // holds: a failed append rejects the enqueue and `recordTurn` never mutates in-memory state.
     secureAppend(dayFilePath, block);
     this.dayFileLineCounts.set(dayFilePath, startLine + lines.length);
+    // D2.5: incrementally index each appended line for session_search (best-effort — an index failure
+    // degrades and never blocks the turn). The `{file, line}` anchor is the day-file's physical line, so
+    // an incrementally-indexed row and a disk rebuild resolve to the same JSONL line (idempotent upsert).
+    // Skip null/empty-content messages (e.g. an assistant tool-call carrier) — nothing textual to search.
+    if (this.turnIndex) {
+      try {
+        for (let i = 0; i < messages.length; i++) {
+          const content = messages[i].content;
+          if (typeof content === 'string' && content.length > 0) {
+            this.turnIndex.indexTurn(anchors[i].file, anchors[i].line, messages[i].role, now, content);
+          }
+        }
+      } catch (e) {
+        console.warn(`[session:${chatId}] turn indexing failed, continuing:`, summarizeErrorForLog(e));
+      }
+    }
     return anchors;
   }
 
