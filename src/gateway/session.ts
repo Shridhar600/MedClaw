@@ -59,6 +59,17 @@ interface WindowConfig {
   keepRecentTurns: number;
 }
 
+// A snapshot of what a compaction will summarize, captured under the write queue so the LLM can then run
+// OFF the queue (H2). `historyRef` is the identity of the history array at snapshot time — the apply
+// aborts if it was replaced since (A-MF3 live-tail re-check). `olderReal` excludes any leading summary.
+interface CompactionSnapshot {
+  historyRef: Message[];
+  split: number;
+  oldSummary: string;
+  olderReal: Message[];
+  rangeAnchors: Anchor[];
+}
+
 // A-M4: the new canonical constructor shape. Expand-contract — the legacy positional signature keeps
 // working during the P2b Wave D-1 cutover and is removed once every caller is migrated.
 export interface SessionManagerOptions {
@@ -90,7 +101,9 @@ export interface SessionManagerOptions {
  * Best-effort: the caller wraps every call so an index failure degrades and never blocks a turn.
  */
 export interface SessionTurnIndexer {
-  indexTurn(file: string, line: number, role: string, ts: string, content: string): void;
+  indexTurn(chatId: string, file: string, line: number, role: string, ts: string, content: string): void;
+  /** H5: durably flag a swallowed incremental-index failure so the next boot reconciles the hole. */
+  markDirty?(): void;
 }
 
 // --- Compaction token-budget trigger (#15) --------------------------------
@@ -113,6 +126,12 @@ export function estimateTokens(messages: Message[]): number {
   }
   return Math.ceil(chars / 4);
 }
+
+// M2: the chars/4 fallback (used only when a provider omits usage) counts the session history but NOT the
+// system prompt (SAFETY + assembled memory) and tool schemas the provider actually received — those can be
+// several thousand tokens. Add a conservative overhead so the fallback errs toward triggering compaction
+// rather than under-reporting a large real prompt as near-zero. Real usage readings never use this.
+const FALLBACK_SYSTEM_OVERHEAD_TOKENS = 3000;
 
 export type WindowTrigger = 'none' | 'prune' | 'compact' | 'emergency';
 
@@ -146,34 +165,28 @@ export function contextWindowFor(model?: string): number {
 // --- Tool-call group integrity (#16) --------------------------------------
 // OpenAI rejects any history where a `tool` message is not a response to a
 // preceding `assistant`+`tool_calls`, or where an `assistant`+`tool_calls`
-// is not immediately followed by its tool result(s). Compaction must never
-// produce such a history.
+// is not immediately followed by its tool result(s). Compaction splits on a
+// turn (user-message) boundary — never mid-group — and `stripOrphanToolMessages`
+// is the belt-and-braces sanitizer that guarantees a valid history regardless.
 
-// Is history[i] a clean place to START the kept (recent) slice? A `tool`
-// message is never clean (it would be orphaned from its parent). An assistant
-// is clean only when it does not continue a tool group (i.e. the previous
-// message is not a tool result). user / system are always clean.
-function isCleanBoundaryStart(history: Message[], i: number): boolean {
-  const msg = history[i];
-  if (!msg) return true;
-  if (msg.role === 'tool') return false;
-  if (msg.role === 'assistant') {
-    const prev = history[i - 1];
-    return !prev || prev.role !== 'tool';
-  }
-  return true;
+// H4 / A-M6: turn-aware retention split. A "turn" = the span from a `user` message to the next `user`
+// message (same definition prune uses). The kept (recent) slice starts ON a user message, so it always
+// begins with the user's question and NEVER an orphaned tool group or a half-turn (spec 14 §4 keeps the
+// last `keepTurns` TURNS, not messages). Returns the index at which the recent slice begins; the older
+// slice is history[0..split). Keeps everything (split 0) when there are fewer turns than `keepTurns`.
+export function turnAwareSplit(history: Message[], keepTurns: number): number {
+  if (keepTurns <= 0) return history.length;
+  const userIdx: number[] = [];
+  for (let i = 0; i < history.length; i++) if (history[i].role === 'user') userIdx.push(i);
+  if (userIdx.length <= keepTurns) return 0; // fewer complete turns than we keep ⇒ keep all
+  return userIdx[userIdx.length - keepTurns]; // the user message that starts the last `keepTurns` turns
 }
 
-// Compute the older/recent split index. Start at `length - keepRecent`, then
-// move EARLIER (keep MORE in recent) until the boundary is clean. Never move
-// later — that would drop content. Keeping a few extra recent turns is
-// harmless.
-export function computeCleanSplit(history: Message[], keepRecent: number): number {
-  let split = Math.max(0, history.length - keepRecent);
-  while (split > 0 && !isCleanBoundaryStart(history, split)) {
-    split--;
-  }
-  return split;
+// M3: strip any `sessions/<file>#L<n>` anchor a model summary may contain, so every stored anchor is
+// application-supplied and range-validated (never a model-fabricated line that could point out of range
+// or at a nonexistent file). Removes an optional wrapping "( … )" and trailing whitespace around it.
+function stripModelAnchors(text: string): string {
+  return text.replace(/\s*\(?sessions\/\S+#L\d+\)?/g, '');
 }
 
 // Defensive sanitizer (belt-and-braces even after the boundary snap, and
@@ -253,6 +266,26 @@ export function anchorSummaryBullets(summaryText: string, rangeAnchors: Anchor[]
       return `${line} (sessions/${a.file}#L${a.line})`;
     })
     .join('\n');
+}
+
+// H11: true when the day file exists and its last byte is not '\n' (a torn/external write). Reads only
+// the final byte (via a positioned read) — never the whole file. Any error ⇒ treat as a normal append.
+function dayFileEndsWithoutNewline(filePath: string): boolean {
+  let fd: number | undefined;
+  try {
+    const size = fs.statSync(filePath).size;
+    if (size === 0) return false;
+    fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(1);
+    fs.readSync(fd, buf, 0, 1, size - 1);
+    return buf[0] !== 0x0a; // 0x0a === '\n'
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* best-effort */ }
+    }
+  }
 }
 
 export class SessionManager {
@@ -436,40 +469,43 @@ export class SessionManager {
   }
 
   async prepareHistory(chatId: string): Promise<Message[]> {
-    return this.enqueue(chatId, async () => {
+    // Three phases so the compaction LLM runs OFF the per-chat write queue (H2): a fast queued
+    // evaluate+prune, then (for compact/emergency) the pipeline whose LLM is off-queue and whose apply
+    // re-enters the queue (A-MF3 live tail), then a fast queued read of the resulting window.
+    const trigger = await this.enqueue(chatId, async () => {
       const session = this.sessions.get(chatId);
-      if (!session) {
-        return [];
-      }
-
+      if (!session) return 'none' as WindowTrigger;
       // P2b/D1.4 (DD10): the perpetual thread NEVER idle-resets. spec 14 §3 real-token triggers replace
-      // the old chars/4 budget heuristic: the last window-fill reading maps to prune / compact / emergency.
-      const trigger = this.evaluateWindowTrigger(chatId);
-      if (trigger !== 'none') {
+      // the old chars/4 heuristic: the last window-fill reading maps to prune / compact / emergency.
+      const t = this.evaluateWindowTrigger(chatId);
+      if (t !== 'none') {
         // A-MF3: consume the reading so the SAME stale value cannot re-fire the trigger every turn (the
-        // reading only changes on the next recordPromptUsage). Marked before the action so a background
-        // compaction started here is not re-started by a concurrent prepareHistory.
+        // reading only changes on the next recordPromptUsage).
         const reading = this.lastPromptTokensByChat.get(chatId);
         if (reading) reading.triggered = true;
-
-        if (trigger === 'prune') {
-          // ≥35%, no LLM — runs synchronously in this queued op (lossless; day file untouched).
+        if (t === 'prune') {
+          // ≥35%, no LLM — synchronous in this queued op (lossless; day file untouched).
           session.history = pruneToolResults(session.history, PRUNE_LAST_TURNS);
           this.saveWindowFor(chatId);
-        } else if (trigger === 'compact') {
-          // ≥50% — run the LLM pipeline in the BACKGROUND (a separate queued op, applied against the live
-          // tail); return the current (possibly over-budget) window now, the compacted one lands later.
-          this.startBackgroundCompaction(chatId);
-        } else if (trigger === 'emergency') {
-          // ≥80% — compact BEFORE the turn proceeds (await). A-M3: always runs, even enabled:false.
-          await this.runEmergencyCompaction(chatId);
         }
       }
-
-      // DD2: the returned history IS the window — the summary system message (if any) followed by the
-      // verbatim tail — sanitized so this boundary never emits an OpenAI-rejectable history (#16).
-      return stripOrphanToolMessages([...(this.sessions.get(chatId)?.history ?? [])]);
+      return t;
     });
+
+    if (trigger === 'compact') {
+      // ≥50% — LLM pipeline in the BACKGROUND (off-queue LLM; queued live-tail apply). Return the
+      // current (possibly over-budget) window now; the compacted one lands on a later turn.
+      this.startBackgroundCompaction(chatId);
+    } else if (trigger === 'emergency') {
+      // ≥80% — reduce BEFORE the turn proceeds (awaited). A-M3: always runs, even enabled:false.
+      await this.runEmergencyCompaction(chatId);
+    }
+
+    // DD2: the returned history IS the window — the summary system message (if any) followed by the
+    // verbatim tail — sanitized so this boundary never emits an OpenAI-rejectable history (#16).
+    return this.enqueue(chatId, async () =>
+      stripOrphanToolMessages([...(this.sessions.get(chatId)?.history ?? [])]),
+    );
   }
 
   // spec 14 §3: map the current window-fill reading to a trigger. A reading already consumed this cycle
@@ -480,34 +516,66 @@ export class SessionManager {
     return windowTriggerFor(this.windowFillPercent(chatId), this.windowThresholds());
   }
 
-  // A-MF3: start a background compaction as a SEPARATE queued op (fire-and-forget) so it applies against
-  // the live tail after the current op, without blocking the returned window. In-flight guarded so a
-  // second ≥50% trigger never starts a second pipeline. Never rejects out (best-effort).
-  private startBackgroundCompaction(chatId: string): void {
-    if (this.compactionInFlight.has(chatId)) return;
-    const p = this.enqueue(chatId, async () => {
-      await this.runCompactionInternal(chatId);
-      this.saveWindowFor(chatId);
-    })
-      .catch((e) => console.warn(`[session:${chatId}] background compaction failed:`, summarizeErrorForLog(e)))
+  // A-MF3 / H1: run at most ONE compaction pipeline per chat at a time. A concurrent trigger (a second
+  // ≥50%, or an ≥80% emergency arriving during a ≥50% compact) reuses the SAME in-flight promise instead
+  // of starting a second LLM pipeline. The LLM runs OFF the write queue (H2); only the snapshot + apply
+  // re-enter it. Never rejects out (best-effort).
+  private guardedCompaction(chatId: string): Promise<void> {
+    const existing = this.compactionInFlight.get(chatId);
+    if (existing) return existing;
+    const p = this.doCompaction(chatId)
+      .catch((e) => console.warn(`[session:${chatId}] compaction failed:`, summarizeErrorForLog(e)))
       .finally(() => this.compactionInFlight.delete(chatId));
     this.compactionInFlight.set(chatId, p);
+    return p;
   }
 
-  // ≥80% emergency (A-MF3 awaits it). A-M3 escape valve: emergency ALWAYS runs even when
-  // compaction.enabled=false — as a no-LLM clean-split truncate — so a disabled config cannot overflow.
+  // ≥50% background compaction (fire-and-forget). M1: honors compaction.enabled=false (no proactive
+  // compaction when disabled — the ≥80% emergency valve still protects against overflow).
+  private startBackgroundCompaction(chatId: string): void {
+    if (this.compactionConfig?.enabled === false) return;
+    void this.guardedCompaction(chatId);
+  }
+
+  // ≥80% emergency (awaited before the turn). When enabled + an LLM is available, summarize (reusing an
+  // in-flight pipeline, never a 2nd — H1). Then GUARANTEE the window is within budget with a no-LLM
+  // turn-aware truncate that preserves a leading summary (A-M3 escape valve + M4) — idempotent, a no-op
+  // when a just-applied compaction already brought the window to target.
   private async runEmergencyCompaction(chatId: string): Promise<void> {
-    if (this.compactionConfig?.enabled === false) {
-      const session = this.sessions.get(chatId);
-      if (session) {
-        const keepRecent = Math.max(1, this.windowThresholds().keepRecentTurns);
-        const split = computeCleanSplit(session.history, keepRecent);
-        session.history = stripOrphanToolMessages(session.history.slice(split));
-      }
-    } else {
-      await this.runCompactionInternal(chatId);
+    if (this.compactionConfig?.enabled !== false && this.llmProvider) {
+      await this.guardedCompaction(chatId);
     }
-    this.saveWindowFor(chatId);
+    await this.enqueue(chatId, async () => {
+      this.emergencyTruncate(chatId);
+      this.saveWindowFor(chatId);
+    });
+  }
+
+  // A-M3 / M4 overflow valve: reduce the in-memory window to a leading summary (preserved as metadata)
+  // plus the last `keepRecentTurns` turns. No LLM; swaps in memory REGARDLESS of window-save success
+  // (the caller persists best-effort) so an ≥80% emergency can never leave the window over budget.
+  private emergencyTruncate(chatId: string): void {
+    const session = this.sessions.get(chatId);
+    if (!session) return;
+    const keepRecent = Math.max(1, this.windowThresholds().keepRecentTurns);
+    const first = session.history[0];
+    const hasSummary = !!first && first.role === 'system'
+      && typeof first.content === 'string' && first.content.startsWith(SUMMARY_PREFIX);
+    const summaryPrefix = hasSummary ? [first] : [];
+    const rest = hasSummary ? session.history.slice(1) : session.history;
+    const split = turnAwareSplit(rest, keepRecent);
+    session.history = [...summaryPrefix, ...stripOrphanToolMessages(rest.slice(split))];
+  }
+
+  // Drain any in-flight compaction for a chat (used by tests + graceful shutdown). Never rejects.
+  async awaitCompaction(chatId: string): Promise<void> {
+    await this.compactionInFlight.get(chatId)?.catch(() => undefined);
+  }
+
+  // Await EVERY in-flight background compaction (graceful shutdown): a fire-and-forget pipeline must not
+  // write the window / summary sink after the store closes, nor outlive the process. Never rejects.
+  async drainCompactions(): Promise<void> {
+    await Promise.all([...this.compactionInFlight.values()].map((p) => p.catch(() => undefined)));
   }
 
   async recordTurn(chatId: string, turnTrace: Message[]): Promise<Anchor[]> {
@@ -553,7 +621,7 @@ export class SessionManager {
     await this.enqueue(chatId, async () => {
       const reading = tokens !== undefined
         ? { tokens, estimated: false }
-        : { tokens: estimateTokens(this.sessions.get(chatId)?.history ?? []), estimated: true };
+        : { tokens: estimateTokens(this.sessions.get(chatId)?.history ?? []) + FALLBACK_SYSTEM_OVERHEAD_TOKENS, estimated: true };
       this.lastPromptTokensByChat.set(chatId, reading);
       this.saveWindowFor(chatId);
     });
@@ -578,11 +646,14 @@ export class SessionManager {
     });
   }
 
+  // Public compaction (the /compact command + tests). With an LLM: the full §4 pipeline (off-queue LLM,
+  // queued live-tail apply), reusing an in-flight one. Without an LLM: a synchronous turn-aware truncate.
   async runCompaction(chatId: string): Promise<void> {
-    await this.enqueue(chatId, async () => {
-      await this.runCompactionInternal(chatId);
-      this.saveWindowFor(chatId); // D1.5: persist the post-compaction window snapshot
-    });
+    if (this.llmProvider) {
+      await this.guardedCompaction(chatId);
+    } else {
+      await this.enqueue(chatId, async () => this.noLlmCompact(chatId));
+    }
   }
 
   /**
@@ -627,50 +698,66 @@ export class SessionManager {
     };
   }
 
-  private async runCompactionInternal(chatId: string): Promise<void> {
+  // No-LLM compaction (no provider): a synchronous turn-aware truncate (M4 preserves a leading summary),
+  // candidate-then-swap so a failed window save keeps the old window (M5 / spec §4). Runs inside a queued op.
+  private noLlmCompact(chatId: string): void {
     const session = this.sessions.get(chatId);
     if (!session) return;
-
     const keepRecent = Math.max(1, this.windowThresholds().keepRecentTurns);
-    const doFlush = this.compactionConfig?.memoryFlush ?? true;
-
-    if (!this.llmProvider) {
-      // #16: snap the boundary so we never start the kept slice on an orphan `tool` message, then
-      // sanitize belt-and-braces. D1.6: in-memory-only — the day-file archive is untouched (DD1).
-      const split = computeCleanSplit(session.history, keepRecent);
-      session.history = stripOrphanToolMessages(session.history.slice(split));
-      return;
-    }
-
-    // #16: split on a CLEAN boundary (never mid tool-call group) so recentTurns
-    // does not start with a dangling `tool` and olderTurns does not end with an
-    // unmatched assistant+tool_calls.
-    const split = computeCleanSplit(session.history, keepRecent);
-    const recentTurns = session.history.slice(split);
-    const olderTurns = session.history.slice(0, split);
-
-    if (olderTurns.length === 0) {
-      session.history = stripOrphanToolMessages(recentTurns);
-      return;
-    }
-
-    // §4.2: the day-file anchors of the older REAL messages (excluding any leading compaction summary),
-    // used to anchor the summary bullets. The tail maps 1:1 to the day-file lines after verbatimFrom
-    // (Option C), and compaction never rewrites the day files (DD1), so these anchors always resolve.
     const first = session.history[0];
     const hasSummary = !!first && first.role === 'system'
       && typeof first.content === 'string' && first.content.startsWith(SUMMARY_PREFIX);
-    const olderRealCount = split - (hasSummary ? 1 : 0);
-    const rangeAnchors: Anchor[] = readLinesAfter(this.archiveDir(chatId), this.deriveWindow(chatId).verbatimFrom)
-      .slice(0, Math.max(0, olderRealCount))
-      .map((l) => ({ file: l.file, line: l.line }));
+    const summaryPrefix = hasSummary ? [first] : [];
+    const rest = hasSummary ? session.history.slice(1) : session.history;
+    const split = turnAwareSplit(rest, keepRecent);
+    if (split === 0) return; // nothing older to drop
+    const candidate = [...summaryPrefix, ...stripOrphanToolMessages(rest.slice(split))];
+    if (!this.persistCandidateWindow(chatId, hasSummary ? (first.content as string).slice(SUMMARY_PREFIX.length) : '', candidate.length - summaryPrefix.length)) {
+      return; // M5: window save failed → keep the old window
+    }
+    session.history = candidate;
+  }
 
-    if (doFlush && this.toolRegistry) {
+  // §4 pipeline as three parts so the LLM runs OFF the write queue (H2):
+  //   1. snapshot (queued read) → 2. flush + summary LLM (off-queue) → 3. apply (queued, live-tail).
+  private async doCompaction(chatId: string): Promise<void> {
+    const snap = await this.enqueue(chatId, async () => this.captureCompactionSnapshot(chatId));
+    if (!snap) return; // nothing older to summarize (H3: never re-summarizes a lone leading summary)
+    const built = await this.buildCompactionSummary(chatId, snap);
+    if (!built) return; // flush/summary failed or empty ⇒ keep the OLD window (H6 / spec §4)
+    await this.enqueue(chatId, async () => this.applyCompaction(chatId, snap, built));
+  }
+
+  // §4.1/4.2 snapshot: the real older messages to summarize (EXCLUDING any leading summary — H3), the
+  // preserved prior-summary text, and the day-file anchors for the older range. null ⇒ nothing to do.
+  private captureCompactionSnapshot(chatId: string): CompactionSnapshot | null {
+    const session = this.sessions.get(chatId);
+    if (!session) return null;
+    const keepRecent = Math.max(1, this.windowThresholds().keepRecentTurns);
+    const history = session.history;
+    const first = history[0];
+    const hasSummary = !!first && first.role === 'system'
+      && typeof first.content === 'string' && first.content.startsWith(SUMMARY_PREFIX);
+    const oldSummary = hasSummary ? (first.content as string).slice(SUMMARY_PREFIX.length) : '';
+    const split = turnAwareSplit(history, keepRecent);
+    const olderReal = history.slice(hasSummary ? 1 : 0, split); // exclude the leading summary (H3)
+    if (olderReal.length === 0) return null;
+    const rangeAnchors: Anchor[] = readLinesAfter(this.archiveDir(chatId), this.deriveWindow(chatId).verbatimFrom)
+      .slice(0, olderReal.length)
+      .map((l) => ({ file: l.file, line: l.line }));
+    return { historyRef: history, split, oldSummary, olderReal, rangeAnchors };
+  }
+
+  // §4 flush + summary, run OFF the write queue. H6: a flush failure is a failed step ⇒ return null (keep
+  // the old window), never fall through to a summary. H3: the prior summary is preserved verbatim and the
+  // new bullets are appended. M3: model-supplied anchors are stripped before app-supplied ones are added.
+  private async buildCompactionSummary(chatId: string, snap: CompactionSnapshot): Promise<{ combinedSummary: string; newBullets: string } | null> {
+    const doFlush = this.compactionConfig?.memoryFlush ?? true;
+    if (doFlush && this.toolRegistry && this.llmProvider) {
       const flushPrompt = `Before this conversation is compacted, persist durable memory.
 - Save health facts to memory files using memory_write if needed.
 - Capture open follow-ups.
 - If nothing is important, respond briefly.`;
-
       try {
         const memoryTools = this.toolRegistry.getAvailable().filter(t => t.group === 'group:memory');
         const toolSchemas: ToolSchema[] = memoryTools.map(t => ({
@@ -678,33 +765,24 @@ export class SessionManager {
           function: {
             name: t.name,
             description: t.description,
-            parameters: {
-              type: 'object' as const,
-              properties: t.parameters.properties,
-              required: t.parameters.required,
-            },
+            parameters: { type: 'object' as const, properties: t.parameters.properties, required: t.parameters.required },
           },
         }));
-
         const flushResponse = await this.runLLMWithRetry<LLMResponse>('compaction-flush', () => this.llmProvider!.chat(
           [
             { role: 'system', content: flushPrompt },
-            // #16: sanitize before sending — a clean split already prevents a
-            // trailing unmatched assistant+tool_calls, this is belt-and-braces.
-            ...stripOrphanToolMessages(olderTurns),
+            ...stripOrphanToolMessages(snap.olderReal),
             { role: 'user', content: 'Persist what should be remembered before compaction.' },
           ],
           toolSchemas,
         ));
-
         if (flushResponse.type === 'tool_call') {
-          for (const c of flushResponse.toolCalls) {
-            await this.toolRegistry.execute(c.name, c.arguments);
-          }
+          for (const c of flushResponse.toolCalls) await this.toolRegistry.execute(c.name, c.arguments);
         }
       } catch (e) {
-        // Provider error messages can echo transcript PHI — sanitized frame only.
-        console.warn('[session] Flush turn failed:', summarizeErrorForLog(e));
+        // H6 / spec §4: the flush is a pipeline STEP — its failure keeps the old window (do NOT summarize).
+        console.warn(`[session:${chatId}] Compaction flush failed (keeping current window):`, summarizeErrorForLog(e));
+        return null;
       }
     }
 
@@ -716,47 +794,73 @@ Preserve:
 - follow-up actions
 - notable report-analysis outcomes
 Keep it concise and structured.`;
-
     try {
       const summaryResponse = await this.runLLMWithRetry<LLMResponse>('compaction-summary', () => this.llmProvider!.chat([
         { role: 'system', content: compactPrompt },
-        { role: 'user', content: JSON.stringify(olderTurns) },
+        { role: 'user', content: JSON.stringify(snap.olderReal) },
       ]));
-
-      const summaryText =
-        summaryResponse.type === 'text' && summaryResponse.text.trim().length > 0
-          ? summaryResponse.text.trim()
-          : null;
+      const summaryText = summaryResponse.type === 'text' && summaryResponse.text.trim().length > 0
+        ? summaryResponse.text.trim()
+        : null;
       if (!summaryText) {
-        // spec 14 §4: an empty summary is a failed step — keep the OLD window intact (never lose the
-        // thread), retry on the next trigger. Do NOT drop the older turns unsummarized.
-        console.warn('[session] Compaction produced no summary; keeping the current window.');
-        return;
+        console.warn(`[session:${chatId}] Compaction produced no summary; keeping the current window.`);
+        return null;
       }
-
-      // §4.2 anchor the bullets, then assemble the new window (§4.3): summary (prepended) + last-N.
-      const anchored = anchorSummaryBullets(summaryText, rangeAnchors);
-      const assembled: Message[] = [
-        { role: 'system', content: `${SUMMARY_PREFIX}${anchored}` },
-        ...recentTurns,
-      ];
-      // #16 belt-and-braces after the clean split. DD1: the day-file archive is NEVER rewritten; the
-      // caller persists the window snapshot (saveWindowFor).
-      session.history = stripOrphanToolMessages(assembled);
-
-      // §4 step 4: copy the anchored bullets to today's daily log (best-effort — a sink failure must not
-      // fail compaction; the window is already updated).
-      if (this.summarySink) {
-        try {
-          await this.summarySink(anchored);
-        } catch (e) {
-          console.warn('[session] Session-summary daily-log copy failed:', summarizeErrorForLog(e));
-        }
-      }
+      // M3: strip any model-fabricated anchor, then attach app-supplied in-range anchors.
+      const newBullets = anchorSummaryBullets(stripModelAnchors(summaryText), snap.rangeAnchors);
+      // H3: preserve the prior summary verbatim (its facts + anchors), append the new bullets.
+      const combinedSummary = snap.oldSummary ? `${snap.oldSummary}\n${newBullets}` : newBullets;
+      return { combinedSummary, newBullets };
     } catch (e) {
-      // spec 14 §4: any step failing ⇒ keep the OLD window (do not truncate to recent), log sanitized,
-      // retry next trigger. Provider error messages can echo transcript PHI — sanitized frame only.
-      console.warn('[session] Compact turn failed (keeping current window):', summarizeErrorForLog(e));
+      // spec §4: any step failing ⇒ keep the OLD window, retry next trigger. Sanitized frame only (PHI).
+      console.warn(`[session:${chatId}] Compact turn failed (keeping current window):`, summarizeErrorForLog(e));
+      return null;
+    }
+  }
+
+  // §4.3 apply against the LIVE tail (A-MF3): if the history array was replaced since the snapshot
+  // (emergency truncate / prune / reset), abort — the reduction already happened another way. M5:
+  // persist the candidate window FIRST; swap in memory only on success. Then copy the NEW bullets to the
+  // daily log (best-effort, idempotent — never the preserved old summary, so no double-logging — H3).
+  private async applyCompaction(chatId: string, snap: CompactionSnapshot, built: { combinedSummary: string; newBullets: string }): Promise<void> {
+    const session = this.sessions.get(chatId);
+    if (!session || session.history !== snap.historyRef) return; // live-tail changed ⇒ abort
+    const recentTail = session.history.slice(snap.split); // includes turns recorded during the LLM call
+    const candidate = stripOrphanToolMessages([
+      { role: 'system', content: `${SUMMARY_PREFIX}${built.combinedSummary}` },
+      ...recentTail,
+    ]);
+    if (!this.persistCandidateWindow(chatId, built.combinedSummary, candidate.length - 1)) {
+      return; // M5: window save failed → keep the old window (spec §4)
+    }
+    session.history = candidate;
+    if (this.summarySink) {
+      try {
+        await this.summarySink(built.newBullets);
+      } catch (e) {
+        console.warn(`[session:${chatId}] Session-summary daily-log copy failed:`, summarizeErrorForLog(e));
+      }
+    }
+  }
+
+  // M5: persist a candidate window (summary + a verbatim tail of `tailLength` day-file lines) WITHOUT
+  // mutating in-memory state. Returns true on a successful save, false (keep old window) on failure.
+  private persistCandidateWindow(chatId: string, summaryBlock: string, tailLength: number): boolean {
+    const window: SessionWindow = {
+      summaryBlock,
+      verbatimFrom: walkBackAnchor(this.archiveDir(chatId), tailLength),
+    };
+    const usage = this.lastPromptTokensByChat.get(chatId);
+    if (usage) {
+      window.lastPromptTokens = usage.tokens;
+      window.lastPromptTokensEstimated = usage.estimated;
+    }
+    try {
+      saveWindow(this.windowPath(chatId), window);
+      return true;
+    } catch (e) {
+      console.warn(`[session:${chatId}] window save failed; keeping the old window (compaction not applied):`, summarizeErrorForLog(e));
+      return false;
     }
   }
 
@@ -764,8 +868,12 @@ Keep it concise and structured.`;
     const nowDate = new Date();
     const now = nowDate.toISOString();
     const lines = messages.map(msg => JSON.stringify(this.serializeEntry(chatId, msg, now)));
-    const block = lines.join('\n') + '\n';
     const dayFilePath = this.dayFilePath(chatId, nowDate);
+    // H11 (defensive): secureAppend has no fsync, so a power-loss / external truncation can leave the
+    // day file without a trailing newline. A raw append would FUSE the new record onto the torn line,
+    // making one malformed physical line — the new (health) turn would vanish from resume + rebuild.
+    // Insert a separating newline so the new record always starts its own physical line.
+    const block = (dayFileEndsWithoutNewline(dayFilePath) ? '\n' : '') + lines.join('\n') + '\n';
     // D1.3: assign each appended message a stable {file, line} anchor from the re-derived count. The
     // first appended message takes line `count+1`; the file basename is the anchor's `file`.
     const startLine = this.dayFileLineCount(dayFilePath);
@@ -781,15 +889,17 @@ Keep it concise and structured.`;
     // an incrementally-indexed row and a disk rebuild resolve to the same JSONL line (idempotent upsert).
     // Skip null/empty-content messages (e.g. an assistant tool-call carrier) — nothing textual to search.
     if (this.turnIndex) {
-      try {
-        for (let i = 0; i < messages.length; i++) {
-          const content = messages[i].content;
-          if (typeof content === 'string' && content.length > 0) {
-            this.turnIndex.indexTurn(anchors[i].file, anchors[i].line, messages[i].role, now, content);
-          }
+      for (let i = 0; i < messages.length; i++) {
+        const content = messages[i].content;
+        if (typeof content !== 'string' || content.length === 0) continue;
+        try {
+          this.turnIndex.indexTurn(chatId, anchors[i].file, anchors[i].line, messages[i].role, now, content);
+        } catch (e) {
+          // H5: per-line guard — one line's index failure must not skip its siblings. Mark the index
+          // dirty so the next boot reconciles the hole from the archive. Never blocks the turn.
+          console.warn(`[session:${chatId}] turn indexing failed, continuing:`, summarizeErrorForLog(e));
+          this.turnIndex.markDirty?.();
         }
-      } catch (e) {
-        console.warn(`[session:${chatId}] turn indexing failed, continuing:`, summarizeErrorForLog(e));
       }
     }
     return anchors;

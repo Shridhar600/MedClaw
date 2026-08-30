@@ -30,10 +30,10 @@ describe('session_search tool', () => {
 
   test('returns a planted turn with its anchor, role, timestamp, and verbatim snippet (PLAT-20/A-L1)', async () => {
     const index = realIndex();
-    index.indexTurn('2026-06-01.jsonl', 7, 'user', '2026-06-01T09:00:00.000Z', 'metformin 500mg twice daily');
+    index.indexTurn('chat1', '2026-06-01.jsonl', 7, 'user', '2026-06-01T09:00:00.000Z', 'metformin 500mg twice daily');
     const [tool] = createSessionTools({ index });
 
-    const res = await tool.execute({ query: 'metformin 500mg twice daily' });
+    const res = await tool.execute({ query: 'metformin 500mg twice daily' }, { chatId: 'chat1' });
     index.close();
 
     expect(res.isError).toBeFalsy();
@@ -46,10 +46,10 @@ describe('session_search tool', () => {
 
   test('a no-match query degrades to a graceful message, not an error', async () => {
     const index = realIndex();
-    index.indexTurn('2026-06-01.jsonl', 1, 'user', '2026-06-01T09:00:00.000Z', 'metformin note');
+    index.indexTurn('chat1', '2026-06-01.jsonl', 1, 'user', '2026-06-01T09:00:00.000Z', 'metformin note');
     const [tool] = createSessionTools({ index });
 
-    const res = await tool.execute({ query: 'zolpidem' });
+    const res = await tool.execute({ query: 'zolpidem' }, { chatId: 'chat1' });
     index.close();
 
     expect(res.isError).toBeFalsy();
@@ -60,22 +60,38 @@ describe('session_search tool', () => {
     const failing = { search: (): SessionSearchResult => ({ hits: [], status: 'failed' }) };
     const [tool] = createSessionTools({ index: failing });
 
-    const res = await tool.execute({ query: 'anything' });
+    const res = await tool.execute({ query: 'anything' }, { chatId: 'chat1' });
 
     expect(res.isError).toBeFalsy();
     expect(res.content[0].text.toLowerCase()).toContain('unavailable');
   });
 
-  test('passes the limit option through to the index', async () => {
-    let captured: { limit?: number } | undefined;
+  // X-1: the tool must scope the search to the calling chat, and fail closed if no chat context is present.
+  test('passes the calling chatId (and limit) through to the index (X-1 scope)', async () => {
+    let captured: { chatId?: string; limit?: number } | undefined;
     const spy = {
-      search: (_q: string, opts?: { limit?: number }): SessionSearchResult => {
+      search: (_q: string, opts?: { chatId?: string; limit?: number }): SessionSearchResult => {
         captured = opts;
         return { hits: [], status: 'full' };
       },
     };
     const [tool] = createSessionTools({ index: spy });
-    await tool.execute({ query: 'x', limit: 3 });
+    await tool.execute({ query: 'x', limit: 3 }, { chatId: 'chat-42' });
+    expect(captured?.chatId).toBe('chat-42');
     expect(captured?.limit).toBe(3);
+  });
+
+  test('fails closed (unavailable) when there is no chat context — never searches unscoped', async () => {
+    let called = false;
+    const spy = {
+      search: (): SessionSearchResult => {
+        called = true;
+        return { hits: [], status: 'full' };
+      },
+    };
+    const [tool] = createSessionTools({ index: spy });
+    const res = await tool.execute({ query: 'x' }); // no context
+    expect(called).toBe(false); // the index was NOT queried unscoped
+    expect(res.content[0].text.toLowerCase()).toContain('unavailable');
   });
 });

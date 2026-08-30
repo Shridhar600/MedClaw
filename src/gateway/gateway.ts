@@ -434,9 +434,11 @@ export class Gateway {
       window: config.sessions.window,
       contextWindow: config.providers.main.contextWindow,
       profileId,
-      // A-MF5: registry-backed installs are one thread per profile (flat archive); the no-registry
-      // legacy/ad-hoc path keeps per-chat isolation (namespaced archive) to avoid cross-chat bleed.
-      perChatArchive: !this.profileRegistry,
+      // Wave-D panel X-1/X-2 (founder decision 2026-08-30): the perpetual THREAD is per-chat (health
+      // MEMORY stays per-profile). Every chat gets its own namespaced archive + window + index scope so a
+      // second chat on a profile can never resume another chat's summary or search its turns. spec 14 §2
+      // "per-profile thread" holds in the common one-chat-per-profile case (P0 auto-pair).
+      perChatArchive: true,
     });
     // F8: run compaction LLM calls at 'background' priority (below user + heartbeat). prepareHistory
     // (where compaction happens) runs before AgentLoop acquires the semaphore, so this never deadlocks.
@@ -577,10 +579,16 @@ export class Gateway {
       // CAP (M5): emergency utterances are the highest-value health data —
       // capture the raw text BEFORE the canned-response early-return.
       await this.captureUserTurn(chatId, text);
-      await this.sessions?.recordTurn(chatId, [
-        { role: 'user', content: text },
-        { role: 'assistant', content: emergency },
-      ]);
+      // C-2/H9: persistence is best-effort — a failed archive must NEVER suppress emergency guidance
+      // (medical-safety: reaching the user wins; divergence is logged sanitized). Mirrors handleMessage.
+      try {
+        await this.sessions?.recordTurn(chatId, [
+          { role: 'user', content: text },
+          { role: 'assistant', content: emergency },
+        ]);
+      } catch (e) {
+        console.error('[gateway] Failed to persist emergency turn (test path; sending guidance anyway):', summarizeErrorForLog(e));
+      }
       return emergency;
     }
 
@@ -605,12 +613,18 @@ export class Gateway {
       console.error('[gateway] Agent error (test path):', summarizeErrorForLog(e));
       return "I'm having trouble right now. Please try again in a moment.";
     }
-    await this.sessions!.recordTurn(chatId, [
-      { role: 'user', content: text },
-      ...result.trace,
-    ]);
-    // Spec 14 §3: feed the real window-fill signal back so the NEXT turn's prepareHistory can trigger.
-    await this.sessions!.recordPromptUsage(chatId, result.lastPromptTokens);
+    // C-2/H9: post-agent persistence is best-effort — mirror handleMessage's guarded pre-send persistence
+    // so the CLI/e2e path DEGRADES (still returns the answer) instead of throwing out of the handler.
+    try {
+      await this.sessions!.recordTurn(chatId, [
+        { role: 'user', content: text },
+        ...result.trace,
+      ]);
+      // Spec 14 §3: feed the real window-fill signal back so the NEXT turn's prepareHistory can trigger.
+      await this.sessions!.recordPromptUsage(chatId, result.lastPromptTokens);
+    } catch (e) {
+      console.error('[gateway] Post-agent persistence error (test path; returning answer anyway):', summarizeErrorForLog(e));
+    }
     await this.debouncedReconcile(chatId);
     return result.text;
   }
@@ -823,6 +837,13 @@ export class Gateway {
     this.reconcileTimers.clear();
     let firstError: unknown;
     try {
+      // Drain any in-flight background compaction BEFORE closing the store so its window/summary write
+      // completes against an open DB and never outlives the process (resilience: no work after stop()).
+      await this.sessions?.drainCompactions();
+    } catch (error) {
+      console.warn('[gateway] Failed to drain compactions:', summarizeErrorForLog(error));
+    }
+    try {
       await this.scheduler?.stop();
     } catch (error) {
       firstError = firstError ?? error;
@@ -1027,10 +1048,15 @@ export class Gateway {
         this.config.heartbeat.timezone,
       );
       const result = await flow.handle('restart onboarding');
-      await this.sessions?.recordTurn(chatId, [
-        { role: 'user', content: input },
-        { role: 'assistant', content: result.response },
-      ]);
+      // C-2/H9: best-effort persistence — a failed archive must not reject the onboarding response.
+      try {
+        await this.sessions?.recordTurn(chatId, [
+          { role: 'user', content: input },
+          { role: 'assistant', content: result.response },
+        ]);
+      } catch (e) {
+        console.error('[gateway] Failed to persist onboarding turn (returning response anyway):', summarizeErrorForLog(e));
+      }
       return result.response;
     }
 
@@ -1044,10 +1070,15 @@ export class Gateway {
     if (!result.response) {
       return undefined;
     }
-    await this.sessions?.recordTurn(chatId, [
-      { role: 'user', content: input },
-      { role: 'assistant', content: result.response },
-    ]);
+    // C-2/H9: best-effort persistence — a failed archive must not reject the onboarding response.
+    try {
+      await this.sessions?.recordTurn(chatId, [
+        { role: 'user', content: input },
+        { role: 'assistant', content: result.response },
+      ]);
+    } catch (e) {
+      console.error('[gateway] Failed to persist onboarding turn (returning response anyway):', summarizeErrorForLog(e));
+    }
     return result.response;
   }
 

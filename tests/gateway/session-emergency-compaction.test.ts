@@ -75,8 +75,9 @@ describe('prepareHistory real-token triggers (spec 14 §3, A-MF3)', () => {
     const before = mgr.getHistory('chat1').length;
 
     const p1 = await mgr.prepareHistory('chat1');
-    expect(p1.length).toBe(before); // not yet compacted — the pipeline is deferred
+    expect(p1.length).toBe(before); // not yet compacted — the pipeline is deferred (LLM runs off-queue)
 
+    await mgr.awaitCompaction('chat1'); // deterministically wait for the background pipeline to apply
     const p2 = await mgr.prepareHistory('chat1'); // the background compaction has landed
     warn.mockRestore();
     expect(p2.length).toBeLessThan(before);

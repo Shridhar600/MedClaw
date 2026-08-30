@@ -48,4 +48,20 @@ describe('AgentLoop token-usage surfacing (A-MF1)', () => {
     const result = await loop.run('hi');
     expect(result.lastPromptTokens).toBeUndefined();
   });
+
+  it('does NOT carry an earlier iteration usage forward when the FINAL call omits usage (H7)', async () => {
+    // First (tool) call reports usage; the final text call omits it. The last call's prompt is the
+    // largest (full accumulated context), so a stale earlier reading UNDER-reports the window fill and
+    // can skip a needed compaction/emergency. The honest signal is "no reading ⇒ downstream estimates".
+    const provider = makeProvider([
+      { type: 'tool_call', toolCalls: [{ id: 'c1', name: 'ping', arguments: {} }], usage: { promptTokens: 100, completionTokens: 5, totalTokens: 105 } },
+      { type: 'text', text: 'done' },
+    ]);
+    const registry = new ToolRegistry({ allow: ['*'], deny: [] });
+    registry.register(pingTool);
+    const loop = new AgentLoop(provider, registry, [], { maxIterations: 15, disclaimerEnabled: false });
+
+    const result = await loop.run('ping the system');
+    expect(result.lastPromptTokens).toBeUndefined();
+  });
 });

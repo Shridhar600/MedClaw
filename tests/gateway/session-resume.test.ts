@@ -60,7 +60,8 @@ describe('session resume from window + day files (D1.5)', () => {
     await a.runCompaction('c1');
     const before = await a.prepareHistory('c1');
     expect(before[0].role).toBe('system');
-    expect(before.slice(1).map((m: Message) => m.content)).toEqual(['u4', 'a4', 'u5', 'a5']);
+    // H4 turn-aware: keepRecentTurns=4 keeps the last 4 TURNS (8 messages), u2..a5.
+    expect(before.slice(1).map((m: Message) => m.content)).toEqual(['u2', 'a2', 'u3', 'a3', 'u4', 'a4', 'u5', 'a5']);
 
     rmActive('c1');
     const b = new SessionManager({ sessionsPath: dir, provider: makeProvider('UNUSED') });
@@ -92,6 +93,35 @@ describe('session resume from window + day files (D1.5)', () => {
     const b = new SessionManager({ sessionsPath: dir, perChatArchive: true });
     expect((await b.prepareHistory('cx')).map((m: Message) => m.content)).toEqual(['x1', 'x2']);
     expect((await b.prepareHistory('cy')).map((m: Message) => m.content)).toEqual(['y1']);
+  });
+
+  it('per-chat mode: one chat\'s compaction summary never leaks to another chat on resume (X-2)', async () => {
+    const a = new SessionManager({
+      sessionsPath: dir,
+      perChatArchive: true,
+      provider: makeProvider('SUMMARY of chat A — glucose 300 recorded'),
+      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: false, keepRecentTurns: 2 },
+    });
+    for (let i = 0; i < 6; i++) {
+      await a.recordTurn('chatA', [
+        { role: 'user', content: `a-u${i}` },
+        { role: 'assistant', content: `a-a${i}` },
+      ]);
+    }
+    await a.runCompaction('chatA'); // chatA now has a summary window mentioning glucose 300
+    await a.recordTurn('chatB', [
+      { role: 'user', content: 'chatB hello' },
+      { role: 'assistant', content: 'chatB hi' },
+    ]);
+
+    rmActive('chatA');
+    rmActive('chatB');
+    const b = new SessionManager({ sessionsPath: dir, perChatArchive: true });
+    const chatB = await b.prepareHistory('chatB');
+    // chatB resumes ONLY its own turns — never chatA's summary/PHI.
+    expect(chatB.some((m: Message) => typeof m.content === 'string' && m.content.includes('glucose 300'))).toBe(false);
+    expect(chatB.some((m: Message) => typeof m.content === 'string' && m.content.includes('Previous conversation summary'))).toBe(false);
+    expect(chatB.map((m: Message) => m.content)).toEqual(['chatB hello', 'chatB hi']);
   });
 
   it('a wiped window resumes empty at EOF, archive preserved (A-L6)', async () => {

@@ -69,10 +69,11 @@ describe('Compaction pipeline (spec 14 §4)', () => {
     const after = fs.readFileSync(dayFile, 'utf8');
     const history = mgr.getHistory('chat1');
 
-    // Window = [summary system message, ...the kept recent tail (keepRecentTurns=2 messages)].
+    // Window = [summary system message, ...the kept recent tail]. H4 turn-aware: keepRecentTurns=2 keeps
+    // the last 2 TURNS = 4 messages (u5,a5,u6,a6), so the window is 1 summary + 4.
     expect(history[0].role).toBe('system');
     expect(history[0].content).toContain('[Previous conversation summary]');
-    expect(history.length).toBe(1 + 2);
+    expect(history.length).toBe(1 + 4);
 
     // Every bullet anchor resolves to a real day-file line (spec 14 §4.2 anchor validity).
     const anchors = [...(history[0].content as string).matchAll(/sessions\/(\S+?)#L(\d+)/g)];

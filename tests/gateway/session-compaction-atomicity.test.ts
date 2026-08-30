@@ -70,11 +70,12 @@ describe('Compaction disk-preservation (DD1)', () => {
     expect(seededRaw).not.toContain('Compaction summary');
     expect(seededRaw).not.toContain('glucose');
 
-    // In-memory compaction still applied (best-effort window save; resume stays lossless from the
-    // un-advanced anchor).
+    // M5 candidate-then-swap: because the window save failed, the compaction is NOT applied in memory
+    // either — the OLD window is retained, so memory and disk never diverge (spec 14 §4). The day-file
+    // archive above is byte-identical regardless; that DD1 guarantee is the core of this test.
     const history = manager.getHistory(chatId);
-    expect(history[0].role).toBe('system');
-    expect(history[0].content).toContain('Previous conversation summary');
+    expect(history.every((m) => m.role !== 'system')).toBe(true);
+    expect(history.length).toBe(12);
 
     warnSpy.mockRestore();
   });

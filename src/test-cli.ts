@@ -193,6 +193,8 @@ async function main(): Promise<void> {
         { role: 'user', content: text },
         ...result.trace,
       ]);
+      // M6: feed the real window-fill signal so the CLI harness exercises the spec-14 token triggers too.
+      await sessions.recordPromptUsage(chatId, result.lastPromptTokens);
       res.json({ response: result.text });
     } catch (e) {
       res.status(500).json({ error: String(e) });
@@ -261,6 +263,8 @@ async function main(): Promise<void> {
         { role: 'user', content: text },
         ...result.trace,
       ]);
+      // M6: feed the real window-fill signal so the CLI harness exercises the spec-14 token triggers too.
+      await sessions.recordPromptUsage(chatId, result.lastPromptTokens);
       process.stdout.write(`🤖 ${result.text}\n\n`);
     } catch (e) {
       process.stdout.write(`❌ Error: ${e}\n\n`);

@@ -32,4 +32,9 @@ describe('deprecatedSessionWarnings (DD10 / A-L5)', () => {
     const w = deprecatedSessionWarnings(noWindow);
     expect(w.some((m) => m.includes('sessions.window'))).toBe(true);
   });
+
+  it('does not throw when the sessions block is absent (M9 — total for a partial config)', () => {
+    expect(() => deprecatedSessionWarnings(undefined as unknown as SessionsConfig)).not.toThrow();
+    expect(deprecatedSessionWarnings(undefined as unknown as SessionsConfig)).toEqual([]);
+  });
 });

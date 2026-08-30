@@ -42,8 +42,8 @@ describe('prepareHistory window (D1.4)', () => {
     expect(history[0].role).toBe('system');
     expect(history[0].content).toContain('[Previous conversation summary]');
     expect(history[0].content).toContain('SUMMARY: older turns');
-    // The verbatim tail (last 4 messages) follows the summary.
-    expect(history.slice(1).map((x: Message) => x.content)).toEqual(['u3', 'a3', 'u4', 'a4']);
+    // H4 turn-aware: keepRecentTurns=4 keeps the last 4 TURNS (8 messages, u1..a4); turn 0 is summarized.
+    expect(history.slice(1).map((x: Message) => x.content)).toEqual(['u1', 'a1', 'u2', 'a2', 'u3', 'a3', 'u4', 'a4']);
   });
 
   it('sanitizes an orphaned trailing assistant+tool_calls out of the returned window (#16)', async () => {

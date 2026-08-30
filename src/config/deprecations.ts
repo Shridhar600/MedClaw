@@ -12,6 +12,9 @@ import { DEFAULT_CONFIG } from './defaults';
 /** Deprecation warnings for a resolved SessionsConfig (empty when nothing deprecated is in effect). */
 export function deprecatedSessionWarnings(sessions: SessionsConfig): string[] {
   const warnings: string[] = [];
+  // M9: total for an absent block — a partial config (or a Gateway built without loadConfig) must not
+  // crash boot on a deprecation check.
+  if (!sessions) return warnings;
   if (sessions.softResetAfterMinutes !== DEFAULT_CONFIG.sessions.softResetAfterMinutes) {
     warnings.push(
       'sessions.softResetAfterMinutes is deprecated (P2b spec 14 §6) — idle resets are retired; the value is ignored. Remove it from config.json.',

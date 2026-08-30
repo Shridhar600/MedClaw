@@ -15,7 +15,7 @@ import type { SessionSearchResult } from '../indexstore';
 import { summarizeErrorForLog } from '../security';
 
 export interface SessionSearchIndex {
-  search(query: string, opts?: { limit?: number }): SessionSearchResult;
+  search(query: string, opts?: { chatId?: string; limit?: number }): SessionSearchResult;
 }
 
 export interface SessionToolsDeps {
@@ -43,15 +43,21 @@ export function createSessionTools(deps: SessionToolsDeps): Tool[] {
       },
       required: ['query'],
     },
-    async execute(params): Promise<ToolResult> {
+    async execute(params, context): Promise<ToolResult> {
       const query = typeof params.query === 'string' ? params.query : '';
       if (query.trim().length === 0) {
         return ok('Provide a non-empty query to search past conversation turns.');
       }
       const limit = typeof params.limit === 'number' ? params.limit : undefined;
+      // Per-chat isolation (X-1): scope the search to the calling chat so it can never surface another
+      // chat's health turns. Fail closed if no chat context is present rather than searching unscoped.
+      const chatId = context?.chatId;
+      if (chatId === undefined) {
+        return ok('Session search is unavailable in this context.');
+      }
 
       try {
-        const result = deps.index.search(query, limit !== undefined ? { limit } : undefined);
+        const result = deps.index.search(query, { chatId, ...(limit !== undefined ? { limit } : {}) });
         if (result.status === 'failed') {
           return ok('Session search is temporarily unavailable (index error). Try again shortly.');
         }

@@ -97,6 +97,27 @@ describe('session day-file anchors (D1.3)', () => {
     expect(nonEmptyLines(path.join(dir, 'cy', '2026-08-26.jsonl')).length).toBe(1);
   });
 
+  it('appending to a torn day file (no final newline) does not concatenate/lose the new turn (H11)', async () => {
+    // Simulate a torn/external write: a valid record with NO trailing newline (secureAppend has no
+    // fsync, so a power-loss can leave this). The next append must NOT fuse onto it.
+    const dayFile = path.join(dir, '2026-08-26.jsonl');
+    fs.writeFileSync(
+      dayFile,
+      JSON.stringify({ timestamp: '2026-08-26T09:00:00.000Z', role: 'user', content: 'seed turn', chatId: 'c1' }),
+      { encoding: 'utf-8' },
+    ); // deliberately no '\n'
+
+    const m = new SessionManager({ sessionsPath: dir });
+    const anchors = await m.recordTurn('c1', [{ role: 'assistant', content: 'appended turn' }]);
+
+    const lines = nonEmptyLines(dayFile);
+    expect(lines.length).toBe(2); // two distinct physical lines, not one fused malformed line
+    expect(JSON.parse(lines[0]).content).toBe('seed turn');
+    expect(JSON.parse(lines[1]).content).toBe('appended turn');
+    // the returned anchor resolves to the appended line
+    expect(JSON.parse(lines[anchors[0].line - 1]).content).toBe('appended turn');
+  });
+
   it('each day file has its own line count (rollover restarts at line 1 in the new file)', async () => {
     const m = new SessionManager({ sessionsPath: dir });
     jest.setSystemTime(new Date('2026-08-26T23:59:00.000Z'));

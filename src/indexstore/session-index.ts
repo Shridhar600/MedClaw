@@ -9,28 +9,32 @@
 // module (v2-core boundary). It owns its own `session_turns` (metadata) + `session_turns_fts` (content)
 // tables, independent of the P0 chunk tables.
 //
+// Per-chat isolation (Wave-D panel X-1/X-2): every row carries a `chat_id`, and the primary key is
+// `<chatId>#<file>#<line>` so two chats sharing a day-file basename never collide, and `search` filters
+// by chat so one chat can never read another chat's health turns. The chatId comes from the JSONL
+// entry (the same value the append path indexes with), so incremental indexing and rebuild agree.
+//
 // A-M1: plain contentful FTS5 + a companion metadata table (NOT external-content — the content lives in
-// JSONL on disk, not a SQLite table). A-MF4: rows are keyed by `id = "<file>#<line>"` so incremental
-// indexing and a full rebuild-from-disk coexist idempotently (a re-index of the same anchor is an upsert,
-// never a duplicate). Anchors are the day-file `{file, line}` — the same physical non-empty line numbers
-// the SessionManager append path assigns, so a rebuilt row resolves to the exact JSONL line.
+// JSONL on disk). Anchors are the day-file `{file, line}` (physical non-empty line numbers), the same the
+// SessionManager append path assigns, so a rebuilt row resolves to the exact JSONL line.
 
 import * as fs from 'fs';
 import * as path from 'path';
 import Database from 'better-sqlite3';
-import { summarizeErrorForLog } from '../security';
+import { summarizeErrorForLog, tightenFile } from '../security';
 
 export interface SqliteSessionIndexConfig {
   dbPath: string;
   /**
-   * The day-file archive root (registry mode) or its parent (no-registry mode — day files sit in
-   * per-chat subdirectories). Enables rebuild-from-disk on empty/corruption (A-MF4 / D2.3). When
-   * omitted, the index still works for incremental indexing but cannot self-heal from the archive.
+   * The day-file archive root. Enables rebuild-from-disk on empty / corruption / a durable dirty marker
+   * (A-MF4 / D2.3 / H5). When omitted, the index still works for incremental indexing but cannot self-heal.
    */
   sessionsDir?: string;
 }
 
 export interface SessionHit {
+  /** The chat the turn belongs to (per-chat isolation). */
+  chatId: string;
   file: string;
   line: number;
   role: string;
@@ -46,6 +50,7 @@ export interface SessionSearchResult {
 }
 
 interface HitRow {
+  chatId: string;
   file: string;
   line: number;
   role: string;
@@ -58,44 +63,73 @@ const DEFAULT_LIMIT = 20;
 
 export class SqliteSessionIndex {
   private readonly db: Database.Database;
+  private readonly dbPath: string;
   private readonly sessionsDir?: string;
+  private readonly dirtyMarkerPath: string;
 
   constructor(config: SqliteSessionIndexConfig) {
+    this.dbPath = config.dbPath;
+    this.dirtyMarkerPath = `${config.dbPath}.session-dirty`;
     this.db = new Database(config.dbPath);
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('busy_timeout = 5000');
     this.sessionsDir = config.sessionsDir;
     this.initSchema();
-    // A-MF4: an empty index next to an existing archive (post-migration / a dropped table) rebuilds
-    // from disk so the archive is searchable without an explicit call. A no-op when no day files exist.
+    // H10: better-sqlite3 creates search.db + its -wal/-shm siblings 0644 (world-readable PHI). Tighten
+    // all three to 0600 after the WAL pragma + schema created them. Warn-and-continue (never crash).
+    this.hardenDbFiles();
+    // Rebuild-from-disk when the archive is present AND the index is untrustworthy: empty (post-migration
+    // / dropped — A-MF4), a durable dirty marker from a swallowed incremental failure (H5), or FTS/metadata
+    // parity is broken (a dropped derived table left stale metadata — H8). Never throws out of the ctor.
     try {
-      if (this.sessionsDir && this.isEmpty()) {
+      if (this.sessionsDir && (this.isEmpty() || this.dirtyMarkerExists() || this.ftsParityBroken())) {
+        this.resetDerivedTables();
         this.rebuildFromDayFiles();
+        this.clearDirtyMarker();
       }
     } catch (e) {
       console.warn('[session-index] boot rebuild skipped:', summarizeErrorForLog(e));
     }
   }
 
-  /** Index (or re-index) one archive line. Idempotent per `{file, line}` (upsert), best-effort caller. */
-  indexTurn(file: string, line: number, role: string, ts: string, content: string): void {
-    this.db.transaction(() => this.writeTurn(file, line, role, ts, content))();
+  /** Index (or re-index) one archive line for a chat. Idempotent per `<chatId>#<file>#<line>` (upsert). */
+  indexTurn(chatId: string, file: string, line: number, role: string, ts: string, content: string): void {
+    this.db.transaction(() => this.writeTurn(chatId, file, line, role, ts, content))();
   }
 
   /**
-   * Verbatim search over the archive. Exact-phrase first (all tokens, adjacent — PLAT-20 "all match"),
-   * OR-joined fallback for recall, ordered by recency. Never throws: a corrupt store rebuilds from disk
-   * and retries once; any residual error degrades to an empty `failed` result (resilience).
+   * H5: record that an incremental index write was lost (a swallowed failure in the append path), durably,
+   * so the NEXT construction rebuilds from the archive and closes the hole even though the db is non-empty.
+   * Best-effort — a marker-write failure only forgoes the durable reconcile, never crashes the turn.
    */
-  search(query: string, opts?: { limit?: number }): SessionSearchResult {
+  markDirty(): void {
+    try {
+      fs.writeFileSync(this.dirtyMarkerPath, new Date().toISOString());
+      tightenFile(this.dirtyMarkerPath);
+    } catch (e) {
+      console.warn('[session-index] could not write dirty marker:', summarizeErrorForLog(e));
+    }
+  }
+
+  /**
+   * Verbatim search over one chat's archive. Exact-phrase first (all tokens, adjacent — PLAT-20 "all
+   * match"), OR-joined fallback for recall, ordered by recency. `chatId` scopes the result to that chat
+   * (omit only for maintenance/tests). Never throws: a corrupt/dropped derived table is reset + rebuilt
+   * from disk and retried once; any residual error degrades to an empty `failed` result (resilience).
+   */
+  search(query: string, opts?: { chatId?: string; limit?: number }): SessionSearchResult {
     const limit = opts?.limit && opts.limit > 0 ? opts.limit : DEFAULT_LIMIT;
     try {
-      return { hits: this.runSearch(query, limit), status: 'full' };
+      return { hits: this.runSearch(query, limit, opts?.chatId), status: 'full' };
     } catch (e) {
       if (this.sessionsDir && SqliteSessionIndex.isCorruptionError(e)) {
         try {
+          // H8: a dropped/damaged derived table is not repaired by an upsert — reset both tables, then
+          // rebuild the whole archive before retrying.
+          this.resetDerivedTables();
           this.rebuildFromDayFiles();
-          return { hits: this.runSearch(query, limit), status: 'full' };
+          this.clearDirtyMarker();
+          return { hits: this.runSearch(query, limit, opts?.chatId), status: 'full' };
         } catch (e2) {
           console.warn('[session-index] search failed after rebuild:', summarizeErrorForLog(e2));
           return { hits: [], status: 'failed' };
@@ -110,7 +144,8 @@ export class SqliteSessionIndex {
    * Re-index every day file under `sessionsDir` in ONE transaction (N-4: a crash mid-rebuild leaves the
    * index untouched, so the emptiness trigger can re-fire — no partial index). Line numbers are physical
    * non-empty positions (malformed lines occupy their slot but are not indexed), matching the append
-   * path's anchor assignment. Idempotent via the `{file, line}` upsert.
+   * path's anchor assignment. The chatId comes from each JSONL entry (matching the incremental path), so
+   * a rebuilt row keys identically. Idempotent via the `<chatId>#<file>#<line>` upsert.
    */
   rebuildFromDayFiles(sessionsDir?: string): void {
     const root = sessionsDir ?? this.sessionsDir;
@@ -119,6 +154,7 @@ export class SqliteSessionIndex {
     this.db.transaction(() => {
       for (const fp of files) {
         const base = path.basename(fp);
+        const subdir = SqliteSessionIndex.subdirChatId(root, fp);
         let lines: string[];
         try {
           lines = fs.readFileSync(fp, 'utf-8').split('\n').filter((l) => l.length > 0);
@@ -128,7 +164,7 @@ export class SqliteSessionIndex {
         }
         for (let i = 0; i < lines.length; i++) {
           const lineNo = i + 1; // 1-based physical non-empty line — the anchor the append path assigns
-          let entry: { role?: unknown; content?: unknown; timestamp?: unknown };
+          let entry: { role?: unknown; content?: unknown; timestamp?: unknown; chatId?: unknown };
           try {
             entry = JSON.parse(lines[i]);
           } catch {
@@ -138,7 +174,9 @@ export class SqliteSessionIndex {
           if (typeof content !== 'string' || content.length === 0) continue; // nothing textual to index
           const role = typeof entry.role === 'string' ? entry.role : '';
           const ts = typeof entry.timestamp === 'string' ? entry.timestamp : '';
-          this.writeTurn(base, lineNo, role, ts, content);
+          // chatId from the entry (matches the append path); fall back to the archive subdir name.
+          const chatId = typeof entry.chatId === 'string' && entry.chatId.length > 0 ? entry.chatId : subdir;
+          this.writeTurn(chatId, base, lineNo, role, ts, content);
         }
       }
     })();
@@ -159,39 +197,40 @@ export class SqliteSessionIndex {
 
   // ---- internals ---------------------------------------------------------
 
-  private runSearch(query: string, limit: number): SessionHit[] {
+  private runSearch(query: string, limit: number, chatId?: string): SessionHit[] {
     const tokens = query.match(/[\p{L}\p{N}]+/gu) ?? [];
     if (tokens.length === 0) return []; // empty / punctuation-only → no results, not an error
 
     // Exact-phrase first (adjacency ⇒ all tokens present, in order). Fall back to OR for recall.
     const phrase = `"${tokens.map(SqliteSessionIndex.escapeFts).join(' ')}"`;
-    let hits = this.matchRows(phrase, limit);
+    let hits = this.matchRows(phrase, limit, chatId);
     if (hits.length === 0 && tokens.length > 1) {
       const or = tokens.map((t) => `"${SqliteSessionIndex.escapeFts(t)}"`).join(' OR ');
-      hits = this.matchRows(or, limit);
+      hits = this.matchRows(or, limit, chatId);
     }
     return hits;
   }
 
-  private matchRows(matchQuery: string, limit: number): SessionHit[] {
+  private matchRows(matchQuery: string, limit: number, chatId?: string): SessionHit[] {
+    const scope = chatId !== undefined ? 'AND m.chat_id = @chatId' : '';
     const rows = this.db.prepare(`
-      SELECT m.file AS file, m.line AS line, m.role AS role, m.ts AS ts, f.content AS content
+      SELECT m.chat_id AS chatId, m.file AS file, m.line AS line, m.role AS role, m.ts AS ts, f.content AS content
       FROM session_turns_fts f
       JOIN session_turns m ON m.id = f.id
-      WHERE session_turns_fts MATCH ?
+      WHERE session_turns_fts MATCH @q ${scope}
       ORDER BY m.ts DESC, m.rowid DESC
-      LIMIT ?
-    `).all(matchQuery, limit) as HitRow[];
-    return rows.map((r) => ({ file: r.file, line: r.line, role: r.role, ts: r.ts, snippet: r.content }));
+      LIMIT @limit
+    `).all({ q: matchQuery, chatId, limit }) as HitRow[];
+    return rows.map((r) => ({ chatId: r.chatId, file: r.file, line: r.line, role: r.role, ts: r.ts, snippet: r.content }));
   }
 
-  private writeTurn(file: string, line: number, role: string, ts: string, content: string): void {
-    const id = `${file}#${line}`;
+  private writeTurn(chatId: string, file: string, line: number, role: string, ts: string, content: string): void {
+    const id = `${chatId}#${file}#${line}`;
     this.db.prepare(`
-      INSERT INTO session_turns (id, file, line, role, ts) VALUES (@id, @file, @line, @role, @ts)
-      ON CONFLICT(id) DO UPDATE SET file = excluded.file, line = excluded.line,
+      INSERT INTO session_turns (id, chat_id, file, line, role, ts) VALUES (@id, @chatId, @file, @line, @role, @ts)
+      ON CONFLICT(id) DO UPDATE SET chat_id = excluded.chat_id, file = excluded.file, line = excluded.line,
         role = excluded.role, ts = excluded.ts
-    `).run({ id, file, line, role, ts });
+    `).run({ id, chatId, file, line, role, ts });
     this.db.prepare('DELETE FROM session_turns_fts WHERE id = ?').run(id);
     this.db.prepare('INSERT INTO session_turns_fts (id, content) VALUES (?, ?)').run(id, content);
   }
@@ -200,14 +239,64 @@ export class SqliteSessionIndex {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS session_turns (
         id TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL,
         file TEXT NOT NULL,
         line INTEGER NOT NULL,
         role TEXT NOT NULL,
         ts TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_session_turns_ts ON session_turns(ts);
+      CREATE INDEX IF NOT EXISTS idx_session_turns_chat ON session_turns(chat_id);
       CREATE VIRTUAL TABLE IF NOT EXISTS session_turns_fts USING fts5(id UNINDEXED, content);
     `);
+  }
+
+  // H8: drop + recreate both derived tables (used when a search hit corruption or a boot parity mismatch).
+  private resetDerivedTables(): void {
+    this.db.exec('DROP TABLE IF EXISTS session_turns_fts; DROP TABLE IF EXISTS session_turns;');
+    this.initSchema();
+  }
+
+  // H8: the metadata has rows but the derived FTS is empty (a dropped/recreated FTS table) — the index is
+  // silently broken and would return healthy-looking empty results. Treat an unreadable table as broken.
+  private ftsParityBroken(): boolean {
+    try {
+      const meta = (this.db.prepare('SELECT COUNT(*) AS c FROM session_turns').get() as { c: number }).c;
+      const fts = (this.db.prepare('SELECT COUNT(*) AS c FROM session_turns_fts').get() as { c: number }).c;
+      return meta > 0 && fts === 0;
+    } catch {
+      return true;
+    }
+  }
+
+  private hardenDbFiles(): void {
+    for (const candidate of [this.dbPath, `${this.dbPath}-wal`, `${this.dbPath}-shm`]) {
+      tightenFile(candidate);
+    }
+  }
+
+  private dirtyMarkerExists(): boolean {
+    try {
+      return fs.existsSync(this.dirtyMarkerPath);
+    } catch {
+      return false;
+    }
+  }
+
+  private clearDirtyMarker(): void {
+    try {
+      if (fs.existsSync(this.dirtyMarkerPath)) fs.rmSync(this.dirtyMarkerPath, { force: true });
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  // The immediate subdirectory of `root` a day file sits in (the no-registry per-chat layout), or '' when
+  // the file is flat under root. Used only as a fallback when a JSONL entry lacks a chatId field.
+  private static subdirChatId(root: string, fp: string): string {
+    const rel = path.relative(root, fp);
+    const parts = rel.split(path.sep);
+    return parts.length > 1 ? parts[0] : '';
   }
 
   private static listDayFilePaths(root: string): string[] {

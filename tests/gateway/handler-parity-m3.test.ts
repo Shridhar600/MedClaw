@@ -1,3 +1,6 @@
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import type { AppConfig } from '../../src/config/types';
 
@@ -88,6 +91,71 @@ describe('handleTestMessage agent-run failure guard (M-3 parity)', () => {
     expect(res).toBe(FALLBACK);
     expect((gateway as any).agentLoop.run).not.toHaveBeenCalled();
     expect(errorSpy.mock.calls.flat().map(String).join('\n')).not.toContain('glucose');
+  });
+});
+
+describe('persistence-failure guards (C-2 / H9 — never-crash + mirror-sync)', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('test path: an emergency recordTurn failure still returns the guidance (does not throw)', async () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const gateway = new Gateway(makeConfig());
+    const emergencyText = 'I have severe chest pain and cannot breathe';
+    const expected = (gateway as any).handleEmergencyInput(emergencyText);
+    (gateway as any).getProfileForChat = () => 'default';
+    (gateway as any).capturePipeline = { ingest: jest.fn().mockResolvedValue(undefined) };
+    (gateway as any).sessions = {
+      recordTurn: jest.fn().mockRejectedValue(new Error('disk full: glucose 240')),
+      recordPromptUsage: jest.fn().mockResolvedValue(undefined),
+      resetSession: jest.fn(),
+    };
+
+    const res = await gateway.handleTestMessage('chat-e', emergencyText);
+    expect(res).toBe(expected);
+    expect(errorSpy.mock.calls.flat().map(String).join('\n')).not.toContain('glucose');
+  });
+
+  it('test path: a post-agent recordTurn/recordPromptUsage failure still returns the answer', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const gateway = new Gateway(makeConfig());
+    (gateway as any).getProfileForChat = () => 'default';
+    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
+    (gateway as any).capturePipeline = { ingest: jest.fn().mockResolvedValue(undefined) };
+    (gateway as any).debouncedReconcile = jest.fn().mockResolvedValue(undefined);
+    (gateway as any).agentLoop = {
+      run: jest.fn().mockResolvedValue({
+        text: 'Eat rice in moderation.',
+        trace: [{ role: 'assistant', content: 'Eat rice in moderation.' }],
+        usedTools: [],
+        healthResponse: false,
+        lastPromptTokens: 10,
+      }),
+    };
+    (gateway as any).sessions = {
+      prepareHistory: jest.fn().mockResolvedValue([]),
+      recordTurn: jest.fn().mockRejectedValue(new Error('disk full: glucose 240')),
+      recordPromptUsage: jest.fn().mockResolvedValue(undefined),
+      resetSession: jest.fn(),
+    };
+
+    const res = await gateway.handleTestMessage('chat-p', 'Can I eat rice?');
+    expect(res).toBe('Eat rice in moderation.');
+  });
+
+  it('onboarding: a recordTurn failure still returns the onboarding response (does not throw)', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-onb-'));
+    const gateway = new Gateway(makeConfig());
+    (gateway as any).getEffectiveWorkspace = () => ws;
+    (gateway as any).sessions = {
+      recordTurn: jest.fn().mockRejectedValue(new Error('disk full: glucose 240')),
+      resetSession: jest.fn(),
+    };
+
+    const res = await (gateway as any).handleOnboarding('chat-o', '/onboarding restart');
+    expect(typeof res).toBe('string');
+    expect(res.length).toBeGreaterThan(0);
+    fs.rmSync(ws, { recursive: true, force: true });
   });
 });
 

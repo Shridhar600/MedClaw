@@ -86,7 +86,8 @@ describe('Gateway session_search wiring (Wave D-2)', () => {
       { role: 'user', content: 'metformin 500mg twice daily' },
     ]);
 
-    const res = await registryOf().execute('session_search', { query: 'metformin 500mg twice daily' });
+    // The tool scopes by the calling chat (X-1) — search as chat-x (the chat the turn was recorded under).
+    const res = await registryOf().execute('session_search', { query: 'metformin 500mg twice daily' }, { chatId: 'chat-x' });
     expect(res.isError).toBeFalsy();
     expect(res.content[0].text).toContain('metformin 500mg twice daily');
     expect(res.content[0].text).toContain('#L1');

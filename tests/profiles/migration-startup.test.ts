@@ -267,7 +267,9 @@ describe('Gateway profile migration + path derivation on startup', () => {
         { role: 'assistant', content: 'hi there' },
       ]);
 
-      const dayFile = path.join(expectedSessionsDir, new Date().toISOString().slice(0, 10) + '.jsonl');
+      // Wave-D X-2: the thread is per-chat, so the day file lives under a <chatId>/ subdir of the
+      // profile's sessions dir (still derived from the profile — the point of this test).
+      const dayFile = path.join(expectedSessionsDir, 'chat-xyz', new Date().toISOString().slice(0, 10) + '.jsonl');
       expect(fs.existsSync(dayFile)).toBe(true);
       const lines = fs
         .readFileSync(dayFile, 'utf8')

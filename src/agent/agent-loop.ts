@@ -92,7 +92,10 @@ export class AgentLoop {
 
     for (let iteration = 0; iteration < this.config.maxIterations; iteration++) {
       const response = await this.provider.chat(messages, tools);
-      if (response.usage) lastPromptTokens = response.usage.promptTokens;
+      // A-MF1 / H7: the LAST provider call's reading wins — assign every iteration (undefined included).
+      // If the final call omits usage, we surface `undefined` (⇒ chars/4 estimate downstream), NOT a
+      // stale earlier-iteration count that under-reports the largest (final) prompt and skips a trigger.
+      lastPromptTokens = response.usage?.promptTokens;
 
       if (response.type === 'text') {
         // B7 <used> tag is parsed + stripped BEFORE health-classification / disclaimer / persist /
