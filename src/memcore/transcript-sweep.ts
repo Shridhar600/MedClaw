@@ -73,12 +73,22 @@ interface Mention {
   /** Normalized entity — the dedup key and `relatedEntity`. */
   entity: string;
   category: Category;
-  /** Global transcript order (turn index * large stride + within-turn char offset). */
-  order: number;
+  /** Transcript turn index (mining order). */
+  turn: number;
+  /** Character offset within the turn (MEDIUM-4: a composite (turn, pos) key — no fixed stride that a
+   *  >1,000,000-char turn could overflow). */
+  pos: number;
 }
 
+// Only a medication-lexicon hit is critical. A bare dose ("500 mg") with no medication context is a
+// real capture miss but NON-critical (spec 14 §5: "non-critical unless med lexicon") — MEDIUM-3.
 function isCritical(category: Category): boolean {
-  return category === 'med' || category === 'med-dose';
+  return category === 'med';
+}
+
+// Order mentions by transcript position: earlier turn first, then earlier char offset.
+function byTranscript(a: Mention, b: Mention): number {
+  return a.turn - b.turn || a.pos - b.pos;
 }
 
 function escapeRe(term: string): string {
@@ -87,7 +97,7 @@ function escapeRe(term: string): string {
 
 // Extract keyword + dose mentions from one user-turn's content, in text order. A dose is only
 // mined when the turn has NO med keyword (otherwise it is reinforcement of that med, not a new miss).
-function extractTurnMentions(content: string, lexicon: SweepLexicon, turnBase: number): Mention[] {
+function extractTurnMentions(content: string, lexicon: SweepLexicon, turn: number): Mention[] {
   const found: Mention[] = [];
   const categories: Array<[Category, string[]]> = [
     ['med', lexicon.med],
@@ -98,15 +108,19 @@ function extractTurnMentions(content: string, lexicon: SweepLexicon, turnBase: n
     for (const term of terms) {
       const re = new RegExp(`\\b${escapeRe(term)}\\b`, 'gi');
       for (const m of content.matchAll(re)) {
-        found.push({ surface: m[0], entity: normalizeEntity(term), category, order: turnBase + (m.index ?? 0) });
+        found.push({ surface: m[0], entity: normalizeEntity(term), category, turn, pos: m.index ?? 0 });
       }
     }
   }
   const hasMed = found.some(f => f.category === 'med');
   if (!hasMed) {
     for (const m of content.matchAll(DOSE_RE)) {
+      const pos = m.index ?? 0;
+      // MEDIUM-3: a dose immediately followed by `/` is a concentration/rate (mg/dL, mg/kg), not a
+      // plain dose — skip it rather than truncate it into a junk entity.
+      if (content[pos + m[0].length] === '/') continue;
       const dose = normalizeEntity(`${m[1]}${m[2]}`).replace(/\s+/g, '');
-      found.push({ surface: m[0], entity: dose, category: 'med-dose', order: turnBase + (m.index ?? 0) });
+      found.push({ surface: m[0], entity: dose, category: 'med-dose', turn, pos });
     }
   }
   return found;
@@ -123,10 +137,14 @@ function userChatContent(line: string): string | null {
     return null; // malformed line — skip, never throw (resilience)
   }
   if (entry.role !== 'user') return null;
-  const origin = typeof entry.origin === 'string' ? entry.origin : 'chat';
+  // MEDIUM-2: trust an EXPLICIT persisted origin. Only fall back to the `[Heartbeat Trigger]` marker
+  // heuristic for legacy entries that carry no origin — so a genuine chat turn whose text happens to
+  // start with that marker is mined, not silently suppressed.
+  const hasOrigin = typeof entry.origin === 'string';
+  const origin = hasOrigin ? (entry.origin as string) : 'chat';
   if (origin !== 'chat') return null;
   if (typeof entry.content !== 'string' || entry.content.length === 0) return null;
-  if (entry.content.split('\n', 1)[0].trim() === '[Heartbeat Trigger]') return null;
+  if (!hasOrigin && entry.content.split('\n', 1)[0].trim() === '[Heartbeat Trigger]') return null;
   return entry.content;
 }
 
@@ -149,10 +167,10 @@ export function sweep(input: SweepInput): SweepResult {
   for (const line of input.dayFileLines) {
     const content = userChatContent(line);
     if (content === null) continue;
-    mentions.push(...extractTurnMentions(content, lexicon, turnIndex * 1_000_000));
+    mentions.push(...extractTurnMentions(content, lexicon, turnIndex));
     turnIndex++;
   }
-  mentions.sort((a, b) => a.order - b.order);
+  mentions.sort(byTranscript);
 
   // First occurrence per normalized entity wins (its surface + category).
   const firstByEntity = new Map<string, Mention>();
@@ -172,7 +190,7 @@ export function sweep(input: SweepInput): SweepResult {
   candidates.sort((a, b) => {
     const ca = isCritical(a.category) ? 0 : 1;
     const cb = isCritical(b.category) ? 0 : 1;
-    return ca !== cb ? ca - cb : a.order - b.order;
+    return ca !== cb ? ca - cb : byTranscript(a, b);
   });
 
   const items: AddCuriosityInput[] = candidates.slice(0, maxItems).map(m => {

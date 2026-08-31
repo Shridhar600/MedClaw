@@ -74,7 +74,11 @@ export class Gateway {
   private sessionIndex?: SqliteSessionIndex;
   // D4.4: the profile's curiosity queue (nightly transcript sweep sink) + the nightly cron task.
   private curiosity?: CuriosityQueue;
+  private ledgerStore?: LedgerStore;
   private sweepTask?: cron.ScheduledTask;
+  // MEDIUM-8/9: one sweep at a time; awaited on shutdown so it never writes after stop().
+  private sweepInFlight?: Promise<NightlySweepResult>;
+  private sweepStopping = false;
   // D3.4 (spec 14 §4 step 4): copies each compaction summary to today's daily log. Built in the memcore
   // block (needs the NarrativeStore + WriteQueue), wired into the SessionManager after it is constructed.
   private sessionSummarySink?: (anchoredSummary: string) => Promise<void>;
@@ -217,6 +221,7 @@ export class Gateway {
       }
 
       const ledgerStore = new LedgerStore(memoryWorkspace);
+      this.ledgerStore = ledgerStore;
       const narrativeStore = new NarrativeStore(memoryWorkspace);
       const safetyView = new SafetyView(memoryWorkspace);
       const episodeStore = new EpisodeStore(memoryWorkspace);
@@ -498,6 +503,7 @@ export class Gateway {
     // LLM. Fire-and-forget at 03:15 local; `runTranscriptSweep` is fully guarded so a failure never
     // escapes, and the task is stopped in `stop()`. A scheduling failure degrades the feature, not boot.
     try {
+      this.sweepTask?.stop(); // MEDIUM-10: a re-`start()` must not orphan the previous cron task
       this.sweepTask = cron.schedule(
         '15 3 * * *',
         () => { void this.runTranscriptSweep(); },
@@ -519,28 +525,45 @@ export class Gateway {
    * so the cron tick, the acceptance suite, and the E2E journey all drive the same path.
    */
   async runTranscriptSweep(): Promise<NightlySweepResult> {
-    if (!this.sessions || !this.factMirror || !this.curiosity) {
+    // MEDIUM-8: a run scheduled after shutdown began does no work (never write after stop()).
+    if (this.sweepStopping) return { scanned: false, added: 0 };
+    // MEDIUM-9: one sweep at a time — a second cron tick or manual call joins the in-flight run
+    // instead of racing the list-then-add dedup boundary.
+    if (this.sweepInFlight) return this.sweepInFlight;
+    if (!this.sessions || !this.ledgerStore || !this.curiosity) {
       return { scanned: false, added: 0 };
     }
-    return runNightlySweep(this.buildSweepDeps());
+    const run = runNightlySweep(this.buildSweepDeps()).finally(() => { this.sweepInFlight = undefined; });
+    this.sweepInFlight = run;
+    return run;
   }
 
   // D4.4: compose the sweep's read/write seams from the live profile collaborators. `ledgerEntitiesForDay`
-  // reads the FactMirror entity heads (all statuses) and keeps those whose head was written on `date`
-  // (UTC) — an approximation of "logged that day" that is fine for the sweep (a re-ask on a same-day
-  // supersede is a mild, desired signal per A-L4). Names are normalized to match the sweep's mentions.
+  // enumerates EVERY ledger version (all types) and keeps those whose `createdAt` falls on `date` (UTC,
+  // parsed so an offset timestamp is placed on its real UTC day — MEDIUM-7). Using all versions, not just
+  // FactMirror heads, means an entity logged yesterday then updated today is still recognized as logged
+  // yesterday (no spurious critical re-ask — MEDIUM-6). Names are normalized to match the sweep's mentions.
   private buildSweepDeps(): NightlySweepDeps {
     const sessions = this.sessions!;
-    const factMirror = this.factMirror!;
+    const ledgerStore = this.ledgerStore!;
     const curiosity = this.curiosity!;
     return {
       readDayLines: (date) => sessions.readDayFileLines(date),
       ledgerEntitiesForDay: async (date) => {
         const key = date.toISOString().slice(0, 10);
         const set = new Set<string>();
-        for await (const rec of factMirror.queryEntityHeads()) {
-          if (typeof rec.createdAt === 'string' && rec.createdAt.slice(0, 10) === key) {
-            set.add(normalizeEntity(rec.entity));
+        for (const type of Object.keys(TYPE_TO_FILE) as FactType[]) {
+          let facts;
+          try {
+            facts = await ledgerStore.listAllOfType(type);
+          } catch {
+            continue; // one type file unreadable — degrade, keep scanning the rest
+          }
+          for (const f of facts) {
+            const created = new Date(f.createdAt);
+            if (!Number.isNaN(created.getTime()) && created.toISOString().slice(0, 10) === key) {
+              set.add(normalizeEntity(f.entity));
+            }
           }
         }
         return set;
@@ -901,8 +924,12 @@ export class Gateway {
       console.warn('[gateway] Failed to drain compactions:', summarizeErrorForLog(error));
     }
     try {
+      // MEDIUM-8: stop scheduling, then AWAIT any in-flight sweep so it can never write a curiosity
+      // item after the stores close / the daemon reports stopped.
+      this.sweepStopping = true;
       this.sweepTask?.stop();
       this.sweepTask = undefined;
+      await this.sweepInFlight?.catch(() => undefined);
     } catch (error) {
       console.warn('[gateway] Failed to stop transcript sweep:', summarizeErrorForLog(error));
     }
@@ -990,10 +1017,11 @@ export class Gateway {
     try {
       const result = await this.agentLoop!.run(input, history, { chatId: job.chatId, origin: 'heartbeat', mode: 'heartbeat' });
       if (result.text === HEARTBEAT_NOOP) {
+        // A-H1: stamp the daemon-authored heartbeat turn so the nightly sweep never mines it.
         await this.sessions!.recordTurn(job.chatId, [
           { role: 'user', content: input },
           ...result.trace,
-        ]);
+        ], 'heartbeat');
         await this.sessions!.recordPromptUsage(job.chatId, result.lastPromptTokens);
         await this.scheduler?.recordOutcome(job.id, 'noop');
         await this.reconcileHeartbeatPolicies(job.chatId);
@@ -1004,7 +1032,7 @@ export class Gateway {
       await this.sessions!.recordTurn(job.chatId, [
         { role: 'user', content: input },
         ...result.trace,
-      ]);
+      ], 'heartbeat');
       await this.sessions!.recordPromptUsage(job.chatId, result.lastPromptTokens);
       await this.scheduler?.recordOutcome(job.id, 'sent');
       await this.reconcileHeartbeatPolicies(job.chatId);

@@ -22,17 +22,27 @@ import {
 // constant so compaction (write), the window snapshot (derive), and resume (render) agree byte-for-byte.
 const SUMMARY_PREFIX = '[Previous conversation summary]\n';
 
+// HIGH-1: upper bound on a single day file the nightly sweep will slurp with a synchronous read
+// (64 MiB — orders of magnitude above any real day of chat). A larger file is skipped, not read.
+const MAX_DAY_FILE_READ_BYTES = 64 * 1024 * 1024;
+
 interface Session {
   chatId: string;
   history: Message[];
   lastActiveAt: Date;
 }
 
+// A-H1 provenance for the nightly sweep: 'chat' = a real user/agent turn (the default, and what an
+// absent field means — legacy/migrated entries stay sweepable); 'heartbeat'/'system' = daemon-authored,
+// never mined for capture misses.
+export type JsonlOrigin = 'chat' | 'heartbeat' | 'system';
+
 interface JsonlEntry {
   timestamp: string;
   role: Message['role'];
   content: string | null;
   chatId: string;
+  origin?: JsonlOrigin;
   tool_call_id?: string;
   tool_calls?: Message['tool_calls'];
   // Backward compatibility with previous camelCase format.
@@ -288,6 +298,17 @@ function dayFileEndsWithoutNewline(filePath: string): boolean {
   }
 }
 
+// Parse a serialized JSONL entry's timestamp to epoch-ms for chronological merge ordering (F-3).
+// A malformed line or missing/invalid timestamp sorts to the END (stable), never throwing.
+function rawTimestampMs(raw: string): number {
+  try {
+    const ts = new Date((JSON.parse(raw) as JsonlEntry).timestamp).getTime();
+    return Number.isNaN(ts) ? Number.MAX_SAFE_INTEGER : ts;
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
+  }
+}
+
 export class SessionManager {
   private sessions: Map<string, Session> = new Map();
   private softResetMs: number;
@@ -363,19 +384,35 @@ export class SessionManager {
       } catch {
         entries = []; // sessions dir unreadable — nothing to sweep
       }
-      for (const e of entries) {
-        if (e.isDirectory()) files.push(path.join(this.sessionsPath, e.name, day));
-      }
+      // MEDIUM-5/F-14: readdir order is filesystem-defined; sort so the sweep's cross-chat ordering
+      // and ≤5 selection are deterministic. `isDirectory()` reflects lstat, so a symlinked chat dir
+      // (isSymbolicLink) is already excluded.
+      const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name).sort();
+      for (const name of dirs) files.push(path.join(this.sessionsPath, name, day));
     } else {
       files.push(path.join(this.sessionsPath, day));
     }
     const lines: string[] = [];
     for (const f of files) {
+      let st: fs.Stats;
+      try {
+        st = fs.lstatSync(f); // lstat: never follows a symlink
+      } catch {
+        continue; // missing — skip
+      }
+      // MEDIUM-1: reject a symlinked (or otherwise non-regular) day file — following it could read
+      // another profile's transcript (cross-profile PHI) or block on a FIFO. HIGH-1: cap the read so
+      // one pathologically large file can neither exhaust the heap nor block the loop unbounded.
+      if (!st.isFile()) continue;
+      if (st.size > MAX_DAY_FILE_READ_BYTES) {
+        console.warn(`[session] day file exceeds the sweep read budget, skipping: ${path.basename(f)}`);
+        continue;
+      }
       let raw: string;
       try {
         raw = fs.readFileSync(f, 'utf-8');
       } catch {
-        continue; // missing/unreadable — skip
+        continue; // unreadable — skip
       }
       for (const line of raw.split('\n')) {
         if (line.trim() !== '') lines.push(line);
@@ -614,7 +651,7 @@ export class SessionManager {
     await Promise.all([...this.compactionInFlight.values()].map((p) => p.catch(() => undefined)));
   }
 
-  async recordTurn(chatId: string, turnTrace: Message[]): Promise<Anchor[]> {
+  async recordTurn(chatId: string, turnTrace: Message[], origin: JsonlOrigin = 'chat'): Promise<Anchor[]> {
     return this.enqueue(chatId, async () => {
       if (turnTrace.length === 0) {
         return [];
@@ -622,8 +659,9 @@ export class SessionManager {
       // Persist-first: append to the JSONL BEFORE mutating in-memory state.
       // If the append/rotation throws, the enqueue promise rejects and the
       // in-memory session.history never sees the turn — no memory/disk
-      // divergence.
-      const anchors = await this.appendMessagesToJsonl(chatId, turnTrace);
+      // divergence. `origin` (A-H1) is stamped so the nightly sweep can trust
+      // provenance instead of guessing from the text (heartbeat turns are daemon-authored).
+      const anchors = await this.appendMessagesToJsonl(chatId, turnTrace, origin);
       const session = this.getOrCreateSessionState(chatId);
       session.history.push(...turnTrace);
       session.lastActiveAt = new Date();
@@ -900,10 +938,10 @@ Keep it concise and structured.`;
     }
   }
 
-  private async appendMessagesToJsonl(chatId: string, messages: Message[]): Promise<Anchor[]> {
+  private async appendMessagesToJsonl(chatId: string, messages: Message[], origin: JsonlOrigin = 'chat'): Promise<Anchor[]> {
     const nowDate = new Date();
     const now = nowDate.toISOString();
-    const lines = messages.map(msg => JSON.stringify(this.serializeEntry(chatId, msg, now)));
+    const lines = messages.map(msg => JSON.stringify(this.serializeEntry(chatId, msg, now, origin)));
     const dayFilePath = this.dayFilePath(chatId, nowDate);
     // H11 (defensive): secureAppend has no fsync, so a power-loss / external truncation can leave the
     // day file without a trailing newline. A raw append would FUSE the new record onto the torn line,
@@ -962,13 +1000,18 @@ Keep it concise and structured.`;
       : path.join(this.sessionsPath, day);
   }
 
-  private serializeEntry(chatId: string, msg: Message, timestamp: string): JsonlEntry {
+  private serializeEntry(chatId: string, msg: Message, timestamp: string, origin: JsonlOrigin = 'chat'): JsonlEntry {
     const entry: JsonlEntry = {
       timestamp,
       role: msg.role,
       content: msg.content ?? null,
       chatId,
     };
+    // A-H1: persist provenance only when it is NOT the default 'chat' (keeps normal-turn JSONL
+    // byte-stable and legacy-compatible; the sweep treats an absent origin as 'chat').
+    if (origin !== 'chat') {
+      entry.origin = origin;
+    }
     if (msg.role === 'tool' && msg.tool_call_id) {
       entry.tool_call_id = msg.tool_call_id;
     }
@@ -1183,9 +1226,27 @@ Keep it concise and structured.`;
         const day = key.slice(sep + 1);
         arr.sort((x, y) => x.ts - y.ts || x.order - y.order); // Array.sort is stable ⇒ ties keep source order
         const dayPath = path.join(targetDir, `${day}.jsonl`);
+        const legacyRaws = arr.map((r) => r.raw);
         if (!fs.existsSync(dayPath)) {
           secureMkdir(targetDir);
-          secureWriteViaTmp(dayPath, arr.map((r) => r.raw).join('\n') + '\n');
+          secureWriteViaTmp(dayPath, legacyRaws.join('\n') + '\n');
+        } else {
+          // F-3: the target day file already exists — a live turn was appended to it after a PRIOR
+          // failed migration (sentinel absent). A blind skip would LOSE every legacy row for this day.
+          // MERGE instead: keep the existing (live) lines, add only legacy lines not already present
+          // (dedup by exact serialized line ⇒ idempotent on re-run), and re-order chronologically by
+          // timestamp with a stable index tie-break. If nothing new is added, leave the file byte-for-
+          // byte untouched (pure idempotent no-op — never rewrite an already-migrated archive).
+          const existing = fs.readFileSync(dayPath, 'utf-8').split('\n').filter((l) => l.length > 0);
+          const existingSet = new Set(existing);
+          const additions = legacyRaws.filter((r) => !existingSet.has(r));
+          if (additions.length > 0) {
+            const merged = [...existing, ...additions]
+              .map((raw, i) => ({ raw, i, ts: rawTimestampMs(raw) }))
+              .sort((a, b) => a.ts - b.ts || a.i - b.i)
+              .map((x) => x.raw);
+            secureWriteViaTmp(dayPath, merged.join('\n') + '\n');
+          }
         }
         archiveDirs.add(targetDir);
       }

@@ -32,11 +32,17 @@ function makeIndex(dbPath: string, sessionsDir: string): SqliteSessionIndex {
   return idx;
 }
 
-function textProvider(text: string): LLMProvider {
+// F-1: a provider that records the messages it is asked to summarize, so a test can prove the REAL
+// older turns (not an empty/ignored input) are what gets summarized.
+function capturingProvider(text: string): { provider: LLMProvider; seen: Message[][] } {
+  const seen: Message[][] = [];
   return {
-    modelName: 'test-model',
-    async chat(): Promise<LLMResponse> { return { type: 'text', text }; },
-    async embed(): Promise<number[]> { return []; },
+    seen,
+    provider: {
+      modelName: 'test-model',
+      async chat(messages: Message[]): Promise<LLMResponse> { seen.push(messages); return { type: 'text', text }; },
+      async embed(): Promise<number[]> { return []; },
+    },
   };
 }
 
@@ -109,10 +115,19 @@ describe('P2b acceptance — spec 14 §7 session hooks', () => {
     mgr.setTurnIndex(index);
 
     for (let n = 1; n <= 7; n++) await mgr.recordTurn('c1', toolTurn(n, `glucose reading ${n}80 mgdl`));
+    const dayFile = path.join(sessionsPath, 'c1', `${dateKey(new Date())}.jsonl`);
+    const archiveBefore = fs.readFileSync(dayFile, 'utf8');
+
     await mgr.pruneWindow('c1');
 
     const firstTool = mgr.getHistory('c1').find(m => m.role === 'tool');
     expect(firstTool?.content).toBe(PRUNED_TOOL_MARKER);
+
+    // F-2: losslessness rests on the ARCHIVE being untouched — prove the day file is byte-identical, so
+    // a rebuilt-from-disk index (not just the live FTS row) can still recover the pruned result.
+    expect(fs.readFileSync(dayFile, 'utf8')).toBe(archiveBefore);
+    const rebuilt = makeIndex(path.join(path.dirname(sessionsPath), 'rebuilt.db'), sessionsPath);
+    expect(rebuilt.search('glucose reading 180 mgdl', { chatId: 'c1' }).hits.some(h => h.snippet === 'glucose reading 180 mgdl')).toBe(true);
 
     const res = index.search('glucose reading 180 mgdl', { chatId: 'c1' });
     expect(res.hits.some(h => h.snippet === 'glucose reading 180 mgdl')).toBe(true);
@@ -133,11 +148,12 @@ describe('P2b acceptance — spec 14 §7 session hooks', () => {
     expect(pruned[8].content).toBe('r3');
   });
 
-  it('compaction: anchored summary + recent tail; every bullet anchor resolves; day file byte-identical', async () => {
+  it('compaction: summarizes the REAL older turns; every bullet is anchored; day file byte-identical', async () => {
     const { sessionsPath } = tmp();
     const summary = '- Patient reported knee pain\n- Started metformin 500mg\n- Follow up next week';
     const compaction = { enabled: true, triggerAtTokenPercent: 80, memoryFlush: false, keepRecentTurns: 2 };
-    const mgr = new SessionManager({ sessionsPath, perChatArchive: true, provider: textProvider(summary), compaction });
+    const { provider, seen } = capturingProvider(summary);
+    const mgr = new SessionManager({ sessionsPath, perChatArchive: true, provider, compaction });
 
     for (let n = 1; n <= 6; n++) {
       await mgr.recordTurn('c1', [{ role: 'user', content: `user message ${n}` }, { role: 'assistant', content: `reply ${n}` }]);
@@ -147,11 +163,23 @@ describe('P2b acceptance — spec 14 §7 session hooks', () => {
 
     await mgr.runCompaction('c1');
 
+    // F-1: the summary call actually received the older turns (not an empty/ignored snapshot).
+    const summarizeCall = seen.find(msgs => msgs.some(m => typeof m.content === 'string' && m.content.includes('Summarize the conversation turns below')));
+    expect(summarizeCall).toBeDefined();
+    const summarizedText = summarizeCall!.map(m => (typeof m.content === 'string' ? m.content : '')).join('\n');
+    expect(summarizedText).toContain('user message 1'); // an older turn that was compacted out
+    expect(summarizedText).toContain('user message 4');
+
     const history = mgr.getHistory('c1');
     expect(history[0].role).toBe('system');
     expect(history[0].content).toContain('[Previous conversation summary]');
-    const anchors = [...(history[0].content as string).matchAll(/sessions\/(\S+?)#L(\d+)/g)];
-    expect(anchors.length).toBeGreaterThan(0);
+
+    // F-10: EVERY non-empty summary bullet carries a resolving anchor, not just "some" anchor.
+    const summaryBody = (history[0].content as string).replace('[Previous conversation summary]\n', '');
+    const bullets = summaryBody.split('\n').filter(l => l.trim().startsWith('- '));
+    const anchors = [...summaryBody.matchAll(/sessions\/(\S+?)#L(\d+)/g)];
+    expect(anchors.length).toBe(bullets.length);
+    expect(bullets.length).toBeGreaterThanOrEqual(3);
     for (const m of anchors) {
       const count = countDayFileLines(path.join(sessionsPath, 'c1', m[1]));
       expect(Number(m[2])).toBeGreaterThanOrEqual(1);
@@ -169,11 +197,12 @@ describe('P2b acceptance — spec 14 §7 session hooks', () => {
       for (let n = 1; n <= 6; n++) {
         await mgr.recordTurn('c1', [{ role: 'user', content: `user message ${n}` }, { role: 'assistant', content: `reply ${n}` }]);
       }
-      const beforeLen = mgr.getHistory('c1').length;
+      const before = mgr.getHistory('c1').map(m => `${m.role}:${m.content}`);
       await expect(mgr.runCompaction('c1')).resolves.toBeUndefined();
-      const history = mgr.getHistory('c1');
-      expect(history.length).toBe(beforeLen);
-      expect(history.every(m => m.role !== 'system')).toBe(true);
+      const after = mgr.getHistory('c1').map(m => `${m.role}:${m.content}`);
+      // F-4: the OLD window is preserved intact — same messages, same CONTENT (not just the same count).
+      expect(after).toEqual(before);
+      expect(mgr.getHistory('c1').every(m => m.role !== 'system')).toBe(true);
     } finally {
       warn.mockRestore();
     }
@@ -264,6 +293,36 @@ describe('P2b acceptance — spec 14 §7 session hooks', () => {
       expect(med?.kind).toBe('missing-data');
       expect(med?.critical).toBe(true);
       expect(items.find(i => i.relatedEntity === 'headache')?.critical).toBeFalsy();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('A-L4: a resolved missing-data item re-fires on the next sweep (fresh signal)', async () => {
+    const { sessionsPath } = tmp();
+    const dir = path.dirname(sessionsPath);
+    const LEX: SweepLexicon = { med: ['naproxen'], symptom: [], appointment: [] };
+    jest.useFakeTimers();
+    try {
+      jest.setSystemTime(new Date('2026-08-30T09:00:00.000Z'));
+      const mgr = new SessionManager({ sessionsPath, perChatArchive: true });
+      await mgr.recordTurn('c1', [{ role: 'user', content: 'took naproxen' }]);
+      const curiosity = new CuriosityQueue(dir);
+      const deps = {
+        readDayLines: (d: Date) => mgr.readDayFileLines(d),
+        ledgerEntitiesForDay: async () => new Set<string>(),
+        listCuriosity: () => curiosity.list(),
+        addCuriosity: (i: Parameters<typeof curiosity.add>[0]) => curiosity.add(i),
+        lexicon: LEX,
+        now: () => new Date('2026-08-31T03:15:00.000Z'),
+      };
+      await runNightlySweep(deps);
+      const first = await curiosity.list();
+      expect(first).toHaveLength(1);
+
+      await curiosity.resolve(first[0].id); // the user answered the question
+      await runNightlySweep(deps);          // next night — the transcript miss is still there
+      expect((await curiosity.list()).map(i => i.relatedEntity)).toEqual(['naproxen']); // re-fires
     } finally {
       jest.useRealTimers();
     }

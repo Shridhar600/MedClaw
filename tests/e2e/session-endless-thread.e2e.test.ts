@@ -154,6 +154,14 @@ describe('P2b E2E — endless per-chat thread (real Gateway.handleTestMessage)',
 
     const afterCompact = await searchTool(gateway, 'allergic to penicillin');
     expect(afterCompact.content[0].text).toContain('allergic to penicillin');
+
+    // F-5: the compaction summary is copied to the profile's daily log through the real Gateway sink
+    // (NarrativeStore + WriteQueue), not just an in-memory callback.
+    const ws = (gateway as any).getEffectiveWorkspace() as string;
+    const dailyLog = path.join(ws, 'memory', `${dateKey(new Date())}.md`);
+    const logText = fs.readFileSync(dailyLog, 'utf8');
+    expect(logText).toContain('## Session summary');
+    expect(logText).toContain('penicillin');
   });
 
   it('a restart mid-journey resumes the compacted window and keeps appending to the same day file', async () => {
@@ -176,7 +184,9 @@ describe('P2b E2E — endless per-chat thread (real Gateway.handleTestMessage)',
 
     // The thread keeps going — a new turn appends to the SAME day file (endless, contiguous).
     await gateway2.handleTestMessage(CHAT, 'one more update after the restart');
-    expect(countDayFileLines(dayFile)).toBeGreaterThan(linesBeforeRestart);
+    // F-12: exactly the new turn's messages are appended (1 user + 1 assistant reply) — not a
+    // duplicated tail or a partial write.
+    expect(countDayFileLines(dayFile)).toBe(linesBeforeRestart + 2);
     const post = await (gateway2 as any).agentLoop.registry.execute('session_search', { query: 'one more update after the restart' }, { chatId: CHAT });
     expect(post.content[0].text).toContain('one more update after the restart');
   });

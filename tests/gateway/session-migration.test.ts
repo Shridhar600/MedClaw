@@ -63,6 +63,42 @@ describe('legacy session migration (D1.6)', () => {
     expect(contents).toEqual(['migrated', 'live turn after migration']); // BOTH survive; no overwrite
   });
 
+  it('MERGES legacy rows into a day file a live append created BEFORE migration completed (F-3 data-loss)', () => {
+    // A prior migration attempt failed (sentinel absent) but a live turn was recorded to today's day
+    // file first. The legacy active file still holds rows for that SAME day. A blind write-if-absent
+    // would skip the whole day and LOSE the legacy rows; migration must merge them in.
+    writeActive('c1', [{ ts: '2026-08-26T09:00:00.000Z', role: 'user', content: 'legacy row' }]);
+    const dayDir = path.join(dir, 'c1');
+    fs.mkdirSync(dayDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dayDir, '2026-08-26.jsonl'),
+      JSON.stringify({ timestamp: '2026-08-26T12:00:00.000Z', role: 'assistant', content: 'live append', chatId: 'c1' }) + '\n',
+    );
+
+    new SessionManager({ sessionsPath: dir, perChatArchive: true });
+
+    const contents = nonEmpty(path.join(dayDir, '2026-08-26.jsonl')).map((l) => JSON.parse(l).content);
+    expect(contents).toContain('legacy row');   // must NOT be lost
+    expect(contents).toContain('live append');  // must be preserved
+    expect(contents).toEqual(['legacy row', 'live append']); // chronological by timestamp
+  });
+
+  it('is idempotent through the merge path — a live-collision day file is byte-stable on re-run', () => {
+    writeActive('c1', [{ ts: '2026-08-26T09:00:00.000Z', role: 'user', content: 'legacy row' }]);
+    const dayDir = path.join(dir, 'c1');
+    fs.mkdirSync(dayDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dayDir, '2026-08-26.jsonl'),
+      JSON.stringify({ timestamp: '2026-08-26T12:00:00.000Z', role: 'assistant', content: 'live append', chatId: 'c1' }) + '\n',
+    );
+    new SessionManager({ sessionsPath: dir, perChatArchive: true });
+    const after1 = fs.readFileSync(path.join(dayDir, '2026-08-26.jsonl'), 'utf-8');
+    // remove the sentinel to force the migration to run again over the merged file
+    fs.rmSync(path.join(dir, '.migrated'));
+    new SessionManager({ sessionsPath: dir, perChatArchive: true });
+    expect(fs.readFileSync(path.join(dayDir, '2026-08-26.jsonl'), 'utf-8')).toBe(after1);
+  });
+
   it('no-registry mode buckets each source file into its own <chatId>/ subdir', () => {
     writeActive('cx', [{ ts: '2026-08-26T10:00:00.000Z', role: 'user', content: 'x1' }]);
     writeActive('cy', [{ ts: '2026-08-26T10:00:00.000Z', role: 'user', content: 'y1' }]);

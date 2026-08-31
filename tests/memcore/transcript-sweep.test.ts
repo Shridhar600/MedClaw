@@ -135,18 +135,48 @@ describe('transcript sweep — ledger-events-for-day seam (D4.3)', () => {
 });
 
 describe('transcript sweep — number+unit dose patterns', () => {
-  it('files a critical dose item when a dose appears with no med keyword in the turn', () => {
+  it('files a dose-only mention as NON-critical (spec: critical only on a med-lexicon hit)', () => {
     const lines = [userLine('took 500 mg this morning and felt fine')];
     const { items } = sweep({ dayFileLines: lines, ledgerEntitiesForDay: new Set(), existingCuriosity: [], lexicon: LEX });
     expect(items).toHaveLength(1);
-    expect(items[0].critical).toBe(true);
+    expect(items[0].critical).toBeFalsy(); // dose alone, no medication context → not critical
     expect(items[0].relatedEntity).toBe('500mg');
   });
 
-  it('does not double-count a dose that accompanies a med keyword', () => {
+  it('does not double-count a dose that accompanies a med keyword (med governs, stays critical)', () => {
     const lines = [userLine('took naproxen 500mg')];
     const { items } = sweep({ dayFileLines: lines, ledgerEntitiesForDay: new Set(), existingCuriosity: [], lexicon: LEX });
     expect(items.map(i => i.relatedEntity)).toEqual(['naproxen']);
+    expect(items[0].critical).toBe(true);
+  });
+
+  it('does not file concentration/rate forms as dose mentions (mg/dL, mg/kg)', () => {
+    const lines = [userLine('lab said 100 mg/dL and the dose was 5mg/kg')];
+    const { items } = sweep({ dayFileLines: lines, ledgerEntitiesForDay: new Set(), existingCuriosity: [], lexicon: LEX });
+    expect(items).toEqual([]); // neither is a plain dose
+  });
+});
+
+describe('transcript sweep — deterministic transcript ordering (A-L3, MEDIUM-4)', () => {
+  it('keeps transcript order even when the first turn exceeds the 1,000,000-char stride', () => {
+    const huge = 'x '.repeat(600_000) + 'headache'; // > 1,000,000 chars, symptom near the end
+    const lines = [userLine(huge), userLine('then some nausea')];
+    const { items } = sweep({ dayFileLines: lines, ledgerEntitiesForDay: new Set(), existingCuriosity: [], lexicon: LEX });
+    expect(items.map(i => i.relatedEntity)).toEqual(['headache', 'nausea']); // earlier turn first
+  });
+
+  it('orders two med-criticals by transcript position (A-L3 tie-break)', () => {
+    const lines = [userLine('took naproxen'), userLine('and metformin')];
+    const { items } = sweep({ dayFileLines: lines, ledgerEntitiesForDay: new Set(), existingCuriosity: [], lexicon: LEX });
+    expect(items.map(i => i.relatedEntity)).toEqual(['naproxen', 'metformin']);
+  });
+});
+
+describe('transcript sweep — origin field (MEDIUM-2)', () => {
+  it('MINES an explicit origin:chat turn even when its text starts with the heartbeat marker', () => {
+    const lines = [userLine('[Heartbeat Trigger]\ntook naproxen', { origin: 'chat' })];
+    const { items } = sweep({ dayFileLines: lines, ledgerEntitiesForDay: new Set(), existingCuriosity: [], lexicon: LEX });
+    expect(items.map(i => i.relatedEntity)).toEqual(['naproxen']); // not suppressed by the marker
   });
 });
 
@@ -157,11 +187,14 @@ describe('transcript sweep — resilience', () => {
     expect(items.map(i => i.relatedEntity)).toEqual(['naproxen']);
   });
 
-  it('uses a sane default lexicon when none is provided', () => {
-    const lines = [userLine('took ibuprofen for a headache')];
+  it('uses a sane default lexicon that mines a med, a symptom, and an appointment', () => {
+    const lines = [userLine('took ibuprofen for a headache and I have an appointment tomorrow')];
     const { items } = sweep({ dayFileLines: lines, ledgerEntitiesForDay: new Set(), existingCuriosity: [] });
-    // default lexicon should recognize at least a common OTC med + a common symptom
-    expect(items.length).toBeGreaterThanOrEqual(1);
-    expect(items.some(i => i.critical)).toBe(true);
+    const byEntity = new Map(items.map(i => [i.relatedEntity, i]));
+    expect(byEntity.get('ibuprofen')?.critical).toBe(true);   // med → critical
+    expect(byEntity.has('headache')).toBe(true);              // symptom mined
+    expect(byEntity.get('headache')?.critical).toBeFalsy();
+    expect(byEntity.has('appointment')).toBe(true);           // appointment mined
+    expect(byEntity.get('appointment')?.critical).toBeFalsy();
   });
 });

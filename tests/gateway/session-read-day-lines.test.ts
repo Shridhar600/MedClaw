@@ -27,6 +27,37 @@ describe('SessionManager.readDayFileLines (D4.4 sweep seam)', () => {
     expect(sm.readDayFileLines(new Date('2000-01-01T00:00:00.000Z'))).toEqual([]);
   });
 
+  it('stamps origin on a heartbeat turn and omits it for a chat turn (A-H1)', async () => {
+    const sm = new SessionManager({ sessionsPath: dir, perChatArchive: true });
+    await sm.recordTurn('c1', [{ role: 'user', content: 'chat turn' }]);             // default 'chat'
+    await sm.recordTurn('c1', [{ role: 'user', content: 'hb turn' }], 'heartbeat');  // daemon-authored
+    const entries = sm.readDayFileLines(new Date()).map(l => JSON.parse(l));
+    expect(entries.find(e => e.content === 'chat turn').origin).toBeUndefined(); // byte-stable default
+    expect(entries.find(e => e.content === 'hb turn').origin).toBe('heartbeat');
+  });
+
+  it('does NOT follow a symlinked day file (no cross-profile read)', () => {
+    const sm = new SessionManager({ sessionsPath: dir, perChatArchive: true });
+    const otherDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-other-'));
+    const otherFile = path.join(otherDir, 'secret.jsonl');
+    fs.writeFileSync(otherFile, JSON.stringify({ role: 'user', content: 'other profile ibuprofen', chatId: 'x' }) + '\n');
+    const day = `${new Date().toISOString().slice(0, 10)}.jsonl`;
+    fs.mkdirSync(path.join(dir, 'chatS'), { recursive: true });
+    fs.symlinkSync(otherFile, path.join(dir, 'chatS', day));
+
+    const lines = sm.readDayFileLines(new Date());
+    expect(lines.join('\n')).not.toContain('other profile ibuprofen'); // symlink not followed
+    fs.rmSync(otherDir, { recursive: true, force: true });
+  });
+
+  it('reads chat subdirectories in deterministic (sorted) order', async () => {
+    const sm = new SessionManager({ sessionsPath: dir, perChatArchive: true });
+    await sm.recordTurn('chatB', [{ role: 'user', content: 'from B' }]);
+    await sm.recordTurn('chatA', [{ role: 'user', content: 'from A' }]);
+    const lines = sm.readDayFileLines(new Date()).map(l => JSON.parse(l).content);
+    expect(lines).toEqual(['from A', 'from B']); // sorted by chat-dir name, not filesystem enumeration
+  });
+
   it('ignores blank lines and non-day-file entries in the sessions dir', async () => {
     const sm = new SessionManager({ sessionsPath: dir, perChatArchive: true });
     await sm.recordTurn('chatA', [{ role: 'user', content: 'metformin' }]);
