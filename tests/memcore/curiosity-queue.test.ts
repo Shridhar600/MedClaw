@@ -79,6 +79,46 @@ describe('CuriosityQueue.list', () => {
   });
 });
 
+describe('CuriosityQueue missing-data kind (DD7)', () => {
+  it('round-trips a missing-data item through add/list', async () => {
+    const s = new CuriosityQueue(tmpDir, fixedClock('2026-08-18T10:00:00Z'), seqIdGen('cq'), 'p1');
+    await s.add(item({
+      kind: 'missing-data',
+      description: 'Did I miss logging naproxen yesterday?',
+      relatedEntity: 'naproxen',
+      critical: true,
+    }));
+
+    const items = await s.list();
+    expect(items).toEqual([
+      expect.objectContaining({
+        kind: 'missing-data',
+        description: 'Did I miss logging naproxen yesterday?',
+        relatedEntity: 'naproxen',
+        critical: true,
+      }),
+    ]);
+  });
+
+  it('still skips a block with an unknown kind (KINDS stays a closed set)', async () => {
+    const s = new CuriosityQueue(tmpDir, fixedClock('2026-08-18T10:00:00Z'), seqIdGen('cq'), 'p1');
+    await s.add(item()); // one valid item first
+    fs.appendFileSync(
+      path.join(tmpDir, 'curiosity.md'),
+      '## bogus\n- kind: not-a-real-kind\n- profileId: p1\n- description: d\n- createdAt: 2026-08-18T10:00:00.000Z\n',
+    );
+
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const items = await s.list();
+      expect(items.map(i => i.kind)).toEqual(['follow-up']); // bogus kind skipped
+      expect(warnSpy).toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+});
+
 describe('CuriosityQueue.resolve', () => {
   it('removes the item from list() and returns true; false for an unknown id', async () => {
     const s = new CuriosityQueue(tmpDir, fixedClock('2026-08-18T10:00:00Z'), seqIdGen('cq'), 'p1');

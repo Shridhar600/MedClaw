@@ -20,7 +20,7 @@ import { createLedgerTools } from '../tools/ledger-tools';
 import { createEpisodeTools } from '../tools/episode-tools';
 import { createSafetyTools } from '../tools/safety-tools';
 import { WriteQueue, replayJournal } from '../profiles';
-import { LedgerStore, NarrativeStore, SafetyView, EpisodeStore, CuriosityQueue, TYPE_TO_FILE } from '../memcore';
+import { LedgerStore, NarrativeStore, SafetyView, EpisodeStore, CuriosityQueue, TYPE_TO_FILE, normalizeEntity } from '../memcore';
 import type { FactType } from '../memcore';
 import { SqliteFactMirror, SqliteEventSink, SqliteVecIndex, SqliteKeywordIndex, SqliteChunkStats, SqliteSessionIndex, ledgerFactToRecord, isRemoteEmbeddingBaseUrl } from '../indexstore';
 import { createSessionTools } from '../tools/session-tools';
@@ -33,9 +33,12 @@ import { SqliteStore } from '../memory/sqlite-store';
 import { MemorySearch } from '../memory/search';
 import { createProvider } from '../providers/factory';
 import { SessionManager } from './session';
+import * as cron from 'node-cron';
 import { HeartbeatStore } from '../scheduler/store';
 import { HeartbeatScheduler } from '../scheduler/runtime';
 import { syncHeartbeatMarkdown } from '../scheduler/heartbeat-markdown';
+import { runNightlySweep } from '../scheduler/transcript-sweep-job';
+import type { NightlySweepDeps, NightlySweepResult } from '../scheduler/transcript-sweep-job';
 import type { HeartbeatJob } from '../scheduler/types';
 import { decideHeartbeatDelivery, HEARTBEAT_NOOP } from '../scheduler/delivery-policy';
 import { buildDesiredHeartbeatJobs } from '../scheduler/policy-engine';
@@ -69,6 +72,9 @@ export class Gateway {
   private factMirror?: SqliteFactMirror;
   private eventSink?: SqliteEventSink;
   private sessionIndex?: SqliteSessionIndex;
+  // D4.4: the profile's curiosity queue (nightly transcript sweep sink) + the nightly cron task.
+  private curiosity?: CuriosityQueue;
+  private sweepTask?: cron.ScheduledTask;
   // D3.4 (spec 14 §4 step 4): copies each compaction summary to today's daily log. Built in the memcore
   // block (needs the NarrativeStore + WriteQueue), wired into the SessionManager after it is constructed.
   private sessionSummarySink?: (anchoredSummary: string) => Promise<void>;
@@ -215,6 +221,7 @@ export class Gateway {
       const safetyView = new SafetyView(memoryWorkspace);
       const episodeStore = new EpisodeStore(memoryWorkspace);
       const curiosityQueue = new CuriosityQueue(memoryWorkspace, undefined, undefined, profileId);
+      this.curiosity = curiosityQueue;
       const safetyRenderer = makeSafetyRenderer({
         render: (facts) => safetyView.render(facts),
         listSafetyRelevant: () => ledgerStore.listSafetyRelevant(),
@@ -487,10 +494,60 @@ export class Gateway {
       }
     }
 
+    // D4.4: the nightly transcript sweep (spec 14 §5 / PD-17 dreaming step 1.5) — deterministic, no
+    // LLM. Fire-and-forget at 03:15 local; `runTranscriptSweep` is fully guarded so a failure never
+    // escapes, and the task is stopped in `stop()`. A scheduling failure degrades the feature, not boot.
+    try {
+      this.sweepTask = cron.schedule(
+        '15 3 * * *',
+        () => { void this.runTranscriptSweep(); },
+        { scheduled: true, timezone: this.config.heartbeat.timezone },
+      );
+    } catch (e) {
+      console.warn('[gateway] nightly transcript sweep could not be scheduled; continuing:', summarizeErrorForLog(e));
+    }
+
     await this.runBootHealthchecks();
     this.runSecurityChecks();
 
     console.log('[gateway] Redacted is running.');
+  }
+
+  /**
+   * D4.4: run the nightly transcript sweep now (spec 14 §5) — deterministic, no LLM. Guarded: a
+   * not-yet-wired profile returns not-scanned, and `runNightlySweep` swallows any I/O failure. Public
+   * so the cron tick, the acceptance suite, and the E2E journey all drive the same path.
+   */
+  async runTranscriptSweep(): Promise<NightlySweepResult> {
+    if (!this.sessions || !this.factMirror || !this.curiosity) {
+      return { scanned: false, added: 0 };
+    }
+    return runNightlySweep(this.buildSweepDeps());
+  }
+
+  // D4.4: compose the sweep's read/write seams from the live profile collaborators. `ledgerEntitiesForDay`
+  // reads the FactMirror entity heads (all statuses) and keeps those whose head was written on `date`
+  // (UTC) — an approximation of "logged that day" that is fine for the sweep (a re-ask on a same-day
+  // supersede is a mild, desired signal per A-L4). Names are normalized to match the sweep's mentions.
+  private buildSweepDeps(): NightlySweepDeps {
+    const sessions = this.sessions!;
+    const factMirror = this.factMirror!;
+    const curiosity = this.curiosity!;
+    return {
+      readDayLines: (date) => sessions.readDayFileLines(date),
+      ledgerEntitiesForDay: async (date) => {
+        const key = date.toISOString().slice(0, 10);
+        const set = new Set<string>();
+        for await (const rec of factMirror.queryEntityHeads()) {
+          if (typeof rec.createdAt === 'string' && rec.createdAt.slice(0, 10) === key) {
+            set.add(normalizeEntity(rec.entity));
+          }
+        }
+        return set;
+      },
+      listCuriosity: () => curiosity.list(),
+      addCuriosity: (item) => curiosity.add(item),
+    };
   }
 
   /**
@@ -842,6 +899,12 @@ export class Gateway {
       await this.sessions?.drainCompactions();
     } catch (error) {
       console.warn('[gateway] Failed to drain compactions:', summarizeErrorForLog(error));
+    }
+    try {
+      this.sweepTask?.stop();
+      this.sweepTask = undefined;
+    } catch (error) {
+      console.warn('[gateway] Failed to stop transcript sweep:', summarizeErrorForLog(error));
     }
     try {
       await this.scheduler?.stop();

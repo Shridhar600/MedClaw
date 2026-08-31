@@ -348,6 +348,42 @@ export class SessionManager {
     return this.sessionsPath;
   }
 
+  /**
+   * D4.4 (nightly-sweep seam): every chat's raw JSONL day-file lines for the UTC day of `date`.
+   * Read-only + best-effort — the layout (per-chat subdir vs flat) matches the append path, a
+   * missing/unreadable file contributes nothing, blank lines are dropped, and it never throws.
+   */
+  readDayFileLines(date: Date): string[] {
+    const day = `${dateKey(date)}.jsonl`;
+    const files: string[] = [];
+    if (this.perChatArchive) {
+      let entries: fs.Dirent[] = [];
+      try {
+        entries = fs.readdirSync(this.sessionsPath, { withFileTypes: true });
+      } catch {
+        entries = []; // sessions dir unreadable — nothing to sweep
+      }
+      for (const e of entries) {
+        if (e.isDirectory()) files.push(path.join(this.sessionsPath, e.name, day));
+      }
+    } else {
+      files.push(path.join(this.sessionsPath, day));
+    }
+    const lines: string[] = [];
+    for (const f of files) {
+      let raw: string;
+      try {
+        raw = fs.readFileSync(f, 'utf-8');
+      } catch {
+        continue; // missing/unreadable — skip
+      }
+      for (const line of raw.split('\n')) {
+        if (line.trim() !== '') lines.push(line);
+      }
+    }
+    return lines;
+  }
+
   private runLLM<T>(fn: () => Promise<T>): Promise<T> {
     return this.runBackground ? this.runBackground(fn) : fn();
   }

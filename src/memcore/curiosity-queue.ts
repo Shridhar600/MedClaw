@@ -133,7 +133,7 @@ interface ParsedBlock {
 
 const KINDS: Record<string, true> = {
   'follow-up': true, 'medication-reminder': true, 'lab-correlation': true,
-  'information-gap': true, insight: true,
+  'information-gap': true, insight: true, 'missing-data': true,
 };
 
 function toItem(block: ParsedBlock): CuriosityItem {

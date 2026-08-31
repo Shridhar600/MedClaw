@@ -71,7 +71,9 @@ export interface NarrativeNote {
   createdAt: string;
 }
 
-export type CuriosityKind = 'follow-up' | 'medication-reminder' | 'lab-correlation' | 'information-gap' | 'insight';
+// `missing-data` (DD7, spec 14 §5): the nightly transcript sweep files these when a user-mentioned
+// entity had no same-day ledger event — "Did I miss logging X yesterday?". med-lexicon hits are critical.
+export type CuriosityKind = 'follow-up' | 'medication-reminder' | 'lab-correlation' | 'information-gap' | 'insight' | 'missing-data';
 
 export interface CuriosityItem {
   id: string;

@@ -39,6 +39,10 @@ export type { ScratchNote, ScratchStoreOptions, PromotionScanResult } from './sc
 export { CuriosityQueue } from './curiosity-queue';
 export type { AddCuriosityInput } from './curiosity-queue';
 
+// Nightly transcript sweep (spec 14 §5) — deterministic capture-miss detector, no LLM
+export { sweep, normalizeEntity, DEFAULT_SWEEP_LEXICON } from './transcript-sweep';
+export type { SweepInput, SweepResult, SweepLexicon } from './transcript-sweep';
+
 // Core types
 export type {
   Authority, Provenance, FactStatus, FactType, LedgerFact,
