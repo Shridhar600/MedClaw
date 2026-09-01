@@ -158,36 +158,39 @@ export class SafetyView {
     // never silently leaves the always-injected net while its dispute is open.
     const eligible = facts.filter(f =>
       f.safetyRelevant && (f.status === 'active' || f.status === 'resolved' || f.status === 'disputed'));
-    // Exactly ONE bullet per TYPE+ENTITY (self-review CRITICAL-2: the same name
-    // can legally exist as both medication and allergy — keying by entity alone
-    // silently dropped one of them). Settled version wins; a disputed cluster is
-    // represented by its ORIGINAL (lowest version), marked as under dispute.
-    const byEntity = new Map<string, LedgerFact>();
+    const byEntity = new Map<string, LedgerFact[]>();
     for (const f of eligible) {
       const key = `${f.type}::${f.entity}`;
-      const cur = byEntity.get(key);
-      if (!cur) {
-        byEntity.set(key, f);
-        continue;
-      }
-      const curSettled = cur.status === 'active' || cur.status === 'resolved';
-      const fSettled = f.status === 'active' || f.status === 'resolved';
-      if (!curSettled && fSettled) byEntity.set(key, f);
-      else if (!curSettled && !fSettled && f.version < cur.version) byEntity.set(key, f);
+      const group = byEntity.get(key);
+      if (group) group.push(f); else byEntity.set(key, [f]);
     }
 
-    const shown = Array.from(byEntity.values());
-    const byType = new Map<FactType, LedgerFact[]>();
-    for (const f of shown) {
-      const list = byType.get(f.type);
-      if (list) list.push(f);
-      else byType.set(f.type, [f]);
+    const byType = new Map<FactType, string[]>();
+    for (const group of byEntity.values()) {
+      const active = group.filter((f) => f.status === 'active').sort((a, b) => a.version - b.version);
+      let line: string;
+      if (active.length > 1) {
+        const values = active.map((f) => {
+          const fields = Object.entries(f.fields)
+            .map(([key, value]) => `${sanitizeSingleLine(key)}=${sanitizeSingleLine(String(value))}`)
+            .join(', ');
+          return `v${f.version}${fields ? ` [${fields}]` : ''}`;
+        }).join(' | ');
+        line = `- ${sanitizeSingleLine(active[0].entity)} — CONFLICT: multiple active ${active[0].type} records: ${values}`;
+      } else {
+        const settled = group.find((f) => f.status === 'active' || f.status === 'resolved');
+        const chosen = settled ?? [...group].sort((a, b) => a.version - b.version)[0];
+        line = this.renderFactBullet(chosen);
+      }
+      const type = group[0].type;
+      const lines = byType.get(type);
+      if (lines) lines.push(line); else byType.set(type, [line]);
     }
     const items: ParsedItem[] = [];
     for (const { type, heading } of MACHINE_SECTION_ORDER) {
       const list = byType.get(type);
       if (!list || list.length === 0) continue;
-      items.push({ kind: 'section', heading, lines: list.map(f => this.renderFactBullet(f)) });
+      items.push({ kind: 'section', heading, lines: list });
     }
     return items;
   }

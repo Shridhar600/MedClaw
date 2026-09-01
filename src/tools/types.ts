@@ -16,6 +16,8 @@ export interface ToolParameters {
 
 export interface ToolExecutionContext {
   chatId?: string;
+  /** Opaque identity shared by every tool call in one AgentLoop.run invocation. */
+  turnId?: string;
 }
 
 export interface Tool {

@@ -46,7 +46,7 @@ export type { SweepInput, SweepResult, SweepLexicon } from './transcript-sweep';
 // Core types
 export type {
   Authority, Provenance, FactStatus, FactType, LedgerFact,
-  ConfirmationToken, MetricPoint, NarrativeNote, CuriosityKind,
+  ConfirmationToken, ConfirmationContext, MetricPoint, NarrativeNote, CuriosityKind,
   CuriosityItem, CaptureEvent, PendingOp, StoredToken,
   RecordFactResult, RetractResult, LedgerMutationResult,
   LedgerFactInput, NarrativeNoteInput, MetricPointInput, LedgerCorrectionInput,

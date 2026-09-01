@@ -14,6 +14,7 @@ import { ToolRegistry } from '../tools/registry';
 import { LLMSemaphore, HeartbeatQueueFullError } from '../tools/semaphore';
 import { createMemoryTools } from '../tools/memory-tools';
 import { createMedicalTools } from '../tools/medical-tools';
+import type { MedicalContextProvider } from '../tools/medical-tools';
 import { createCronManageTool } from '../tools/cron-manage';
 import { createHeartbeatManageTool } from '../tools/heartbeat-manage';
 import { createLedgerTools } from '../tools/ledger-tools';
@@ -50,11 +51,8 @@ import { checkSystemReadiness, probeChatCompletion } from '../providers/healthch
 import type { ReadinessResult } from '../providers/healthcheck';
 import type { LLMProvider } from '../providers/types';
 import { checkProviderBindAddresses, verifyWorkspacePermissions, summarizeErrorForLog, secureMkdir } from '../security';
+import { EMERGENCY_RESPONSE, isEmergencyInput } from '../safety/emergency-detector';
 
-const EMERGENCY_PATTERN =
-  /\b(chest pain|can't breathe|cannot breathe|difficulty breathing|stroke|heart attack|severe bleeding|suicidal|emergency)\b/i;
-const EMERGENCY_RESPONSE =
-  'This may be an emergency. Please contact local emergency services now or go to the nearest emergency department. If you can, ask someone nearby to stay with you while you get help.';
 const UNRECOGNIZED_CHAT_RESPONSE =
   'This chat is not recognized. This is a private health assistant; new chats cannot be added over this channel.';
 // PROD-P1-6: an empty or whitespace-only text message with no media gets a
@@ -160,6 +158,7 @@ export class Gateway {
     // Providers
     const mainProvider = createProvider(config.providers.main);
     this.mainProvider = mainProvider; // #3: kept for the boot completion probe.
+    let medicalContextProvider: MedicalContextProvider | undefined;
 
     // Tools
     const registry = new ToolRegistry(config.tools);
@@ -180,13 +179,20 @@ export class Gateway {
     // Medical tools with medical provider
     try {
       const medicalProvider = createProvider(config.providers.medical);
-      for (const tool of createMedicalTools(memory, search, medicalProvider, mainProvider, memoryWorkspace, {
-        medicalProviderType: config.providers.medical.type,
-        medicalProviderBaseUrl: config.providers.medical.baseUrl,
-        allowRawMedicalMedia: config.providers.medical.allowRawMedicalMedia,
-        mainProviderType: config.providers.main.type,
-        mainProviderBaseUrl: config.providers.main.baseUrl,
-      })) {
+      for (const tool of createMedicalTools(
+        memory,
+        (query) => medicalContextProvider ? medicalContextProvider(query) : Promise.resolve(''),
+        medicalProvider,
+        mainProvider,
+        memoryWorkspace,
+        {
+          medicalProviderType: config.providers.medical.type,
+          medicalProviderBaseUrl: config.providers.medical.baseUrl,
+          allowRawMedicalMedia: config.providers.medical.allowRawMedicalMedia,
+          mainProviderType: config.providers.main.type,
+          mainProviderBaseUrl: config.providers.main.baseUrl,
+        },
+      )) {
         registry.register(tool);
       }
     } catch (e) {
@@ -346,6 +352,20 @@ export class Gateway {
           maxChars: config.memory.bootstrapMaxChars,
           clock: systemClock,
         });
+        medicalContextProvider = async (userMessage) => {
+          let recall = null as Awaited<ReturnType<typeof recallEngine.run>> | null;
+          try {
+            recall = await recallEngine.run({ profileId, userMessage }, { narrative: true });
+          } catch (e) {
+            console.warn('[gateway] medical recall failed (using SAFETY/profile only):', summarizeErrorForLog(e));
+          }
+          const report = await v2Assembler.assemble(profileId, 'chat', recall);
+          const medicalKeys = new Set(['SAFETY.md', 'active-ledger', 'recall', 'check']);
+          return report.sections
+            .filter((section) => medicalKeys.has(section.key))
+            .map((section) => `## ${section.title}\n${section.content}`)
+            .join('\n\n');
+        };
         prepareSystem = async (mode, userMessage) => {
           // Recall is best-effort: any failure degrades to no recall, never blocks the turn
           // (resilience). Assembly is NOT guarded here — a SAFETY-invariant violation must abort the
@@ -365,6 +385,8 @@ export class Gateway {
             recordUsed: recall
               ? (ids) => recallEngine.recordUsage(ids, systemClock.now().toISOString())
               : undefined,
+            healthContextTouched: report.sections.some((section) =>
+              ['SAFETY.md', 'HEALTH_PROFILE.md', 'active-ledger', 'recall', 'check'].includes(section.key)),
           };
         };
         console.log('[gateway] Per-turn recall + v2 context assembler ready (D9)');
@@ -424,7 +446,11 @@ export class Gateway {
 
     // Agent
     const semaphore = new LLMSemaphore();
-    this.agentLoop = new AgentLoop(mainProvider, registry, prepareSystem ?? systemMessages, config.agent, semaphore);
+    const agentSystem: PrepareSystem = prepareSystem ?? (async () => ({
+      messages: systemMessages,
+      healthContextTouched: systemMessages.length > 0,
+    }));
+    this.agentLoop = new AgentLoop(mainProvider, registry, agentSystem, config.agent, semaphore);
     this.promptMode = prepareSystem ? 'per-turn' : 'boot-cached';
 
     // Sessions
@@ -1137,6 +1163,7 @@ export class Gateway {
         new OnboardingStore(workspace),
         workspace,
         this.config.heartbeat.timezone,
+        this.config.emergency?.keywords,
       );
       const result = await flow.handle('restart onboarding');
       // C-2/H9: best-effort persistence — a failed archive must not reject the onboarding response.
@@ -1152,7 +1179,7 @@ export class Gateway {
     }
 
     const store = new OnboardingStore(workspace);
-    const flow = new OnboardingFlow(store, workspace, this.config.heartbeat.timezone);
+    const flow = new OnboardingFlow(store, workspace, this.config.heartbeat.timezone, this.config.emergency?.keywords);
     if (await flow.isComplete()) {
       return undefined;
     }
@@ -1178,7 +1205,7 @@ export class Gateway {
       .split(/\r?\n/)
       .filter((line) => !/^\s*(user id|reply to message id|uploaded media path)\s*:/i.test(line))
       .join('\n');
-    if (!EMERGENCY_PATTERN.test(cleanInput)) {
+    if (!isEmergencyInput(cleanInput, this.config.emergency?.keywords)) {
       return undefined;
     }
     return EMERGENCY_RESPONSE;
@@ -1458,4 +1485,3 @@ export class Gateway {
     }
   }
 }
-

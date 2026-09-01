@@ -126,6 +126,11 @@ export interface AgentConfig {
   disclaimerEnabled: boolean;
 }
 
+export interface EmergencyConfig {
+  /** Literal phrases that extend the built-in emergency detector. */
+  keywords: string[];
+}
+
 export interface ProfileConfig {
   baseDir: string;
   defaultProfileId: string;
@@ -143,5 +148,6 @@ export interface AppConfig {
   sessions: SessionsConfig;
   heartbeat: HeartbeatConfig;
   agent: AgentConfig;
+  emergency?: EmergencyConfig;
   profiles?: ProfileConfig;
 }

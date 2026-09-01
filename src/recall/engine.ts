@@ -268,23 +268,30 @@ export class RecallEngine {
   private async stage1Ledger(): Promise<{ text: string; tokens: number; truncated: boolean }> {
     const { factMirror, config } = this.deps;
     try {
-      // Active clinical facts, deduped by entity → highest version (CONTRA-07).
-      const byEntity = new Map<string, FactRecord>();
+      const byEntity = new Map<string, FactRecord[]>();
       for await (const f of factMirror.queryActive()) {
         if (!config.ledgerTypes.includes(f.type)) continue;
-        const cur = byEntity.get(f.entity);
-        if (!cur || f.version > cur.version) byEntity.set(f.entity, f);
+        const key = `${f.type}::${f.entity}`;
+        const group = byEntity.get(key);
+        if (group) group.push(f); else byEntity.set(key, [f]);
       }
       // Priority order so a tight budget never silently evicts a safety row (F3): safety/allergy
       // first, then the clinical ordering, stable tiebreak by entity.
-      const activeFacts = [...byEntity.values()].sort((a, b) =>
-        ledgerRank(a) - ledgerRank(b) || a.entity.localeCompare(b.entity));
-      const lines: string[] = activeFacts.map(f => RecallEngine.renderActive(f));
+      const activeGroups = [...byEntity.values()].sort((a, b) =>
+        ledgerRank(a[0]) - ledgerRank(b[0]) || a[0].entity.localeCompare(b[0].entity));
+      const lines: string[] = activeGroups.map((group) => {
+        if (group.length === 1) return RecallEngine.renderActive(group[0]);
+        const values = [...group]
+          .sort((a, b) => a.version - b.version)
+          .map((f) => `v${f.version}: ${RecallEngine.renderActive(f).replace(/^- /, '')}`)
+          .join(' | ');
+        return `- CONFLICT: multiple active ${group[0].type} records for ${group[0].entity} — ${values}`;
+      });
       // Paused facts that carry a pre_pause_summary (KNEE-08) — skip entities that already have an
       // active head (active wins; no double-render, F15).
       for await (const f of factMirror.queryPaused()) {
         if (!config.ledgerTypes.includes(f.type)) continue;
-        if (byEntity.has(f.entity)) continue;
+        if (byEntity.has(`${f.type}::${f.entity}`)) continue;
         const summary = f.fields['pre_pause_summary'];
         if (summary === undefined) continue;
         lines.push(`- ${f.entity} (${f.type}) paused — ${fmtFieldValue(summary)}`);

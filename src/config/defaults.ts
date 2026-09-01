@@ -1,6 +1,7 @@
 import * as os from 'os';
 import * as path from 'path';
 import type { AppConfig } from './types';
+import { BUILT_IN_EMERGENCY_KEYWORDS } from '../safety/emergency-detector';
 
 export const DEFAULT_CONFIG: AppConfig = {
   providers: {
@@ -99,6 +100,9 @@ export const DEFAULT_CONFIG: AppConfig = {
   agent: {
     maxIterations: 15,
     disclaimerEnabled: true,
+  },
+  emergency: {
+    keywords: [...BUILT_IN_EMERGENCY_KEYWORDS],
   },
   profiles: {
     baseDir: path.join(os.homedir(), '.redacted'),

@@ -3,7 +3,7 @@ import * as path from 'path';
 import { createHash } from 'crypto';
 import {
   AUTHORITY_RANK, ConfirmationToken, FactStatus, FactType, LedgerFact,
-  LedgerMutationResult, PendingOp, Provenance, RecordFactResult, RetractResult, StoredToken, TYPE_TO_FILE,
+  ConfirmationContext, LedgerMutationResult, PendingOp, Provenance, RecordFactResult, RetractResult, StoredToken, TYPE_TO_FILE,
 } from './types';
 import { parseLedgerFile, renderLedgerFile, canonicalFields } from './ledger-parser';
 import { TokenRejectedError } from './token-errors';
@@ -27,6 +27,10 @@ function makeToken(entity: string, changeHash: string, nowMs: number): Confirmat
 
 function isMedOrAllergy(t: FactType): boolean {
   return t === 'medication' || t === 'allergy';
+}
+
+function factSnapshotHash(fact: LedgerFact): string {
+  return hash(`${fact.id}:${JSON.stringify(canonicalFields(fact.fields))}`);
 }
 
 interface RecordFactParams {
@@ -154,6 +158,7 @@ export class LedgerStore {
     // active facts. Exclude them so a corrupt block cannot surface as a ghost active fact.
     const active = facts.filter(f => f.entity === entity && f.status === 'active' && f.version >= 1);
     if (active.length === 0) return null;
+    if (active.length > 1) throw new Error('multiple-active-versions');
     active.sort((a, b) => b.version - a.version);
     return active[0];
   }
@@ -185,6 +190,7 @@ export class LedgerStore {
     now: string,
     current?: LedgerFact,
     fieldsOverride?: Record<string, string | number | string[]>,
+    preserveCurrentProvenance = false,
   ): LedgerFact {
     // SB-2 (specs/07 §5 merge-update): a superseding version MERGES the prior active/paused
     // fact's fields with the proposal — a non-conflicting add or a single-key change must never
@@ -193,13 +199,13 @@ export class LedgerStore {
     const fields = fieldsOverride
       ? fieldsOverride
       : (current ? { ...current.fields, ...params.fields } : { ...params.fields });
-    const pf: Provenance = {
-      source: params.provenance.source,
-      confidence: params.provenance.confidence,
-      anchor: params.provenance.anchor,
-      capturedAt: now,
-      note: params.provenance.note,
-    };
+    const keepProvenance = Boolean(
+      preserveCurrentProvenance && current
+      && AUTHORITY_RANK[params.provenance.source] < AUTHORITY_RANK[current.provenance.source],
+    );
+    const pf: Provenance = keepProvenance
+      ? { ...current!.provenance }
+      : { ...params.provenance, capturedAt: now };
 
     return {
       id: `${params.entity}@v${version}`,
@@ -218,11 +224,12 @@ export class LedgerStore {
       // Medications and allergies are ALWAYS safety-relevant — the SAFETY.md net and
       // the retract/discontinue confirmation must never depend on a caller/model flag
       // (medical-safety). Other types honor the caller's flag as before.
-      safetyRelevant: isMedOrAllergy(params.type) ? true : (params.safetyRelevant ?? false),
-      episodeId: params.episodeId,
-      language: params.language || 'en',
-      verbatim: params.verbatim,
-      visibility: (params.visibility as 'private' | 'shareable-summary' | 'shareable-full') || 'private',
+      safetyRelevant: isMedOrAllergy(params.type) || current?.safetyRelevant === true || params.safetyRelevant === true,
+      episodeId: params.episodeId ?? current?.episodeId,
+      language: params.language ?? current?.language ?? 'en',
+      verbatim: params.verbatim ?? current?.verbatim,
+      visibility: (params.visibility as 'private' | 'shareable-summary' | 'shareable-full' | undefined)
+        ?? current?.visibility ?? 'private',
       createdAt: now,
     };
   }
@@ -250,7 +257,7 @@ export class LedgerStore {
       const proposed = this.makeFact(params, v, 'paused', now, cur, fields);
       const changeHash = hash(`${params.entity}:${params.type}:${JSON.stringify(canonicalFields(params.fields))}`);
       // CH: snapshot the current fact so confirm() can detect state drift.
-      const baselineCurHash = hash(`${cur.id}:${JSON.stringify(canonicalFields(cur.fields))}`);
+      const baselineCurHash = factSnapshotHash(cur);
       const token = makeToken(params.entity, changeHash, this.clock.now().getTime());
       this.tokens.set(token.uuid, { token, op: { kind: 'write', ...params, fields, baselineCurHash }, used: false });
       return { kind: 'needs-confirmation', token, current: cur, proposed };
@@ -264,7 +271,7 @@ export class LedgerStore {
         const v = this.nextVersion(allFacts, params.entity);
         const proposed = this.makeFact(params, v, 'active', now, cur);
         const changeHash = hash(`resume:${params.entity}:${params.type}:${JSON.stringify(canonicalFields(params.fields))}`);
-        const baselineCurHash = hash(`${cur.id}:${JSON.stringify(canonicalFields(cur.fields))}`);
+        const baselineCurHash = factSnapshotHash(cur);
         const token = makeToken(params.entity, changeHash, this.clock.now().getTime());
         this.tokens.set(token.uuid, { token, op: { kind: 'write', ...params, baselineCurHash }, used: false });
         return { kind: 'needs-confirmation', token, current: cur, proposed };
@@ -282,7 +289,7 @@ export class LedgerStore {
     if (!hasConflict) {
       const v = this.nextVersion(allFacts, params.entity);
       active.status = 'superseded';
-      const fact = this.makeFact(params, v, 'active', now, active);
+      const fact = this.makeFact(params, v, 'active', now, active, undefined, true);
       allFacts.push(fact);
       await this.writeFacts(params.type, allFacts);
       return { kind: 'applied', fact };
@@ -337,7 +344,7 @@ export class LedgerStore {
       const proposed = this.makeFact(params, v, 'active', now, active);
       const changeHash = hash(`${params.entity}:${params.type}:${JSON.stringify(canonicalFields(params.fields))}`);
       // CH: snapshot the current fact so confirm() can detect state drift.
-      const baselineCurHash = hash(`${active.id}:${JSON.stringify(canonicalFields(active.fields))}`);
+      const baselineCurHash = factSnapshotHash(active);
       const token = makeToken(params.entity, changeHash, this.clock.now().getTime());
       this.tokens.set(token.uuid, { token, op: { kind: 'write', ...params, fields: params.fields, baselineCurHash }, used: false });
       return { kind: 'needs-confirmation', token, current: active, proposed };
@@ -360,9 +367,12 @@ export class LedgerStore {
     // regardless of the flag (aligns with discontinue's type-based guard).
     if (cur.safetyRelevant || isMedOrAllergy(cur.type)) {
       const changeHash = hash(`retract:${params.entity}:${params.type}`);
+      const baselineCurHash = factSnapshotHash(cur);
       const token = makeToken(params.entity, changeHash, this.clock.now().getTime());
       this.tokens.set(token.uuid, {
-        token, op: { kind: 'retract', entity: params.entity, type: params.type, provenance: params.provenance }, used: false,
+        token,
+        op: { kind: 'retract', entity: params.entity, type: params.type, provenance: params.provenance, baselineCurHash },
+        used: false,
       });
       return { kind: 'needs-confirmation', fact: cur, token };
     }
@@ -442,10 +452,11 @@ export class LedgerStore {
 
     if (isMedOrAllergy(type)) {
       const changeHash = hash(`discontinue:${entity}:${type}`);
+      const baselineCurHash = factSnapshotHash(cur);
       const token = makeToken(entity, changeHash, this.clock.now().getTime());
       this.tokens.set(token.uuid, {
         token,
-        op: { kind: 'discontinue', entity, type, provenance, reason: opts?.reason, replacedBy: opts?.replacedBy },
+        op: { kind: 'discontinue', entity, type, provenance, reason: opts?.reason, replacedBy: opts?.replacedBy, baselineCurHash },
         used: false,
       });
       return { kind: 'needs-confirmation', fact: cur, token };
@@ -497,10 +508,11 @@ export class LedgerStore {
 
     if (isMedOrAllergy(type)) {
       const changeHash = hash(`restart:${entity}:${type}`);
+      const baselineCurHash = factSnapshotHash(discontinued);
       const token = makeToken(entity, changeHash, this.clock.now().getTime());
       this.tokens.set(token.uuid, {
         token,
-        op: { kind: 'restart', entity, type, provenance, fields: { ...fields }, restartOf: discontinued.id },
+        op: { kind: 'restart', entity, type, provenance, fields: { ...fields }, restartOf: discontinued.id, baselineCurHash },
         used: false,
       });
       return { kind: 'needs-confirmation', fact: discontinued, token };
@@ -573,12 +585,31 @@ export class LedgerStore {
     stored.used = true;
   }
 
-  async confirm(tokenId: string, options?: { winningVersion?: number }): Promise<LedgerFact> {
+  bindTokenContext(tokenId: string, context?: ConfirmationContext): void {
+    if (!context) return;
+    const stored = this.tokens.get(tokenId);
+    if (stored && !stored.confirmationContext) stored.confirmationContext = { ...context };
+  }
+
+  async confirm(
+    tokenId: string,
+    options?: { winningVersion?: number },
+    context?: ConfirmationContext,
+  ): Promise<LedgerFact> {
     const stored = this.tokens.get(tokenId);
     if (!stored) throw new TokenRejectedError('token-not-found');
     if (stored.used) throw new TokenRejectedError('token-already-used');
     if (new Date(stored.token.expiresAt) < this.clock.now()) {
       throw new TokenRejectedError('token-expired');
+    }
+    if (stored.confirmationContext && context) {
+      if (stored.confirmationContext.chatId && context.chatId
+        && stored.confirmationContext.chatId !== context.chatId) {
+        throw new TokenRejectedError('confirmation-context-mismatch');
+      }
+      if (stored.confirmationContext.turnId === context.turnId) {
+        throw new TokenRejectedError('same-turn-confirm');
+      }
     }
 
     const op = stored.op;
@@ -609,7 +640,7 @@ export class LedgerStore {
       // CH (M2/M3-sec): reject a stale token whose target state moved since the
       // proposal — confirming blind would clobber a newer legitimate change.
       if (op.baselineCurHash !== undefined
-        && hash(`${cur.id}:${JSON.stringify(canonicalFields(cur.fields))}`) !== op.baselineCurHash) {
+        && factSnapshotHash(cur) !== op.baselineCurHash) {
         throw new TokenRejectedError('state-moved-since-proposal');
       }
       const now = this.clock.now().toISOString();
@@ -656,6 +687,9 @@ export class LedgerStore {
       const allFacts = await this.readFacts(op.type);
       const cur = this.activeVersion(allFacts, op.entity);
       if (!cur) throw new TokenRejectedError('no-active-version');
+      if (factSnapshotHash(cur) !== op.baselineCurHash) {
+        throw new TokenRejectedError('state-moved-since-proposal');
+      }
       const now = this.clock.now().toISOString();
       const v = this.nextVersion(allFacts, op.entity);
       cur.status = 'superseded';
@@ -684,6 +718,9 @@ export class LedgerStore {
     if (op.kind === 'dispute') {
       const winningVersion = options?.winningVersion;
       if (!winningVersion) throw new TokenRejectedError('dispute-incomplete');
+      if (winningVersion !== op.versionA && winningVersion !== op.versionB) {
+        throw new TokenRejectedError('dispute-version-not-offered');
+      }
       const allFacts = await this.readFacts(op.type);
       // Self-review IMPORTANT-3: at mint time the pre-dispute fact was flipped to
       // `disputed`, so ANY current active version means a third write landed in
@@ -711,6 +748,9 @@ export class LedgerStore {
       const allFacts = await this.readFacts(op.type);
       const cur = this.activeVersion(allFacts, op.entity);
       if (!cur) throw new TokenRejectedError('no-active-version');
+      if (factSnapshotHash(cur) !== op.baselineCurHash) {
+        throw new TokenRejectedError('state-moved-since-proposal');
+      }
       return this.applyDiscontinue(allFacts, cur, op.entity, op.type, op.provenance, { reason: op.reason, replacedBy: op.replacedBy });
     }
 
@@ -721,8 +761,11 @@ export class LedgerStore {
       if (this.activeVersion(allFacts, op.entity)) {
         throw new TokenRejectedError('entity-already-active');
       }
-      const discontinued = allFacts.find(f => f.id === op.restartOf) ?? this.latestDiscontinued(allFacts, op.entity);
+      const discontinued = this.latestDiscontinued(allFacts, op.entity);
       if (!discontinued) throw new TokenRejectedError('no-active-version');
+      if (discontinued.id !== op.restartOf || factSnapshotHash(discontinued) !== op.baselineCurHash) {
+        throw new TokenRejectedError('state-moved-since-proposal');
+      }
       return this.applyRestart(allFacts, discontinued, op.entity, op.type, op.provenance, { ...op.fields }, discontinued.id);
     }
 

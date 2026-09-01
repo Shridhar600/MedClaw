@@ -51,10 +51,14 @@ describe('Unified MEDICAL_DISCLAIMER constant (PROD-P2-8)', () => {
       embed: jest.fn().mockResolvedValue([]),
     };
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
-    const loop = new AgentLoop(provider, registry, [], { maxIterations: 15, disclaimerEnabled: true });
+    const loop = new AgentLoop(
+      provider,
+      registry,
+      async () => ({ messages: [], healthContextTouched: true }),
+      { maxIterations: 15, disclaimerEnabled: true },
+    );
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const result = await (loop.run('My fasting glucose was 180 this morning.') as any);
+    const result = await loop.run('My fasting glucose was 180 this morning.');
     expect(result.healthResponse).toBe(true);
     // The exact unified constant is appended — not a divergent local copy.
     expect(result.text.endsWith(MEDICAL_DISCLAIMER)).toBe(true);

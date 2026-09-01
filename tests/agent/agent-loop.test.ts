@@ -90,7 +90,12 @@ describe('AgentLoop', () => {
   it('sets healthResponse from health intent context even when response lacks health keywords', async () => {
     const provider = makeProvider([{ type: 'text', text: 'Consider discussing this with a professional soon.' }]);
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
-    const loop = new AgentLoop(provider, registry, [], { maxIterations: 15, disclaimerEnabled: true });
+    const loop = new AgentLoop(
+      provider,
+      registry,
+      async () => ({ messages: [], healthContextTouched: true }),
+      { maxIterations: 15, disclaimerEnabled: true },
+    );
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const result = await (loop.run('My fasting glucose was 180 this morning.') as any);
@@ -99,6 +104,22 @@ describe('AgentLoop', () => {
     const lastTrace = result.trace[result.trace.length - 1];
     expect(lastTrace.role).toBe('assistant');
     expect(lastTrace.content).toBe(result.text);
+  });
+
+  it('appends the disclaimer from assembled health context even when the kill-switch is false', async () => {
+    const provider = makeProvider([{ type: 'text', text: 'Your lisinopril dose is fine.' }]);
+    const registry = new ToolRegistry({ allow: ['*'], deny: [] });
+    const loop = new AgentLoop(
+      provider,
+      registry,
+      async () => ({ messages: [], healthContextTouched: true } as never),
+      { maxIterations: 15, disclaimerEnabled: false },
+    );
+
+    const result = await loop.run('Tell me about lisinopril.');
+
+    expect(result.healthResponse).toBe(true);
+    expect(result.text).toContain('I am an AI health companion, not a doctor');
   });
 
   it('does not mark clearly non-health responses as medical', async () => {
@@ -123,19 +144,25 @@ describe('AgentLoop', () => {
     expect(result.text).toContain('maximum');
   });
 
-  it('forwards run-context chatId to tool execution', async () => {
+  it('forwards one generated turn id to every tool call and changes it on the next run', async () => {
     const provider = makeProvider([
       { type: 'tool_call', toolCalls: [{ id: 'c1', name: 'ping', arguments: {} }] },
       { type: 'text', text: 'done' },
+      { type: 'tool_call', toolCalls: [{ id: 'c2', name: 'ping', arguments: {} }] },
+      { type: 'text', text: 'done again' },
     ]);
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
     registry.register(pingTool);
     const executeSpy = jest.spyOn(registry, 'execute');
     const loop = new AgentLoop(provider, registry, [], { maxIterations: 15, disclaimerEnabled: false });
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (loop as any).run('Ping with context', [], { chatId: 'chat-context-1' });
+    await loop.run('Ping with context', [], { chatId: 'chat-context-1' });
+    await loop.run('Ping again', [], { chatId: 'chat-context-1' });
 
-    expect(executeSpy).toHaveBeenCalledWith('ping', {}, { chatId: 'chat-context-1' });
+    const firstContext = executeSpy.mock.calls[0][2] as { chatId?: string; turnId?: string };
+    const secondContext = executeSpy.mock.calls[1][2] as { chatId?: string; turnId?: string };
+    expect(firstContext).toEqual(expect.objectContaining({ chatId: 'chat-context-1', turnId: expect.any(String) }));
+    expect(secondContext).toEqual(expect.objectContaining({ chatId: 'chat-context-1', turnId: expect.any(String) }));
+    expect(secondContext.turnId).not.toBe(firstContext.turnId);
   });
 });

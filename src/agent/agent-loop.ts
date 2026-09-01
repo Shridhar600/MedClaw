@@ -15,6 +15,7 @@ interface AgentConfig {
 
 interface AgentRunContext {
   chatId?: string;
+  turnId?: string;
   origin?: SemaphorePriority;
   /** The assembler mode for this turn (Gateway owns the origin→mode mapping — H-4). */
   mode?: AssemblerMode;
@@ -24,6 +25,8 @@ interface AgentRunContext {
 export interface PreparedSystem {
   messages: Message[];
   recordUsed?: (usedIds: string[]) => Promise<void>;
+  /** True when this turn received health data from SAFETY/profile/ledger/recall. */
+  healthContextTouched?: boolean;
 }
 
 /** Builds the system prompt fresh for a turn (D9). Recall + assembly happen inside; SAFETY is
@@ -32,6 +35,7 @@ export type PrepareSystem = (mode: AssemblerMode, userMessage: string) => Promis
 
 export class AgentLoop {
   private readonly prepareSystem: PrepareSystem;
+  private turnSequence = 0;
 
   constructor(
     private readonly provider: LLMProvider,
@@ -52,7 +56,11 @@ export class AgentLoop {
     conversationHistory: Message[] = [],
     runContext?: AgentRunContext,
   ): Promise<AgentRunResult> {
-    const exec = (): Promise<AgentRunResult> => this.runInternal(userMessage, conversationHistory, runContext);
+    const context: AgentRunContext = {
+      ...runContext,
+      turnId: runContext?.turnId ?? `${runContext?.chatId ?? 'anonymous'}:${++this.turnSequence}`,
+    };
+    const exec = (): Promise<AgentRunResult> => this.runInternal(userMessage, conversationHistory, context);
     if (this.semaphore) {
       const priority: SemaphorePriority = runContext?.origin ?? 'user';
       return this.semaphore.run(priority, exec);
@@ -104,8 +112,9 @@ export class AgentLoop {
         if (usedIds.length > 0 && prepared.recordUsed) {
           try { await prepared.recordUsed(usedIds); } catch { /* recordUsage is best-effort + guarded */ }
         }
-        const isHealthRelated = this.config.disclaimerEnabled
-          && this.isHealthResponse(userMessage, rawText, usedTools);
+        const isHealthRelated = Boolean(
+          prepared.healthContextTouched || usedTools.some((toolName) => MEDICAL_TOOLS.has(toolName)),
+        );
         const alreadyHasDisclaimer = rawText.includes(MEDICAL_DISCLAIMER_SENTINEL);
         const finalText = isHealthRelated && !alreadyHasDisclaimer ? rawText + MEDICAL_DISCLAIMER : rawText;
         trace.push({ role: 'assistant', content: finalText });
@@ -169,22 +178,4 @@ export class AgentLoop {
     };
   }
 
-  private looksHealthRelated(text: string): boolean {
-    const keywords = [
-      'health', 'medical', 'symptom', 'medication', 'blood', 'glucose', 'fasting', 'diabetes',
-      'pain', 'doctor', 'diagnosis', 'hba1c', 'cholesterol', 'bp',
-    ];
-    const lower = text.toLowerCase();
-    return keywords.some(k => lower.includes(k));
-  }
-
-  private isHealthResponse(userMessage: string, responseText: string, usedTools: string[]): boolean {
-    if (usedTools.some((toolName) => MEDICAL_TOOLS.has(toolName))) {
-      return true;
-    }
-    if (this.looksHealthRelated(userMessage)) {
-      return true;
-    }
-    return this.looksHealthRelated(responseText);
-  }
 }

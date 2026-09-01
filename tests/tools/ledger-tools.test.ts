@@ -80,6 +80,53 @@ describe('ledger tools (Task 12.1–12.3)', () => {
     expect(await view.read()).toContain('warfarin');
   });
 
+  it('rejects same-turn confirmation but accepts the same token on a later turn in the same chat', async () => {
+    await ledger.recordFact({ entity: 'warfarin', type: 'medication', fields: { dose: '5mg' }, provenance: { source: 'user', confidence: 0.9, anchor: '', capturedAt: DAY } });
+    const minted = await byName('ledger_record').execute(
+      { entity: 'warfarin', type: 'medication', fields: { dose: '10mg' } },
+      { chatId: 'chat-1', turnId: 'turn-1' } as never,
+    );
+    const tokenId = (minted.content[0].text.match(/[0-9a-f]{12}/) ?? [])[0]!;
+
+    const sameTurn = await byName('ledger_update').execute(
+      { tokenId, confirm: true },
+      { chatId: 'chat-1', turnId: 'turn-1' } as never,
+    );
+    expect(sameTurn.isError).toBe(true);
+    expect(sameTurn.content[0].text).toContain('same turn that created it');
+    expect((await ledger.getActive('warfarin', 'medication'))!.fields.dose).toBe('5mg');
+
+    const laterTurn = await byName('ledger_update').execute(
+      { tokenId, confirm: true },
+      { chatId: 'chat-1', turnId: 'turn-2' } as never,
+    );
+    expect(laterTurn.isError).toBeFalsy();
+    expect((await ledger.getActive('warfarin', 'medication'))!.fields.dose).toBe('10mg');
+  });
+
+  it('blocks ledger_remove self-confirmation until a later inbound turn', async () => {
+    await ledger.recordFact({ entity: 'lisinopril', type: 'medication', fields: { dose: '10mg' }, provenance: { source: 'user', confidence: 0.9, anchor: '', capturedAt: DAY } });
+    const removal = await byName('ledger_remove').execute(
+      { entity: 'lisinopril', type: 'medication' },
+      { chatId: 'chat-1', turnId: 'turn-1' } as never,
+    );
+    const tokenId = (removal.content[0].text.match(/[0-9a-f]{12}/) ?? [])[0]!;
+
+    const sameTurn = await byName('ledger_update').execute(
+      { tokenId, confirm: true },
+      { chatId: 'chat-1', turnId: 'turn-1' } as never,
+    );
+    expect(sameTurn.isError).toBe(true);
+    expect(await ledger.getActive('lisinopril', 'medication')).not.toBeNull();
+
+    const laterTurn = await byName('ledger_update').execute(
+      { tokenId, confirm: true },
+      { chatId: 'chat-1', turnId: 'turn-2' } as never,
+    );
+    expect(laterTurn.isError).toBeFalsy();
+    expect(await ledger.getActive('lisinopril', 'medication')).toBeNull();
+  });
+
   it('ledger_update with confirm=false does not apply the change', async () => {
     await ledger.recordFact({ entity: 'warfarin', type: 'medication', fields: { dose: '5mg' }, provenance: { source: 'user', confidence: 0.9, anchor: '', capturedAt: DAY } });
     const rec = await byName('ledger_record').execute({ entity: 'warfarin', type: 'medication', fields: { dose: '10mg' } });

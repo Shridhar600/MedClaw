@@ -4,7 +4,7 @@
 // (both lanes + D8 SAFETY re-render); confirmations and queries go straight to the store.
 // `src/tools/` is the legacy layer and MAY import memcore/capture concretes.
 
-import type { Tool, ToolResult } from './types';
+import type { Tool, ToolExecutionContext, ToolResult } from './types';
 import type { CapturePipeline, QueuePort, SafetyRenderer } from '../capture';
 import type { LedgerStore } from '../memcore';
 import type { FactType, LedgerFact, RecordFactResult, Authority, Provenance } from '../memcore';
@@ -109,6 +109,15 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
     }
   };
   const clock = deps.clock ?? systemClock;
+  const confirmationContext = (context?: ToolExecutionContext) => context?.turnId
+    ? { chatId: context.chatId, turnId: context.turnId }
+    : undefined;
+  const bindRecordTokens = (result: RecordFactResult | void, context?: ToolExecutionContext): void => {
+    if (!result) return;
+    if (result.kind === 'needs-confirmation') deps.ledger.bindTokenContext(result.token.uuid, confirmationContext(context));
+    if (result.kind === 'disputed') deps.ledger.bindTokenContext(result.disputeToken.uuid, confirmationContext(context));
+    if (result.pendingRetract) deps.ledger.bindTokenContext(result.pendingRetract.uuid, confirmationContext(context));
+  };
   const provenance = (source: Authority, confidence: number): Provenance => ({
     source,
     confidence,
@@ -166,7 +175,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       },
       required: ['entity', 'type'],
     },
-    async execute(params): Promise<ToolResult> {
+    async execute(params, context): Promise<ToolResult> {
       // I2: model-supplied args are untrusted — validate shapes at the boundary and
       // return a clean error the model can self-correct from, never a raw TypeError
       // from deep inside render/sanitize code.
@@ -232,6 +241,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
           corrects: params.corrects as string | undefined,
         },
       });
+      bindRecordTokens(result, context);
       return renderRecordResult(result, entity, type);
     },
   };
@@ -250,7 +260,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       },
       required: ['tokenId', 'confirm'],
     },
-    async execute(params): Promise<ToolResult> {
+    async execute(params, context): Promise<ToolResult> {
       // I2: same boundary rule as ledger_record — clean self-correctable errors.
       if (typeof params.tokenId !== 'string' || params.tokenId.trim() === '') {
         return err('Missing or invalid required field "tokenId" (the confirmation token id string from ledger_record).');
@@ -282,6 +292,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
             const applied = await deps.ledger.confirm(
               tokenId,
               winningVersion !== undefined ? { winningVersion } : undefined,
+              confirmationContext(context),
             );
             // D8: a confirmed safety-relevant change must re-render SAFETY.md in the same op.
             if (applied.safetyRelevant) {
@@ -333,7 +344,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       },
       required: ['entity', 'type'],
     },
-    async execute(params): Promise<ToolResult> {
+    async execute(params, context): Promise<ToolResult> {
       // I2: boundary validation — a non-string entity/reason would otherwise
       // TypeError deep in sanitize/parse instead of self-correcting.
       if (typeof params.entity !== 'string' || params.entity.trim() === '') {
@@ -371,6 +382,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
         return ok(`Nothing to remove: ${result.reason.replace(/-/g, ' ')}.`);
       }
       if (result.kind === 'needs-confirmation') {
+        if (result.token) deps.ledger.bindTokenContext(result.token.uuid, confirmationContext(context));
         return ok(
           `Removing ${entity} needs your confirmation. To apply, call ledger_update with tokenId="${result.token.uuid}" and confirm=true; to decline, confirm=false.\n` +
           `current: ${summarizeFields(result.fact)}`,
@@ -408,9 +420,12 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       const conflicts = type ? await deps.ledger.listActiveConflicts(type) : [];
 
       if (entity && type) {
+        const hasConflict = conflicts.includes(entity);
         const facts = status === 'all'
           ? await deps.ledger.getChain(entity, type)
-          : ((f): LedgerFact[] => (f ? [f] : []))(await deps.ledger.getActive(entity, type));
+          : hasConflict
+            ? (await deps.ledger.listByType(type)).filter((f) => f.entity === entity)
+            : ((f): LedgerFact[] => (f ? [f] : []))(await deps.ledger.getActive(entity, type));
         const links = await deps.ledger.getCrossLinks(entity, type);
         const linkLines: string[] = [];
         if (links.replaces.length) linkLines.push(`replaces: ${links.replaces.join(', ')}`);
@@ -418,7 +433,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
         if (links.corrects.length) linkLines.push(`corrects: ${links.corrects.join(', ')}`);
         if (links.correctedBy.length) linkLines.push(`correctedBy: ${links.correctedBy.join(', ')}`);
         const linkText = linkLines.length ? `\ncross-links → ${linkLines.join(' · ')}` : '';
-        const warn = conflicts.includes(entity)
+        const warn = hasConflict
           ? `⚠️ CONFLICT: ${entity} has multiple active records — ask the user which is current.\n`
           : '';
         return ok(warn + renderFacts(facts) + linkText);

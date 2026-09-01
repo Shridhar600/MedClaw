@@ -153,6 +153,42 @@ describe('OnboardingFlow', () => {
     expect(state.status).toBe('not_started');
   });
 
+  it.each([
+    'I want to kill myself',
+    'I want to die',
+    "I don't want to live anymore",
+    "I don't want to be alive",
+    'I am going to end it',
+    'I plan to end my life',
+    'Life is not worth living',
+    'I took all my pills',
+    'I may have overdosed',
+    'I am thinking about self-harm',
+    'They are unconscious',
+    'They are unresponsive',
+    'They are unconscious and not breathing',
+    'This looks like anaphylaxis',
+    'They are having a seizure',
+  ])('bypasses onboarding for ordinary crisis phrasing: %s', async (input) => {
+    const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
+
+    const result = await flow.handle(input);
+
+    expect(result.bypass).toBe(true);
+    expect(result.response).toContain('emergency');
+    expect(result.response).toContain('I am an AI health companion, not a doctor');
+  });
+
+  it('extends built-in emergency phrases with configured literal keywords', async () => {
+    const flow = new (OnboardingFlow as never as new (...args: unknown[]) => OnboardingFlow)(
+      new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata', ['code violet'],
+    );
+
+    const result = await flow.handle('Please start code violet now');
+
+    expect(result.bypass).toBe(true);
+  });
+
   it('supports skip without corrupting profile files', async () => {
     const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
 

@@ -53,6 +53,11 @@ export interface ConfirmationToken {
   singleUse: true;
 }
 
+export interface ConfirmationContext {
+  chatId?: string;
+  turnId: string;
+}
+
 export interface MetricPoint {
   metric: string;
   value: number;
@@ -154,10 +159,10 @@ export type CaptureEvent =
 
 export type PendingOp =
   | { kind: 'write'; entity: string; type: FactType; fields: Record<string, string | number | string[]>; provenance: Provenance; safetyRelevant?: boolean; episodeId?: string; language?: string; verbatim?: string; visibility?: string; resume?: boolean; /** Cross-entity links (E1.2): carried through confirm so a confirmed write stamps the reverse link. */ replaces?: string; corrects?: string; /** Hash of the current fact at proposal time (CH): verified at confirm to reject stale-token clobbers. */ baselineCurHash?: string }
-  | { kind: 'retract'; entity: string; type: FactType; provenance: Provenance }
+  | { kind: 'retract'; entity: string; type: FactType; provenance: Provenance; baselineCurHash: string }
   | { kind: 'dispute'; entity: string; type: FactType; versionA: number; versionB: number; originalId: string }
-  | { kind: 'discontinue'; entity: string; type: FactType; provenance: Provenance; reason?: string; replacedBy?: string }
-  | { kind: 'restart'; entity: string; type: FactType; provenance: Provenance; fields: Record<string, string | number | string[]>; restartOf: string };
+  | { kind: 'discontinue'; entity: string; type: FactType; provenance: Provenance; reason?: string; replacedBy?: string; baselineCurHash: string }
+  | { kind: 'restart'; entity: string; type: FactType; provenance: Provenance; fields: Record<string, string | number | string[]>; restartOf: string; baselineCurHash: string };
 
 /**
  * Result of a lifecycle mutation (discontinue / restart / pause). `noop` is an
@@ -173,6 +178,7 @@ export interface StoredToken {
   token: ConfirmationToken;
   op: PendingOp;
   used: boolean;
+  confirmationContext?: ConfirmationContext;
 }
 
 export type RecordFactResult =

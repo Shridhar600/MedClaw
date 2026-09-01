@@ -7,7 +7,6 @@ import { ContextAssembler } from './agent/context';
 import { MemoryEngine } from './memory/memory-engine';
 import { ToolRegistry } from './tools/registry';
 import { createMemoryTools } from './tools/memory-tools';
-import { createMedicalTools } from './tools/medical-tools';
 import { SqliteStore } from './memory/sqlite-store';
 import { MemorySearch } from './memory/search';
 import { createProvider } from './providers/factory';
@@ -147,21 +146,18 @@ async function main(): Promise<void> {
   const search = new MemorySearch(store, embeddingProvider, config.memory.search.hybridWeights);
 
   const mainProvider = createProvider(config.providers.main);
-  const medicalProvider = createProvider(config.providers.medical);
 
   const registry = new ToolRegistry(config.tools);
   for (const tool of createMemoryTools(memory, search)) registry.register(tool);
-  for (const tool of createMedicalTools(memory, search, medicalProvider, mainProvider, workspacePath, {
-    medicalProviderType: config.providers.medical.type,
-    medicalProviderBaseUrl: config.providers.medical.baseUrl,
-    allowRawMedicalMedia: config.providers.medical.allowRawMedicalMedia,
-    mainProviderType: config.providers.main.type,
-    mainProviderBaseUrl: config.providers.main.baseUrl,
-  })) registry.register(tool);
 
   const assembler = new ContextAssembler(memory, config.memory.bootstrapMaxChars);
   const systemMessages = await assembler.buildSystemMessages();
-  const agentLoop = new AgentLoop(mainProvider, registry, systemMessages, config.agent);
+  const agentLoop = new AgentLoop(
+    mainProvider,
+    registry,
+    async () => ({ messages: systemMessages, healthContextTouched: systemMessages.length > 0 }),
+    config.agent,
+  );
 
   const sessionsPath = path.join(process.env.HOME ?? '', '.redacted', 'sessions');
   const sessions = new SessionManager({

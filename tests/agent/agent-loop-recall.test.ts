@@ -74,7 +74,11 @@ describe('AgentLoop — per-turn assembly + <used> feedback (C3)', () => {
   });
 
   it('strips <used> BEFORE appending the disclaimer / classifying health (H-3 ordering)', async () => {
-    const prepare: PrepareSystem = async () => ({ messages: [], recordUsed: async () => undefined });
+    const prepare: PrepareSystem = async () => ({
+      messages: [],
+      recordUsed: async () => undefined,
+      healthContextTouched: true,
+    });
     const { provider } = recordingProvider([{ type: 'text', text: 'Your glucose note looks stable.\n<used>c9</used>' }]);
     const loop = new AgentLoop(provider, new ToolRegistry({ allow: ['*'], deny: [] }), prepare, { maxIterations: 15, disclaimerEnabled: true });
 

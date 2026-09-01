@@ -1,9 +1,8 @@
 import { writeOnboardingProfile } from './profile-writer';
 import { OnboardingStore } from './store';
 import type { OnboardingAnswers, OnboardingResult, OnboardingState, OnboardingStep } from './types';
+import { EMERGENCY_RESPONSE, isEmergencyInput } from '../safety/emergency-detector';
 
-const EMERGENCY_PATTERN =
-  /\b(chest pain|can't breathe|cannot breathe|difficulty breathing|stroke|heart attack|severe bleeding|suicidal|emergency)\b/i;
 const SKIP_PATTERN = /^(skip|later)$/i;
 const CONFIRM_PATTERN = /^(confirm|yes|y)\b/i;
 
@@ -12,6 +11,7 @@ export class OnboardingFlow {
     private readonly store: OnboardingStore,
     private readonly workspacePath: string,
     private readonly defaultTimezone: string,
+    private readonly emergencyKeywords: readonly string[] = [],
   ) {}
 
   async isComplete(): Promise<boolean> {
@@ -20,11 +20,10 @@ export class OnboardingFlow {
 
   async handle(input: string): Promise<OnboardingResult> {
     const cleanInput = sanitizeOnboardingInput(input);
-    if (EMERGENCY_PATTERN.test(cleanInput)) {
+    if (isEmergencyInput(cleanInput, this.emergencyKeywords)) {
       return {
         bypass: true,
-        response:
-          'This may be an emergency. Please contact local emergency services now or go to the nearest emergency department. If you can, ask someone nearby to stay with you while you get help.',
+        response: EMERGENCY_RESPONSE,
       };
     }
 

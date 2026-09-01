@@ -39,14 +39,15 @@ describe('RecallEngine — Stage 1 (active ledger)', () => {
     expect(r.ledger).not.toContain('naproxen');
   });
 
-  it('CONTRA-07: dedupes by entity, keeping only the highest active version', async () => {
+  it('renders every dual-active value as an explicit conflict instead of choosing one', async () => {
     const mirror = new FakeFactMirror([
       frec({ id: 'metformin@v3', entity: 'metformin', version: 3, status: 'active', fields: { dose: '850mg' } }),
       frec({ id: 'metformin@v5', entity: 'metformin', version: 5, status: 'active', fields: { dose: '1000mg' } }),
     ]);
     const r = await makeEngine({ factMirror: mirror }).run({ profileId: 'default', userMessage: 'hello' });
+    expect(r.ledger).toContain('CONFLICT');
     expect(r.ledger).toContain('1000mg');
-    expect(r.ledger).not.toContain('850mg');
+    expect(r.ledger).toContain('850mg');
   });
 
   it('caps the ledger section at the configured token budget', async () => {
