@@ -126,7 +126,7 @@ export class CuratedMemory {
       const nodeErr = err as NodeJS.ErrnoException;
       if (nodeErr.code === 'ENOENT') return null;
       console.warn(`[curated-memory] read failed: ${summarizeErrorForLog(err)}`);
-      return null;
+      throw err;
     }
   }
 
@@ -213,7 +213,9 @@ export class CuratedMemory {
       const nodeErr = err as NodeJS.ErrnoException;
       if (nodeErr.code === 'ENOENT') return { items: this.freshItems() };
       console.warn(`[curated-memory] degraded read: ${summarizeErrorForLog(err)}`);
-      return { items: this.quarantinedItems(this.salvageRaw(fp)) };
+      // Do not turn an unreadable existing MEMORY.md into a fresh skeleton. The
+      // caller must retry after the source file becomes readable.
+      throw err;
     }
     if (raw.includes('\uFFFD')) {
       console.warn('[curated-memory] degraded read: invalid UTF-8 content');

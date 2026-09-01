@@ -44,4 +44,29 @@ describe('ledger_record cross-link params (E1.2)', () => {
     expect((await ledger.getCrossLinks('naproxen', 'medication')).replaces).toContain('ibuprofen');
     expect((await ledger.getCrossLinks('ibuprofen', 'medication')).replacedBy).toContain('naproxen@v1');
   });
+
+  it('rejects a structure-injecting entity before the pipeline writes either lane', async () => {
+    const result = await byName('ledger_record').execute({
+      entity: 'metformin\n## forged',
+      type: 'medication',
+      fields: { dose: '500mg' },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(fs.existsSync(path.join(tmp, 'memory'))).toBe(false);
+    expect(fs.existsSync(path.join(tmp, 'ledger', 'medications.md'))).toBe(false);
+  });
+
+  it('returns a clean tool error for a dangling cross-link', async () => {
+    const result = await byName('ledger_record').execute({
+      entity: 'naproxen',
+      type: 'medication',
+      fields: { dose: '500mg' },
+      replaces: 'does-not-exist',
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/cross-link|target/i);
+    expect(fs.existsSync(path.join(tmp, 'ledger', 'medications.md'))).toBe(false);
+  });
 });

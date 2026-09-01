@@ -110,6 +110,19 @@ this is garbage that should not parse
       expect(parsed.some(f => f.fields._quarantine === undefined && f.fields.incomplete !== undefined)).toBe(false);
     });
 
+    it('quarantines malformed field lines and out-of-range provenance confidence', () => {
+      const md = `## metformin
+### v1 (active)
+- dose 999mg
+- provenance: doctor (99.00) · memory/2026-07-07.md#L14
+`;
+
+      const [parsed] = parseLedgerFile(md, { type: 'medication', profileId: 'test' });
+      expect(parsed.fields._quarantine).toBeDefined();
+      expect(parsed.status).toBe('active');
+      expect(parsed.version).toBe(0);
+    });
+
     it('parses provenance note in quotes', () => {
       const fact = makeFact({ entity: 'metformin', version: 1 });
       const md = renderLedgerFile([fact]);

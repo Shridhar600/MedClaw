@@ -101,4 +101,46 @@ describe('LedgerStore reverse-link stamping (M-6 / E1.2)', () => {
 
     expect((await store.getCrossLinks('ibuprofen', 'medication')).replacedBy).toContain('naproxen@v1');
   });
+
+  it('resolves a bare-name link to the latest target createdAt as of the source', async () => {
+    const clock = mutableClock('2026-03-01T00:00:00.000Z');
+    const s = new LedgerStore(tmp, clock);
+    await s.recordFact({ entity: 'ibuprofen', type: 'medication', fields: { dose: '400mg' }, provenance: prov('doctor') });
+
+    // The higher version is a backfill with an older clinical timestamp.
+    clock.set('2026-01-01T00:00:00.000Z');
+    await s.recordFact({ entity: 'ibuprofen', type: 'medication', fields: { note: 'backfilled' }, provenance: prov('doctor') });
+
+    clock.set('2026-06-01T00:00:00.000Z');
+    await s.recordFact({ entity: 'naproxen', type: 'medication', fields: { dose: '500mg' }, provenance: prov('doctor'), replaces: 'ibuprofen' });
+
+    const chain = await s.getChain('ibuprofen', 'medication');
+    expect(chain.find((f) => f.version === 1)!.replacedBy).toBe('naproxen@v1');
+    expect(chain.find((f) => f.version === 2)!.replacedBy).toBeUndefined();
+  });
+
+  it('rejects a dangling cross-link instead of persisting it as verified', async () => {
+    await expect(store.recordFact({
+      entity: 'naproxen',
+      type: 'medication',
+      fields: { dose: '500mg' },
+      provenance: prov('doctor'),
+      replaces: 'does-not-exist',
+    })).rejects.toThrow('unresolved-cross-link');
+
+    expect(await store.getCrossLinks('naproxen', 'medication')).toEqual({
+      replaces: [],
+      replacedBy: [],
+      corrects: [],
+      correctedBy: [],
+    });
+  });
+
+  it('stamps supersededBy on the prior version when a new version supersedes it', async () => {
+    await store.recordFact({ entity: 'migraine', type: 'condition', fields: { severity: 'mild' }, provenance: prov('user') });
+    await store.recordFact({ entity: 'migraine', type: 'condition', fields: { frequency: 'weekly' }, provenance: prov('user') });
+
+    const chain = await store.getChain('migraine', 'condition');
+    expect(chain.find((f) => f.version === 1)!.supersededBy).toBe('migraine@v2');
+  });
 });

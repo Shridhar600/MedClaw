@@ -1,5 +1,12 @@
 import { Authority, AUTHORITY_RANK, FactStatus, FactType, LedgerFact } from './types';
-import { sanitizeSingleLine } from './sanitize';
+import { normalizeEntitySlug, sanitizeSingleLine } from './sanitize';
+
+const FACT_STATUSES: ReadonlySet<FactStatus> = new Set([
+  'active', 'superseded', 'retracted', 'discontinued', 'resolved', 'paused', 'disputed',
+]);
+const VISIBILITIES: ReadonlySet<LedgerFact['visibility']> = new Set([
+  'private', 'shareable-summary', 'shareable-full',
+]);
 
 function detectValue(raw: string): string | number | string[] {
   const trimmed = raw.trim();
@@ -46,11 +53,13 @@ function parseProvenance(rawValue: string): { source: Authority; confidence: num
   // v0 "active" fact on the next read).
   const parts = rawValue.split('·').map(s => s.trim());
 
-  const sourceMatch = parts[0].match(/^([a-zA-Z]+)\s*\(([\d.]+)\)/);
+  const sourceMatch = parts[0].match(/^([a-zA-Z]+)\s*\((\d+(?:\.\d+)?)\)$/);
   if (!sourceMatch) return null;
 
   const source = sourceMatch[1] as Authority;
-  const confidence = parseFloat(sourceMatch[2]);
+  if (!Object.prototype.hasOwnProperty.call(AUTHORITY_RANK, source)) return null;
+  const confidence = Number(sourceMatch[2]);
+  if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) return null;
   const anchor = parts[1] ?? '';
   let note: string | undefined;
   if (parts.length > 2) {
@@ -204,12 +213,20 @@ export function parseLedgerFile(md: string, options: { type: FactType; profileId
   if (entityMatches.length === 0) return facts;
 
   for (let i = 0; i < entityMatches.length; i++) {
-    const entityName = entityMatches[i][1];
+    const rawEntityName = entityMatches[i][1];
+    const entityName = normalizeEntitySlug(rawEntityName);
     const sectionStart = entityMatches[i].index!;
     const sectionEnd = i + 1 < entityMatches.length ? entityMatches[i + 1].index! : md.length;
     const sectionContent = md.slice(sectionStart, sectionEnd);
 
     const versionMatches = Array.from(sectionContent.matchAll(/^### v(\d+) \((\w+)(?: ([^)]+))?\)$/gm));
+    const versionHeaders = Array.from(sectionContent.matchAll(/^###.*$/gm));
+    const validHeaderLines = new Set(versionMatches.map((match) => match[0]));
+    const hasMalformedHeader = versionHeaders.some((match) => !validHeaderLines.has(match[0]));
+    if (entityName === null || hasMalformedHeader) {
+      facts.push(createParseErrorFact(rawEntityName, options, `PARSE-ERROR block for ${rawEntityName}: invalid entity or version header`));
+      continue;
+    }
     if (versionMatches.length === 0) continue;
 
     for (let j = 0; j < versionMatches.length; j++) {
@@ -222,6 +239,11 @@ export function parseLedgerFile(md: string, options: { type: FactType; profileId
       const blockBody = sectionContent.slice(headerEnd, blockEnd);
 
       try {
+        if (!Number.isSafeInteger(version) || version < 1 || !FACT_STATUSES.has(status)) {
+          throw new Error('invalid-version-header');
+        }
+        // Active headers have no lifecycle annotation in the canonical format.
+        if (status === 'active' && vm[3] !== undefined) throw new Error('invalid-active-header');
         const fact = parseSingleVersionBlock(entityName, version, status, blockBody, options);
         if (fact) facts.push(fact);
       } catch {
@@ -258,7 +280,15 @@ function parseSingleVersionBlock(
   body: string,
   options: { type: FactType; profileId: string },
 ): LedgerFact | null {
-  const lines = body.split('\n').filter(l => l.startsWith('- '));
+  const bodyLines = body.split('\n');
+  // Preserve the existing lenient treatment of free-form non-bullet text, but never
+  // silently discard a line that claims to be a structured field and is malformed.
+  for (const line of bodyLines) {
+    if (line.startsWith('- ') && !/^- [^:]+: .*$/.test(line)) {
+      throw new Error('malformed-field-line');
+    }
+  }
+  const lines = bodyLines.filter(l => l.startsWith('- '));
   const fields: Record<string, string | number | string[]> = {};
 
   let provSource: Authority = 'user';
@@ -289,16 +319,19 @@ function parseSingleVersionBlock(
 
     if (key === 'provenance') {
       const parsed = parseProvenance(rawVal);
-      if (parsed) {
-        provSource = parsed.source;
-        provConfidence = parsed.confidence;
-        provAnchor = parsed.anchor;
-        provNote = parsed.note;
-        sawProvenance = true;
-      }
+      if (!parsed) throw new Error('invalid-provenance');
+      provSource = parsed.source;
+      provConfidence = parsed.confidence;
+      provAnchor = parsed.anchor;
+      provNote = parsed.note;
+      sawProvenance = true;
     } else if (key === 'captured_at') {
       capturedAt = rawVal;
+      if (Number.isNaN(new Date(capturedAt).getTime())) throw new Error('invalid-captured-at');
     } else if (key === 'safety_relevant' || key === 'episode' || key === 'lang') {
+      if (key === 'safety_relevant' && !['true', 'false'].includes(rawVal.split(' · ')[0].trim())) {
+        throw new Error('invalid-safety-relevant');
+      }
       const meta = parseCombinedMetaValues(key, rawVal);
       if (meta.safetyRelevant !== undefined) safetyRelevant = meta.safetyRelevant;
       if (meta.episodeId !== undefined) episodeId = meta.episodeId;
@@ -306,6 +339,7 @@ function parseSingleVersionBlock(
     } else if (key === 'verbatim') {
       verbatim = rawVal.replace(/^"(.*)"$/, '$1');
     } else if (key === 'visibility') {
+      if (!VISIBILITIES.has(rawVal as LedgerFact['visibility'])) throw new Error('invalid-visibility');
       visibility = rawVal as 'private' | 'shareable-summary' | 'shareable-full';
     } else if (key === 'supersedes') {
       supersedes = rawVal;
@@ -325,6 +359,7 @@ function parseSingleVersionBlock(
       fields.restartOf = rawVal;
     } else if (key === 'created_at') {
       createdAt = rawVal;
+      if (Number.isNaN(new Date(createdAt).getTime())) throw new Error('invalid-created-at');
     } else if (key === 'pre_pause_summary') {
       fields.pre_pause_summary = rawVal;
     } else {

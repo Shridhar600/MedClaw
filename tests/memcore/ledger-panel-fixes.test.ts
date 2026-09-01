@@ -101,6 +101,43 @@ describe('F3 — corrupt ledger file is quarantined, not silently truncated', ()
       warnSpy.mockRestore();
     }
   });
+
+  it('sidecar-quarantines a partially corrupt block before the next write', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'ledger'), { recursive: true });
+    const fp = path.join(tmpDir, 'ledger', 'medications.md');
+    const corrupt = Buffer.from([
+      '## metformin\n',
+      '### v1 (active)\n',
+      '- dose 999mg\n',
+      '- provenance: doctor (99.00) · memory/visit.md#L1\n',
+    ].join(''));
+    fs.writeFileSync(fp, corrupt);
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    try {
+      await store.recordFact({ entity: 'aspirin', type: 'medication', fields: { dose: '75mg' }, provenance: doc });
+    } finally {
+      warnSpy.mockRestore();
+    }
+
+    const sidecars = fs.readdirSync(path.join(tmpDir, 'ledger')).filter(n => n.includes('corrupt'));
+    expect(sidecars).toHaveLength(1);
+    expect(fs.readFileSync(path.join(tmpDir, 'ledger', sidecars[0]))).toEqual(corrupt);
+    expect(await store.getActive('metformin', 'medication')).toBeNull();
+  });
+});
+
+describe('C-64 — entity slugs are validated before an id is created', () => {
+  it('rejects a newline-bearing entity at the store boundary', async () => {
+    await expect(store.recordFact({
+      entity: 'metformin\n## forged',
+      type: 'medication',
+      fields: { dose: '500mg' },
+      provenance: doc,
+    })).rejects.toThrow('invalid-entity-slug');
+
+    expect(fs.existsSync(path.join(tmpDir, 'ledger', 'medications.md'))).toBe(false);
+  });
 });
 
 describe('F19 — LedgerStore uses an injected clock for token expiry', () => {

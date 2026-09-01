@@ -120,6 +120,24 @@ describe('CuratedMemory.write', () => {
     await cm.write('life', 'loves Nolan films');
     expect(await readHealthSection()).toBe(before);
   });
+
+  it('does not overwrite MEMORY.md when the existing file cannot be read', async () => {
+    const cm = new CuratedMemory(tmpDir, { budgetChars: 2200 });
+    await cm.write('health', 'existing private health note');
+    const before = fs.readFileSync(memoryFile());
+    fs.chmodSync(memoryFile(), 0o200);
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    try {
+      await expect(cm.read()).rejects.toThrow();
+      await expect(cm.write('health', 'new note must not replace the old file')).rejects.toThrow();
+    } finally {
+      fs.chmodSync(memoryFile(), 0o600);
+      warnSpy.mockRestore();
+    }
+
+    expect(fs.readFileSync(memoryFile())).toEqual(before);
+  });
 });
 
 describe('CuratedMemory.replace', () => {

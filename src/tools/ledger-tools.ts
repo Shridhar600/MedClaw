@@ -9,6 +9,7 @@ import type { CapturePipeline, QueuePort, SafetyRenderer } from '../capture';
 import type { LedgerStore } from '../memcore';
 import type { FactType, LedgerFact, RecordFactResult, Authority, Provenance } from '../memcore';
 import { TokenRejectedError, sanitizeSingleLine } from '../memcore';
+import { normalizeEntitySlug } from '../memcore/sanitize';
 import type { Clock } from '../ports';
 import { systemClock } from '../ports';
 import { summarizeErrorForLog, contentContainsCredentials } from '../security';
@@ -50,7 +51,7 @@ function err(text: string): ToolResult {
 // a clean, self-correctable tool error — never a deep TypeError.
 function validateRecordArgs(params: Record<string, unknown>): string | null {
   const entity = params.entity;
-  if (typeof entity !== 'string' || entity.trim() === '') {
+  if (normalizeEntitySlug(entity) === null) {
     return 'Missing or invalid required field "entity" (a non-empty string naming the fact, e.g. "metformin").';
   }
   if (params.fields !== undefined) {
@@ -69,6 +70,9 @@ function validateRecordArgs(params: Record<string, unknown>): string | null {
     const v = params[key];
     if (v !== undefined && typeof v !== 'string') {
       return `Invalid field "${key}": expected a string.`;
+    }
+    if ((key === 'replaces' || key === 'corrects') && v !== undefined && normalizeEntitySlug(v) === null) {
+      return `Invalid field "${key}": expected a non-empty ledger reference without control or heading characters.`;
     }
   }
   if (params.confidence !== undefined && (typeof params.confidence !== 'number' || !Number.isFinite(params.confidence))) {
@@ -181,7 +185,10 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       // from deep inside render/sanitize code.
       const argErr = validateRecordArgs(params);
       if (argErr) return err(argErr);
-      const entity = params.entity as string;
+      const entity = normalizeEntitySlug(params.entity);
+      if (entity === null) {
+        return err('Missing or invalid required field "entity" (a non-empty string naming the fact, e.g. "metformin").');
+      }
       const type = params.type as FactType;
       if (!FACT_TYPES.includes(type)) return err(`Unknown fact type "${type}".`);
       const fields = { ...((params.fields as Record<string, string | number | string[]>) ?? {}) };
@@ -223,24 +230,36 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
 
       const source = (params.source as Authority) ?? 'user';
       const confidence = (params.confidence as number) ?? 0.9;
-      const result = await deps.pipeline.ingest({
-        profileId: 'default',
-        source: 'tool:ledger_record',
-        kind: 'ledger-fact',
-        payload: {
-          entity,
-          type,
-          fields,
-          provenance: provenance(source, confidence),
-          safetyRelevant: params.safety_relevant as boolean | undefined,
-          episodeId: params.episode_id as string | undefined,
-          language: params.language as string | undefined,
-          verbatim: params.verbatim as string | undefined,
-          text: params.note as string | undefined,
-          replaces: params.replaces as string | undefined,
-          corrects: params.corrects as string | undefined,
-        },
-      });
+      let result: RecordFactResult | void;
+      try {
+        result = await deps.pipeline.ingest({
+          profileId: 'default',
+          source: 'tool:ledger_record',
+          kind: 'ledger-fact',
+          payload: {
+            entity,
+            type,
+            fields,
+            provenance: provenance(source, confidence),
+            safetyRelevant: params.safety_relevant as boolean | undefined,
+            episodeId: params.episode_id as string | undefined,
+            language: params.language as string | undefined,
+            verbatim: params.verbatim as string | undefined,
+            text: params.note as string | undefined,
+            replaces: normalizeEntitySlug(params.replaces) ?? undefined,
+            corrects: normalizeEntitySlug(params.corrects) ?? undefined,
+          },
+        });
+      } catch (e) {
+        const message = e !== null && typeof e === 'object' && 'message' in e
+          ? String((e as { message?: unknown }).message)
+          : '';
+        if (message === 'invalid-cross-link' || message === 'unresolved-cross-link') {
+          return err('Write rejected: cross-link target could not be resolved.');
+        }
+        console.warn('[ledger_record] write failed:', summarizeErrorForLog(e));
+        return err('Could not record this ledger fact. Please try again.');
+      }
       bindRecordTokens(result, context);
       return renderRecordResult(result, entity, type);
     },
@@ -347,7 +366,8 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
     async execute(params, context): Promise<ToolResult> {
       // I2: boundary validation — a non-string entity/reason would otherwise
       // TypeError deep in sanitize/parse instead of self-correcting.
-      if (typeof params.entity !== 'string' || params.entity.trim() === '') {
+      const entity = normalizeEntitySlug(params.entity);
+      if (entity === null) {
         return err('Missing or invalid required field "entity" (a non-empty string naming the fact to remove).');
       }
       const type = params.type as FactType;
@@ -355,7 +375,6 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       if (params.reason !== undefined && typeof params.reason !== 'string') {
         return err('Invalid field "reason": expected a string.');
       }
-      const entity = params.entity as string;
       // CRED + INJ (self-review CRITICAL-1): the reason persists into a ledger
       // type file — it passes the SAME credential bar and single-line discipline
       // as every other caller-controlled input. A multi-line reason could
@@ -410,7 +429,10 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       },
     },
     async execute(params): Promise<ToolResult> {
-      const entity = params.entity as string | undefined;
+      const entity = params.entity === undefined ? undefined : normalizeEntitySlug(params.entity);
+      if (params.entity !== undefined && entity === null) {
+        return err('Invalid field "entity": expected a non-empty name without control or heading characters.');
+      }
       const type = params.type as FactType | undefined;
       const status = (params.status as string) ?? 'active';
       if (type && !FACT_TYPES.includes(type)) return err(`Unknown fact type "${type}".`);

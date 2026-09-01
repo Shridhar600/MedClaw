@@ -1,13 +1,16 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
+import { isUtf8 } from 'node:buffer';
 import {
   AUTHORITY_RANK, ConfirmationToken, FactStatus, FactType, LedgerFact,
   ConfirmationContext, LedgerMutationResult, PendingOp, Provenance, RecordFactResult, RetractResult, StoredToken, TYPE_TO_FILE,
 } from './types';
 import { parseLedgerFile, renderLedgerFile, canonicalFields } from './ledger-parser';
+import { normalizeEntitySlug } from './sanitize';
 import { TokenRejectedError } from './token-errors';
-import { secureWriteViaTmp, secureMkdir, secureChmodFile, summarizeErrorForLog, resolveContainedPath } from '../security';
+import { ParseQuarantineError } from '../shared/errors';
+import { secureWrite, secureWriteViaTmp, secureMkdir, secureChmodFile, summarizeErrorForLog, resolveContainedPath } from '../security';
 import type { Clock } from '../ports';
 import { systemClock } from '../ports';
 
@@ -27,6 +30,19 @@ function makeToken(entity: string, changeHash: string, nowMs: number): Confirmat
 
 function isMedOrAllergy(t: FactType): boolean {
   return t === 'medication' || t === 'allergy';
+}
+
+function requireEntitySlug(value: unknown): string {
+  const entity = normalizeEntitySlug(value);
+  if (entity === null) throw new Error('invalid-entity-slug');
+  return entity;
+}
+
+function normalizeOptionalReference(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  const reference = normalizeEntitySlug(value);
+  if (reference === null) throw new Error('invalid-cross-link');
+  return reference;
 }
 
 function factSnapshotHash(fact: LedgerFact): string {
@@ -65,35 +81,48 @@ export class LedgerStore {
 
   private async readFacts(type: FactType): Promise<LedgerFact[]> {
     const fp = this.filePath(type);
-    let content: string;
+    let rawBytes: Buffer;
     try {
-      content = await fs.promises.readFile(fp, 'utf-8');
+      rawBytes = await fs.promises.readFile(fp);
     } catch (err: unknown) {
       const nodeErr = err as NodeJS.ErrnoException;
       if (nodeErr.code === 'ENOENT') return [];
       throw err;
     }
-    const facts = parseLedgerFile(content, { type, profileId: path.basename(this.rootDir) });
-    // A non-empty file that parses to zero facts is corrupt (e.g. truncated
-    // mid-header). Quarantine the raw bytes to a sidecar BEFORE any later write
-    // can overwrite them — never treat a failed parse as an empty store.
-    if (facts.length === 0 && content.trim() !== '') {
-      this.quarantineCorruptFile(fp);
+    if (!isUtf8(rawBytes)) {
+      console.warn('[ledger-store] invalid UTF-8 content; preserving bytes in quarantine');
+      if (!this.quarantineCorruptFile(fp, rawBytes)) {
+        throw new ParseQuarantineError('ledger source could not be quarantined safely');
+      }
       return [];
+    }
+    const content = rawBytes.toString('utf8');
+    const facts = parseLedgerFile(content, { type, profileId: path.basename(this.rootDir) });
+    const hasQuarantineFact = facts.some((fact) => fact.version === 0 && fact.fields._quarantine !== undefined);
+    // A file with no usable facts, or one containing a malformed block, is corrupt.
+    // Preserve the exact source bytes before a later write is allowed to replace the
+    // live file. Valid blocks remain usable; quarantine sentinels never enter callers.
+    if ((facts.length === 0 && content.trim() !== '') || hasQuarantineFact) {
+      if (!this.quarantineCorruptFile(fp, rawBytes)) {
+        throw new ParseQuarantineError('ledger source could not be quarantined safely');
+      }
+      return facts.filter((fact) => fact.version >= 1 && fact.fields._quarantine === undefined);
     }
     return facts;
   }
 
-  /** Move an unparseable ledger file aside (rename → `*.corrupt-<stamp>`) so a fresh write cannot destroy it. */
-  private quarantineCorruptFile(fp: string): void {
+  /** Copy corrupt source bytes to a secure sidecar so read-only callers retain usable facts. */
+  private quarantineCorruptFile(fp: string, rawBytes: Buffer): boolean {
     try {
       const sidecar = `${fp}.corrupt-${this.clock.now().getTime()}`;
-      fs.renameSync(fp, sidecar);
+      secureWrite(sidecar, rawBytes);
       secureChmodFile(sidecar);
       // PHI-safe: log the file basename (a type name) only, never the content.
       console.warn(`[ledger-store] quarantined unparseable ledger file ${path.basename(fp)} to a .corrupt sidecar`);
+      return true;
     } catch (err) {
       console.warn(`[ledger-store] ledger quarantine failed: ${summarizeErrorForLog(err)}`);
+      return false;
     }
   }
 
@@ -117,35 +146,58 @@ export class LedgerStore {
    * field is single-valued — when two facts both replace one target, the last same-file source in
    * array (append) order wins (the forward links preserve the full graph; documented conscious choice).
    */
-  private static reconcileReverseLinks(facts: LedgerFact[]): void {
-    const byId = new Map(facts.map(f => [f.id, f]));
+  private static resolveByName(facts: LedgerFact[], entity: string, source: LedgerFact): LedgerFact | undefined {
     const byEntity = new Map<string, LedgerFact[]>();
     for (const f of facts) {
       const arr = byEntity.get(f.entity);
       if (arr) arr.push(f); else byEntity.set(f.entity, [f]);
     }
-    // Resolve a bare entity name to the highest-version fact of that entity NOT created after `source`
-    // (undated/unparseable timestamps fail open → the plain max-version head).
-    const resolveByName = (entity: string, source: LedgerFact): LedgerFact | undefined => {
-      const versions = byEntity.get(entity);
-      if (!versions) return undefined;
-      const asOf = new Date(source.createdAt).getTime();
-      let best: LedgerFact | undefined;
-      for (const v of versions) {
-        const t = new Date(v.createdAt).getTime();
-        if (!Number.isNaN(t) && !Number.isNaN(asOf) && t > asOf) continue; // created after the link declared
-        if (!best || v.version > best.version) best = v;
+    const versions = byEntity.get(entity);
+    if (!versions) return undefined;
+
+    const asOf = new Date(source.createdAt).getTime();
+    const eligible = versions.filter((version) => {
+      const createdAt = new Date(version.createdAt).getTime();
+      return Number.isNaN(asOf) || Number.isNaN(createdAt) || createdAt <= asOf;
+    });
+    if (eligible.length === 0) return undefined;
+
+    const compare = (left: LedgerFact, right: LedgerFact): number => {
+      const leftTime = new Date(left.createdAt).getTime();
+      const rightTime = new Date(right.createdAt).getTime();
+      if (!Number.isNaN(leftTime) && !Number.isNaN(rightTime) && leftTime !== rightTime) {
+        return leftTime - rightTime;
       }
-      return best;
+      if (!Number.isNaN(leftTime) !== !Number.isNaN(rightTime)) {
+        return Number.isNaN(leftTime) ? -1 : 1;
+      }
+      if (left.version !== right.version) return left.version - right.version;
+      return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
     };
+
+    return eligible.reduce((best, candidate) => compare(candidate, best) > 0 ? candidate : best);
+  }
+
+  private static resolveReference(facts: LedgerFact[], reference: string, source: LedgerFact): LedgerFact | undefined {
+    return new Map(facts.map((fact) => [fact.id, fact])).get(reference)
+      ?? LedgerStore.resolveByName(facts, reference, source);
+  }
+
+  private static reconcileReverseLinks(facts: LedgerFact[]): void {
+    const byId = new Map(facts.map(f => [f.id, f]));
     const stamp = (ref: string | undefined, source: LedgerFact, field: 'replacedBy' | 'correctedBy'): void => {
       if (!ref) return;
-      const target = byId.get(ref) ?? resolveByName(ref, source);
-      if (target && target.id !== source.id) target[field] = source.id;
+      const target = byId.get(ref) ?? LedgerStore.resolveByName(facts, ref, source);
+      if (!target || target.id === source.id) throw new Error('unresolved-cross-link');
+      target[field] = source.id;
     };
-    for (const f of facts) {
-      stamp(f.replaces, f, 'replacedBy');
-      stamp(f.corrects, f, 'correctedBy');
+    for (const fact of facts) {
+      if (fact.supersedes) {
+        const previous = byId.get(fact.supersedes);
+        if (previous && previous.id !== fact.id) previous.supersededBy = fact.id;
+      }
+      stamp(fact.replaces, fact, 'replacedBy');
+      stamp(fact.corrects, fact, 'correctedBy');
     }
   }
 
@@ -237,31 +289,39 @@ export class LedgerStore {
   }
 
   async recordFact(params: RecordFactParams): Promise<RecordFactResult> {
-    const allFacts = await this.readFacts(params.type);
-    const active = this.activeVersion(allFacts, params.entity);
-    const cur = active || this.pausedVersion(allFacts, params.entity);
+    const p: RecordFactParams = {
+      ...params,
+      entity: requireEntitySlug(params.entity),
+      replaces: normalizeOptionalReference(params.replaces),
+      replacedBy: normalizeOptionalReference(params.replacedBy),
+      corrects: normalizeOptionalReference(params.corrects),
+      correctedBy: normalizeOptionalReference(params.correctedBy),
+    };
+    const allFacts = await this.readFacts(p.type);
+    const active = this.activeVersion(allFacts, p.entity);
+    const cur = active || this.pausedVersion(allFacts, p.entity);
     const now = this.clock.now().toISOString();
 
     if (!cur) {
-      const fact = this.makeFact(params, 1, 'active', now);
+      const fact = this.makeFact(p, 1, 'active', now);
       allFacts.push(fact);
-      await this.writeFacts(params.type, allFacts);
+      await this.writeFacts(p.type, allFacts);
       return { kind: 'applied', fact };
     }
 
-    if (cur.status === 'paused' && !params.resume) {
-      const fields = { ...params.fields };
+    if (cur.status === 'paused' && !p.resume) {
+      const fields = { ...p.fields };
       const pps = cur.fields['pre_pause_summary'];
       if (pps !== undefined) {
         fields.pre_pause_summary = pps;
       }
-      const v = this.nextVersion(allFacts, params.entity);
-      const proposed = this.makeFact(params, v, 'paused', now, cur, fields);
-      const changeHash = hash(`${params.entity}:${params.type}:${JSON.stringify(canonicalFields(params.fields))}`);
+      const v = this.nextVersion(allFacts, p.entity);
+      const proposed = this.makeFact(p, v, 'paused', now, cur, fields);
+      const changeHash = hash(`${p.entity}:${p.type}:${JSON.stringify(canonicalFields(p.fields))}`);
       // CH: snapshot the current fact so confirm() can detect state drift.
       const baselineCurHash = factSnapshotHash(cur);
-      const token = makeToken(params.entity, changeHash, this.clock.now().getTime());
-      this.tokens.set(token.uuid, { token, op: { kind: 'write', ...params, fields, baselineCurHash }, used: false });
+      const token = makeToken(p.entity, changeHash, this.clock.now().getTime());
+      this.tokens.set(token.uuid, { token, op: { kind: 'write', ...p, fields, baselineCurHash }, used: false });
       return { kind: 'needs-confirmation', token, current: cur, proposed };
     }
 
@@ -269,86 +329,86 @@ export class LedgerStore {
       // cur is paused and resume was requested: supersede the paused version with an active one.
       // H-1: resuming a med/allergy STILL requires confirmation — the resume flag must never
       // bypass the med-class gate (medical-safety), matching every other conflicting med path.
-      if (isMedOrAllergy(params.type)) {
-        const v = this.nextVersion(allFacts, params.entity);
-        const proposed = this.makeFact(params, v, 'active', now, cur);
-        const changeHash = hash(`resume:${params.entity}:${params.type}:${JSON.stringify(canonicalFields(params.fields))}`);
+      if (isMedOrAllergy(p.type)) {
+        const v = this.nextVersion(allFacts, p.entity);
+        const proposed = this.makeFact(p, v, 'active', now, cur);
+        const changeHash = hash(`resume:${p.entity}:${p.type}:${JSON.stringify(canonicalFields(p.fields))}`);
         const baselineCurHash = factSnapshotHash(cur);
-        const token = makeToken(params.entity, changeHash, this.clock.now().getTime());
-        this.tokens.set(token.uuid, { token, op: { kind: 'write', ...params, baselineCurHash }, used: false });
+        const token = makeToken(p.entity, changeHash, this.clock.now().getTime());
+        this.tokens.set(token.uuid, { token, op: { kind: 'write', ...p, baselineCurHash }, used: false });
         return { kind: 'needs-confirmation', token, current: cur, proposed };
       }
-      const v = this.nextVersion(allFacts, params.entity);
+      const v = this.nextVersion(allFacts, p.entity);
       cur.status = 'superseded';
-      const fact = this.makeFact(params, v, 'active', now, cur);
+      const fact = this.makeFact(p, v, 'active', now, cur);
       allFacts.push(fact);
-      await this.writeFacts(params.type, allFacts);
+      await this.writeFacts(p.type, allFacts);
       return { kind: 'applied', fact };
     }
 
-    const hasConflict = this.conflictsWith(active, params.fields);
+    const hasConflict = this.conflictsWith(active, p.fields);
 
     if (!hasConflict) {
-      const v = this.nextVersion(allFacts, params.entity);
+      const v = this.nextVersion(allFacts, p.entity);
       active.status = 'superseded';
-      const fact = this.makeFact(params, v, 'active', now, active, undefined, true);
+      const fact = this.makeFact(p, v, 'active', now, active, undefined, true);
       allFacts.push(fact);
-      await this.writeFacts(params.type, allFacts);
+      await this.writeFacts(p.type, allFacts);
       return { kind: 'applied', fact };
     }
 
-    const provRank = AUTHORITY_RANK[params.provenance.source];
+    const provRank = AUTHORITY_RANK[p.provenance.source];
     const curRank = AUTHORITY_RANK[active.provenance.source];
 
     // AR / C2: authority-rank auto-apply NEVER applies to med/allergy facts — a
     // conflicting change to a safety-class fact routes to needs-confirmation
     // regardless of provenance rank (specs/13 A5/A6 posture; medical-safety).
-    if (provRank > curRank && !isMedOrAllergy(params.type)) {
-      const v = this.nextVersion(allFacts, params.entity);
+    if (provRank > curRank && !isMedOrAllergy(p.type)) {
+      const v = this.nextVersion(allFacts, p.entity);
       active.status = 'superseded';
-      const fact = this.makeFact(params, v, 'active', now, active);
+      const fact = this.makeFact(p, v, 'active', now, active);
       allFacts.push(fact);
-      await this.writeFacts(params.type, allFacts);
+      await this.writeFacts(p.type, allFacts);
       return { kind: 'applied', fact };
     }
 
-    if (provRank === curRank && !isMedOrAllergy(params.type)) {
-      const vA = this.nextVersion(allFacts, params.entity);
+    if (provRank === curRank && !isMedOrAllergy(p.type)) {
+      const vA = this.nextVersion(allFacts, p.entity);
       const vB = vA + 1;
       active.status = 'disputed';
       // DS (SB-3): the two heads must carry the two COMPETING values.
       // Head A = the NEW claim, preserving prior fields (known_side_effects etc.).
-      const disputeA = this.makeFact(params, vA, 'disputed', now, active, { ...active.fields, ...params.fields });
+      const disputeA = this.makeFact(p, vA, 'disputed', now, active, { ...active.fields, ...p.fields });
       // Head B = the OLD active claim re-presented — its OWN fields + provenance,
       // so the user can restore it verbatim.
       const disputeB: LedgerFact = {
         ...active,
-        id: `${params.entity}@v${vB}`,
+        id: `${p.entity}@v${vB}`,
         version: vB,
         status: 'disputed',
         createdAt: now,
         supersedes: active.id,
       };
       allFacts.push(disputeA, disputeB);
-      await this.writeFacts(params.type, allFacts);
-      const changeHash = hash(`dispute:${params.entity}:${vA}:${vB}`);
-      const token = makeToken(params.entity, changeHash, this.clock.now().getTime());
+      await this.writeFacts(p.type, allFacts);
+      const changeHash = hash(`dispute:${p.entity}:${vA}:${vB}`);
+      const token = makeToken(p.entity, changeHash, this.clock.now().getTime());
       this.tokens.set(token.uuid, {
         token,
-        op: { kind: 'dispute', entity: params.entity, type: params.type, versionA: vA, versionB: vB, originalId: active.id },
+        op: { kind: 'dispute', entity: p.entity, type: p.type, versionA: vA, versionB: vB, originalId: active.id },
         used: false,
       });
       return { kind: 'disputed', versions: [disputeA, disputeB], disputeToken: token };
     }
 
     {
-      const v = this.nextVersion(allFacts, params.entity);
-      const proposed = this.makeFact(params, v, 'active', now, active);
-      const changeHash = hash(`${params.entity}:${params.type}:${JSON.stringify(canonicalFields(params.fields))}`);
+      const v = this.nextVersion(allFacts, p.entity);
+      const proposed = this.makeFact(p, v, 'active', now, active);
+      const changeHash = hash(`${p.entity}:${p.type}:${JSON.stringify(canonicalFields(p.fields))}`);
       // CH: snapshot the current fact so confirm() can detect state drift.
       const baselineCurHash = factSnapshotHash(active);
-      const token = makeToken(params.entity, changeHash, this.clock.now().getTime());
-      this.tokens.set(token.uuid, { token, op: { kind: 'write', ...params, fields: params.fields, baselineCurHash }, used: false });
+      const token = makeToken(p.entity, changeHash, this.clock.now().getTime());
+      this.tokens.set(token.uuid, { token, op: { kind: 'write', ...p, fields: p.fields, baselineCurHash }, used: false });
       return { kind: 'needs-confirmation', token, current: active, proposed };
     }
   }
@@ -358,8 +418,9 @@ export class LedgerStore {
     type: FactType;
     provenance: Provenance;
   }): Promise<RetractResult> {
+    const entity = requireEntitySlug(params.entity);
     const allFacts = await this.readFacts(params.type);
-    const cur = this.activeVersion(allFacts, params.entity);
+    const cur = this.activeVersion(allFacts, entity);
     if (!cur) {
       return { kind: 'noop', reason: 'no-active-version' };
     }
@@ -368,23 +429,23 @@ export class LedgerStore {
     // Safety-relevant facts AND all med/allergy facts require confirmation to retract,
     // regardless of the flag (aligns with discontinue's type-based guard).
     if (cur.safetyRelevant || isMedOrAllergy(cur.type)) {
-      const changeHash = hash(`retract:${params.entity}:${params.type}`);
+      const changeHash = hash(`retract:${entity}:${params.type}`);
       const baselineCurHash = factSnapshotHash(cur);
-      const token = makeToken(params.entity, changeHash, this.clock.now().getTime());
+      const token = makeToken(entity, changeHash, this.clock.now().getTime());
       this.tokens.set(token.uuid, {
         token,
-        op: { kind: 'retract', entity: params.entity, type: params.type, provenance: params.provenance, baselineCurHash },
+        op: { kind: 'retract', entity, type: params.type, provenance: params.provenance, baselineCurHash },
         used: false,
       });
       return { kind: 'needs-confirmation', fact: cur, token };
     }
 
-    const v = this.nextVersion(allFacts, params.entity);
+    const v = this.nextVersion(allFacts, entity);
     cur.status = 'superseded';
     const fact: LedgerFact = {
-      id: `${params.entity}@v${v}`,
+      id: `${entity}@v${v}`,
       profileId: cur.profileId,
-      entity: params.entity,
+      entity,
       type: params.type,
       version: v,
       supersedes: cur.id,
@@ -448,6 +509,7 @@ export class LedgerStore {
     entity: string, type: FactType, provenance: Provenance,
     opts?: { reason?: string; replacedBy?: string },
   ): Promise<LedgerMutationResult> {
+    entity = requireEntitySlug(entity);
     const allFacts = await this.readFacts(type);
     const cur = this.activeVersion(allFacts, entity);
     if (!cur) return { kind: 'noop', reason: 'no-active-version' };
@@ -503,6 +565,7 @@ export class LedgerStore {
     entity: string, type: FactType, provenance: Provenance,
     fields: Record<string, string | number | string[]>,
   ): Promise<LedgerMutationResult> {
+    entity = requireEntitySlug(entity);
     const allFacts = await this.readFacts(type);
     if (this.activeVersion(allFacts, entity)) return { kind: 'noop', reason: 'already-active' };
     const discontinued = this.latestDiscontinued(allFacts, entity);
@@ -533,6 +596,7 @@ export class LedgerStore {
     entity: string, type: FactType, provenance: Provenance,
     opts: { prePauseSummary: string },
   ): Promise<LedgerMutationResult> {
+    entity = requireEntitySlug(entity);
     const allFacts = await this.readFacts(type);
     const active = this.activeVersion(allFacts, entity);
     if (!active) return { kind: 'noop', reason: 'no-active-version' };
@@ -564,15 +628,40 @@ export class LedgerStore {
   async getCrossLinks(entity: string, type: FactType): Promise<{
     replaces: string[]; replacedBy: string[]; corrects: string[]; correctedBy: string[];
   }> {
+    entity = requireEntitySlug(entity);
     const allFacts = await this.readFacts(type);
     const entityFacts = allFacts.filter(f => f.entity === entity);
-    const collect = (pick: (f: LedgerFact) => string | undefined): string[] =>
-      Array.from(new Set(entityFacts.map(pick).filter((x): x is string => Boolean(x))));
+    const byId = new Map(allFacts.map((fact) => [fact.id, fact]));
+    const isVerifiedForward = (source: LedgerFact, reference: string | undefined, target?: LedgerFact): boolean => {
+      if (!reference) return false;
+      const resolved = LedgerStore.resolveReference(allFacts, reference, source);
+      return resolved !== undefined && resolved.id !== source.id && (!target || resolved.id === target.id);
+    };
+    const collectForward = (pick: (f: LedgerFact) => string | undefined): string[] => {
+      const values = new Set<string>();
+      for (const fact of entityFacts) {
+        const reference = pick(fact);
+        if (isVerifiedForward(fact, reference)) values.add(reference!);
+      }
+      return [...values];
+    };
+    const collectReverse = (
+      pick: (f: LedgerFact) => string | undefined,
+      forwardField: 'replaces' | 'corrects',
+    ): string[] => {
+      const values = new Set<string>();
+      for (const target of entityFacts) {
+        const sourceId = pick(target);
+        const source = sourceId ? byId.get(sourceId) : undefined;
+        if (source && isVerifiedForward(source, source[forwardField], target)) values.add(source.id);
+      }
+      return [...values];
+    };
     return {
-      replaces: collect(f => f.replaces),
-      replacedBy: collect(f => f.replacedBy),
-      corrects: collect(f => f.corrects),
-      correctedBy: collect(f => f.correctedBy),
+      replaces: collectForward(f => f.replaces),
+      replacedBy: collectReverse(f => f.replacedBy, 'replaces'),
+      corrects: collectForward(f => f.corrects),
+      correctedBy: collectReverse(f => f.correctedBy, 'corrects'),
     };
   }
 
@@ -775,11 +864,13 @@ export class LedgerStore {
   }
 
   async getActive(entity: string, type: FactType): Promise<LedgerFact | null> {
+    entity = requireEntitySlug(entity);
     const allFacts = await this.readFacts(type);
     return this.activeVersion(allFacts, entity);
   }
 
   async getChain(entity: string, type: FactType): Promise<LedgerFact[]> {
+    entity = requireEntitySlug(entity);
     const allFacts = await this.readFacts(type);
     const chain = allFacts.filter(f => f.entity === entity);
     chain.sort((a, b) => b.version - a.version);

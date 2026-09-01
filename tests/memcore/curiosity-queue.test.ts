@@ -51,6 +51,24 @@ describe('CuriosityQueue.add', () => {
       'recheck HbA1c in 3 months',
     ]);
   });
+
+  it('does not overwrite an existing queue when the read fails', async () => {
+    const s = new CuriosityQueue(tmpDir, fixedClock('2026-08-18T10:00:00Z'), seqIdGen('cq'), 'p1');
+    await s.add(item());
+    const fp = path.join(tmpDir, 'curiosity.md');
+    const before = fs.readFileSync(fp);
+    fs.chmodSync(fp, 0o200);
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    try {
+      await expect(s.add(item({ description: 'new item must not replace the old queue' }))).rejects.toThrow();
+    } finally {
+      fs.chmodSync(fp, 0o600);
+      warnSpy.mockRestore();
+    }
+
+    expect(fs.readFileSync(fp)).toEqual(before);
+  });
 });
 
 describe('CuriosityQueue.list', () => {

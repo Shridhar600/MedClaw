@@ -97,19 +97,17 @@ describe('W-C/D fix pass — INJ: markdown/newline injection cannot cross render
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-  it('a hostile entity renders as ONE heading line in the ledger file', async () => {
-    const result = await store.recordFact({
+  it('rejects a hostile entity before creating a ledger id or file', async () => {
+    // C-64 deliberately strengthens the old render-only assertion: the prior test
+    // proved that hostile structure was sanitized after an id was already created;
+    // this assertion proves the invalid identity is rejected before any write.
+    await expect(store.recordFact({
       entity: 'metformin\n## EVIL\n- injected_field: pwned',
       type: 'medication',
       fields: { dose: '500mg\n### fake-version (active)\n- stolen: yes' },
       provenance: prov('user'),
-    });
-    expect(result.kind).toBe('applied');
-    const raw = fs.readFileSync(path.join(tmp, 'ledger', 'medications.md'), 'utf-8');
-    expect(raw).not.toMatch(/^## EVIL$/m);
-    expect(raw).not.toMatch(/^- injected_field:/m);
-    expect(raw).not.toMatch(/^### fake-version/m);
-    expect(raw).not.toMatch(/^- stolen:/m);
+    })).rejects.toThrow('invalid-entity-slug');
+    expect(fs.existsSync(path.join(tmp, 'ledger', 'medications.md'))).toBe(false);
   });
 
   it('a hostile verbatim stays inside its quoted line', async () => {

@@ -104,7 +104,9 @@ export class CuriosityQueue {
       const nodeErr = err as NodeJS.ErrnoException;
       if (nodeErr.code === 'ENOENT') return '';
       console.warn(`[curiosity-queue] read failed: ${summarizeErrorForLog(err)}`);
-      return '';
+      // A readable empty queue is valid; an unreadable existing queue is not.
+      // Refuse every read-modify-write or listing operation until the source is readable.
+      throw err;
     }
   }
 

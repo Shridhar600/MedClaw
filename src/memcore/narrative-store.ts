@@ -10,9 +10,11 @@
 // language, so nothing is paraphrased away before the agent sees it.
 
 import * as fs from 'fs';
+import { isUtf8 } from 'node:buffer';
 import type { Clock } from '../ports';
 import { systemClock } from '../ports';
 import { secureWriteViaTmp, secureMkdir, summarizeErrorForLog, quarantineToSideFile, resolveContainedPath, PathContainmentError } from '../security';
+import { neutralizeStructuralHeadings } from './sanitize';
 
 export interface NarrativeAppendResult {
   date: string;
@@ -54,9 +56,12 @@ export class NarrativeStore {
     const date = entry.date ?? this.dayOf(now);
     const time = this.timeOf(now);
 
-    const entryLines = [`- ${time} — ${entry.text}`];
+    const entryLines = [`- ${time} — ${neutralizeStructuralHeadings(entry.text)}`];
     if (entry.verbatim !== undefined && entry.verbatim !== '') {
-      entryLines.push(`  > ${entry.verbatim} (lang: ${entry.language ?? 'en'})`);
+      const verbatimLines = neutralizeStructuralHeadings(entry.verbatim).split(/\r\n|\n|\r/);
+      entryLines.push(...verbatimLines.map((line, index) =>
+        `  > ${line}${index === verbatimLines.length - 1 ? ` (lang: ${entry.language ?? 'en'})` : ''}`,
+      ));
     }
 
     const { lines, lineStart } = this.insertIntoLogSection(this.readLines(date), date, entryLines);
@@ -81,7 +86,10 @@ export class NarrativeStore {
    */
   async appendSessionSummary(chatId: string, date: string, summary: string): Promise<string> {
     const fp = this.sessionSummaryPath(chatId, date);
-    const entryLines = summary.split('\n').filter((l) => l.length > 0);
+    const entryLines = summary
+      .split(/\r\n|\n|\r/)
+      .filter((l) => l.length > 0)
+      .map(neutralizeStructuralHeadings);
     const lines = this.readSummaryLines(fp, date);
     if (!lines.includes(SESSION_SUMMARY_HEADING)) {
       lines.push(SESSION_SUMMARY_HEADING);
@@ -95,7 +103,8 @@ export class NarrativeStore {
   async read(date: string): Promise<string | null> {
     const fp = this.filePath(date);
     try {
-      return await fs.promises.readFile(fp, 'utf-8');
+      const raw = await fs.promises.readFile(fp);
+      return this.decodeUtf8(fp, raw);
     } catch (err) {
       const nodeErr = err as NodeJS.ErrnoException;
       if (nodeErr.code === 'ENOENT') return null;
@@ -115,25 +124,22 @@ export class NarrativeStore {
   }
 
   /**
-   * Read the day file into lines. On a non-ENOENT read failure we degrade to a
-   * fresh header but preserve any existing bytes as a quarantine note (D2), so a
-   * transient read error can never silently truncate the lossless lane.
+   * Read the day file into lines. Only ENOENT is an empty day. Any other read
+   * failure aborts the read-modify-write operation so the lossless lane cannot
+   * be replaced with a fresh header.
    */
   private readLines(date: string): string[] {
     const fp = this.filePath(date);
-    let raw: string | null = null;
+    let rawBytes: Buffer;
     try {
-      raw = fs.readFileSync(fp, 'utf-8');
+      rawBytes = fs.readFileSync(fp);
     } catch (err) {
       const nodeErr = err as NodeJS.ErrnoException;
       if (nodeErr.code === 'ENOENT') return this.freshHeader(date);
       console.warn(`[narrative-store] degraded read for ${date}: ${summarizeErrorForLog(err)}`);
-      const salvaged = this.salvageRaw(fp);
-      const header = this.freshHeader(date);
-      // Salvaged bytes → 0600 side file; inline only a constant pointer (never the raw bytes).
-      if (salvaged) header.push(quarantineToSideFile(this.filePath(date), salvaged));
-      return header;
+      throw err;
     }
+    const raw = this.decodeUtf8(fp, rawBytes);
     const lines = raw.split('\n');
     // Drop a single trailing empty element from the final newline so appends stay tight.
     if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
@@ -142,26 +148,28 @@ export class NarrativeStore {
   }
 
   private readSummaryLines(fp: string, date: string): string[] {
-    let raw: string;
+    let rawBytes: Buffer;
     try {
-      raw = fs.readFileSync(fp, 'utf-8');
+      rawBytes = fs.readFileSync(fp);
     } catch (err) {
       const nodeErr = err as NodeJS.ErrnoException;
       if (nodeErr.code === 'ENOENT') return [`# ${date}`, SESSION_SUMMARY_HEADING];
       console.warn('[narrative-store] session-summary read failed:', summarizeErrorForLog(err));
       throw err;
     }
+    const raw = this.decodeUtf8(fp, rawBytes);
     const lines = raw.split('\n');
     if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
     return lines.length > 0 ? lines : [`# ${date}`, SESSION_SUMMARY_HEADING];
   }
 
-  private salvageRaw(fp: string): string | null {
-    try {
-      return fs.readFileSync(fp).toString('latin1');
-    } catch {
-      return null;
+  private decodeUtf8(fp: string, rawBytes: Buffer): string {
+    if (!isUtf8(rawBytes)) {
+      console.warn('[narrative-store] invalid UTF-8 content; preserving bytes in quarantine');
+      quarantineToSideFile(fp, rawBytes);
+      throw new Error('invalid-utf8');
     }
+    return rawBytes.toString('utf8');
   }
 
   private freshHeader(date: string): string[] {

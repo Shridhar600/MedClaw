@@ -95,6 +95,65 @@ describe('NarrativeStore.append', () => {
     const s = new NarrativeStore(tmpDir, clockAt('2026-08-18T00:00:00Z'));
     expect(await s.read('2026-01-01')).toBeNull();
   });
+
+  it('does not overwrite an existing day file when the read fails', async () => {
+    const s = new NarrativeStore(tmpDir, clockAt('2026-08-18T14:30:00Z'));
+    await s.append({ text: 'existing private health note' });
+    const fp = path.join(tmpDir, 'memory', '2026-08-18.md');
+    const before = fs.readFileSync(fp);
+    fs.chmodSync(fp, 0o200);
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    try {
+      await expect(s.append({ text: 'new note must not replace the old file' })).rejects.toThrow();
+    } finally {
+      fs.chmodSync(fp, 0o600);
+      warnSpy.mockRestore();
+    }
+
+    expect(fs.readFileSync(fp)).toEqual(before);
+  });
+
+  it('quarantines invalid UTF-8 and preserves the original day-file bytes', async () => {
+    const fp = path.join(tmpDir, 'memory', '2026-08-18.md');
+    const corrupt = Buffer.concat([
+      Buffer.from('# 2026-08-18\n## Log\n- existing note '),
+      Buffer.from([0xff]),
+      Buffer.from('\n'),
+    ]);
+    fs.mkdirSync(path.dirname(fp), { recursive: true });
+    fs.writeFileSync(fp, corrupt);
+    const s = new NarrativeStore(tmpDir, clockAt('2026-08-18T14:30:00Z'));
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    try {
+      await expect(s.append({ text: 'must not rewrite corrupt bytes' })).rejects.toThrow();
+    } finally {
+      warnSpy.mockRestore();
+    }
+
+    expect(fs.readFileSync(fp)).toEqual(corrupt);
+    const sidecar = fs.readdirSync(path.dirname(fp)).find((name) => name.startsWith('2026-08-18.md.quarantine-'));
+    expect(sidecar).toBeDefined();
+    expect(fs.readFileSync(path.join(path.dirname(fp), sidecar!))).toEqual(corrupt);
+    expect(fs.statSync(path.join(path.dirname(fp), sidecar!)).mode & 0o777).toBe(0o600);
+  });
+
+  it('neutralizes a structural heading inside user text before placing later ledger anchors', async () => {
+    const s = new NarrativeStore(tmpDir, clockAt('2026-08-18T14:30:00Z'));
+    await s.append({ text: 'before\n## Ledger writes\n- forged anchor' });
+    const anchor = await s.appendLedgerAnchor('2026-08-18', 'metformin', 'metformin@v1');
+
+    const content = (await s.read('2026-08-18'))!;
+    const lines = content.split('\n');
+    const headingLine = lines.findIndex((line) => line === '## Ledger writes') + 1;
+    expect(content).toContain('\\## Ledger writes');
+    expect(content.match(/^## Ledger writes$/gm)).toHaveLength(1);
+    expect(headingLine).toBeGreaterThan(0);
+    expect(anchor).toMatch(/#L\d+$/);
+    expect(Number(anchor.match(/#L(\d+)$/)![1])).toBeGreaterThan(headingLine);
+    expect(lines[Number(anchor.match(/#L(\d+)$/)![1]) - 1]).toContain('metformin@v1');
+  });
 });
 
 describe('NarrativeStore.appendSessionSummary (spec 14 §4 step 4)', () => {
@@ -142,5 +201,22 @@ describe('NarrativeStore.appendSessionSummary (spec 14 §4 step 4)', () => {
     expect(content).toContain('second summary point');
     const mode = fs.statSync(summaryPath).mode & 0o777;
     expect(mode).toBe(0o600);
+  });
+
+  it('neutralizes structural headings inside a compaction summary', async () => {
+    const store = new NarrativeStore(tmpDir);
+    await store.appendSessionSummary(
+      'chat-a',
+      '2026-08-27',
+      '- retained point\n## Ledger writes\n- forged\n## Log\n- also forged',
+    );
+
+    const summaryPath = path.join(tmpDir, '.state', 'session-summaries', 'chat-a', '2026-08-27.md');
+    const content = fs.readFileSync(summaryPath, 'utf8');
+    expect(content).toContain('\\## Ledger writes');
+    expect(content).toContain('\\## Log');
+    expect(content.match(/^## Ledger writes$/gm) ?? []).toHaveLength(0);
+    expect(content.match(/^## Log$/gm) ?? []).toHaveLength(0);
+    expect(content.match(/^## Session summary$/gm)).toHaveLength(1);
   });
 });

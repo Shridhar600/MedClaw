@@ -24,10 +24,13 @@ export const QUARANTINE_POINTER_PREFIX = '<!-- PARSE-ERROR:';
  * (never throw — the caller is already degrading). The hash suffix (not a timestamp)
  * keeps the sidecar name date-free and dedupes identical corrupt content.
  */
-export function quarantineToSideFile(filePath: string, rawBytes: string): string {
+export function quarantineToSideFile(filePath: string, rawBytes: string | Buffer): string {
   try {
-    const suffix = createHash('sha256').update(rawBytes).digest('hex').slice(0, 12);
-    secureWrite(`${filePath}.quarantine-${suffix}`, rawBytes);
+    // Normalize strings for the existing callers, but keep Buffer input byte-for-byte so
+    // invalid UTF-8 never changes while it is being quarantined.
+    const bytes = typeof rawBytes === 'string' ? Buffer.from(rawBytes, 'utf8') : Buffer.from(rawBytes);
+    const suffix = createHash('sha256').update(bytes).digest('hex').slice(0, 12);
+    secureWrite(`${filePath}.quarantine-${suffix}`, bytes);
   } catch (err) {
     console.warn(`[security] quarantine side-file write failed: ${summarizeErrorForLog(err)}`);
   }
