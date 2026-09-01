@@ -36,6 +36,12 @@ export function installGlobalSafetyNet(target: SafetyNetTarget = process as unkn
   };
 }
 
+export function reportFatalStartupError(error: unknown): void {
+  console.error('[main] Fatal error:', summarizeErrorForLog(error));
+  console.error('[main] If configuration is missing, run `npm run cli -- onboard`.');
+  process.exit(1);
+}
+
 async function main(): Promise<void> {
   const config = await loadRuntimeConfig();
   const gateway = new Gateway(config);
@@ -62,9 +68,5 @@ async function main(): Promise<void> {
 // src/index.ts` (the production launcher) and false under jest/ts-jest import.
 if (require.main === module) {
   installGlobalSafetyNet();
-  main().catch((e) => {
-    const message = e instanceof Error ? e.message : String(e);
-    console.error('[main] Fatal error:', message);
-    process.exit(1);
-  });
+  main().catch(reportFatalStartupError);
 }

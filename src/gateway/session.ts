@@ -114,6 +114,8 @@ export interface SessionTurnIndexer {
   indexTurn(chatId: string, file: string, line: number, role: string, ts: string, content: string): void;
   /** H5: durably flag a swallowed incremental-index failure so the next boot reconciles the hole. */
   markDirty?(): void;
+  /** C-12: rebuild derived rows after migration appends records at new physical anchors. */
+  reconcileFromDayFiles?(): void;
 }
 
 // --- Compaction token-budget trigger (#15) --------------------------------
@@ -298,17 +300,6 @@ function dayFileEndsWithoutNewline(filePath: string): boolean {
   }
 }
 
-// Parse a serialized JSONL entry's timestamp to epoch-ms for chronological merge ordering (F-3).
-// A malformed line or missing/invalid timestamp sorts to the END (stable), never throwing.
-function rawTimestampMs(raw: string): number {
-  try {
-    const ts = new Date((JSON.parse(raw) as JsonlEntry).timestamp).getTime();
-    return Number.isNaN(ts) ? Number.MAX_SAFE_INTEGER : ts;
-  } catch {
-    return Number.MAX_SAFE_INTEGER;
-  }
-}
-
 export class SessionManager {
   private sessions: Map<string, Session> = new Map();
   private softResetMs: number;
@@ -343,6 +334,9 @@ export class SessionManager {
   // D2.5: the session_search FTS index. When wired, recordTurn feeds each appended archive line to it
   // (best-effort). Optional — no index ⇒ no incremental indexing (session_search unavailable / degraded).
   private turnIndex?: SessionTurnIndexer;
+  // C-12: migration runs before Gateway wires the index. Remember an append-only merge so setTurnIndex
+  // can reconcile an already-open index whose existing physical anchors must remain valid.
+  private migrationAppendedRows = false;
 
   /** Wire compaction LLM calls through the semaphore at background priority (F8). */
   setBackgroundRunner(run: <T>(fn: () => Promise<T>) => Promise<T>): void {
@@ -352,6 +346,19 @@ export class SessionManager {
   /** Wire the session_search FTS index for incremental per-turn indexing (D2.5). */
   setTurnIndex(index: SessionTurnIndexer): void {
     this.turnIndex = index;
+    if (!this.migrationAppendedRows) return;
+    try {
+      if (index.reconcileFromDayFiles) {
+        index.reconcileFromDayFiles();
+      } else {
+        // A non-rebuilding test/adapter can still arrange reconciliation on its next construction.
+        index.markDirty?.();
+      }
+      this.migrationAppendedRows = false;
+    } catch (e) {
+      index.markDirty?.();
+      console.warn('[session] migration index reconciliation failed; continuing:', summarizeErrorForLog(e));
+    }
   }
 
   // D3.4 spec 14 §4 step 4: the sink that copies each compaction summary (anchored bullets) to today's
@@ -1007,11 +1014,9 @@ Keep it concise and structured.`;
       content: msg.content ?? null,
       chatId,
     };
-    // A-H1: persist provenance only when it is NOT the default 'chat' (keeps normal-turn JSONL
-    // byte-stable and legacy-compatible; the sweep treats an absent origin as 'chat').
-    if (origin !== 'chat') {
-      entry.origin = origin;
-    }
+    // A-H1/C-56: every current entry carries explicit provenance. Read-back remains tolerant of
+    // origin-less legacy lines, but the marker heuristic is now legacy-only.
+    entry.origin = origin;
     if (msg.role === 'tool' && msg.tool_call_id) {
       entry.tool_call_id = msg.tool_call_id;
     }
@@ -1231,21 +1236,17 @@ Keep it concise and structured.`;
           secureMkdir(targetDir);
           secureWriteViaTmp(dayPath, legacyRaws.join('\n') + '\n');
         } else {
-          // F-3: the target day file already exists — a live turn was appended to it after a PRIOR
+          // F-3/C-12: the target day file already exists — a live turn was appended to it after a PRIOR
           // failed migration (sentinel absent). A blind skip would LOSE every legacy row for this day.
-          // MERGE instead: keep the existing (live) lines, add only legacy lines not already present
-          // (dedup by exact serialized line ⇒ idempotent on re-run), and re-order chronologically by
-          // timestamp with a stable index tie-break. If nothing new is added, leave the file byte-for-
-          // byte untouched (pure idempotent no-op — never rewrite an already-migrated archive).
+          // Append only legacy lines not already present (dedup by exact serialized line ⇒ idempotent on
+          // re-run). Never reorder or rewrite existing bytes: physical #L<n> anchors are immutable.
           const existing = fs.readFileSync(dayPath, 'utf-8').split('\n').filter((l) => l.length > 0);
           const existingSet = new Set(existing);
           const additions = legacyRaws.filter((r) => !existingSet.has(r));
           if (additions.length > 0) {
-            const merged = [...existing, ...additions]
-              .map((raw, i) => ({ raw, i, ts: rawTimestampMs(raw) }))
-              .sort((a, b) => a.ts - b.ts || a.i - b.i)
-              .map((x) => x.raw);
-            secureWriteViaTmp(dayPath, merged.join('\n') + '\n');
+            const separator = dayFileEndsWithoutNewline(dayPath) ? '\n' : '';
+            secureAppend(dayPath, `${separator}${additions.join('\n')}\n`);
+            this.migrationAppendedRows = true;
           }
         }
         archiveDirs.add(targetDir);

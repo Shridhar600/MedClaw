@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-import { installGlobalSafetyNet } from '../src/index';
+import { installGlobalSafetyNet, reportFatalStartupError } from '../src/index';
 
 describe('Global safety net (RES-P1-3)', () => {
   it('logs sanitized unhandledRejection and continues (does not throw nor exit)', () => {
@@ -66,5 +66,22 @@ describe('Global safety net (RES-P1-3)', () => {
     teardown();
     const after = target.listenerCount('unhandledRejection') + target.listenerCount('uncaughtException');
     expect(after).toBe(before);
+  });
+
+  it('logs a sanitized fatal startup error before exiting', () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const exitSpy = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    try {
+      reportFatalStartupError(new Error('startup failed with MEDICALSECRET12345'));
+      const logged = errorSpy.mock.calls.flat().map(String).join('\n');
+      expect(logged).toContain('Fatal error');
+      expect(logged).toContain('Error');
+      expect(logged).not.toContain('MEDICALSECRET12345');
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    } finally {
+      errorSpy.mockRestore();
+      exitSpy.mockRestore();
+    }
   });
 });

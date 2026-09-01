@@ -18,6 +18,13 @@ function normalizeHomoglyphs(content: string): string {
   return content.replace(HOMOGLYPH_PATTERN, (ch) => HOMOGLYPH_MAP[ch] ?? ch);
 }
 
+// Scan-only normalization: Unicode's Default_Ignorable_Code_Point property includes zero-width
+// controls, word joiners, soft hyphen, and variation selectors. Removing them from the detector's
+// copy closes de-contiguation bypasses without changing the content that is ultimately stored.
+function stripDefaultIgnorableCodePoints(content: string): string {
+  return content.replace(/\p{Default_Ignorable_Code_Point}/gu, '');
+}
+
 const CREDENTIAL_PATTERNS: RegExp[] = [
   // Label + value. The filler `[^A-Za-z0-9_-]{0,100000}` lets the scanner
   // catch a label and value separated by non-alphanumeric padding (the
@@ -33,9 +40,9 @@ const CREDENTIAL_PATTERNS: RegExp[] = [
 ];
 
 export function contentContainsCredentials(content: string): { matched: boolean; pattern: string } {
-  // SEC-M2a: normalize homoglyphs to ASCII, then lowercase so case-variant
-  // labels (ApiKey, API_KEY) collapse before the patterns run.
-  const normalized = normalizeHomoglyphs(content).toLowerCase();
+  // SEC-M2a/M2c: remove default-ignorable code points and normalize homoglyphs to ASCII, then
+  // lowercase so invisible splits and case-variant labels (ApiKey, API_KEY) collapse before patterns run.
+  const normalized = normalizeHomoglyphs(stripDefaultIgnorableCodePoints(content)).toLowerCase();
   for (const pattern of CREDENTIAL_PATTERNS) {
     if (pattern.test(normalized)) {
       return { matched: true, pattern: pattern.source.slice(0, 40) };

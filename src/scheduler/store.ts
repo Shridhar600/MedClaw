@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
-import { secureMkdir, secureWriteViaTmp, tightenFile } from '../security';
+import { secureMkdir, secureWriteViaTmp, summarizeErrorForLog, tightenFile } from '../security';
 import type {
   CreateHeartbeatJobInput,
   HeartbeatJob,
@@ -159,14 +159,14 @@ export class HeartbeatStore {
       console.error(
         `[scheduler] CORRUPTION DETECTED at ${this.lastCorruptionAt}`,
       );
-      const reason = error instanceof Error ? error.message : String(error);
+      const reason = summarizeErrorForLog(error);
       try {
         const quarantinedPath = this.quarantineCorruptFile();
         console.error(
           `[scheduler] Corrupt heartbeat store recovered: ${reason}. Quarantined at ${quarantinedPath}.`,
         );
       } catch (quarantineError) {
-        const quarantineReason = quarantineError instanceof Error ? quarantineError.message : String(quarantineError);
+        const quarantineReason = summarizeErrorForLog(quarantineError);
         console.error(
           `[scheduler] Corrupt heartbeat store recovered: ${reason}. Quarantine failed: ${quarantineReason}. Using empty store.`,
         );

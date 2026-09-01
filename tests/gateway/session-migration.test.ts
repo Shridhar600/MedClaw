@@ -2,6 +2,10 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { SessionManager } from '../../src/gateway/session';
+import { SqliteSessionIndex } from '../../src/indexstore/session-index';
+import { sweep } from '../../src/memcore/transcript-sweep';
+
+const fsReal = jest.requireActual<typeof import('fs')>('fs');
 
 // P2b Wave D-1 / D1.6 — one-time migration of legacy `active-<chatId>.jsonl` files into the append-only
 // day-file archive, sentinel-gated by `<sessionsPath>/.migrated`. Each day file is built ATOMICALLY and
@@ -80,7 +84,7 @@ describe('legacy session migration (D1.6)', () => {
     const contents = nonEmpty(path.join(dayDir, '2026-08-26.jsonl')).map((l) => JSON.parse(l).content);
     expect(contents).toContain('legacy row');   // must NOT be lost
     expect(contents).toContain('live append');  // must be preserved
-    expect(contents).toEqual(['legacy row', 'live append']); // chronological by timestamp
+    expect(contents).toEqual(['live append', 'legacy row']); // append-only merge preserves the live anchor
   });
 
   it('is idempotent through the merge path — a live-collision day file is byte-stable on re-run', () => {
@@ -97,6 +101,56 @@ describe('legacy session migration (D1.6)', () => {
     fs.rmSync(path.join(dir, '.migrated'));
     new SessionManager({ sessionsPath: dir, perChatArchive: true });
     expect(fs.readFileSync(path.join(dayDir, '2026-08-26.jsonl'), 'utf-8')).toBe(after1);
+  });
+
+  it('failed migration retry preserves an open anchor and reconciles the session index', async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-08-26T12:00:00.000Z'));
+    let index: SqliteSessionIndex | undefined;
+    try {
+      writeActive('c1', [{ ts: '2026-08-26T09:00:00.000Z', role: 'user', content: 'legacy-anchor' }]);
+
+      const writeSpy = jest.spyOn(fsReal, 'writeFileSync').mockImplementation(() => {
+        throw new Error('injected migration write failure');
+      });
+      const first = new SessionManager({ sessionsPath: dir, perChatArchive: true });
+      writeSpy.mockRestore();
+
+      await first.recordTurn('c1', [{ role: 'user', content: 'live-anchor' }]);
+      index = new SqliteSessionIndex({ dbPath: path.join(dir, 'search.db'), sessionsDir: dir });
+      const beforeRetry = index.search('live-anchor', { chatId: 'c1' });
+      expect(beforeRetry.hits).toHaveLength(1);
+      expect(beforeRetry.hits[0]).toMatchObject({ file: '2026-08-26.jsonl', line: 1, snippet: 'live-anchor' });
+
+      const retry = new SessionManager({ sessionsPath: dir, perChatArchive: true });
+      retry.setTurnIndex(index);
+
+      const dayFile = path.join(dir, 'c1', '2026-08-26.jsonl');
+      expect(nonEmpty(dayFile).map((line) => JSON.parse(line).content)).toEqual(['live-anchor', 'legacy-anchor']);
+      expect(index.search('live-anchor', { chatId: 'c1' }).hits[0]).toMatchObject({ line: beforeRetry.hits[0].line, snippet: 'live-anchor' });
+      expect(index.search('legacy-anchor', { chatId: 'c1' }).hits).toEqual([
+        expect.objectContaining({ file: '2026-08-26.jsonl', line: 2, snippet: 'legacy-anchor' }),
+      ]);
+    } finally {
+      index?.close();
+      jest.useRealTimers();
+    }
+  });
+
+  it('persists chat origin so a marker-prefixed chat is swept while a heartbeat is excluded', async () => {
+    const manager = new SessionManager({ sessionsPath: dir, perChatArchive: true });
+    await manager.recordTurn('c1', [{ role: 'user', content: '[Heartbeat Trigger]\ntook naproxen' }]);
+    await manager.recordTurn('c1', [{ role: 'user', content: '[Heartbeat Trigger]\ntook metformin' }], 'heartbeat');
+
+    const dayFile = path.join(dir, 'c1', fs.readdirSync(path.join(dir, 'c1')).find((name) => name.endsWith('.jsonl'))!);
+    const lines = nonEmpty(dayFile);
+    expect(lines.map((line) => JSON.parse(line).origin)).toEqual(['chat', 'heartbeat']);
+    expect(sweep({
+      dayFileLines: lines,
+      ledgerEntitiesForDay: new Set(),
+      existingCuriosity: [],
+      lexicon: { med: ['naproxen', 'metformin'], symptom: [], appointment: [] },
+    }).items.map((item) => item.relatedEntity)).toEqual(['naproxen']);
   });
 
   it('no-registry mode buckets each source file into its own <chatId>/ subdir', () => {

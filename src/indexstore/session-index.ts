@@ -182,6 +182,13 @@ export class SqliteSessionIndex {
     })();
   }
 
+  /** C-12: reset stale derived anchors, rebuild from the append-only archive, then clear dirty state. */
+  reconcileFromDayFiles(): void {
+    this.resetDerivedTables();
+    this.rebuildFromDayFiles();
+    this.clearDirtyMarker();
+  }
+
   isEmpty(): boolean {
     const row = this.db.prepare('SELECT COUNT(*) AS c FROM session_turns').get() as { c: number };
     return row.c === 0;

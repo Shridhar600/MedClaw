@@ -528,6 +528,7 @@ export class Gateway {
     // D4.4: the nightly transcript sweep (spec 14 §5 / PD-17 dreaming step 1.5) — deterministic, no
     // LLM. Fire-and-forget at 03:15 local; `runTranscriptSweep` is fully guarded so a failure never
     // escapes, and the task is stopped in `stop()`. A scheduling failure degrades the feature, not boot.
+    this.sweepStopping = false;
     try {
       this.sweepTask?.stop(); // MEDIUM-10: a re-`start()` must not orphan the previous cron task
       this.sweepTask = cron.schedule(

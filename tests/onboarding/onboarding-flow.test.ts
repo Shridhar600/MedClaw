@@ -213,6 +213,23 @@ describe('OnboardingFlow', () => {
     expect(fs.readdirSync(stateDir).some((name) => name.startsWith('onboarding.json.corrupt-'))).toBe(true);
   });
 
+  it('never logs corrupt onboarding content during quarantine', async () => {
+    const stateDir = path.join(tmpDir, '.redacted');
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, 'onboarding.json'), 'MEDICALSECRET12345', 'utf8');
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    try {
+      await new OnboardingStore(tmpDir).load();
+      const logged = errorSpy.mock.calls.flat().map(String).join('\n');
+      expect(logged).not.toContain('MEDICALSECRET12345');
+      expect(logged).toContain('Corrupt onboarding state recovered');
+      expect(logged).toContain('Error');
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   // ── I1: slot-drift hardening — echo-back + per-slot validation ──────────
 
   describe('slot echo-back (I1)', () => {

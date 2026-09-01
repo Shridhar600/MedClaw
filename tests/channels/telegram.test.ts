@@ -124,7 +124,7 @@ describe('TelegramChannel', () => {
       expect(receivedMessages[0].mediaError).toContain('Failed to download');
     });
 
-    it('document download failure logs redact Telegram bot token from error URL', async () => {
+    it('document download failure logs only the sanitized error identity', async () => {
       let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
       const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
 
@@ -160,13 +160,15 @@ describe('TelegramChannel', () => {
       const logged = consoleError.mock.calls.flat().map(String).join('\n');
       consoleError.mockRestore();
       expect(logged).not.toContain('test-token');
-      expect(logged).toContain('https://api.telegram.org/file/bot<redacted>/documents/report.pdf');
+      expect(logged).not.toContain('https://api.telegram.org');
+      expect(logged).not.toContain('failed ');
+      expect(logged).toContain('Error');
       expect(receivedMessages).toHaveLength(1);
       expect(receivedMessages[0].mediaPath).toBeUndefined();
       expect(receivedMessages[0].mediaError).toContain('Failed to download');
     });
 
-    it('document download failure logs redact Telegram bot token from Bot API URL', async () => {
+    it('document download failure does not log the Bot API error message', async () => {
       let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
       const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
 
@@ -199,7 +201,38 @@ describe('TelegramChannel', () => {
       const logged = consoleError.mock.calls.flat().map(String).join('\n');
       consoleError.mockRestore();
       expect(logged).not.toContain('test-token');
-      expect(logged).toContain('https://api.telegram.org/bot<redacted>/getFile');
+      expect(logged).not.toContain('https://api.telegram.org');
+      expect(logged).not.toContain('failed ');
+      expect(logged).toContain('Error');
+    });
+
+    it('document download failure never logs a PHI-bearing filename', async () => {
+      let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
+      const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
+      const marker = 'MEDICALSECRET12345';
+
+      mockBotOn.mockImplementation((event: string, cb: (ctx: MockCtx) => Promise<void>) => {
+        if (event === 'message:document') handler = cb;
+      });
+      mockGetFile.mockResolvedValue({ file_path: 'documents/test.pdf' });
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        arrayBuffer: () => Promise.resolve(new ArrayBuffer(1)),
+      });
+
+      const channel = new TelegramChannel('test-token', '/tmp/test-workspace');
+      await channel.onMessage(async () => undefined);
+      await handler?.({
+        message: { document: { file_id: 'doc123', file_name: `${marker}${'x'.repeat(300)}.pdf` } },
+        chat: { id: 123 },
+        from: { id: 456 },
+      });
+
+      const logged = consoleError.mock.calls.flat().map(String).join('\n');
+      consoleError.mockRestore();
+      expect(logged).not.toContain(marker);
+      expect(logged).not.toContain('ENAMETOOLONG');
     });
 
     it('photo handler sets mediaPath for highest resolution photo', async () => {
@@ -290,7 +323,7 @@ describe('TelegramChannel', () => {
       expect(receivedMessages[0].mediaError).toContain('Failed to download');
     });
 
-    it('photo download failure logs redact Telegram bot token from error URL', async () => {
+    it('photo download failure logs only the sanitized error identity', async () => {
       let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
       const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
 
@@ -326,7 +359,9 @@ describe('TelegramChannel', () => {
       const logged = consoleError.mock.calls.flat().map(String).join('\n');
       consoleError.mockRestore();
       expect(logged).not.toContain('test-token');
-      expect(logged).toContain('https://api.telegram.org/file/bot<redacted>/photos/photo.jpg');
+      expect(logged).not.toContain('https://api.telegram.org');
+      expect(logged).not.toContain('failed ');
+      expect(logged).toContain('Error');
       expect(receivedMessages).toHaveLength(1);
       expect(receivedMessages[0].mediaPath).toBeUndefined();
       expect(receivedMessages[0].mediaError).toContain('Failed to download');

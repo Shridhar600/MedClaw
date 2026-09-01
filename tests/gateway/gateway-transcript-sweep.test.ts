@@ -1,8 +1,13 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import * as cron from 'node-cron';
 import { Gateway } from '../../src/gateway/gateway';
 import type { AppConfig } from '../../src/config/types';
+
+jest.mock('node-cron', () => ({
+  schedule: jest.fn(() => ({ stop: jest.fn() })),
+}));
 
 // F-6 + MEDIUM-6: the nightly sweep exercised through the REAL Gateway seam — Gateway.runTranscriptSweep()
 // composes buildSweepDeps() over the real SessionManager day files, the real LedgerStore (ALL versions),
@@ -94,6 +99,34 @@ describe('Gateway.runTranscriptSweep (F-6 integration, MEDIUM-6)', () => {
     const p2 = gateway.runTranscriptSweep(); // same tick, before p1 resolves
     const [r1, r2] = await Promise.all([p1, p2]);
     expect(r1).toBe(r2); // both awaited the SAME in-flight run (one execution, one result object)
+  });
+
+  it('restarts the nightly sweep with a live callback after stop', async () => {
+    gateway = new Gateway(makeConfig(tmpDir));
+    const scheduled: Array<{
+      expression: string;
+      callback: ((now: Date | 'manual' | 'init') => void) | string;
+      options?: cron.ScheduleOptions;
+    }> = [];
+    const scheduleMock = cron.schedule as jest.MockedFunction<typeof cron.schedule>;
+    scheduleMock.mockClear();
+    scheduleMock.mockImplementation((expression, callback, options) => {
+      scheduled.push({ expression, callback, options });
+      return { stop: jest.fn() } as unknown as cron.ScheduledTask;
+    });
+
+    try {
+      await gateway.start();
+      await gateway.stop();
+      await gateway.start();
+
+      const latest = scheduled.at(-1);
+      expect(latest).toMatchObject({ expression: '15 3 * * *', options: { scheduled: true, timezone: 'Asia/Kolkata' } });
+      expect(typeof latest?.callback).toBe('function');
+      await expect(gateway.runTranscriptSweep()).resolves.toMatchObject({ scanned: true });
+    } finally {
+      scheduleMock.mockReset();
+    }
   });
 
   it('does not run a sweep after stop() (MEDIUM-8)', async () => {

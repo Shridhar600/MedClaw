@@ -71,4 +71,18 @@ more text`;
     const result = contentContainsCredentials(content);
     expect(result.matched).toBe(true);
   });
+
+  it.each([
+    ['U+200B ZERO WIDTH SPACE', '\u200b'],
+    ['U+200C ZERO WIDTH NON-JOINER', '\u200c'],
+    ['U+200D ZERO WIDTH JOINER', '\u200d'],
+    ['U+2060 WORD JOINER', '\u2060'],
+    ['U+FEFF ZERO WIDTH NO-BREAK SPACE', '\ufeff'],
+    ['U+00AD SOFT HYPHEN', '\u00ad'],
+    ['U+180E MONGOLIAN VOWEL SEPARATOR', '\u180e'],
+    ['U+FE0F VARIATION SELECTOR-16', '\ufe0f'],
+  ])('rejects a credential split by %s', (_label, invisible) => {
+    const content = `sk${invisible}-abc123def456ghi789jkl012mno345pqr678`;
+    expect(contentContainsCredentials(content).matched).toBe(true);
+  });
 });

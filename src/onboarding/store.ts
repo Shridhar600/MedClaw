@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { secureWriteViaTmp, tightenFile } from '../security';
+import { secureWriteViaTmp, summarizeErrorForLog, tightenFile } from '../security';
 import type { OnboardingState } from './types';
 
 const DEFAULT_STATE: OnboardingState = {
@@ -38,14 +38,14 @@ export class OnboardingStore {
   }
 
   private quarantineCorruptState(error: unknown): void {
-    const reason = error instanceof Error ? error.message : String(error);
+    const reason = summarizeErrorForLog(error);
     try {
       const corruptPath = `${this.filePath}.corrupt-${Date.now()}`;
       fs.renameSync(this.filePath, corruptPath);
       tightenFile(corruptPath);
       console.error(`[onboarding] Corrupt onboarding state recovered: ${reason}. Quarantined at ${corruptPath}.`);
     } catch (quarantineError) {
-      const quarantineReason = quarantineError instanceof Error ? quarantineError.message : String(quarantineError);
+      const quarantineReason = summarizeErrorForLog(quarantineError);
       console.error(
         `[onboarding] Corrupt onboarding state recovered: ${reason}. Quarantine failed: ${quarantineReason}. Using default state.`,
       );

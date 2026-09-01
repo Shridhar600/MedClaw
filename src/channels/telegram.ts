@@ -4,23 +4,6 @@ import * as crypto from 'crypto';
 import { secureMkdir, secureWrite, summarizeErrorForLog } from '../security';
 import type { Channel, IncomingMessage, OutgoingMessage } from './types';
 
-export function redactTelegramBotTokens(text: string): string {
-  return text.replace(
-    /(https:\/\/api\.telegram\.org\/(?:file\/)?bot)[^/\s]+/g,
-    '$1<redacted>',
-  );
-}
-
-function summarizeError(error: unknown): string {
-  if (error instanceof Error) {
-    const name = redactTelegramBotTokens(error.name);
-    const message = redactTelegramBotTokens(error.message);
-    return `${name}: ${message}`;
-  }
-
-  return redactTelegramBotTokens(String(error));
-}
-
 export class TelegramChannel implements Channel {
   readonly name = 'telegram';
   private bot: Bot;
@@ -104,7 +87,7 @@ export class TelegramChannel implements Channel {
       try {
         mediaPath = await this.downloadFile(fileId, fileName);
       } catch (e) {
-        console.error('[telegram] Failed to download document:', summarizeError(e));
+        console.error('[telegram] Failed to download document:', summarizeErrorForLog(e));
         mediaError = `Failed to download uploaded file ${fileName}. Please try uploading it again.`;
       }
 
@@ -136,7 +119,7 @@ export class TelegramChannel implements Channel {
       try {
         mediaPath = await this.downloadFile(fileId, fileName);
       } catch (e) {
-        console.error('[telegram] Failed to download photo:', summarizeError(e));
+        console.error('[telegram] Failed to download photo:', summarizeErrorForLog(e));
         mediaError = 'Failed to download uploaded photo. Please try sending it again.';
       }
 

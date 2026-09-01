@@ -27,12 +27,12 @@ describe('SessionManager.readDayFileLines (D4.4 sweep seam)', () => {
     expect(sm.readDayFileLines(new Date('2000-01-01T00:00:00.000Z'))).toEqual([]);
   });
 
-  it('stamps origin on a heartbeat turn and omits it for a chat turn (A-H1)', async () => {
+  it('stamps explicit origin on chat and heartbeat turns (A-H1/C-56)', async () => {
     const sm = new SessionManager({ sessionsPath: dir, perChatArchive: true });
     await sm.recordTurn('c1', [{ role: 'user', content: 'chat turn' }]);             // default 'chat'
     await sm.recordTurn('c1', [{ role: 'user', content: 'hb turn' }], 'heartbeat');  // daemon-authored
     const entries = sm.readDayFileLines(new Date()).map(l => JSON.parse(l));
-    expect(entries.find(e => e.content === 'chat turn').origin).toBeUndefined(); // byte-stable default
+    expect(entries.find(e => e.content === 'chat turn').origin).toBe('chat');
     expect(entries.find(e => e.content === 'hb turn').origin).toBe('heartbeat');
   });
 
