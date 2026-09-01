@@ -67,9 +67,14 @@ describe('WriteQueue per-line journal', () => {
     ).rejects.toThrow();
     await q.enqueue('turn', { label: 'ledger:y', run: async () => { /* succeeds */ } });
 
-    const j = await fs.promises.readFile(jp, 'utf-8');
-    expect(j).toContain('ledger:x');     // failed line survives as an A4 replay target
-    expect(j).not.toContain('ledger:y'); // succeeded line cleared
+    const records = (await fs.promises.readFile(jp, 'utf-8')).trim().split('\n')
+      .map((line) => JSON.parse(line) as { phase: string; id: string; label?: string });
+    const failed = records.find((record) => record.phase === 'begin' && record.label === 'ledger:x');
+    const succeeded = records.find((record) => record.phase === 'begin' && record.label === 'ledger:y');
+    expect(failed).toBeDefined(); // failed intent remains an unresolved A4 recovery target
+    expect(succeeded).toBeDefined();
+    expect(records).toContainEqual({ phase: 'commit', id: succeeded!.id }); // success is explicit, not deletion
+    expect(records).not.toContainEqual({ phase: 'commit', id: failed!.id });
   });
 
   it('does not cross-delete a stuck line when a later op shares the same label', async () => {
@@ -79,9 +84,13 @@ describe('WriteQueue per-line journal', () => {
     ).rejects.toThrow();
     await q.enqueue('turn', { label: 'ledger:dup', run: async () => { /* succeeds */ } });
 
-    const j = await fs.promises.readFile(jp, 'utf-8');
-    // exactly one 'ledger:dup' line remains — the failed one, not the succeeded one
-    expect(j.split('\n').filter(l => l.includes('ledger:dup'))).toHaveLength(1);
+    const records = (await fs.promises.readFile(jp, 'utf-8')).trim().split('\n')
+      .map((line) => JSON.parse(line) as { phase: string; id: string; label?: string });
+    const begins = records.filter((record) => record.phase === 'begin' && record.label === 'ledger:dup');
+    const commits = new Set(records.filter((record) => record.phase === 'commit').map((record) => record.id));
+    // Same-label operations remain distinct: only the successful id is committed.
+    expect(begins).toHaveLength(2);
+    expect(begins.filter((record) => commits.has(record.id))).toHaveLength(1);
   });
 
   it('never blocks an op when the journal path is unwritable (warn-and-continue)', async () => {

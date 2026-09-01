@@ -50,15 +50,17 @@ describe('SessionManager JSONL Persistence', () => {
   // dirs, contiguous line numbers, empty-context resume) is covered by session-new-window.test.ts.
   // (Was: "archives session on resetSession and creates summary".)
 
-  // P2b/D1.6: resetSession clears the in-memory session + the window, but the append-only day-file
-  // archive is PRESERVED (never deleted — DD1). (Was: "active JSONL deleted after archive".)
-  it('resetSession clears the session + window but preserves the day-file archive', async () => {
+  // P2b/D1.6: resetSession clears the in-memory session with a durable empty window, but the append-only
+  // day-file archive is PRESERVED (never deleted — DD1). (Was: "active JSONL deleted after archive".)
+  it('resetSession clears the session with an empty window and preserves the day-file archive', async () => {
     await manager.addTurn('chat1', { role: 'user', content: 'Test' }, { role: 'assistant', content: 'Response' });
     expect(fs.existsSync(dayFile())).toBe(true);
 
     await manager.resetSession('chat1');
     expect(manager.getHistory('chat1')).toEqual([]);
-    expect(fs.existsSync(path.join(tmpDir, 'session-window.json'))).toBe(false);
+    const window = JSON.parse(fs.readFileSync(path.join(tmpDir, 'session-window.json'), 'utf8'));
+    expect(window.summaryBlock).toBe('');
+    expect(window.verbatimFrom.line).toBe(2);
     expect(fs.existsSync(dayFile())).toBe(true);
   });
 

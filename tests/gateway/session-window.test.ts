@@ -95,6 +95,8 @@ describe('session-window (D1.1)', () => {
   it('resolveWindow: a present, valid window is returned unchanged', () => {
     const p = path.join(dir, 'session-window.json');
     const w = win({ lastPromptTokens: 99 });
+    // A valid persisted cursor must resolve to an existing day file and physical slot.
+    fs.writeFileSync(path.join(dir, '2026-08-25.jsonl'), 'a\nb\nc\nd\n');
     saveWindow(p, w);
     expect(resolveWindow(p, dir)).toEqual(w);
   });

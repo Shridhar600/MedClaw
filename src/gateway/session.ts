@@ -8,7 +8,6 @@ import { type RotationConfig } from '../scheduler/rotation';
 import {
   summarizeErrorForLog,
   secureMkdir,
-  secureWrite,
   secureWriteViaTmp,
   secureAppend,
   PathContainmentError,
@@ -19,7 +18,9 @@ import {
   countDayFileLines,
   listDayFiles,
   walkBackAnchor,
+  anchorBefore,
   readLinesAfter,
+  latestDayFileEof,
   resolveWindow,
   saveWindow,
   type Anchor,
@@ -37,6 +38,8 @@ const MAX_DAY_FILE_READ_BYTES = 64 * 1024 * 1024;
 interface Session {
   chatId: string;
   history: Message[];
+  /** One physical archive cursor per history message; summary messages carry no cursor. */
+  historyAnchors: Array<Anchor | undefined>;
   lastActiveAt: Date;
 }
 
@@ -61,6 +64,24 @@ interface JsonlEntry {
   toolResult?: string;
 }
 
+interface SessionMigrationSentinel {
+  version: 1;
+  completed: true;
+  completedAt: string;
+}
+
+function isValidSessionMigrationSentinel(filePath: string): boolean {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as Partial<SessionMigrationSentinel>;
+    return parsed.version === 1
+      && parsed.completed === true
+      && typeof parsed.completedAt === 'string'
+      && !Number.isNaN(new Date(parsed.completedAt).getTime());
+  } catch {
+    return false;
+  }
+}
+
 interface CompactionConfig {
   enabled: boolean;
   triggerAtTokenPercent: number;
@@ -82,6 +103,7 @@ interface WindowConfig {
 // aborts if it was replaced since (A-MF3 live-tail re-check). `olderReal` excludes any leading summary.
 interface CompactionSnapshot {
   historyRef: Message[];
+  historyAnchorsRef: Array<Anchor | undefined>;
   split: number;
   oldSummary: string;
   olderReal: Message[];
@@ -242,6 +264,37 @@ export function stripOrphanToolMessages(messages: Message[]): Message[] {
   return out;
 }
 
+interface AnchoredMessage {
+  message: Message;
+  anchor?: Anchor;
+}
+
+/** Keep the physical anchor paired with a message while applying the OpenAI tool-group sanitizer. */
+function stripOrphanToolMessagesWithAnchors(entries: AnchoredMessage[]): AnchoredMessage[] {
+  const out: AnchoredMessage[] = [];
+  for (const entry of entries) {
+    if (entry.message.role === 'tool') {
+      const previous = out[out.length - 1]?.message;
+      const inValidGroup =
+        !!previous &&
+        ((previous.role === 'assistant' && !!previous.tool_calls && previous.tool_calls.length > 0) ||
+          previous.role === 'tool');
+      if (inValidGroup) out.push(entry);
+      continue;
+    }
+    out.push(entry);
+  }
+  while (out.length > 0) {
+    const last = out[out.length - 1].message;
+    if (last.role === 'assistant' && last.tool_calls && last.tool_calls.length > 0) {
+      out.pop();
+    } else {
+      break;
+    }
+  }
+  return out;
+}
+
 // spec 14 §3 prune marker (in-window only — the day-file archive keeps the verbatim result, retrievable
 // via session_search). One constant so the marker text is a single source of truth.
 export const PRUNED_TOOL_MARKER = '[tool result pruned — session_search to retrieve]';
@@ -316,6 +369,7 @@ export class SessionManager {
   private hardResetMs: number;
   private sessionsPath: string;
   private operationQueues: Map<string, Array<() => Promise<void>>> = new Map();
+  private readonly chatsWithUserActivity: Set<string> = new Set();
   private readonly llmProvider?: LLMProvider;
   private readonly toolRegistry?: ToolRegistry;
   private readonly compactionConfig?: CompactionConfig;
@@ -349,6 +403,8 @@ export class SessionManager {
   // C-12: migration runs before Gateway wires the index. Remember an append-only merge so setTurnIndex
   // can reconcile an already-open index whose existing physical anchors must remain valid.
   private migrationAppendedRows = false;
+  // C-40: a summary copy is durable pending work until the sink and the cleared window state both commit.
+  private readonly pendingSummariesByChat: Map<string, string> = new Map();
 
   /** Wire compaction LLM calls through the semaphore at background priority (F8). */
   setBackgroundRunner(run: <T>(fn: () => Promise<T>) => Promise<T>): void {
@@ -381,6 +437,35 @@ export class SessionManager {
   /** Wire the compaction-summary → chat-scoped sink (D3.4 / C-29). */
   setSummarySink(sink: (chatId: string, anchoredSummary: string) => Promise<void>): void {
     this.summarySink = sink;
+  }
+
+  /** Retry summary copies that were durably attached to a window but not yet accepted by the sink. */
+  async retryPendingSummaries(): Promise<void> {
+    if (!this.summarySink) return;
+    for (const chatId of [...this.pendingSummariesByChat.keys()]) {
+      try {
+        await this.enqueue(chatId, async () => this.flushPendingSummaryLocked(chatId));
+      } catch (e) {
+        console.warn('[session] pending summary retry failed, continuing:', summarizeErrorForLog(e));
+      }
+    }
+  }
+
+  /** Run while the per-chat queue is held; failures leave the pending marker intact for a later retry. */
+  private async flushPendingSummaryLocked(chatId: string): Promise<void> {
+    const summary = this.pendingSummariesByChat.get(chatId);
+    if (!summary || !this.summarySink) return;
+    try {
+      await this.summarySink(chatId, summary);
+    } catch (e) {
+      console.warn(`[session:${chatId}] Session-summary daily-log copy failed:`, summarizeErrorForLog(e));
+      return;
+    }
+
+    // The sink succeeded, but the marker is cleared only after the window state is durably updated.
+    // If that second write fails, restore the in-memory marker so the copy is retried at least once.
+    this.pendingSummariesByChat.delete(chatId);
+    if (!this.saveWindowFor(chatId)) this.pendingSummariesByChat.set(chatId, summary);
   }
 
   /** Whether the constructor completed the legacy-session migration step. */
@@ -552,6 +637,7 @@ export class SessionManager {
     const created: Session = {
       chatId,
       history: [],
+      historyAnchors: [],
       lastActiveAt: new Date(),
     };
     this.sessions.set(chatId, created);
@@ -563,12 +649,14 @@ export class SessionManager {
   }
 
   getLastActiveAt(chatId: string): Date | undefined {
+    if (!this.chatsWithUserActivity.has(chatId)) return undefined;
     return this.sessions.get(chatId)?.lastActiveAt;
   }
 
   getMostRecentChatId(): string | undefined {
     let latest: Session | undefined;
     for (const session of this.sessions.values()) {
+      if (!this.chatsWithUserActivity.has(session.chatId)) continue;
       if (!latest || session.lastActiveAt.getTime() > latest.lastActiveAt.getTime()) {
         latest = session;
       }
@@ -669,10 +757,16 @@ export class SessionManager {
     const first = session.history[0];
     const hasSummary = !!first && first.role === 'system'
       && typeof first.content === 'string' && first.content.startsWith(SUMMARY_PREFIX);
-    const summaryPrefix = hasSummary ? [first] : [];
-    const rest = hasSummary ? session.history.slice(1) : session.history;
-    const split = turnAwareSplit(rest, keepRecent);
-    session.history = [...summaryPrefix, ...stripOrphanToolMessages(rest.slice(split))];
+    const entries = session.history.map((message, index) => ({
+      message,
+      anchor: session.historyAnchors[index],
+    }));
+    const summaryPrefix = hasSummary ? entries.slice(0, 1) : [];
+    const rest = hasSummary ? entries.slice(1) : entries;
+    const split = turnAwareSplit(rest.map((entry) => entry.message), keepRecent);
+    const kept = stripOrphanToolMessagesWithAnchors([...summaryPrefix, ...rest.slice(split)]);
+    session.history = kept.map((entry) => entry.message);
+    session.historyAnchors = kept.map((entry) => entry.anchor);
   }
 
   // Drain any in-flight compaction for a chat (used by tests + graceful shutdown). Never rejects.
@@ -699,7 +793,11 @@ export class SessionManager {
       const anchors = await this.appendMessagesToJsonl(chatId, turnTrace, origin);
       const session = this.getOrCreateSessionState(chatId);
       session.history.push(...turnTrace);
-      session.lastActiveAt = new Date();
+      session.historyAnchors.push(...anchors);
+      if (origin === 'chat') {
+        this.chatsWithUserActivity.add(chatId);
+        session.lastActiveAt = new Date();
+      }
       this.sessions.set(chatId, session);
       // D1.5: persist the window snapshot so a restart resumes this tail from the day-file archive.
       this.saveWindowFor(chatId);
@@ -737,27 +835,33 @@ export class SessionManager {
   }
 
   /**
-   * DD9 `/new`: start a fresh CONTEXT window. Clear the in-memory history + the fill signal and drop the
-   * window snapshot so resume replays nothing. The append-only day-file archive is UNTOUCHED (DD1) — the
-   * disk log continues with contiguous line numbers and stays searchable via session_search. The old
-   * `archive/` + `summaries/` side-files are retired (replaced by day files + daily-log summaries).
+   * DD9 `/new`: publish an empty EOF window before clearing in-memory state. The append-only day-file
+   * archive is UNTOUCHED (DD1), so the disk log continues with contiguous line numbers and stays
+   * searchable via session_search. A failed replacement write rejects the reset and leaves the old state
+   * in place; callers must not report a successful reset after that failure.
    */
   async resetSession(chatId: string): Promise<void> {
     await this.enqueue(chatId, async () => {
+      const pendingSummary = this.pendingSummariesByChat.get(chatId);
+      const replacement: SessionWindow = {
+        summaryBlock: '',
+        verbatimFrom: latestDayFileEof(this.archiveDir(chatId)),
+        ...(pendingSummary ? { pendingSummary } : {}),
+      };
+      // Persist the replacement first. The old window remains authoritative until this atomic write
+      // succeeds, so a crash or unlink failure cannot resurrect pre-/new context.
+      saveWindow(this.windowPath(chatId), replacement);
       this.sessions.delete(chatId);
+      this.chatsWithUserActivity.delete(chatId);
       this.lastPromptTokensByChat.delete(chatId);
-      try {
-        const wp = this.windowPath(chatId);
-        if (fs.existsSync(wp)) fs.unlinkSync(wp);
-      } catch (e) {
-        console.warn(`[session:${chatId}] window state clear failed, continuing:`, summarizeErrorForLog(e));
-      }
+      if (!pendingSummary) this.pendingSummariesByChat.delete(chatId);
     });
   }
 
   // Public compaction (the /compact command + tests). With an LLM: the full §4 pipeline (off-queue LLM,
   // queued live-tail apply), reusing an in-flight one. Without an LLM: a synchronous turn-aware truncate.
   async runCompaction(chatId: string): Promise<void> {
+    await this.retryPendingSummaries();
     if (this.llmProvider) {
       await this.guardedCompaction(chatId);
     } else {
@@ -816,15 +920,27 @@ export class SessionManager {
     const first = session.history[0];
     const hasSummary = !!first && first.role === 'system'
       && typeof first.content === 'string' && first.content.startsWith(SUMMARY_PREFIX);
-    const summaryPrefix = hasSummary ? [first] : [];
-    const rest = hasSummary ? session.history.slice(1) : session.history;
-    const split = turnAwareSplit(rest, keepRecent);
+    const entries = session.history.map((message, index) => ({
+      message,
+      anchor: session.historyAnchors[index],
+    }));
+    const summaryPrefix = hasSummary ? entries.slice(0, 1) : [];
+    const rest = hasSummary ? entries.slice(1) : entries;
+    const split = turnAwareSplit(rest.map((entry) => entry.message), keepRecent);
     if (split === 0) return; // nothing older to drop
-    const candidate = [...summaryPrefix, ...stripOrphanToolMessages(rest.slice(split))];
-    if (!this.persistCandidateWindow(chatId, hasSummary ? (first.content as string).slice(SUMMARY_PREFIX.length) : '', candidate.length - summaryPrefix.length)) {
+    const candidateEntries = stripOrphanToolMessagesWithAnchors([...summaryPrefix, ...rest.slice(split)]);
+    const candidate = candidateEntries.map((entry) => entry.message);
+    const candidateAnchors = candidateEntries.map((entry) => entry.anchor);
+    if (!this.persistCandidateWindow(
+      chatId,
+      hasSummary ? (first.content as string).slice(SUMMARY_PREFIX.length) : '',
+      candidate,
+      candidateAnchors,
+    )) {
       return; // M5: window save failed → keep the old window
     }
     session.history = candidate;
+    session.historyAnchors = candidateAnchors;
   }
 
   // §4 pipeline as three parts so the LLM runs OFF the write queue (H2):
@@ -851,10 +967,17 @@ export class SessionManager {
     const split = turnAwareSplit(history, keepRecent);
     const olderReal = history.slice(hasSummary ? 1 : 0, split); // exclude the leading summary (H3)
     if (olderReal.length === 0) return null;
-    const rangeAnchors: Anchor[] = readLinesAfter(this.archiveDir(chatId), this.deriveWindow(chatId).verbatimFrom)
-      .slice(0, olderReal.length)
-      .map((l) => ({ file: l.file, line: l.line }));
-    return { historyRef: history, split, oldSummary, olderReal, rangeAnchors };
+    const rangeAnchors = session.historyAnchors
+      .slice(hasSummary ? 1 : 0, split)
+      .filter((anchor): anchor is Anchor => anchor !== undefined);
+    return {
+      historyRef: history,
+      historyAnchorsRef: session.historyAnchors,
+      split,
+      oldSummary,
+      olderReal,
+      rangeAnchors,
+    };
   }
 
   // §4 flush + summary, run OFF the write queue. H6: a flush failure is a failed step ⇒ return null (keep
@@ -933,37 +1056,41 @@ Keep it concise and structured.`;
   // daily log (best-effort, idempotent — never the preserved old summary, so no double-logging — H3).
   private async applyCompaction(chatId: string, snap: CompactionSnapshot, built: { combinedSummary: string; newBullets: string }): Promise<void> {
     const session = this.sessions.get(chatId);
-    if (!session || session.history !== snap.historyRef) return; // live-tail changed ⇒ abort
-    const recentTail = session.history.slice(snap.split); // includes turns recorded during the LLM call
-    const candidate = stripOrphanToolMessages([
-      { role: 'system', content: `${SUMMARY_PREFIX}${built.combinedSummary}` },
+    if (!session || session.history !== snap.historyRef || session.historyAnchors !== snap.historyAnchorsRef) {
+      return; // live-tail changed ⇒ abort
+    }
+    const recentTail = session.history.slice(snap.split).map((message, index) => ({
+      message,
+      anchor: session.historyAnchors[snap.split + index],
+    })); // includes turns recorded during the LLM call
+    const candidateEntries = stripOrphanToolMessagesWithAnchors([
+      { message: { role: 'system', content: `${SUMMARY_PREFIX}${built.combinedSummary}` }, anchor: undefined },
       ...recentTail,
     ]);
-    if (!this.persistCandidateWindow(chatId, built.combinedSummary, candidate.length - 1)) {
+    const candidate = candidateEntries.map((entry) => entry.message);
+    const candidateAnchors = candidateEntries.map((entry) => entry.anchor);
+    if (!this.persistCandidateWindow(chatId, built.combinedSummary, candidate, candidateAnchors, built.newBullets)) {
       return; // M5: window save failed → keep the old window (spec §4)
     }
     session.history = candidate;
+    session.historyAnchors = candidateAnchors;
+    this.pendingSummariesByChat.set(chatId, built.newBullets);
     if (this.summarySink) {
-      try {
-        await this.summarySink(chatId, built.newBullets);
-      } catch (e) {
-        console.warn(`[session:${chatId}] Session-summary daily-log copy failed:`, summarizeErrorForLog(e));
-      }
+      await this.flushPendingSummaryLocked(chatId);
     }
   }
 
-  // M5: persist a candidate window (summary + a verbatim tail of `tailLength` day-file lines) WITHOUT
-  // mutating in-memory state. Returns true on a successful save, false (keep old window) on failure.
-  private persistCandidateWindow(chatId: string, summaryBlock: string, tailLength: number): boolean {
-    const window: SessionWindow = {
-      summaryBlock,
-      verbatimFrom: walkBackAnchor(this.archiveDir(chatId), tailLength),
-    };
-    const usage = this.lastPromptTokensByChat.get(chatId);
-    if (usage) {
-      window.lastPromptTokens = usage.tokens;
-      window.lastPromptTokensEstimated = usage.estimated;
-    }
+  // M5: persist a candidate window (summary + a verbatim tail) WITHOUT mutating in-memory state. The
+  // candidate carries physical anchors for every retained message, so malformed archive slots do not
+  // shift its cursor. Returns true on a successful save, false (keep old window) on failure.
+  private persistCandidateWindow(
+    chatId: string,
+    summaryBlock: string,
+    history: Message[],
+    historyAnchors: Array<Anchor | undefined>,
+    pendingSummary?: string,
+  ): boolean {
+    const window = this.windowForHistory(chatId, history, historyAnchors, pendingSummary);
     try {
       saveWindow(this.windowPath(chatId), window);
       return true;
@@ -1105,18 +1232,25 @@ Keep it concise and structured.`;
     }
   }
 
-  // D1.5: the window as a DERIVED snapshot of the in-memory history + the archive position. summaryBlock
-  // = the leading compaction summary (if any); verbatimFrom = the archive EOF walked back by the verbatim
-  // tail length. This holds because every non-summary message in `history` is exactly the last-K lines of
-  // the append-only day archive (compaction never rewrites day files — DD1).
-  private deriveWindow(chatId: string): SessionWindow {
-    const history = this.sessions.get(chatId)?.history ?? [];
+  /** Build a window cursor from the physical anchor of its first retained archive message. */
+  private windowForHistory(
+    chatId: string,
+    history: Message[],
+    historyAnchors: Array<Anchor | undefined>,
+    pendingSummary?: string,
+  ): SessionWindow {
     const first = history[0];
     const hasSummary =
       !!first && first.role === 'system' && typeof first.content === 'string' && first.content.startsWith(SUMMARY_PREFIX);
+    const firstRealIndex = hasSummary ? 1 : 0;
     const summaryBlock = hasSummary ? (first.content as string).slice(SUMMARY_PREFIX.length) : '';
-    const realTailLength = history.length - (hasSummary ? 1 : 0);
-    const window: SessionWindow = { summaryBlock, verbatimFrom: walkBackAnchor(this.archiveDir(chatId), realTailLength) };
+    const realTailLength = history.length - firstRealIndex;
+    const firstAnchor = historyAnchors[firstRealIndex];
+    const verbatimFrom = realTailLength > 0 && firstAnchor
+      ? anchorBefore(firstAnchor)
+      : walkBackAnchor(this.archiveDir(chatId), realTailLength);
+    const window: SessionWindow = { summaryBlock, verbatimFrom };
+    if (pendingSummary) window.pendingSummary = pendingSummary;
     // DD3: carry the last window-fill reading so a restart resumes the trigger signal (A3).
     const usage = this.lastPromptTokensByChat.get(chatId);
     if (usage) {
@@ -1126,13 +1260,27 @@ Keep it concise and structured.`;
     return window;
   }
 
+  // D1.5: the window as a DERIVED snapshot of in-memory history + physical archive anchors. A malformed
+  // physical slot is absent from history but remains represented by the valid messages' carried cursors.
+  private deriveWindow(chatId: string): SessionWindow {
+    const session = this.sessions.get(chatId);
+    return this.windowForHistory(
+      chatId,
+      session?.history ?? [],
+      session?.historyAnchors ?? [],
+      this.pendingSummariesByChat.get(chatId),
+    );
+  }
+
   // D1.5: persist the window snapshot (best-effort — a save failure must never break the turn, per
   // resilience.md; the archive on disk remains the source of truth).
-  private saveWindowFor(chatId: string): void {
+  private saveWindowFor(chatId: string): boolean {
     try {
       saveWindow(this.windowPath(chatId), this.deriveWindow(chatId));
+      return true;
     } catch (e) {
       console.warn(`[session:${chatId}] window state save failed, continuing:`, summarizeErrorForLog(e));
+      return false;
     }
   }
 
@@ -1185,8 +1333,11 @@ Keep it concise and structured.`;
         estimated: window.lastPromptTokensEstimated ?? false,
       });
     }
-    const tail: Message[] = [];
+    if (window.pendingSummary) this.pendingSummariesByChat.set(chatId, window.pendingSummary);
+    else this.pendingSummariesByChat.delete(chatId);
+    const tail: AnchoredMessage[] = [];
     let lastTimestamp: Date | undefined;
+    let hasUserActivity = false;
     for (const line of readLinesAfter(this.archiveDir(chatId), window.verbatimFrom)) {
       let entry: JsonlEntry;
       try {
@@ -1197,19 +1348,30 @@ Keep it concise and structured.`;
       if (entry.chatId !== chatId) continue; // registry mode: only this chat's entries
       const message = this.entryToMessage(entry);
       if (!message) continue;
-      tail.push(message);
+      tail.push({ message, anchor: { file: line.file, line: line.line } });
       const ts = new Date(entry.timestamp);
-      if (!Number.isNaN(ts.getTime())) lastTimestamp = ts;
+      if ((entry.origin ?? 'chat') === 'chat') {
+        hasUserActivity = true;
+        if (!Number.isNaN(ts.getTime())) lastTimestamp = ts;
+      }
     }
 
-    const rendered: Message[] = [
-      ...(window.summaryBlock ? [{ role: 'system' as const, content: SUMMARY_PREFIX + window.summaryBlock }] : []),
+    const rendered: AnchoredMessage[] = [
+      ...(window.summaryBlock
+        ? [{ message: { role: 'system' as const, content: SUMMARY_PREFIX + window.summaryBlock }, anchor: undefined }]
+        : []),
       ...tail,
     ];
-    const history = stripOrphanToolMessages(rendered);
-    if (history.length === 0) return;
+    const historyEntries = stripOrphanToolMessagesWithAnchors(rendered);
+    if (historyEntries.length === 0) return;
 
-    this.sessions.set(chatId, { chatId, history, lastActiveAt: lastTimestamp ?? new Date() });
+    this.sessions.set(chatId, {
+      chatId,
+      history: historyEntries.map((entry) => entry.message),
+      historyAnchors: historyEntries.map((entry) => entry.anchor),
+      lastActiveAt: lastTimestamp ?? new Date(),
+    });
+    if (hasUserActivity) this.chatsWithUserActivity.add(chatId);
   }
 
   private chatIdOfRaw(raw: string): string | undefined {
@@ -1231,21 +1393,21 @@ Keep it concise and structured.`;
     const sentinel = path.join(this.sessionsPath, '.migrated');
     const externalSource = path.resolve(sourcePath) !== path.resolve(this.sessionsPath);
     try {
-      if (fs.existsSync(sentinel) && !externalSource) return true;
+      if (isValidSessionMigrationSentinel(sentinel) && !externalSource) return true;
       let legacy: string[];
       try {
         legacy = fs.readdirSync(sourcePath).filter((f) => f.startsWith('active-') && f.endsWith('.jsonl'));
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
         if (code === 'ENOENT') {
-          if (!fs.existsSync(sentinel)) secureWrite(sentinel, new Date().toISOString());
-          return fs.existsSync(sentinel);
+          if (!isValidSessionMigrationSentinel(sentinel)) this.writeSessionMigrationSentinel(sentinel);
+          return isValidSessionMigrationSentinel(sentinel);
         }
         throw error;
       }
       if (legacy.length === 0) {
-        if (!fs.existsSync(sentinel)) secureWrite(sentinel, new Date().toISOString());
-        return fs.existsSync(sentinel);
+        if (!isValidSessionMigrationSentinel(sentinel)) this.writeSessionMigrationSentinel(sentinel);
+        return isValidSessionMigrationSentinel(sentinel);
       }
 
       // Parse every legacy entry, preserving source-file order (sorted) then in-file order — the tie-break
@@ -1330,8 +1492,8 @@ Keep it concise and structured.`;
         this.seedWindowIfAbsent(this.windowPath(''), this.sessionsPath, keepRecent);
       }
 
-      if (!fs.existsSync(sentinel)) secureWrite(sentinel, new Date().toISOString()); // LAST — commits the migration
-      return fs.existsSync(sentinel);
+      if (!isValidSessionMigrationSentinel(sentinel)) this.writeSessionMigrationSentinel(sentinel); // LAST — commits the migration
+      return isValidSessionMigrationSentinel(sentinel);
     } catch (e) {
       // Boot-failure policy (A-MF2): warn sanitized, sentinel left UNWRITTEN (retry next boot), never crash.
       console.warn('[session] legacy migration failed, will retry next boot:', summarizeErrorForLog(e));
@@ -1342,6 +1504,15 @@ Keep it concise and structured.`;
   private seedWindowIfAbsent(windowPath: string, archiveDir: string, keepRecent: number): void {
     if (fs.existsSync(windowPath)) return;
     saveWindow(windowPath, { summaryBlock: '', verbatimFrom: walkBackAnchor(archiveDir, keepRecent) });
+  }
+
+  private writeSessionMigrationSentinel(sentinelPath: string): void {
+    const payload: SessionMigrationSentinel = {
+      version: 1,
+      completed: true,
+      completedAt: new Date().toISOString(),
+    };
+    secureWriteViaTmp(sentinelPath, JSON.stringify(payload));
   }
 
   private enqueue<T>(chatId: string, operation: () => Promise<T>): Promise<T> {

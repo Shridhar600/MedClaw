@@ -18,7 +18,7 @@ export interface NightlySweepDeps {
   /** Raw JSONL lines of `date`'s day file(s), across the profile's chats. */
   readDayLines: (date: Date) => Promise<string[]> | string[];
   /** Normalized entity names that had a ledger write on `date`. */
-  ledgerEntitiesForDay: (date: Date) => Promise<Set<string>> | Set<string>;
+  ledgerEntitiesForDay: (date: Date) => Promise<Set<string> | LedgerDayRead> | Set<string> | LedgerDayRead;
   /** Current UNRESOLVED curiosity items (for cross-night dedup). */
   listCuriosity: () => Promise<CuriosityItem[]> | CuriosityItem[];
   /** Persist one curiosity item. */
@@ -36,6 +36,13 @@ export interface NightlySweepResult {
   scanned: boolean;
   /** How many curiosity items were persisted. */
   added: number;
+  /** true when a required ledger lane could not be read; no missing-data conclusions were emitted. */
+  incomplete?: boolean;
+}
+
+export interface LedgerDayRead {
+  entities: Set<string>;
+  incomplete: boolean;
 }
 
 export async function runNightlySweep(deps: NightlySweepDeps): Promise<NightlySweepResult> {
@@ -45,11 +52,15 @@ export async function runNightlySweep(deps: NightlySweepDeps): Promise<NightlySw
     // accessors derive the day-file key from it (shared UTC dateKey, A-H3).
     const yesterday = new Date(now.getTime() - DAY_MS);
 
-    const [dayFileLines, ledgerEntitiesForDay, existingCuriosity] = await Promise.all([
+    const [dayFileLines, ledgerRead, existingCuriosity] = await Promise.all([
       deps.readDayLines(yesterday),
       deps.ledgerEntitiesForDay(yesterday),
       deps.listCuriosity(),
     ]);
+
+    const ledgerEntitiesForDay = ledgerRead instanceof Set ? ledgerRead : ledgerRead.entities;
+    const incomplete = ledgerRead instanceof Set ? false : ledgerRead.incomplete;
+    if (incomplete) return { scanned: true, added: 0, incomplete: true };
 
     const { items } = sweep({
       dayFileLines,

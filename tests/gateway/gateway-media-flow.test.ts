@@ -420,7 +420,9 @@ describe('Gateway media flow', () => {
     })).resolves.toBeUndefined();
 
     expect(run).not.toHaveBeenCalled();
-    expect(recordTurn).not.toHaveBeenCalled();
+    // Persist-before-send records the failure trace even when the channel rejects, so the
+    // failed interaction remains durable and searchable.
+    expect(recordTurn).toHaveBeenCalledTimes(1);
     expect(errorSpy.mock.calls.flat().join('\n')).not.toContain('glucose');
   });
 

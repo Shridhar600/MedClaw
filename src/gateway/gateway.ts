@@ -29,7 +29,7 @@ import { createSessionTools } from '../tools/session-tools';
 import { deprecatedSessionWarnings } from '../config/deprecations';
 import type { EmbeddingPort } from '../ports';
 import { systemClock } from '../ports';
-import { CapturePipeline } from '../capture';
+import { CapturePipeline, FileCaptureIdempotency } from '../capture';
 import { makeSafetyRenderer } from '../capture';
 import { SqliteStore } from '../memory/sqlite-store';
 import { MemorySearch } from '../memory/search';
@@ -40,7 +40,7 @@ import { HeartbeatStore } from '../scheduler/store';
 import { HeartbeatScheduler } from '../scheduler/runtime';
 import { syncHeartbeatMarkdown } from '../scheduler/heartbeat-markdown';
 import { runNightlySweep } from '../scheduler/transcript-sweep-job';
-import type { NightlySweepDeps, NightlySweepResult } from '../scheduler/transcript-sweep-job';
+import type { LedgerDayRead, NightlySweepDeps, NightlySweepResult } from '../scheduler/transcript-sweep-job';
 import type { HeartbeatJob } from '../scheduler/types';
 import { decideHeartbeatDelivery, HEARTBEAT_NOOP } from '../scheduler/delivery-policy';
 import { buildDesiredHeartbeatJobs } from '../scheduler/policy-engine';
@@ -62,6 +62,7 @@ const PROFILE_UNAVAILABLE_RESPONSE =
 // short canned reply — no agent run, no session write. Matches the test-cli's
 // existing empty-input guard so the dev web UI exercises the same boundary.
 const EMPTY_MESSAGE_RESPONSE = "I didn't catch any message. Send some text or an attachment and I'll take a look.";
+const SESSION_RESET_FAILURE_RESPONSE = "I couldn't start a fresh session right now. Please try again in a moment.";
 
 export class Gateway {
   private config: AppConfig;
@@ -217,16 +218,22 @@ export class Gateway {
       const stateDir = path.join(memoryWorkspace, '.state');
       secureMkdir(stateDir);
       const journalPath = path.join(stateDir, 'write-queue.journal');
-      const writeQueue = new WriteQueue({ journalPath });
-      // A4 / 13.4: replay any ops journalled by a crash before serving (P1 logs stuck ops).
+      const writeQueue = new WriteQueue({
+        journalPath,
+        onReconcile: (record) => {
+          console.warn('[gateway] unresolved write-queue intent detected:', record.label);
+        },
+      });
+      // A4 / 13.4: reconcile any begin-without-commit intent before serving. The later boot rebuilds
+      // repair derived state; the append-only source journal remains available for another reconcile.
       try {
         await replayJournal(journalPath, (label) => {
           // A4: the SQLite mirror + search index are rebuilt from Markdown below (boot rebuild +
           // indexAll), so a stuck op's derived state self-heals — Markdown is the source of truth.
-          console.warn('[gateway] stuck write-queue op recovered at boot (mirror/index rebuilt from Markdown):', label);
+          console.warn('[gateway] unresolved write-queue intent at boot:', label);
         });
       } catch (e) {
-        console.warn('[gateway] write-queue journal replay failed:', summarizeErrorForLog(e));
+        console.warn('[gateway] write-queue journal reconciliation failed:', summarizeErrorForLog(e));
       }
 
       const ledgerStore = new LedgerStore(memoryWorkspace);
@@ -319,6 +326,7 @@ export class Gateway {
         curiosity: curiosityQueue,
         events: eventSink,
         rederive,
+        idempotency: new FileCaptureIdempotency(path.join(stateDir, 'capture-idempotency.log')),
       });
       this.capturePipeline = pipeline;
 
@@ -497,6 +505,11 @@ export class Gateway {
     // the sink; absent ⇒ compaction still runs, just without the daily-log copy).
     if (this.sessionSummarySink) {
       this.sessions.setSummarySink(this.sessionSummarySink);
+      try {
+        await this.sessions.retryPendingSummaries();
+      } catch (e) {
+        console.warn('[gateway] Pending session-summary retry failed; continuing:', summarizeErrorForLog(e));
+      }
     }
 
     // Wave D-2 (PLAT-20): session_search FTS over the append-only day-file archive — the losslessness
@@ -591,12 +604,15 @@ export class Gateway {
       ledgerEntitiesForDay: async (date) => {
         const key = date.toISOString().slice(0, 10);
         const set = new Set<string>();
+        let incomplete = false;
         for (const type of Object.keys(TYPE_TO_FILE) as FactType[]) {
           let facts;
           try {
             facts = await ledgerStore.listAllOfType(type);
-          } catch {
-            continue; // one type file unreadable — degrade, keep scanning the rest
+          } catch (e) {
+            incomplete = true;
+            console.warn('[gateway] transcript sweep ledger lane unreadable:', summarizeErrorForLog(e));
+            continue;
           }
           for (const f of facts) {
             const created = new Date(f.createdAt);
@@ -605,7 +621,7 @@ export class Gateway {
             }
           }
         }
-        return set;
+        return { entities: set, incomplete } satisfies LedgerDayRead;
       },
       listCuriosity: () => curiosity.list(),
       addCuriosity: (item) => curiosity.add(item),
@@ -618,7 +634,7 @@ export class Gateway {
    * Structured ledger entries stay agent-initiated via tools. Capture never blocks the reply:
    * a failure warns-and-continues (resilience). Empty text and media-only turns are skipped.
    */
-  private async captureUserTurn(chatId: string, text: string): Promise<void> {
+  private async captureUserTurn(chatId: string, text: string, sourceMessageId?: string): Promise<void> {
     const pipeline = this.capturePipeline;
     if (!pipeline || text.trim().length === 0) return;
     try {
@@ -627,9 +643,22 @@ export class Gateway {
         source: 'chat',
         kind: 'narrative-note',
         payload: { text },
+        ...(sourceMessageId ? { idempotencyKey: `chat:${chatId}:${sourceMessageId}` } : {}),
       });
     } catch (e) {
       console.warn('[gateway] per-turn narrative capture failed (continuing):', summarizeErrorForLog(e));
+    }
+  }
+
+  /** Persist a generated fallback before delivery so provider failures remain searchable in the chat archive. */
+  private async persistFailureTrace(chatId: string, userContent: string, fallback: string): Promise<void> {
+    try {
+      await this.sessions?.recordTurn(chatId, [
+        { role: 'user', content: userContent },
+        { role: 'assistant', content: fallback },
+      ]);
+    } catch (e) {
+      console.error('[gateway] Failed to persist agent failure trace (continuing):', summarizeErrorForLog(e));
     }
   }
 
@@ -661,7 +690,7 @@ export class Gateway {
     }
   }
 
-  async handleTestMessage(chatId: string, text: string): Promise<string> {
+  async handleTestMessage(chatId: string, text: string, sourceMessageId?: string): Promise<string> {
     // PROD-P1-6: empty/whitespace-only text → short canned reply, no agent run,
     // no session write (mirrors the channel path in handleMessage).
     if (text.trim().length === 0) {
@@ -689,7 +718,12 @@ export class Gateway {
     // forka #4: /new must reset the session here too (parity with the channel
     // path in handleMessage). Previously it fell through to the agent loop.
     if (text.trim() === '/new') {
-      await this.sessions!.resetSession(chatId);
+      try {
+        await this.sessions!.resetSession(chatId);
+      } catch (e) {
+        console.error('[gateway] Failed to reset session (keeping existing context):', summarizeErrorForLog(e));
+        return SESSION_RESET_FAILURE_RESPONSE;
+      }
       return 'Starting fresh session. Your health memory is preserved.';
     }
 
@@ -703,7 +737,7 @@ export class Gateway {
     if (emergency) {
       // CAP (M5): emergency utterances are the highest-value health data —
       // capture the raw text BEFORE the canned-response early-return.
-      await this.captureUserTurn(chatId, text);
+      await this.captureUserTurn(chatId, text, sourceMessageId);
       // C-2/H9: persistence is best-effort — a failed archive must NEVER suppress emergency guidance
       // (medical-safety: reaching the user wins; divergence is logged sanitized). Mirrors handleMessage.
       try {
@@ -721,12 +755,12 @@ export class Gateway {
     if (onboarding) {
       // CAP (M6-sec): onboarding answers carry structured health facts (meds,
       // conditions) — captured losslessly like every other turn.
-      await this.captureUserTurn(chatId, text);
+      await this.captureUserTurn(chatId, text, sourceMessageId);
       return onboarding;
     }
 
     // Lossless per-turn capture (F4) — always, before the agent run.
-    await this.captureUserTurn(chatId, text);
+    await this.captureUserTurn(chatId, text, sourceMessageId);
 
     // M-3: guard the agent run exactly like handleMessage — the CLI/e2e path must DEGRADE to the
     // canned fallback, never throw out of the handler (mirror-sync law).
@@ -736,6 +770,7 @@ export class Gateway {
       result = await this.agentLoop!.run(text, history, { chatId, mode: 'chat' });
     } catch (e) {
       console.error('[gateway] Agent error (test path):', summarizeErrorForLog(e));
+      await this.persistFailureTrace(chatId, text, "I'm having trouble right now. Please try again in a moment.");
       return "I'm having trouble right now. Please try again in a moment.";
     }
     // C-2/H9: post-agent persistence is best-effort — mirror handleMessage's guarded pre-send persistence
@@ -805,7 +840,17 @@ export class Gateway {
 
     // Handle /new command
     if (text.trim() === '/new') {
-      await this.sessions!.resetSession(chatId);
+      try {
+        await this.sessions!.resetSession(chatId);
+      } catch (e) {
+        console.error('[gateway] Failed to reset session (keeping existing context):', summarizeErrorForLog(e));
+        try {
+          await this.channel!.send(chatId, { text: SESSION_RESET_FAILURE_RESPONSE });
+        } catch (sendError) {
+          console.error('[gateway] Failed to send session-reset failure response:', summarizeErrorForLog(sendError));
+        }
+        return;
+      }
       await this.channel!.send(chatId, { text: 'Starting fresh session. Your health memory is preserved.' });
       return;
     }
@@ -821,7 +866,7 @@ export class Gateway {
     if (emergency) {
       // CAP (M5): capture raw text before the early-return (parity with
       // handleTestMessage). Emergency utterances are the highest-value data.
-      await this.captureUserTurn(chatId, text);
+      await this.captureUserTurn(chatId, text, incoming.messageId);
       // Persist-first (RES-P0-4): record the turn BEFORE sending so a crash
       // between the two never loses the turn. The emergency text is canned
       // and carries no PHI, but ordering still matters for transcript
@@ -852,23 +897,22 @@ export class Gateway {
     if (incoming.mediaError) {
       // M-3 / F4 parity: this was the one branch that skipped lossless capture. Capture the raw
       // caption first (no-ops on an empty caption) so a failed upload never loses the user's words.
-      await this.captureUserTurn(chatId, text);
+      await this.captureUserTurn(chatId, text, incoming.messageId);
       const failureTrace = [
         { role: 'user' as const, content: agentInput },
         { role: 'assistant' as const, content: `[Media upload failure]\n${incoming.mediaError}` },
       ];
 
       try {
-        await this.channel!.send(chatId, { text: incoming.mediaError });
-      } catch (e) {
-        console.error('[gateway] Failed to send media upload error:', summarizeErrorForLog(e));
-        return;
-      }
-
-      try {
         await this.sessions!.recordTurn(chatId, failureTrace);
       } catch (e) {
         console.error('[gateway] Failed to persist media upload error turn:', summarizeErrorForLog(e));
+      }
+
+      try {
+        await this.channel!.send(chatId, { text: incoming.mediaError });
+      } catch (e) {
+        console.error('[gateway] Failed to send media upload error:', summarizeErrorForLog(e));
       }
       return;
     }
@@ -876,7 +920,7 @@ export class Gateway {
     const onboarding = await this.handleOnboarding(chatId, text);
     if (onboarding) {
       // CAP (M6-sec): parity with handleTestMessage — capture before the return.
-      await this.captureUserTurn(chatId, text);
+      await this.captureUserTurn(chatId, text, incoming.messageId);
       await this.channel!.send(chatId, { text: onboarding });
       return;
     }
@@ -885,7 +929,7 @@ export class Gateway {
     const postOnboardingEmergency = this.handleEmergencyInput(text);
     if (postOnboardingEmergency) {
       // CAP (M5): parity — raw text lands in the lossless lane here too.
-      await this.captureUserTurn(chatId, text);
+      await this.captureUserTurn(chatId, text, incoming.messageId);
       // Persist-first (RES-P0-4), mirroring the early emergency branch above.
       try {
         await this.sessions!.recordTurn(chatId, [
@@ -907,7 +951,7 @@ export class Gateway {
     }
 
     // Lossless per-turn capture (F4) — the RAW user text, always, before the agent run.
-    await this.captureUserTurn(chatId, text);
+    await this.captureUserTurn(chatId, text, incoming.messageId);
 
     let result: Awaited<ReturnType<AgentLoop['run']>>;
     try {
@@ -915,6 +959,7 @@ export class Gateway {
       result = await this.agentLoop!.run(agentInput, history, { chatId, mode: 'chat' });
     } catch (e) {
       console.error('[gateway] Agent error:', summarizeErrorForLog(e));
+      await this.persistFailureTrace(chatId, agentInput, "I'm having trouble right now. Please try again in a moment.");
       try {
         await this.channel!.send(chatId, { text: "I'm having trouble right now. Please try again in a moment." });
       } catch (fallbackError) {
@@ -1077,18 +1122,28 @@ export class Gateway {
           { role: 'user', content: input },
           ...result.trace,
         ], 'heartbeat');
-        await this.sessions!.recordPromptUsage(job.chatId, result.lastPromptTokens);
+        try {
+          await this.sessions!.recordPromptUsage(job.chatId, result.lastPromptTokens);
+        } catch (e) {
+          console.warn('[gateway] Failed to persist heartbeat prompt usage; continuing to delivery:', summarizeErrorForLog(e));
+        }
         await this.scheduler?.recordOutcome(job.id, 'noop');
         await this.reconcileHeartbeatPolicies(job.chatId);
         return;
       }
 
-      await this.channel!.send(job.chatId, { text: result.text });
+      // Persist-before-send: a persistence failure leaves the job undelivered so the scheduler can retry
+      // without duplicating a nudge that already reached the channel.
       await this.sessions!.recordTurn(job.chatId, [
         { role: 'user', content: input },
         ...result.trace,
       ], 'heartbeat');
-      await this.sessions!.recordPromptUsage(job.chatId, result.lastPromptTokens);
+      try {
+        await this.sessions!.recordPromptUsage(job.chatId, result.lastPromptTokens);
+      } catch (e) {
+        console.warn('[gateway] Failed to persist heartbeat prompt usage; continuing to delivery:', summarizeErrorForLog(e));
+      }
+      await this.channel!.send(job.chatId, { text: result.text });
       await this.scheduler?.recordOutcome(job.id, 'sent');
       await this.reconcileHeartbeatPolicies(job.chatId);
     } catch (error) {

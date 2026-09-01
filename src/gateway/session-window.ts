@@ -29,6 +29,8 @@ export interface SessionWindow {
   summaryBlock: string;
   /** First archive line the verbatim tail replays from. `file` is a day-file basename. */
   verbatimFrom: Anchor;
+  /** Summary copy waiting for the chat-scoped sink to commit. The value is PHI-bearing and stays 0600. */
+  pendingSummary?: string;
   /** Real `usage.promptTokens` from the last provider response (the window-fill signal). */
   lastPromptTokens?: number;
   /** True when `lastPromptTokens` is a chars/4 estimate (provider omitted usage). */
@@ -145,6 +147,11 @@ export function walkBackAnchor(sessionsDir: string, k: number): Anchor {
   return { file: files[last], line: counts[last] }; // pre === total (k ≤ 0): empty tail at EOF
 }
 
+/** Return the EOF-exclusive cursor immediately before a known physical archive line. */
+export function anchorBefore(anchor: Anchor): Anchor {
+  return { file: anchor.file, line: Math.max(0, anchor.line - 1) };
+}
+
 /**
  * Every non-empty archive line strictly AFTER `from` (exclusive) through EOF, in chronological order,
  * each with its physical `{file, line}` anchor and raw JSON text. Skips the first `from.line` lines of
@@ -180,7 +187,16 @@ export function latestDayFileEof(sessionsDir: string): Anchor {
  * anchored at the latest day file's EOF (A-L6/N-7).
  */
 export function resolveWindow(filePath: string, sessionsDir: string): SessionWindow {
-  return loadWindow(filePath) ?? { summaryBlock: '', verbatimFrom: latestDayFileEof(sessionsDir) };
+  const persisted = loadWindow(filePath);
+  if (persisted && isValidAnchor(persisted.verbatimFrom, sessionsDir)) return persisted;
+
+  // A pending summary is source-side durable work. Preserve it even when a cursor is invalid so a
+  // torn/stale window cannot discard a summary that still needs to reach its sink.
+  return {
+    summaryBlock: '',
+    verbatimFrom: latestDayFileEof(sessionsDir),
+    ...(persisted?.pendingSummary ? { pendingSummary: persisted.pendingSummary } : {}),
+  };
 }
 
 function isSessionWindow(v: unknown): v is SessionWindow {
@@ -190,5 +206,29 @@ function isSessionWindow(v: unknown): v is SessionWindow {
   const from = o.verbatimFrom;
   if (from === null || typeof from !== 'object') return false;
   const f = from as Record<string, unknown>;
-  return typeof f.file === 'string' && typeof f.line === 'number';
+  if (typeof f.file !== 'string' || typeof f.line !== 'number') return false;
+  if (!Number.isInteger(f.line) || f.line < 0) return false;
+  if (f.file !== '' && !DAY_FILE_RE.test(f.file)) return false;
+  if (f.file === '' && f.line !== 0) return false;
+  if (o.pendingSummary !== undefined && typeof o.pendingSummary !== 'string') return false;
+  return true;
+}
+
+/**
+ * Validate a persisted cursor against the archive it claims to point into. The cursor is an
+ * EOF-exclusive physical slot, so line zero is valid only for an existing day file and line equal
+ * to the physical non-empty count is valid at EOF. `{file:'',line:0}` is reserved for an empty archive.
+ */
+function isValidAnchor(anchor: Anchor, sessionsDir: string): boolean {
+  if (!Number.isInteger(anchor.line) || anchor.line < 0) return false;
+  const dayFiles = listDayFiles(sessionsDir);
+  if (anchor.file === '') return anchor.line === 0 && dayFiles.length === 0;
+  if (!DAY_FILE_RE.test(anchor.file)) return false;
+  const filePath = path.join(sessionsDir, anchor.file);
+  try {
+    if (!fs.lstatSync(filePath).isFile()) return false;
+  } catch {
+    return false;
+  }
+  return anchor.line <= countDayFileLines(filePath);
 }

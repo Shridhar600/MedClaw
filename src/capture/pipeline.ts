@@ -12,6 +12,7 @@
 
 import type { Clock, EventSink } from '../ports';
 import { systemClock } from '../ports';
+import { randomUUID } from 'crypto';
 import type {
   LedgerFact,
   CaptureEvent,
@@ -28,11 +29,19 @@ import type {
 } from '../memcore';
 import { summarizeErrorForLog, contentContainsCredentials } from '../security';
 import { sanitizeSingleLine, TYPE_TO_FILE } from '../memcore';
+import type { CaptureIdempotency } from './idempotency';
 
 /** The single-writer queue seam (WriteQueue). Ops MUST be IO-only (B2). */
 export interface QueuePort {
-  enqueue<T>(priority: 'turn' | 'background', op: { label: string; run(): Promise<T> }): Promise<T>;
+  enqueue<T>(priority: 'turn' | 'background', op: {
+    label: string;
+    scope?: string;
+    idempotencyKey?: string;
+    run(): Promise<T>;
+  }): Promise<T>;
 }
+
+export type CaptureEventInput = CaptureEvent & { idempotencyKey?: string };
 
 /** The structured lane. Mirrors LedgerStore.recordFact / retract. */
 export interface LedgerWriter {
@@ -89,6 +98,7 @@ export interface CapturePipelineDeps {
   events?: EventSink;
   clock?: Clock;
   rederive?: Rederiver;
+  idempotency?: CaptureIdempotency;
 }
 
 /** Internal route outcome: the caller-facing result + the workspace paths the op mutated. */
@@ -99,6 +109,7 @@ interface RouteOutcome {
 
 export class CapturePipeline {
   private readonly clock: Clock;
+  private readonly eventKeys = new WeakMap<object, string>();
 
   constructor(private readonly deps: CapturePipelineDeps) {
     this.clock = deps.clock ?? systemClock;
@@ -110,10 +121,18 @@ export class CapturePipeline {
    * writes. Returns the ledger result for fact-bearing kinds (so the tool layer can relay
    * a needs-confirmation / disputed question); void for narrative-only kinds.
    */
-  async ingest(event: CaptureEvent): Promise<RecordFactResult | void> {
+  async ingest(event: CaptureEventInput): Promise<RecordFactResult | void> {
+    const idempotencyKey = this.idempotencyKeyFor(event);
     const outcome = await this.deps.queue.enqueue('turn', {
       label: `capture:${event.kind}`,
-      run: () => this.route(event),
+      scope: `capture:${event.kind}`,
+      idempotencyKey,
+      run: async () => {
+        if (this.isCommitted(idempotencyKey)) return { result: undefined, changed: [] };
+        const routed = await this.route(event);
+        this.markCommitted(idempotencyKey);
+        return routed;
+      },
     });
     // Out-of-op (B2): re-derive the mirror + reindex chunks for the changed files. This runs
     // OUTSIDE the single-writer queue op so embedding latency never wedges the queue. Best-effort
@@ -126,6 +145,37 @@ export class CapturePipeline {
       }
     }
     return outcome.result;
+  }
+
+  private idempotencyKeyFor(event: CaptureEventInput): string {
+    const supplied = event.idempotencyKey;
+    if (typeof supplied === 'string' && supplied.length > 0) return supplied;
+    const existing = this.eventKeys.get(event);
+    if (existing) return existing;
+    const generated = randomUUID();
+    this.eventKeys.set(event, generated);
+    return generated;
+  }
+
+  private isCommitted(key: string): boolean {
+    if (!this.deps.idempotency) return false;
+    try {
+      return this.deps.idempotency.hasCommitted(key);
+    } catch (e) {
+      console.warn(`[capture] idempotency read failed; source operation continues: ${summarizeErrorForLog(e)}`);
+      return false;
+    }
+  }
+
+  private markCommitted(key: string): void {
+    if (!this.deps.idempotency) return;
+    try {
+      this.deps.idempotency.markCommitted(key);
+    } catch (e) {
+      // The source lanes have already committed. A marker outage is a durable-recovery degradation,
+      // never a reason to reject the health-data write or the caller's turn.
+      console.warn(`[capture] idempotency commit failed; source operation succeeded: ${summarizeErrorForLog(e)}`);
+    }
   }
 
   private async route(event: CaptureEvent): Promise<RouteOutcome> {

@@ -200,9 +200,8 @@ describe('PHI file modes', () => {
     });
 
     // P2b/D3.6 (DD9): /new is a window-archive — the archive/ + summaries/ side-files are retired. The
-    // day-file archive is preserved 0600 and continues; the window snapshot is dropped. (Was: "archive +
-    // summary dirs/files are 0o700 / 0o600 after reset".)
-    it('reset preserves the day-file archive 0600 and drops the window (no archive/summaries side-files)', async () => {
+    // day-file archive is preserved 0600 and continues; the replacement window is durable and empty.
+    it('reset preserves the day-file archive 0600 and writes an empty window (no archive/summaries side-files)', async () => {
       const sessionsPath = path.join(root, 'sessions2');
       const sm = new SessionManager(60, 1440, sessionsPath, undefined, undefined, undefined, 'default');
       await sm.recordTurn('456', [mkMsg('user', 'hi'), mkMsg('assistant', 'hello')]);
@@ -212,10 +211,11 @@ describe('PHI file modes', () => {
       expect(fs.existsSync(path.join(sessionsPath, 'archive'))).toBe(false);
       expect(fs.existsSync(path.join(sessionsPath, 'summaries'))).toBe(false);
 
-      // The append-only day file is preserved at 0600 (searchable), the window snapshot is dropped.
+      // The append-only day file is preserved at 0600 (searchable), and the replacement window is 0600.
       expectDirMode(sessionsPath);
       expectFileMode(path.join(sessionsPath, new Date().toISOString().slice(0, 10) + '.jsonl'));
-      expect(fs.existsSync(path.join(sessionsPath, 'session-window.json'))).toBe(false);
+      expectFileMode(path.join(sessionsPath, 'session-window.json'));
+      expect(JSON.parse(fs.readFileSync(path.join(sessionsPath, 'session-window.json'), 'utf8')).summaryBlock).toBe('');
     });
 
     it('append to a pre-existing loose day file tightens it to 0o600', async () => {

@@ -3,15 +3,11 @@
 // Per-profile single-writer queue. Every memory mutation funnels through one
 // serialized promise-chain so two writes never interleave on the same profile
 // (PLAT-03, amendment B2). Inbound-turn ops outrank background ops (a user is
-// waiting; heartbeats/dreaming are not). A crash-safe PER-LINE journal
-// (amendment A4) records each op's intent BEFORE it runs and clears only that
-// op's line on success, so a boot after a crash can detect a half-applied write.
-//
-// Ops MUST be IO-only (B2): no LLM calls inside run(). The tool layer does any
-// model lookup BEFORE enqueueing, so the critical section stays fast, bounded,
-// and replay-safe.
+// waiting; heartbeats/dreaming are not). Journal failures are advisory: they
+// degrade recovery visibility but never block the source operation.
 
 import * as fs from 'fs';
+import * as readline from 'readline';
 import type { IdGen } from '../ports';
 import { uuidIdGen } from '../ports';
 import { secureAppend, secureWriteViaTmp, summarizeErrorForLog } from '../security';
@@ -21,6 +17,10 @@ export type WritePriority = 'turn' | 'background';
 /** A unit of work. `run()` MUST be IO-only — never an LLM call (amendment B2). */
 export interface WriteOp<T> {
   label: string;
+  /** PHI-free affected-lane name, for recovery diagnostics. */
+  scope?: string;
+  /** Opaque source-event identity used to join queue recovery with capture dedup. */
+  idempotencyKey?: string;
   run(): Promise<T>;
 }
 
@@ -28,6 +28,8 @@ export interface WriteQueueOptions {
   journalPath: string;
   /** Injected for testability; defaults to a crypto UUID generator. */
   idGen?: IdGen;
+  /** Receives every begin record that has no matching commit at queue-idle. */
+  onReconcile?: (record: JournalBeginRecord) => Promise<void> | void;
 }
 
 interface QueueItem {
@@ -36,35 +38,169 @@ interface QueueItem {
   reject: (reason: unknown) => void;
 }
 
-interface JournalRecord {
+export interface JournalBeginRecord {
+  phase: 'begin';
   id: string;
   label: string;
+  scope?: string;
+  idempotencyKey?: string;
 }
 
-const JOURNAL_SEP = '\t';
+export interface JournalCommitRecord {
+  phase: 'commit';
+  id: string;
+}
 
-/** Strip line/field separators so a label can never break the line-oriented journal format. */
-function sanitizeLabel(label: string): string {
-  return label.replace(/[\t\r\n]+/g, ' ');
+export type JournalRecord = JournalBeginRecord | JournalCommitRecord;
+
+type ParsedJournalRecord = JournalRecord & {
+  /** True when this record came from the pre-RR-6b tab-separated format. */
+  legacy?: boolean;
+};
+
+/** Keep journal fields line-safe and bounded. Callers must supply labels/scopes without health content. */
+function sanitizeJournalField(value: string): string {
+  return value.replace(/[\t\r\n]+/g, ' ').slice(0, 256);
 }
 
 function serializeJournal(records: JournalRecord[]): string {
-  return records.map(r => `${r.id}${JOURNAL_SEP}${r.label}`).join('\n') + (records.length ? '\n' : '');
+  return records.map((record) => JSON.stringify(record)).join('\n') + (records.length ? '\n' : '');
 }
 
-function parseJournal(content: string): JournalRecord[] {
-  const records: JournalRecord[] = [];
-  for (const line of content.split('\n')) {
-    if (!line.trim()) continue;
-    const sep = line.indexOf(JOURNAL_SEP);
-    if (sep < 0) {
-      // Legacy/garbled line with no id — treat the whole line as the label.
-      records.push({ id: '', label: line.trim() });
+function serializeLegacyJournal(records: ParsedJournalRecord[]): string {
+  return records
+    .filter((record): record is JournalBeginRecord & { legacy?: boolean } => record.phase === 'begin')
+    .map((record) => `${record.id}\t${sanitizeJournalField(record.label)}`)
+    .join('\n') + (records.some((record) => record.phase === 'begin') ? '\n' : '');
+}
+
+function recordPhase(parsed: Record<string, unknown>): unknown {
+  return parsed.phase ?? parsed.type ?? parsed.kind ?? parsed.event;
+}
+
+function parseJournalLine(line: string): ParsedJournalRecord {
+  try {
+    const parsed = JSON.parse(line) as Record<string, unknown>;
+    const phase = recordPhase(parsed);
+    if (phase === 'begin' && typeof parsed.id === 'string' && typeof parsed.label === 'string') {
+      return {
+        phase: 'begin',
+        id: parsed.id,
+        label: parsed.label,
+        ...(typeof parsed.scope === 'string' ? { scope: parsed.scope } : {}),
+        ...(typeof parsed.idempotencyKey === 'string' ? { idempotencyKey: parsed.idempotencyKey } : {}),
+      };
+    }
+    if (phase === 'commit' && typeof parsed.id === 'string') return { phase: 'commit', id: parsed.id };
+  } catch {
+    // Fall through to the legacy line parser. A malformed line remains visible to reconciliation.
+  }
+
+  const sep = line.indexOf('\t');
+  if (sep < 0) return { phase: 'begin', id: '', label: line.trim(), legacy: true };
+  return { phase: 'begin', id: line.slice(0, sep), label: line.slice(sep + 1), legacy: true };
+}
+
+function unresolvedBegins(records: ParsedJournalRecord[]): JournalBeginRecord[] {
+  const committed = new Set(
+    records
+      .filter((record): record is JournalCommitRecord => record.phase === 'commit')
+      .map((record) => record.id),
+  );
+  return records.filter(
+    (record): record is JournalBeginRecord => record.phase === 'begin' && !committed.has(record.id),
+  );
+}
+
+async function readJournal(journalPath: string): Promise<{ records: ParsedJournalRecord[]; legacy: boolean } | null> {
+  let input: fs.ReadStream | undefined;
+  try {
+    input = fs.createReadStream(journalPath, { encoding: 'utf8' });
+    const reader = readline.createInterface({ input, crlfDelay: Infinity });
+    const records: ParsedJournalRecord[] = [];
+    let sawRecord = false;
+    let allLegacy = true;
+    try {
+      for await (const line of reader) {
+        const text = String(line);
+        if (!text.trim()) continue;
+        const record = parseJournalLine(text);
+        records.push(record);
+        sawRecord = true;
+        if (!record.legacy) allLegacy = false;
+      }
+    } finally {
+      reader.close();
+    }
+    return { records, legacy: sawRecord && allLegacy };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      console.warn(`[write-queue] journal read failed: ${summarizeErrorForLog(err)}`);
+    }
+    return null;
+  } finally {
+    input?.destroy();
+  }
+}
+
+export interface JournalReconcileResult {
+  readable: boolean;
+  uncommitted: number;
+}
+
+/** Detect begin-without-commit records without deleting or rewriting the append-only journal. */
+export async function reconcileJournal(
+  journalPath: string,
+  onUncommitted?: (record: JournalBeginRecord) => Promise<void> | void,
+): Promise<JournalReconcileResult> {
+  const journal = await readJournal(journalPath);
+  if (!journal) {
+    return { readable: false, uncommitted: 0 };
+  }
+  const pending = unresolvedBegins(journal.records);
+  for (const record of pending) {
+    try {
+      await onUncommitted?.(record);
+    } catch (err) {
+      console.warn(`[write-queue] journal reconciliation callback failed: ${summarizeErrorForLog(err)}`);
+    }
+  }
+  return { readable: true, uncommitted: pending.length };
+}
+
+/**
+ * Compatibility recovery entry point. Legacy tab-separated journals retain their old clear-on-success
+ * behavior. RR-6b JSON journals are append-only: this function surfaces unresolved begins but leaves the
+ * records in place, because a callback that only rebuilds projections cannot prove the source committed.
+ */
+export async function replayJournal(
+  journalPath: string,
+  onStuck: (label: string) => Promise<void> | void,
+): Promise<void> {
+  const journal = await readJournal(journalPath);
+  if (!journal) return;
+
+  if (!journal.legacy) {
+    await reconcileJournal(journalPath, (record) => onStuck(record.label));
+    return;
+  }
+
+  const remaining = [...journal.records];
+  for (const record of unresolvedBegins(journal.records)) {
+    try {
+      await onStuck(record.label);
+    } catch (err) {
+      console.warn(`[write-queue] recovery of a stuck op failed: ${summarizeErrorForLog(err)}`);
       continue;
     }
-    records.push({ id: line.slice(0, sep), label: line.slice(sep + 1) });
+    const idx = remaining.indexOf(record);
+    if (idx >= 0) remaining.splice(idx, 1);
+    try {
+      secureWriteViaTmp(journalPath, serializeLegacyJournal(remaining));
+    } catch (err) {
+      console.warn(`[write-queue] journal rewrite during replay failed: ${summarizeErrorForLog(err)}`);
+    }
   }
-  return records;
 }
 
 export class WriteQueue {
@@ -72,12 +208,23 @@ export class WriteQueue {
   private readonly idGen: IdGen;
   private readonly turnQ: QueueItem[] = [];
   private readonly backgroundQ: QueueItem[] = [];
+  private onReconcile: (record: JournalBeginRecord) => Promise<void> | void;
   private running = false;
   private drainWaiters: Array<() => void> = [];
+  private idleReconcile?: Promise<void>;
+  private journalDegraded = false;
 
   constructor(options: WriteQueueOptions) {
     this.journalPath = options.journalPath;
     this.idGen = options.idGen ?? uuidIdGen;
+    this.onReconcile = options.onReconcile ?? ((record) => {
+      console.warn(`[write-queue] uncommitted operation detected: ${sanitizeJournalField(record.label)}`);
+    });
+  }
+
+  /** Replace the recovery callback after boot wiring has constructed the profile collaborators. */
+  setReconciler(onReconcile: (record: JournalBeginRecord) => Promise<void> | void): void {
+    this.onReconcile = onReconcile;
   }
 
   /** Enqueue an IO-only op. Resolves/rejects with the op's own result. */
@@ -89,9 +236,9 @@ export class WriteQueue {
     });
   }
 
-  /** Resolves once the queue is idle (test/shutdown hook). */
+  /** Resolves after the queue is idle and its advisory journal reconciliation has completed. */
   drain(): Promise<void> {
-    if (this.isIdle()) return Promise.resolve();
+    if (this.isIdle()) return this.idleReconcile ?? this.scheduleIdleReconcile();
     return new Promise(resolve => this.drainWaiters.push(resolve));
   }
 
@@ -121,85 +268,61 @@ export class WriteQueue {
 
   private async execute(item: QueueItem): Promise<void> {
     const journalId = this.idGen.newId();
-    // Record intent BEFORE running so a crash mid-op leaves a replayable line.
-    this.appendJournalLine(journalId, item.op.label);
+    this.appendJournalRecord({
+      phase: 'begin',
+      id: journalId,
+      label: sanitizeJournalField(item.op.label),
+      ...(item.op.scope ? { scope: sanitizeJournalField(item.op.scope) } : {}),
+      ...(item.op.idempotencyKey ? { idempotencyKey: sanitizeJournalField(item.op.idempotencyKey) } : {}),
+    });
     try {
       const result = await item.op.run();
-      // Success: clear only THIS op's line (keyed by id, so a duplicate-label
-      // failed line from an earlier op is never cross-deleted).
-      this.removeJournalLine(journalId);
+      // A commit is appended only after the source op succeeds. A commit-write failure is degraded and
+      // never changes the source result, so a journal outage cannot fail health-data persistence.
+      this.appendJournalRecord({ phase: 'commit', id: journalId });
       item.resolve(result);
     } catch (err) {
-      // Failure: leave the line as an A4 replay target; do not wedge the queue.
+      // A source failure belongs to the source op. Its begin remains an unresolved recovery target.
       item.reject(err);
     }
   }
 
-  private appendJournalLine(id: string, label: string): void {
+  private appendJournalRecord(record: JournalRecord): void {
     try {
-      secureAppend(this.journalPath, `${id}${JOURNAL_SEP}${sanitizeLabel(label)}\n`);
+      secureAppend(this.journalPath, serializeJournal([record]));
     } catch (err) {
-      // Journalling is best-effort — a write failure must never block the op.
-      console.warn(`[write-queue] journal append failed: ${summarizeErrorForLog(err)}`);
+      this.journalDegraded = true;
+      console.warn(`[write-queue] journal append failed; source operation continues: ${summarizeErrorForLog(err)}`);
+      this.persistJournalDegradedFlag();
     }
   }
 
-  private removeJournalLine(id: string): void {
+  private persistJournalDegradedFlag(): void {
     try {
-      const content = fs.readFileSync(this.journalPath, 'utf-8');
-      const remaining = parseJournal(content).filter(r => r.id !== id);
-      secureWriteViaTmp(this.journalPath, serializeJournal(remaining));
+      secureWriteViaTmp(`${this.journalPath}.degraded`, JSON.stringify({ version: 1, degraded: true }));
     } catch (err) {
-      const nodeErr = err as NodeJS.ErrnoException;
-      if (nodeErr.code === 'ENOENT') return; // nothing journalled (append had failed)
-      console.warn(`[write-queue] journal prune failed: ${summarizeErrorForLog(err)}`);
+      console.warn(`[write-queue] journal degraded flag write failed: ${summarizeErrorForLog(err)}`);
     }
+  }
+
+  private scheduleIdleReconcile(): Promise<void> {
+    const run = reconcileJournal(this.journalPath, this.onReconcile)
+      .then(() => undefined)
+      .catch((err) => {
+        // Reconciliation is never allowed to reject a source or a drain waiter.
+        console.warn(`[write-queue] queue-idle reconciliation failed: ${summarizeErrorForLog(err)}`);
+      });
+    this.idleReconcile = run;
+    return run;
   }
 
   private flushDrainWaiters(): void {
     if (!this.isIdle()) return;
+    const reconcile = this.scheduleIdleReconcile();
     const waiters = this.drainWaiters;
     this.drainWaiters = [];
-    for (const w of waiters) w();
-  }
-}
-
-/**
- * Replay residual journal lines at boot (amendment A4). For each stuck op, call
- * `onStuck(label)` and only remove that line once the callback resolves, so a
- * crash mid-replay re-surfaces the unprocessed lines on the next boot. A missing
- * journal is a no-op. In P1 `onStuck` only logs; mirror rebuild lands in P2.
- */
-export async function replayJournal(
-  journalPath: string,
-  onStuck: (label: string) => Promise<void> | void,
-): Promise<void> {
-  let content: string;
-  try {
-    content = await fs.promises.readFile(journalPath, 'utf-8');
-  } catch (err) {
-    const nodeErr = err as NodeJS.ErrnoException;
-    if (nodeErr.code === 'ENOENT') return;
-    console.warn(`[write-queue] journal read failed: ${summarizeErrorForLog(err)}`);
-    return;
-  }
-
-  const records = parseJournal(content);
-  const remaining = [...records];
-  for (const rec of records) {
-    try {
-      await onStuck(rec.label);
-    } catch (err) {
-      // Recovery failed — leave the line for the next boot rather than dropping it.
-      console.warn(`[write-queue] recovery of a stuck op failed: ${summarizeErrorForLog(err)}`);
-      continue;
-    }
-    const idx = remaining.indexOf(rec);
-    if (idx >= 0) remaining.splice(idx, 1);
-    try {
-      secureWriteViaTmp(journalPath, serializeJournal(remaining));
-    } catch (err) {
-      console.warn(`[write-queue] journal rewrite during replay failed: ${summarizeErrorForLog(err)}`);
-    }
+    void reconcile.then(() => {
+      for (const waiter of waiters) waiter();
+    });
   }
 }

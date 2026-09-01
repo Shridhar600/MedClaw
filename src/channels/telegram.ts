@@ -61,6 +61,7 @@ export class TelegramChannel implements Channel {
           chatId: String(ctx.chat.id),
           userId: String(ctx.from?.id ?? ''),
           text: ctx.message.text,
+          messageId: String(ctx.message.message_id),
           replyToMessageId: ctx.message.reply_to_message?.message_id
             ? String(ctx.message.reply_to_message.message_id)
             : undefined,
@@ -96,6 +97,7 @@ export class TelegramChannel implements Channel {
           chatId: String(ctx.chat.id),
           userId: String(ctx.from?.id ?? ''),
           text: ctx.message.caption ?? `Uploaded: ${fileName}`,
+          messageId: String(ctx.message.message_id),
           mediaPath,
           mediaError,
           replyToMessageId: ctx.message.reply_to_message?.message_id
@@ -128,6 +130,7 @@ export class TelegramChannel implements Channel {
           chatId: String(ctx.chat.id),
           userId: String(ctx.from?.id ?? ''),
           text: ctx.message.caption ?? 'Sent a photo',
+          messageId: String(ctx.message.message_id),
           mediaPath,
           mediaError,
           replyToMessageId: ctx.message.reply_to_message?.message_id

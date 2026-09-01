@@ -419,7 +419,7 @@ describe('Gateway heartbeat integration', () => {
     await (gateway as any).scheduler?.stop();
   });
 
-  it('does not persist a false assistant turn when scheduled delivery fails', async () => {
+  it('persists the attempted heartbeat before scheduled delivery fails', async () => {
     const config = makeConfig({
       heartbeat: {
         enabled: true,
@@ -482,7 +482,8 @@ describe('Gateway heartbeat integration', () => {
     await expect((gateway as any).handleScheduledJob(job)).rejects.toThrow('send failed');
 
     const sessionJsonl = path.join(tmpDir, 'sessions', new Date().toISOString().slice(0, 10) + '.jsonl');
-    expect(fs.existsSync(sessionJsonl)).toBe(false);
+    expect(fs.existsSync(sessionJsonl)).toBe(true);
+    expect(fs.readFileSync(sessionJsonl, 'utf8')).toContain('Heartbeat sent');
     const refreshed = await scheduler.getStore().get(job.id);
     expect(refreshed?.lastOutcome).toBe('error');
     await scheduler.stop();

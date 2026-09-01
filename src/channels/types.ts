@@ -2,6 +2,8 @@ export interface IncomingMessage {
   chatId: string;
   userId: string;
   text: string;
+  /** Source message identity, when the channel provides one, for capture deduplication. */
+  messageId?: string;
   mediaPath?: string;  // Local path if user sent a file/image
   mediaError?: string;
   replyToMessageId?: string;

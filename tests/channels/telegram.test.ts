@@ -42,9 +42,27 @@ describe('TelegramChannel', () => {
     });
   });
 
-  type MockCtx = { message: { document?: { file_id: string; file_name?: string }; photo?: Array<{ file_id: string; width: number; height: number }>; caption?: string; reply_to_message?: { message_id: number } }; chat: { id: number }; from?: { id: number } };
+  type MockCtx = { message: { text?: string; message_id?: number; document?: { file_id: string; file_name?: string }; photo?: Array<{ file_id: string; width: number; height: number }>; caption?: string; reply_to_message?: { message_id: number } }; chat: { id: number }; from?: { id: number } };
 
   describe('message handlers', () => {
+    it('propagates the transport message id for capture deduplication', async () => {
+      let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
+
+      mockBotOn.mockImplementation((event: string, cb: (ctx: MockCtx) => Promise<void>) => {
+        if (event === 'message:text') handler = cb;
+      });
+
+      const channel = new TelegramChannel('test-token', '/tmp/test-workspace');
+      const receivedMessages: { messageId?: string }[] = [];
+      channel.onMessage(async (msg) => {
+        receivedMessages.push(msg);
+      });
+
+      await handler?.({ message: { text: 'hello', message_id: 77 }, chat: { id: 123 }, from: { id: 456 } });
+
+      expect(receivedMessages[0].messageId).toBe('77');
+    });
+
     it('document handler sets mediaPath on incoming message', async () => {
       let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
 

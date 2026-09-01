@@ -1,11 +1,18 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID, createHash } from 'crypto';
-import { secureMkdir, secureWrite, secureCopyFile, secureChmodTree, tightenFile, summarizeErrorForLog } from '../security';
+import { secureMkdir, secureWriteViaTmp, secureCopyFile, secureChmodTree, tightenFile, summarizeErrorForLog } from '../security';
 import type { ProfileId, ProfileMeta } from './types';
 
 interface RegistryData {
   profiles: ProfileMeta[];
+}
+
+interface ProfileMigrationSentinel {
+  version: 1;
+  completed: true;
+  completedAt: string;
+  sourceHash: string;
 }
 
 export class ProfileRegistry {
@@ -275,7 +282,16 @@ export class ProfileRegistry {
     const profileDir = this.profileDir(profileId);
     const hash = this.sha256Prefix(legacyWorkspace, 12);
     const sentinelPath = path.join(profileDir, `.migrated-from-${hash}`);
-    return fs.existsSync(sentinelPath);
+    try {
+      const parsed = JSON.parse(fs.readFileSync(sentinelPath, 'utf8')) as Partial<ProfileMigrationSentinel>;
+      return parsed.version === 1
+        && parsed.completed === true
+        && parsed.sourceHash === hash
+        && typeof parsed.completedAt === 'string'
+        && !Number.isNaN(new Date(parsed.completedAt).getTime());
+    } catch {
+      return false;
+    }
   }
 
   // ── Private helpers ──────────────────────────────────────────────
@@ -351,7 +367,13 @@ export class ProfileRegistry {
     const hash = this.sha256Prefix(legacyWorkspace, 12);
     const sentinelPath = path.join(this.profileDir(profileId), `.migrated-from-${hash}`);
     try {
-      secureWrite(sentinelPath, '');
+      const payload: ProfileMigrationSentinel = {
+        version: 1,
+        completed: true,
+        completedAt: new Date().toISOString(),
+        sourceHash: hash,
+      };
+      secureWriteViaTmp(sentinelPath, JSON.stringify(payload));
       return sentinelPath;
     } catch (err) {
       // Sentinel (fs) write error — sanitized frame only.
