@@ -40,6 +40,28 @@ describe('ScratchStore.put/get', () => {
     expect(await s.remove('scratch-1')).toBe(false);
   });
 
+  it('rejects a traversal remove and leaves a sibling safety file untouched', async () => {
+    const safetyPath = path.join(tmpDir, 'SAFETY.md');
+    fs.writeFileSync(safetyPath, 'keep this safety file\n', 'utf8');
+    const store = new ScratchStore(tmpDir, mutableClock('2026-08-18T10:00:00Z'), seqIdGen('scratch'));
+
+    await expect(store.remove('../SAFETY')).rejects.toThrow();
+    expect(fs.readFileSync(safetyPath, 'utf8')).toBe('keep this safety file\n');
+  });
+
+  it('refuses a symlinked scratch lane instead of writing outside the profile root', async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-scratch-outside-'));
+    try {
+      fs.symlinkSync(outside, path.join(tmpDir, 'scratch'), 'dir');
+      const store = new ScratchStore(tmpDir, mutableClock('2026-08-18T10:00:00Z'), seqIdGen('scratch'));
+
+      await expect(store.put('must not escape')).rejects.toThrow();
+      expect(fs.readdirSync(outside)).toEqual([]);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   it('list returns every note on disk', async () => {
     const s = new ScratchStore(tmpDir, mutableClock('2026-08-18T10:00:00Z'), seqIdGen('scratch'));
     await s.put('first');

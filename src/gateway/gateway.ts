@@ -1,3 +1,4 @@
+import * as fs from 'fs';
 import * as path from 'path';
 import type { AppConfig } from '../config/types';
 import { ProfileRegistry } from '../profiles';
@@ -77,9 +78,9 @@ export class Gateway {
   // MEDIUM-8/9: one sweep at a time; awaited on shutdown so it never writes after stop().
   private sweepInFlight?: Promise<NightlySweepResult>;
   private sweepStopping = false;
-  // D3.4 (spec 14 §4 step 4): copies each compaction summary to today's daily log. Built in the memcore
-  // block (needs the NarrativeStore + WriteQueue), wired into the SessionManager after it is constructed.
-  private sessionSummarySink?: (anchoredSummary: string) => Promise<void>;
+  // D3.4/C-29: copies each compaction summary to a chat-scoped state lane. Built in the memcore block
+  // (needs the NarrativeStore + WriteQueue), wired into the SessionManager after construction.
+  private sessionSummarySink?: (chatId: string, anchoredSummary: string) => Promise<void>;
   private profileRegistry?: ProfileRegistry;
   private resolvedMemoryWorkspace?: string;
   private bootHealth?: { providers: ReadinessResult[]; telegram: ReadinessResult };
@@ -238,16 +239,16 @@ export class Gateway {
         listSafetyRelevant: () => ledgerStore.listSafetyRelevant(),
       });
 
-      // D3.4 (spec 14 §4 step 4 / A-M2): the compaction-summary → daily-log sink. The write goes through
+      // D3.4/C-29: the compaction-summary → chat-scoped sink. The write goes through
       // the single-writer WriteQueue (background priority); the LLM that produced the summary already ran
       // outside the queue (B2). Best-effort — the SessionManager wraps the call so a failure never fails
       // compaction. Searchable/dreamable: the bullets (with their sessions/<file>#L<n> anchors) land in the
-      // narrative daily log, read directly by dreaming and indexed on the next reconcile/boot.
-      this.sessionSummarySink = async (anchoredSummary: string): Promise<void> => {
+      // per-chat state lane, which is not part of profile-wide memory recall.
+      this.sessionSummarySink = async (chatId: string, anchoredSummary: string): Promise<void> => {
         const day = new Date().toISOString().slice(0, 10);
         await writeQueue.enqueue('background', {
           label: 'session-summary',
-          run: () => narrativeStore.appendSessionSummary(day, anchoredSummary),
+          run: () => narrativeStore.appendSessionSummary(chatId, day, anchoredSummary),
         });
       };
 
@@ -460,7 +461,11 @@ export class Gateway {
     // caller already has to compute (ProfileRegistry.profileSessions). Only
     // derived when a profiles config was actually supplied; otherwise
     // SessionManager keeps its own legacy default.
-    const sessionsPath = this.profileRegistry ? this.profileRegistry.profileSessions(profileId) : undefined;
+    const sessionsPath = this.profileRegistry
+      ? (usingProfileWorkspace
+        ? this.profileRegistry.profileSessions(profileId)
+        : path.join(path.dirname(config.memory.workspace), 'sessions'))
+      : undefined;
     this.sessions = new SessionManager({
       sessionsPath,
       softResetMinutes: config.sessions.softResetAfterMinutes,
@@ -663,6 +668,12 @@ export class Gateway {
       const emergency = this.handleEmergencyInput(text);
       return emergency ?? UNRECOGNIZED_CHAT_RESPONSE;
     }
+    if (!this.isDefaultRuntimeProfile(profileId)) {
+      // C-01 interim: this Gateway instance owns stores for the configured default profile only.
+      // Refuse a paired non-default chat rather than serving it with the wrong profile's stores.
+      const emergency = this.handleEmergencyInput(text);
+      return emergency ?? UNRECOGNIZED_CHAT_RESPONSE;
+    }
 
     if (text.trim() === '/status') {
       return this.buildBootStatusText();
@@ -763,6 +774,16 @@ export class Gateway {
         await this.channel!.send(chatId, { text: emergency ?? UNRECOGNIZED_CHAT_RESPONSE });
       } catch (e) {
         console.error('[gateway] Failed to respond to unrecognized chat:', summarizeErrorForLog(e));
+      }
+      return;
+    }
+    if (!this.isDefaultRuntimeProfile(profileId)) {
+      // C-01 interim: never dispatch a non-default profile into this default-bound pipeline.
+      const emergency = this.handleEmergencyInput(text);
+      try {
+        await this.channel!.send(chatId, { text: emergency ?? UNRECOGNIZED_CHAT_RESPONSE });
+      } catch (e) {
+        console.error('[gateway] Failed to respond to unavailable profile chat:', summarizeErrorForLog(e));
       }
       return;
     }
@@ -1018,8 +1039,8 @@ export class Gateway {
 
   private async handleScheduledJob(job: HeartbeatJob, invokedByScheduler: boolean = false): Promise<void> {
     const profileId = this.getProfileForChat(job.chatId);
-    if (profileId === null) {
-      console.warn(`[gateway] Skipping heartbeat job ${job.id}: chat is not paired to any profile.`);
+    if (profileId === null || !this.isDefaultRuntimeProfile(profileId)) {
+      console.warn(`[gateway] Skipping heartbeat job ${job.id}: chat is not available in this runtime.`);
       return;
     }
     const decision = decideHeartbeatDelivery(job, {
@@ -1098,6 +1119,11 @@ export class Gateway {
     if (!this.scheduler) {
       return;
     }
+    const resolved = this.profileRegistry?.getProfileForChat(chatId);
+    if (resolved && !this.isDefaultRuntimeProfile(resolved.profileId)) {
+      // C-01 interim: policy reconciliation also reads/writes the default-bound workspace.
+      return;
+    }
 
     const desired = await buildDesiredHeartbeatJobs({
       workspacePath: this.getEffectiveWorkspace(),
@@ -1135,12 +1161,12 @@ export class Gateway {
     // leaked-token stranger the default profile. reconcileHeartbeatPolicies and
     // handleScheduledJob use the chatId directly / re-check pairing themselves.
     const sessionChatId = this.sessions?.getMostRecentChatId();
-    if (sessionChatId) {
+    if (sessionChatId && this.isDefaultRuntimeChat(sessionChatId)) {
       return sessionChatId;
     }
 
     const jobs = await this.scheduler!.listJobs();
-    return jobs.find((job) => job.chatId !== '__startup__')?.chatId;
+    return jobs.find((job) => job.chatId !== '__startup__' && this.isDefaultRuntimeChat(job.chatId))?.chatId;
   }
 
   private buildAgentInput(incoming: IncomingMessage): string {
@@ -1272,6 +1298,40 @@ export class Gateway {
     }
   }
 
+  /**
+   * Migrate the old global session archive before the profile workspace sentinel seals the cutover.
+   * SessionManager owns the append-only conversion and exposes its completion result so a partial
+   * conversion cannot be mistaken for a completed profile migration.
+   */
+  private migrateLegacySessionsBeforeProfileSeal(
+    registry: ProfileRegistry,
+    profileId: ProfileId,
+    legacyWorkspace: string,
+  ): boolean {
+    const legacySessionsPath = path.join(path.dirname(legacyWorkspace), 'sessions');
+    try {
+      if (!fs.existsSync(legacySessionsPath)) return true;
+      const legacyFiles = fs.readdirSync(legacySessionsPath)
+        .filter((file) => file.startsWith('active-') && file.endsWith('.jsonl'));
+      if (legacyFiles.length === 0) return true;
+
+      const migration = new SessionManager({
+        sessionsPath: registry.profileSessions(profileId),
+        legacySessionsPath,
+        perChatArchive: true,
+        compaction: this.config.sessions.compaction,
+      });
+      if (!migration.didCompleteLegacyMigration) {
+        console.warn('[gateway] Legacy global session migration did not complete; profile sentinel remains unsealed.');
+        return false;
+      }
+      return true;
+    } catch (error) {
+      console.error('[gateway] Legacy global session migration failed; profile sentinel remains unsealed:', summarizeErrorForLog(error));
+      return false;
+    }
+  }
+
   // Idempotently migrates the legacy single-user workspace into the
   // profile-scoped layout (via ProfileRegistry.migrateLegacyWorkspace, which
   // already handles the sentinel + idempotent per-file copy) and decides
@@ -1289,9 +1349,18 @@ export class Gateway {
   ): string {
     try {
       if (registry.hasBeenMigrated(profileId, legacyWorkspace)) {
+        if (!this.migrateLegacySessionsBeforeProfileSeal(registry, profileId, legacyWorkspace)) {
+          return legacyWorkspace;
+        }
         const profileWorkspace = registry.profileWorkspace(profileId);
         console.log(`[gateway] Profile "${profileId}" already migrated; using ${profileWorkspace}`);
         return profileWorkspace;
+      }
+
+      // The workspace sentinel is the commit point for the whole cutover. Convert the separate global
+      // session archive first so a successful sentinel can never strand the pre-cutover conversation.
+      if (!this.migrateLegacySessionsBeforeProfileSeal(registry, profileId, legacyWorkspace)) {
+        return legacyWorkspace;
       }
 
       const result = registry.migrateLegacyWorkspace(legacyWorkspace);
@@ -1458,6 +1527,15 @@ export class Gateway {
     this.profileRegistry.pairChatToProfile(chatId, defaultProfile.profileId);
     console.log(`[gateway] Paired chat ${chatId} to profile "${defaultProfile.profileId}" (first-contact auto-pair)`);
     return defaultProfile.profileId;
+  }
+
+  private isDefaultRuntimeProfile(profileId: ProfileId): boolean {
+    return profileId === (this.config.profiles?.defaultProfileId ?? 'default');
+  }
+
+  private isDefaultRuntimeChat(chatId: string): boolean {
+    const resolved = this.profileRegistry?.getProfileForChat(chatId);
+    return !resolved || this.isDefaultRuntimeProfile(resolved.profileId);
   }
 
   // Same sentinel-gated fallback as migrateAndResolveWorkspace: heartbeat

@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
 import { runCli } from '../../src/cli/index';
+import { createCliSessionManager } from '../../src/test-cli';
 
 function createTempHome(): { tmpDir: string; restore: () => void } {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-cli-home-'));
@@ -22,6 +23,23 @@ function createTempHome(): { tmpDir: string; restore: () => void } {
 }
 
 describe('cli router', () => {
+  it('keeps web-harness sessions isolated by chat id', async () => {
+    const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-cli-sessions-'));
+    try {
+      const sessions = createCliSessionManager({ sessionsPath: sessionsDir });
+      await sessions.recordTurn('chat-a', [{ role: 'user', content: 'private A' }]);
+      await sessions.recordTurn('chat-b', [{ role: 'user', content: 'private B' }]);
+
+      const day = `${new Date().toISOString().slice(0, 10)}.jsonl`;
+      expect(fs.existsSync(path.join(sessionsDir, 'chat-a', day))).toBe(true);
+      expect(fs.existsSync(path.join(sessionsDir, 'chat-b', day))).toBe(true);
+      expect(sessions.getHistory('chat-a').map((m) => m.content)).toEqual(['private A']);
+      expect(sessions.getHistory('chat-b').map((m) => m.content)).toEqual(['private B']);
+    } finally {
+      fs.rmSync(sessionsDir, { recursive: true, force: true });
+    }
+  });
+
   it('prints help and exits cleanly', async () => {
     const output: string[] = [];
     const code = await runCli(['--help'], {

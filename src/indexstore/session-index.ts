@@ -11,8 +11,8 @@
 //
 // Per-chat isolation (Wave-D panel X-1/X-2): every row carries a `chat_id`, and the primary key is
 // `<chatId>#<file>#<line>` so two chats sharing a day-file basename never collide, and `search` filters
-// by chat so one chat can never read another chat's health turns. The chatId comes from the JSONL
-// entry (the same value the append path indexes with), so incremental indexing and rebuild agree.
+// by chat so one chat can never read another chat's health turns. In the per-chat layout the directory
+// component is authoritative; a flat legacy archive falls back to the JSONL field for its scope.
 //
 // A-M1: plain contentful FTS5 + a companion metadata table (NOT external-content — the content lives in
 // JSONL on disk). Anchors are the day-file `{file, line}` (physical non-empty line numbers), the same the
@@ -144,8 +144,8 @@ export class SqliteSessionIndex {
    * Re-index every day file under `sessionsDir` in ONE transaction (N-4: a crash mid-rebuild leaves the
    * index untouched, so the emptiness trigger can re-fire — no partial index). Line numbers are physical
    * non-empty positions (malformed lines occupy their slot but are not indexed), matching the append
-   * path's anchor assignment. The chatId comes from each JSONL entry (matching the incremental path), so
-   * a rebuilt row keys identically. Idempotent via the `<chatId>#<file>#<line>` upsert.
+   * path's anchor assignment. In a per-chat layout the containing directory supplies the chat scope; a
+   * flat legacy file falls back to its embedded chatId. Idempotent via the `<chatId>#<file>#<line>` upsert.
    */
   rebuildFromDayFiles(sessionsDir?: string): void {
     const root = sessionsDir ?? this.sessionsDir;
@@ -174,8 +174,12 @@ export class SqliteSessionIndex {
           if (typeof content !== 'string' || content.length === 0) continue; // nothing textual to index
           const role = typeof entry.role === 'string' ? entry.role : '';
           const ts = typeof entry.timestamp === 'string' ? entry.timestamp : '';
-          // chatId from the entry (matches the append path); fall back to the archive subdir name.
-          const chatId = typeof entry.chatId === 'string' && entry.chatId.length > 0 ? entry.chatId : subdir;
+          // A per-chat directory is the trust boundary. Never let a JSONL field reassign a line to a
+          // different chat. Flat legacy archives have no directory scope, so use their embedded field.
+          const chatId = subdir || (typeof entry.chatId === 'string' && entry.chatId.length > 0
+            ? entry.chatId
+            : undefined);
+          if (!chatId) continue;
           this.writeTurn(chatId, base, lineNo, role, ts, content);
         }
       }
@@ -318,7 +322,13 @@ export class SqliteSessionIndex {
       for (const e of entries) {
         const full = path.join(dir, e.name);
         if (e.isDirectory()) walk(full);
-        else if (DAY_FILE_RE.test(e.name)) out.push(full);
+        else if (DAY_FILE_RE.test(e.name)) {
+          try {
+            if (fs.lstatSync(full).isFile()) out.push(full);
+          } catch {
+            // Missing/replaced/non-regular day files are not part of the rebuild boundary.
+          }
+        }
       }
     };
     walk(root);

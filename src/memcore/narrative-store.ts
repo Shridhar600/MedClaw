@@ -10,10 +10,9 @@
 // language, so nothing is paraphrased away before the agent sees it.
 
 import * as fs from 'fs';
-import * as path from 'path';
 import type { Clock } from '../ports';
 import { systemClock } from '../ports';
-import { secureWriteViaTmp, summarizeErrorForLog, quarantineToSideFile } from '../security';
+import { secureWriteViaTmp, secureMkdir, summarizeErrorForLog, quarantineToSideFile, resolveContainedPath, PathContainmentError } from '../security';
 
 export interface NarrativeAppendResult {
   date: string;
@@ -24,12 +23,25 @@ export interface NarrativeAppendResult {
 const LOG_HEADING = '## Log';
 const LEDGER_HEADING = '## Ledger writes';
 const SESSION_SUMMARY_HEADING = '## Session summary';
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 export class NarrativeStore {
-  constructor(private readonly rootDir: string, private readonly clock: Clock = systemClock) {}
+  constructor(private readonly rootDir: string, private readonly clock: Clock = systemClock) {
+    secureMkdir(rootDir);
+  }
 
   private filePath(date: string): string {
-    return path.join(this.rootDir, 'memory', `${date}.md`);
+    this.validateDate(date);
+    return resolveContainedPath(this.rootDir, 'memory', `${date}.md`);
+  }
+
+  private sessionSummaryPath(chatId: string, date: string): string {
+    this.validateDate(date);
+    return resolveContainedPath(this.rootDir, '.state', 'session-summaries', chatId, `${date}.md`);
+  }
+
+  private validateDate(date: string): void {
+    if (!DATE_RE.test(date)) throw new PathContainmentError('invalid-component');
   }
 
   /**
@@ -63,24 +75,27 @@ export class NarrativeStore {
   }
 
   /**
-   * Append a compaction summary block under `## Session summary` (spec 14 §4 step 4). The bullets carry
-   * `sessions/<file>#L<n>` anchors, so the daily log is searchable + dreamable and points back at the
-   * verbatim day-file lines. Reuses the heading if it already exists that day.
+   * Append a compaction summary block under `## Session summary` in the chat-scoped state lane (C-29).
+   * The bullets carry `sessions/<file>#L<n>` anchors back to verbatim day-file lines. Reuses the heading
+   * if it already exists for that chat and day.
    */
-  async appendSessionSummary(date: string, summary: string): Promise<string> {
+  async appendSessionSummary(chatId: string, date: string, summary: string): Promise<string> {
+    const fp = this.sessionSummaryPath(chatId, date);
     const entryLines = summary.split('\n').filter((l) => l.length > 0);
-    const lines = this.readLines(date);
+    const lines = this.readSummaryLines(fp, date);
     if (!lines.includes(SESSION_SUMMARY_HEADING)) {
       lines.push(SESSION_SUMMARY_HEADING);
     }
     const lineStart = lines.length + 1;
     lines.push(...entryLines);
-    return this.write(date, lines, lineStart);
+    secureWriteViaTmp(fp, lines.join('\n') + '\n');
+    return `.state/session-summaries/${chatId}/${date}.md#L${lineStart}`;
   }
 
   async read(date: string): Promise<string | null> {
+    const fp = this.filePath(date);
     try {
-      return await fs.promises.readFile(this.filePath(date), 'utf-8');
+      return await fs.promises.readFile(fp, 'utf-8');
     } catch (err) {
       const nodeErr = err as NodeJS.ErrnoException;
       if (nodeErr.code === 'ENOENT') return null;
@@ -124,6 +139,21 @@ export class NarrativeStore {
     if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
     if (lines.length === 0) return this.freshHeader(date);
     return lines;
+  }
+
+  private readSummaryLines(fp: string, date: string): string[] {
+    let raw: string;
+    try {
+      raw = fs.readFileSync(fp, 'utf-8');
+    } catch (err) {
+      const nodeErr = err as NodeJS.ErrnoException;
+      if (nodeErr.code === 'ENOENT') return [`# ${date}`, SESSION_SUMMARY_HEADING];
+      console.warn('[narrative-store] session-summary read failed:', summarizeErrorForLog(err));
+      throw err;
+    }
+    const lines = raw.split('\n');
+    if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+    return lines.length > 0 ? lines : [`# ${date}`, SESSION_SUMMARY_HEADING];
   }
 
   private salvageRaw(fp: string): string | null {

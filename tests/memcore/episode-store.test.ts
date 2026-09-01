@@ -31,6 +31,19 @@ describe('EpisodeStore.create', () => {
     expect(content).toContain('- status: open');
     expect(fs.statSync(fp).mode & 0o777).toBe(0o600);
   });
+
+  it('rejects a symlinked episodes lane before writing outside the profile root', async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-episode-outside-'));
+    try {
+      fs.symlinkSync(outside, path.join(tmpDir, 'episodes'), 'dir');
+      const s = new EpisodeStore(tmpDir, fixedClock('2026-08-18T10:00:00Z'), seqIdGen('ep'));
+
+      await expect(s.create({ title: 'should not escape', profileId: 'p1' })).rejects.toThrow();
+      expect(fs.readdirSync(outside)).toEqual([]);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('EpisodeStore.get', () => {
@@ -75,6 +88,11 @@ describe('EpisodeStore.update', () => {
   it('returns null when the episode does not exist', async () => {
     const s = new EpisodeStore(tmpDir, fixedClock('2026-08-18T10:00:00Z'), seqIdGen('ep'));
     expect(await s.update('ghost', { status: 'resolved' })).toBeNull();
+  });
+
+  it('rejects an id containing a path separator without reading another lane', async () => {
+    const s = new EpisodeStore(tmpDir, fixedClock('2026-08-18T10:00:00Z'), seqIdGen('ep'));
+    await expect(s.update('../SAFETY', { status: 'resolved' })).rejects.toThrow();
   });
 });
 

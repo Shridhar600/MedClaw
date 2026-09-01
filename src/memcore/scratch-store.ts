@@ -13,10 +13,9 @@
 // scratch file is skipped with a sanitized warning and never deleted (D2).
 
 import * as fs from 'fs';
-import * as path from 'path';
 import type { Clock, IdGen } from '../ports';
 import { systemClock, uuidIdGen } from '../ports';
-import { contentContainsCredentials, secureWriteViaTmp, summarizeErrorForLog } from '../security';
+import { contentContainsCredentials, secureWriteViaTmp, secureMkdir, summarizeErrorForLog, resolveContainedPath } from '../security';
 
 /** Default note lifetime: 30 days (spec 03: `scratch/` TTL 30d). */
 export const DEFAULT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -66,15 +65,16 @@ export class ScratchStore {
     private readonly idGen: IdGen = uuidIdGen,
     opts?: ScratchStoreOptions,
   ) {
+    secureMkdir(rootDir);
     this.ttlMs = opts?.ttlMs ?? DEFAULT_TTL_MS;
   }
 
   private dirPath(): string {
-    return path.join(this.rootDir, 'scratch');
+    return resolveContainedPath(this.rootDir, 'scratch');
   }
 
   private filePath(id: string): string {
-    return path.join(this.dirPath(), `${id}.md`);
+    return resolveContainedPath(this.rootDir, 'scratch', `${id}.md`);
   }
 
   async put(content: string): Promise<ScratchNote> {
@@ -107,8 +107,9 @@ export class ScratchStore {
   }
 
   async remove(id: string): Promise<boolean> {
+    const fp = this.filePath(id);
     try {
-      await fs.promises.unlink(this.filePath(id));
+      await fs.promises.unlink(fp);
       return true;
     } catch (err) {
       const nodeErr = err as NodeJS.ErrnoException;

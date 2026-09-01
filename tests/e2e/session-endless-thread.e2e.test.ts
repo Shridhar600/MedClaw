@@ -155,13 +155,15 @@ describe('P2b E2E — endless per-chat thread (real Gateway.handleTestMessage)',
     const afterCompact = await searchTool(gateway, 'allergic to penicillin');
     expect(afterCompact.content[0].text).toContain('allergic to penicillin');
 
-    // F-5: the compaction summary is copied to the profile's daily log through the real Gateway sink
-    // (NarrativeStore + WriteQueue), not just an in-memory callback.
+    // RR-4/C-29: the compaction summary is copied through the real Gateway sink into a chat-scoped
+    // state lane, not profile-wide narrative memory.
     const ws = (gateway as any).getEffectiveWorkspace() as string;
+    const summaryPath = path.join(ws, '.state', 'session-summaries', CHAT, `${dateKey(new Date())}.md`);
+    const summaryText = fs.readFileSync(summaryPath, 'utf8');
+    expect(summaryText).toContain('## Session summary');
+    expect(summaryText).toContain('penicillin');
     const dailyLog = path.join(ws, 'memory', `${dateKey(new Date())}.md`);
-    const logText = fs.readFileSync(dailyLog, 'utf8');
-    expect(logText).toContain('## Session summary');
-    expect(logText).toContain('penicillin');
+    expect(fs.readFileSync(dailyLog, 'utf8')).not.toContain('## Session summary');
   });
 
   it('a restart mid-journey resumes the compacted window and keeps appending to the same day file', async () => {

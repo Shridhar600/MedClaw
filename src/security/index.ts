@@ -5,4 +5,6 @@ export type { PermsCheckResult } from './perms-check';
 export { contentContainsCredentials } from './credential-rejection';
 export { summarizeErrorForLog } from './log';
 export { quarantineToSideFile, QUARANTINE_POINTER, QUARANTINE_POINTER_PREFIX } from './quarantine';
+export { PathContainmentError, resolveContainedPath } from './path-containment';
+export type { PathContainmentReason } from './path-containment';
 export * from './secure-fs';

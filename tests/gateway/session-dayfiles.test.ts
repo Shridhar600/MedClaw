@@ -52,6 +52,33 @@ describe('session day-file archive (D1.2)', () => {
     expect(fs.existsSync(path.join(dir, '2026-08-26.jsonl'))).toBe(false);
   });
 
+  it('rejects a path-traversing chatId before any archive write', async () => {
+    jest.setSystemTime(new Date('2026-08-26T10:00:00.000Z'));
+    const m = new SessionManager({ sessionsPath: dir, perChatArchive: true });
+    const escaped = path.join(path.dirname(dir), 'redacted-session-escape');
+    try {
+      await expect(m.recordTurn('../redacted-session-escape', [{ role: 'user', content: 'must not escape' }]))
+        .rejects.toThrow();
+      expect(fs.existsSync(path.join(escaped, '2026-08-26.jsonl'))).toBe(false);
+    } finally {
+      fs.rmSync(escaped, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a pre-existing symlinked chat lane before appending', async () => {
+    jest.setSystemTime(new Date('2026-08-26T10:00:00.000Z'));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-session-outside-'));
+    try {
+      fs.symlinkSync(outside, path.join(dir, 'chatS'), 'dir');
+      const m = new SessionManager({ sessionsPath: dir, perChatArchive: true });
+
+      await expect(m.recordTurn('chatS', [{ role: 'user', content: 'must not escape' }])).rejects.toThrow();
+      expect(fs.readdirSync(outside)).toEqual([]);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   it('day files are written 0600', async () => {
     jest.setSystemTime(new Date('2026-08-26T10:00:00.000Z'));
     const m = new SessionManager({ sessionsPath: dir });

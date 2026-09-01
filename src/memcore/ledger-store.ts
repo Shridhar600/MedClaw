@@ -7,7 +7,7 @@ import {
 } from './types';
 import { parseLedgerFile, renderLedgerFile, canonicalFields } from './ledger-parser';
 import { TokenRejectedError } from './token-errors';
-import { secureWriteViaTmp, secureChmodFile, summarizeErrorForLog } from '../security';
+import { secureWriteViaTmp, secureMkdir, secureChmodFile, summarizeErrorForLog, resolveContainedPath } from '../security';
 import type { Clock } from '../ports';
 import { systemClock } from '../ports';
 
@@ -54,11 +54,13 @@ interface RecordFactParams {
 export class LedgerStore {
   private tokens = new Map<string, StoredToken>();
 
-  constructor(private rootDir: string, private clock: Clock = systemClock) {}
+  constructor(private rootDir: string, private clock: Clock = systemClock) {
+    secureMkdir(rootDir);
+  }
 
   private filePath(type: FactType): string {
     const name = TYPE_TO_FILE[type];
-    return path.join(this.rootDir, 'ledger', name);
+    return resolveContainedPath(this.rootDir, 'ledger', name);
   }
 
   private async readFacts(type: FactType): Promise<LedgerFact[]> {

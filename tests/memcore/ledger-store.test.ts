@@ -21,6 +21,23 @@ const userProv: Provenance = { source: 'user', confidence: 1, anchor: 'memory/us
 const sensorProv: Provenance = { source: 'sensor', confidence: 0.8, anchor: 'memory/sensor.md#L1', capturedAt: '', note: 'Device reading' };
 const labProv: Provenance = { source: 'lab', confidence: 0.9, anchor: 'memory/lab.md#L1', capturedAt: '', note: 'Lab result' };
 describe('LedgerStore', () => {
+  it('refuses a symlinked ledger lane instead of writing outside the profile root', async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-ledger-outside-'));
+    try {
+      fs.symlinkSync(outside, path.join(tmpDir, 'ledger'), 'dir');
+
+      await expect(store.recordFact({
+        entity: 'metformin',
+        type: 'medication',
+        fields: { dose: '850mg' },
+        provenance: docProv,
+      })).rejects.toThrow();
+      expect(fs.readdirSync(outside)).toEqual([]);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   describe('v1 create', () => {
     it('creates v1 when no prior version exists', async () => {
       const result = await store.recordFact({

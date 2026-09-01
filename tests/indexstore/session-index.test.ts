@@ -189,6 +189,56 @@ describe('SqliteSessionIndex', () => {
     expect(res.hits[0].file).toBe('2026-08-27.jsonl');
   });
 
+  test('rebuild uses the per-chat directory as authoritative scope over embedded chatId', () => {
+    const { dbPath, sessionsDir } = tmp();
+    const chatDir = path.join(sessionsDir, 'chatA');
+    fs.mkdirSync(chatDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(chatDir, '2026-08-27.jsonl'),
+      JSON.stringify({
+        timestamp: '2026-08-27T10:00:00.000Z',
+        role: 'user',
+        content: 'chat A private marker',
+        chatId: 'chatB',
+      }) + '\n',
+    );
+
+    const idx = new SqliteSessionIndex({ dbPath, sessionsDir });
+    const fromA = idx.search('private marker', { chatId: 'chatA' });
+    const fromB = idx.search('private marker', { chatId: 'chatB' });
+    idx.close();
+
+    expect(fromA.hits).toHaveLength(1);
+    expect(fromA.hits[0].chatId).toBe('chatA');
+    expect(fromB.hits).toHaveLength(0);
+  });
+
+  test('rebuild skips symlinked day files', () => {
+    const { dbPath, sessionsDir } = tmp();
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-index-outside-'));
+    try {
+      const outsideDay = path.join(outside, 'secret.jsonl');
+      fs.writeFileSync(
+        outsideDay,
+        JSON.stringify({
+          timestamp: '2026-08-27T10:00:00.000Z',
+          role: 'user',
+          content: 'other profile private marker',
+          chatId: 'chatA',
+        }) + '\n',
+      );
+      const chatDir = path.join(sessionsDir, 'chatA');
+      fs.mkdirSync(chatDir, { recursive: true });
+      fs.symlinkSync(outsideDay, path.join(chatDir, '2026-08-27.jsonl'));
+
+      const idx = new SqliteSessionIndex({ dbPath, sessionsDir });
+      expect(idx.search('private marker', { chatId: 'chatA' }).hits).toHaveLength(0);
+      idx.close();
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   // X-1: two chats sharing a day-file basename + line number must NOT collide, and a scoped search must
   // never surface another chat's health content.
   test('two chats with the same {file,line} do not collide and search is chat-scoped (X-1)', () => {

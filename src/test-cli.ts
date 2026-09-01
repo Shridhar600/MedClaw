@@ -10,7 +10,7 @@ import { createMemoryTools } from './tools/memory-tools';
 import { SqliteStore } from './memory/sqlite-store';
 import { MemorySearch } from './memory/search';
 import { createProvider } from './providers/factory';
-import { SessionManager } from './gateway/session';
+import { SessionManager, type SessionManagerOptions } from './gateway/session';
 import { createInterface } from 'readline';
 import { secureMkdir } from './security';
 
@@ -125,6 +125,29 @@ const HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
+/** Build the supported local web/CLI session seam with per-chat archive isolation enabled. */
+export function createCliSessionManager(
+  options: Omit<SessionManagerOptions, 'perChatArchive'>,
+): SessionManager {
+  return new SessionManager({ ...options, perChatArchive: true });
+}
+
+function countSessionFiles(dir: string): number {
+  let count = 0;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) count += countSessionFiles(full);
+    else if (entry.isFile() && entry.name.endsWith('.jsonl')) count += 1;
+  }
+  return count;
+}
+
 async function main(): Promise<void> {
   const config = await loadConfig();
 
@@ -160,7 +183,7 @@ async function main(): Promise<void> {
   );
 
   const sessionsPath = path.join(process.env.HOME ?? '', '.redacted', 'sessions');
-  const sessions = new SessionManager({
+  const sessions = createCliSessionManager({
     sessionsPath,
     softResetMinutes: config.sessions.softResetAfterMinutes,
     hardResetMinutes: config.sessions.hardResetAfterMinutes,
@@ -243,10 +266,8 @@ async function main(): Promise<void> {
     }
 
     if (text === '/sessions') {
-      const files = fs.existsSync(sessionsPath)
-        ? fs.readdirSync(sessionsPath).filter(f => f.endsWith('.jsonl'))
-        : [];
-      process.stdout.write(`Active sessions: ${files.length}\n\n`);
+      const files = fs.existsSync(sessionsPath) ? countSessionFiles(sessionsPath) : 0;
+      process.stdout.write(`Active sessions: ${files}\n\n`);
       continue;
     }
 
@@ -268,7 +289,9 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((e) => {
-  process.stdout.write(`Fatal error: ${e}\n`);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((e) => {
+    process.stdout.write(`Fatal error: ${e}\n`);
+    process.exit(1);
+  });
+}

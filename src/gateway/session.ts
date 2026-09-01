@@ -5,7 +5,15 @@ import type { Message, ToolSchema } from '../providers/types';
 import type { LLMProvider, LLMResponse } from '../providers/types';
 import type { ToolRegistry } from '../tools/registry';
 import { type RotationConfig } from '../scheduler/rotation';
-import { summarizeErrorForLog, secureMkdir, secureWrite, secureWriteViaTmp, secureAppend } from '../security';
+import {
+  summarizeErrorForLog,
+  secureMkdir,
+  secureWrite,
+  secureWriteViaTmp,
+  secureAppend,
+  PathContainmentError,
+  resolveContainedPath,
+} from '../security';
 import {
   dateKey,
   countDayFileLines,
@@ -102,6 +110,8 @@ export interface SessionManagerOptions {
    * is present.
    */
   perChatArchive?: boolean;
+  /** Optional legacy global session directory to migrate into this archive before it is served. */
+  legacySessionsPath?: string;
 }
 
 /**
@@ -312,6 +322,7 @@ export class SessionManager {
   private readonly windowConfig?: WindowConfig;
   private readonly contextWindow?: number;
   private readonly profileId: string;
+  private readonly legacyMigrationComplete: boolean;
   // DD3 (A-MF1): the last window-fill reading per chat — real `usage.promptTokens` (estimated:false) or
   // a chars/4 fallback (estimated:true). Persisted in the window state; seeded from it on resume.
   // `triggered` marks a reading already consumed by a prune/compact/emergency this cycle so the SAME
@@ -321,6 +332,7 @@ export class SessionManager {
   private readonly compactionInFlight: Map<string, Promise<void>> = new Map();
   private readonly rotationConfig?: Partial<RotationConfig>;
   private readonly perChatArchive: boolean;
+  private readonly legacySessionsPath?: string;
   // D1.3 (A-H2): the current physical non-empty line count of each day file, keyed by full day-file
   // path. Seeded FROM DISK on first touch this process (in-memory tracking is lost on restart and
   // `secureAppend` does not fsync), then advanced as we append. Every anchor is computed from this
@@ -361,14 +373,19 @@ export class SessionManager {
     }
   }
 
-  // D3.4 spec 14 §4 step 4: the sink that copies each compaction summary (anchored bullets) to today's
-  // daily log `## Session summary`. Wired by the Gateway through the WriteQueue + index refresh. Optional
-  // and best-effort — a sink failure never fails compaction.
-  private summarySink?: (anchoredSummary: string) => Promise<void>;
+  // D3.4/C-29: the sink that copies each compaction summary (anchored bullets) to the chat-scoped
+  // session-summary lane. Wired by the Gateway through the WriteQueue. Optional and best-effort — a sink
+  // failure never fails compaction.
+  private summarySink?: (chatId: string, anchoredSummary: string) => Promise<void>;
 
-  /** Wire the compaction-summary → daily-log sink (D3.4 / spec 14 §4 step 4). */
-  setSummarySink(sink: (anchoredSummary: string) => Promise<void>): void {
+  /** Wire the compaction-summary → chat-scoped sink (D3.4 / C-29). */
+  setSummarySink(sink: (chatId: string, anchoredSummary: string) => Promise<void>): void {
     this.summarySink = sink;
+  }
+
+  /** Whether the constructor completed the legacy-session migration step. */
+  get didCompleteLegacyMigration(): boolean {
+    return this.legacyMigrationComplete;
   }
 
   /** The resolved day-file archive root — the Gateway builds the search index over this same directory. */
@@ -395,9 +412,19 @@ export class SessionManager {
       // and ≤5 selection are deterministic. `isDirectory()` reflects lstat, so a symlinked chat dir
       // (isSymbolicLink) is already excluded.
       const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name).sort();
-      for (const name of dirs) files.push(path.join(this.sessionsPath, name, day));
+      for (const name of dirs) {
+        try {
+          files.push(resolveContainedPath(this.sessionsPath, name, day));
+        } catch (e) {
+          console.warn('[session] skipping unsafe chat archive lane:', summarizeErrorForLog(e));
+        }
+      }
     } else {
-      files.push(path.join(this.sessionsPath, day));
+      try {
+        files.push(resolveContainedPath(this.sessionsPath, day));
+      } catch (e) {
+        console.warn('[session] skipping unsafe day-file path:', summarizeErrorForLog(e));
+      }
     }
     const lines: string[] = [];
     for (const f of files) {
@@ -511,8 +538,9 @@ export class SessionManager {
     this.profileId = opts.profileId ?? 'default';
     this.rotationConfig = opts.rotationConfig;
     this.perChatArchive = opts.perChatArchive ?? false;
+    this.legacySessionsPath = opts.legacySessionsPath;
     secureMkdir(this.sessionsPath);
-    this.migrateLegacySessions();
+    this.legacyMigrationComplete = this.migrateLegacySessions(this.legacySessionsPath);
     this.resumeSessions();
   }
 
@@ -917,7 +945,7 @@ Keep it concise and structured.`;
     session.history = candidate;
     if (this.summarySink) {
       try {
-        await this.summarySink(built.newBullets);
+        await this.summarySink(chatId, built.newBullets);
       } catch (e) {
         console.warn(`[session:${chatId}] Session-summary daily-log copy failed:`, summarizeErrorForLog(e));
       }
@@ -1002,9 +1030,11 @@ Keep it concise and structured.`;
   // `dateKey` (A-H3) so a turn after local midnight lands in the correct file.
   private dayFilePath(chatId: string, now: Date): string {
     const day = `${dateKey(now)}.jsonl`;
-    return this.perChatArchive
-      ? path.join(this.sessionsPath, chatId, day)
-      : path.join(this.sessionsPath, day);
+    const resolved = this.perChatArchive
+      ? resolveContainedPath(this.sessionsPath, chatId, day)
+      : resolveContainedPath(this.sessionsPath, day);
+    this.assertRegularFileIfPresent(resolved);
+    return resolved;
   }
 
   private serializeEntry(chatId: string, msg: Message, timestamp: string, origin: JsonlOrigin = 'chat'): JsonlEntry {
@@ -1052,15 +1082,27 @@ Keep it concise and structured.`;
   // mode = per-chat so distinct ad-hoc chats never share a window (N-2). Lives inside sessionsPath
   // (test-isolated; the day-file scan ignores it — it is not a `YYYY-MM-DD.jsonl`).
   private windowPath(chatId: string): string {
-    return this.perChatArchive
-      ? path.join(this.sessionsPath, `session-window.${chatId}.json`)
-      : path.join(this.sessionsPath, 'session-window.json');
+    const resolved = this.perChatArchive
+      ? resolveContainedPath(this.sessionsPath, `session-window.${chatId}.json`)
+      : resolveContainedPath(this.sessionsPath, 'session-window.json');
+    this.assertRegularFileIfPresent(resolved);
+    return resolved;
   }
 
   // D1.5/A-MF5: the day-file archive directory for `chatId` — flat per profile (registry) or namespaced
   // per chat (no-registry). Mirrors `dayFilePath`.
   private archiveDir(chatId: string): string {
-    return this.perChatArchive ? path.join(this.sessionsPath, chatId) : this.sessionsPath;
+    return this.perChatArchive ? resolveContainedPath(this.sessionsPath, chatId) : this.sessionsPath;
+  }
+
+  private assertRegularFileIfPresent(filePath: string): void {
+    try {
+      if (!fs.lstatSync(filePath).isFile()) throw new PathContainmentError('unavailable');
+    } catch (error) {
+      if (error instanceof PathContainmentError) throw error;
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
   }
 
   // D1.5: the window as a DERIVED snapshot of the in-memory history + the archive position. summaryBlock
@@ -1108,8 +1150,13 @@ Keep it concise and structured.`;
         return;
       }
       for (const e of entries) {
-        if (e.isDirectory() && listDayFiles(this.archiveDir(e.name)).length > 0) {
-          this.resumeChat(e.name);
+        if (!e.isDirectory()) continue;
+        try {
+          if (listDayFiles(this.archiveDir(e.name)).length > 0) {
+            this.resumeChat(e.name);
+          }
+        } catch (error) {
+          console.warn('[session] skipping unsafe chat archive lane during resume:', summarizeErrorForLog(error));
         }
       }
     } else {
@@ -1180,14 +1227,25 @@ Keep it concise and structured.`;
   // sources into shared root day files; no-registry mode buckets each source into its own `<chatId>/`
   // subdir (A-MF5/N-3). Best-effort: any failure logs sanitized and leaves the sentinel UNWRITTEN so the
   // migration retries next boot; the daemon never crashes.
-  private migrateLegacySessions(): void {
+  private migrateLegacySessions(sourcePath: string = this.sessionsPath): boolean {
     const sentinel = path.join(this.sessionsPath, '.migrated');
+    const externalSource = path.resolve(sourcePath) !== path.resolve(this.sessionsPath);
     try {
-      if (fs.existsSync(sentinel)) return;
-      const legacy = fs.readdirSync(this.sessionsPath).filter((f) => f.startsWith('active-') && f.endsWith('.jsonl'));
+      if (fs.existsSync(sentinel) && !externalSource) return true;
+      let legacy: string[];
+      try {
+        legacy = fs.readdirSync(sourcePath).filter((f) => f.startsWith('active-') && f.endsWith('.jsonl'));
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT') {
+          if (!fs.existsSync(sentinel)) secureWrite(sentinel, new Date().toISOString());
+          return fs.existsSync(sentinel);
+        }
+        throw error;
+      }
       if (legacy.length === 0) {
-        secureWrite(sentinel, new Date().toISOString());
-        return;
+        if (!fs.existsSync(sentinel)) secureWrite(sentinel, new Date().toISOString());
+        return fs.existsSync(sentinel);
       }
 
       // Parse every legacy entry, preserving source-file order (sorted) then in-file order — the tie-break
@@ -1198,7 +1256,11 @@ Keep it concise and structured.`;
       let order = 0;
       for (const file of legacy.sort()) {
         const chatId = file.replace(/^active-/, '').replace(/\.jsonl$/, '');
-        const lines = fs.readFileSync(path.join(this.sessionsPath, file), 'utf-8').split('\n').filter((l) => l.length > 0);
+        const sourceFile = resolveContainedPath(sourcePath, file);
+        if (!fs.lstatSync(sourceFile).isFile()) {
+          throw new Error('legacy session source is not a regular file');
+        }
+        const lines = fs.readFileSync(sourceFile, 'utf-8').split('\n').filter((l) => l.length > 0);
         for (const raw of lines) {
           let entry: JsonlEntry;
           try {
@@ -1220,7 +1282,9 @@ Keep it concise and structured.`;
       // write it WRITE-IF-ABSENT. The raw serialized line is preserved verbatim (no re-serialization).
       const buckets = new Map<string, Row[]>();
       for (const r of rows) {
-        const targetDir = this.perChatArchive ? path.join(this.sessionsPath, r.chatId) : this.sessionsPath;
+        const targetDir = this.perChatArchive
+          ? resolveContainedPath(this.sessionsPath, r.chatId)
+          : this.sessionsPath;
         const key = `${targetDir} ${r.day}`;
         (buckets.get(key) ?? buckets.set(key, []).get(key)!).push(r);
       }
@@ -1230,7 +1294,10 @@ Keep it concise and structured.`;
         const targetDir = key.slice(0, sep);
         const day = key.slice(sep + 1);
         arr.sort((x, y) => x.ts - y.ts || x.order - y.order); // Array.sort is stable ⇒ ties keep source order
-        const dayPath = path.join(targetDir, `${day}.jsonl`);
+        const dayPath = this.perChatArchive
+          ? resolveContainedPath(this.sessionsPath, path.basename(targetDir), `${day}.jsonl`)
+          : resolveContainedPath(this.sessionsPath, `${day}.jsonl`);
+        this.assertRegularFileIfPresent(dayPath);
         const legacyRaws = arr.map((r) => r.raw);
         if (!fs.existsSync(dayPath)) {
           secureMkdir(targetDir);
@@ -1263,10 +1330,12 @@ Keep it concise and structured.`;
         this.seedWindowIfAbsent(this.windowPath(''), this.sessionsPath, keepRecent);
       }
 
-      secureWrite(sentinel, new Date().toISOString()); // LAST — commits the migration
+      if (!fs.existsSync(sentinel)) secureWrite(sentinel, new Date().toISOString()); // LAST — commits the migration
+      return fs.existsSync(sentinel);
     } catch (e) {
       // Boot-failure policy (A-MF2): warn sanitized, sentinel left UNWRITTEN (retry next boot), never crash.
       console.warn('[session] legacy migration failed, will retry next boot:', summarizeErrorForLog(e));
+      return false;
     }
   }
 

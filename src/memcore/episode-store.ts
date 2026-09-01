@@ -10,10 +10,9 @@
 // Corrupt episode files are skipped with a sanitized warning, never a crash (D2).
 
 import * as fs from 'fs';
-import * as path from 'path';
 import type { Clock, IdGen } from '../ports';
 import { systemClock, uuidIdGen } from '../ports';
-import { secureWriteViaTmp, secureMkdir, summarizeErrorForLog } from '../security';
+import { secureWriteViaTmp, secureMkdir, summarizeErrorForLog, resolveContainedPath } from '../security';
 import { sanitizeSingleLine } from './sanitize';
 
 export type EpisodeStatus = 'open' | 'resolving' | 'resolved' | 'reopened';
@@ -62,14 +61,16 @@ export class EpisodeStore {
     private readonly rootDir: string,
     private readonly clock: Clock = systemClock,
     private readonly idGen: IdGen = uuidIdGen,
-  ) {}
+  ) {
+    secureMkdir(rootDir);
+  }
 
   private dirPath(): string {
-    return path.join(this.rootDir, 'episodes');
+    return resolveContainedPath(this.rootDir, 'episodes');
   }
 
   private filePath(id: string): string {
-    return path.join(this.dirPath(), `${id}.md`);
+    return resolveContainedPath(this.rootDir, 'episodes', `${id}.md`);
   }
 
   async create(input: CreateEpisodeInput): Promise<Episode> {
@@ -153,9 +154,10 @@ export class EpisodeStore {
     const src = this.filePath(id);
     if (!fs.existsSync(src)) return false;
     try {
-      const trashDir = path.join(this.dirPath(), '.trash');
+      const trashDir = resolveContainedPath(this.rootDir, 'episodes', '.trash');
       secureMkdir(trashDir);
-      fs.renameSync(src, path.join(trashDir, `${id}.md`)); // rename preserves the 0600 mode
+      const destination = resolveContainedPath(this.rootDir, 'episodes', '.trash', `${id}.md`);
+      fs.renameSync(src, destination); // rename preserves the 0600 mode
       return true;
     } catch (err) {
       console.warn(`[episode-store] soft-delete failed for ${id}: ${summarizeErrorForLog(err)}`);

@@ -117,7 +117,7 @@ describe('Compaction pipeline (spec 14 §4)', () => {
     const mgr = new SessionManager({ sessionsPath, provider: textProvider(summary), compaction });
 
     const received: string[] = [];
-    mgr.setSummarySink(async (s) => {
+    mgr.setSummarySink(async (_chatId, s) => {
       received.push(s);
     });
 

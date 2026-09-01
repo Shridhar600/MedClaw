@@ -102,6 +102,79 @@ describe('Gateway profile migration + path derivation on startup', () => {
     expect(registry.hasBeenMigrated('default' as ProfileId, legacyWorkspace)).toBe(true);
   });
 
+  it('migrates legacy global session rows into the profile chat archive before sealing, idempotently', async () => {
+    fs.mkdirSync(legacyWorkspace, { recursive: true });
+    const legacySessions = path.join(tmpDir, 'sessions');
+    fs.mkdirSync(legacySessions, { recursive: true });
+    fs.writeFileSync(
+      path.join(legacySessions, 'active-legacy-chat.jsonl'),
+      JSON.stringify({
+        timestamp: '2026-08-26T10:00:00.000Z',
+        role: 'user',
+        content: 'pre-cutover health conversation',
+        chatId: 'legacy-chat',
+      }) + '\n',
+      'utf8',
+    );
+    jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const gatewayA = new Gateway(makeConfig());
+    await gatewayA.start();
+    await gatewayA.stop();
+
+    const dayFile = path.join(
+      baseDir,
+      'profiles',
+      'default',
+      '.state',
+      'sessions',
+      'legacy-chat',
+      '2026-08-26.jsonl',
+    );
+    expect(fs.readFileSync(dayFile, 'utf8')).toContain('pre-cutover health conversation');
+    // The post-migration SessionManager must resume the imported line into the same chat window.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((gatewayA as any).sessions.getHistory('legacy-chat').map((m: { content: string | null }) => m.content))
+      .toContain('pre-cutover health conversation');
+    const before = fs.readFileSync(dayFile, 'utf8');
+
+    const gatewayB = new Gateway(makeConfig());
+    await gatewayB.start();
+    await gatewayB.stop();
+    expect(fs.readFileSync(dayFile, 'utf8')).toBe(before);
+  });
+
+  it('does not seal profile migration when a legacy global session lane is unsafe', () => {
+    fs.mkdirSync(legacyWorkspace, { recursive: true });
+    const legacySessions = path.join(tmpDir, 'sessions');
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-migration-outside-'));
+    try {
+      fs.mkdirSync(legacySessions, { recursive: true });
+      fs.writeFileSync(path.join(outside, 'secret.jsonl'), 'secret\n', 'utf8');
+      fs.symlinkSync(
+        path.join(outside, 'secret.jsonl'),
+        path.join(legacySessions, 'active-legacy-chat.jsonl'),
+      );
+      const targetSessions = path.join(baseDir, 'profiles', 'default', '.state', 'sessions');
+      fs.mkdirSync(targetSessions, { recursive: true });
+      fs.writeFileSync(path.join(targetSessions, '.migrated'), 'old-session-sentinel\n', 'utf8');
+      const registry = new ProfileRegistry(baseDir);
+      const gateway = new Gateway(makeConfig());
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const result = (gateway as any).migrateAndResolveWorkspace(
+        registry,
+        'default' as ProfileId,
+        legacyWorkspace,
+      ) as string;
+
+      expect(result).toBe(legacyWorkspace);
+      expect(registry.hasBeenMigrated('default' as ProfileId, legacyWorkspace)).toBe(false);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   it('second boot is a no-op: sentinel prevents re-scanning the legacy workspace', async () => {
     fs.mkdirSync(legacyWorkspace, { recursive: true });
     fs.writeFileSync(path.join(legacyWorkspace, 'hello.md'), 'world', 'utf8');

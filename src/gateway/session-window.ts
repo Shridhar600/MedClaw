@@ -91,6 +91,7 @@ export function countDayFileLines(filePath: string): number {
 
 function nonEmptyLinesOf(filePath: string): string[] {
   try {
+    if (!fs.lstatSync(filePath).isFile()) return [];
     return fs.readFileSync(filePath, 'utf-8').split('\n').filter((l) => l.length > 0);
   } catch {
     return [];
@@ -100,7 +101,16 @@ function nonEmptyLinesOf(filePath: string): string[] {
 /** Sorted `YYYY-MM-DD.jsonl` basenames in `sessionsDir` (chronological). Empty on absent/unreadable dir. */
 export function listDayFiles(sessionsDir: string): string[] {
   try {
-    return fs.readdirSync(sessionsDir).filter((f) => DAY_FILE_RE.test(f)).sort();
+    return fs.readdirSync(sessionsDir)
+      .filter((f) => DAY_FILE_RE.test(f))
+      .filter((f) => {
+        try {
+          return fs.lstatSync(path.join(sessionsDir, f)).isFile();
+        } catch {
+          return false;
+        }
+      })
+      .sort();
   } catch {
     return [];
   }

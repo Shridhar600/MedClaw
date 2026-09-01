@@ -215,6 +215,39 @@ describe('Gateway chat→profile pairing', () => {
     }
   });
 
+  it('refuses a paired non-default chat before the default-profile agent or session can run', async () => {
+    const config = makeConfig(tmpDir);
+    const { gateway, registry, sessions } = buildGatewayWithRegistry(config);
+    const workProfile = registry.createProfile('work');
+    registry.pairChatToProfile('work-chat-42', workProfile.profileId);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const agent = (gateway as any).agentLoop;
+    const reply = await gateway.handleTestMessage('work-chat-42', 'show my private health history');
+
+    expect(reply).toContain('not recognized');
+    expect(agent.run).not.toHaveBeenCalled();
+    expect(sessions.getHistory('work-chat-42')).toEqual([]);
+  });
+
+  it('handleMessage also refuses a paired non-default chat while preserving emergency guidance', async () => {
+    const config = makeConfig(tmpDir);
+    const { gateway, registry } = buildGatewayWithRegistry(config);
+    const workProfile = registry.createProfile('work');
+    registry.pairChatToProfile('work-chat-42', workProfile.profileId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const send = (gateway as any).channel.send as jest.Mock;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (gateway as any).handleMessage({ chatId: 'work-chat-42', text: 'show my private health history' });
+    expect(send.mock.calls.at(-1)?.[1].text).toContain('not recognized');
+
+    send.mockClear();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (gateway as any).handleMessage({ chatId: 'work-chat-42', text: 'severe chest pain right now' });
+    expect(send).toHaveBeenCalledWith('work-chat-42', expect.objectContaining({ text: expect.stringMatching(/emergency/i) }));
+  });
+
   it('registry-less config still routes with default profileId (no crash)', async () => {
     const config = makeConfig(tmpDir, { withProfiles: false });
     const gateway = new Gateway(config);

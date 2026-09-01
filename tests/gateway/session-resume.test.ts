@@ -95,6 +95,31 @@ describe('session resume from window + day files (D1.5)', () => {
     expect((await b.prepareHistory('cy')).map((m: Message) => m.content)).toEqual(['y1']);
   });
 
+  it('does not resume a symlinked day file into a chat window', () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-resume-outside-'));
+    try {
+      const day = '2026-08-26.jsonl';
+      const outsideDay = path.join(outside, day);
+      fs.writeFileSync(outsideDay, JSON.stringify({
+        timestamp: '2026-08-26T10:00:00.000Z',
+        role: 'user',
+        content: 'other profile secret',
+        chatId: 'chatS',
+      }) + '\n');
+      fs.mkdirSync(path.join(dir, 'chatS'), { recursive: true });
+      fs.symlinkSync(outsideDay, path.join(dir, 'chatS', day));
+      fs.writeFileSync(
+        path.join(dir, 'session-window.chatS.json'),
+        JSON.stringify({ summaryBlock: '', verbatimFrom: { file: day, line: 0 } }),
+      );
+
+      const b = new SessionManager({ sessionsPath: dir, perChatArchive: true });
+      expect(b.getHistory('chatS')).toEqual([]);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   it('per-chat mode: one chat\'s compaction summary never leaks to another chat on resume (X-2)', async () => {
     const a = new SessionManager({
       sessionsPath: dir,
