@@ -17,7 +17,7 @@ export { NarrativeStore } from './narrative-store';
 export type { NarrativeAppendResult } from './narrative-store';
 
 // SAFETY.md rendered view
-export { SafetyView, SafetyRemovalRefusedError } from './safety-view';
+export { SafetyView, SafetyRemovalRefusedError, SafetyProjectionDirtyError } from './safety-view';
 export type { CriticalEvent } from './safety-view';
 
 // MEMORY.md curated budget engine

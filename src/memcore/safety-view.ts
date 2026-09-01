@@ -22,6 +22,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import type { Clock } from '../ports';
 import { systemClock } from '../ports';
 import { AppError } from '../shared/errors';
@@ -34,6 +35,18 @@ export class SafetyRemovalRefusedError extends AppError {
   constructor(message: string) {
     super(message);
   }
+}
+
+/** A safety projection is known to be stale or could not be durably validated. */
+export class SafetyProjectionDirtyError extends AppError {
+  constructor() {
+    super('SAFETY.md projection is unavailable until it is successfully re-rendered');
+  }
+}
+
+interface SafetyProjectionState {
+  sourceGeneration: string | null;
+  contentHash: string;
 }
 
 /** A Critical Event. `date` is caller bookkeeping only — the render NEVER emits it (C6a). */
@@ -66,30 +79,70 @@ function isMachineSection(i: ParsedItem): i is { kind: 'section'; heading: strin
   return i.kind === 'section' && MACHINE_HEADINGS.has(i.heading);
 }
 
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value !== null && typeof value === 'object') {
+    const object = value as Record<string, unknown>;
+    return Object.fromEntries(Object.keys(object).sort().map(key => [key, stableValue(object[key])]));
+  }
+  return value;
+}
+
 export class SafetyView {
   // The clock is part of the stable constructor contract (mirrors the other memcore
   // stores). P1 renders are date-free by design (C6a), so it is currently reserved.
   constructor(
     private readonly rootDir: string,
     private readonly clock: Clock = systemClock,
+    private readonly source?: () => Promise<LedgerFact[]>,
   ) {}
 
   private filePath(): string {
     return path.join(this.rootDir, 'SAFETY.md');
   }
 
+  private dirtyMarkerPath(): string {
+    return path.join(this.rootDir, '.state', 'safety-view.dirty');
+  }
+
+  private generationPath(): string {
+    return path.join(this.rootDir, '.state', 'safety-view.generation');
+  }
+
+  /** Persist a PHI-free signal that the current SAFETY bytes must not be served. */
+  markDirty(): void {
+    try {
+      secureWriteViaTmp(this.dirtyMarkerPath(), 'dirty\n');
+    } catch (e) {
+      console.warn('[safety-view] could not persist dirty marker:', summarizeErrorForLog(e));
+    }
+  }
+
   /** Regenerate SAFETY.md from the given facts; preserve Critical Events, Notes, and any other hand-written content. */
   async render(facts: LedgerFact[]): Promise<string> {
-    const { items } = this.load();
-    const preamble = items.find(i => i.kind === 'preamble')?.lines ?? [];
-    const rest = items.filter(i => i.kind !== 'preamble');
-    const preserved = rest.filter(i => i.kind !== 'section' || !MACHINE_HEADINGS.has(i.heading));
-    const rebuilt: ParsedItem[] = [
-      { kind: 'preamble', lines: preamble.length > 0 ? preamble : ['# Safety'] },
-      ...this.renderMachineSections(facts),
-      ...preserved,
-    ];
-    return this.writeItems(rebuilt);
+    // Mark before any read/replace so a process interruption during publication leaves a
+    // durable fail-closed signal for the next turn.
+    this.markDirty();
+    try {
+      const { items } = this.load();
+      const preamble = items.find(i => i.kind === 'preamble')?.lines ?? [];
+      const rest = items.filter(i => i.kind !== 'preamble');
+      const preserved = rest.filter(i => i.kind !== 'section' || !MACHINE_HEADINGS.has(i.heading));
+      const rebuilt: ParsedItem[] = [
+        { kind: 'preamble', lines: preamble.length > 0 ? preamble : ['# Safety'] },
+        ...this.renderMachineSections(facts),
+        ...preserved,
+      ];
+      const rendered = this.writeItems(rebuilt);
+      // The generation sidecar contains no health content. If it cannot be written, keep the
+      // dirty marker rather than serving a file whose source generation is unknown.
+      this.writeState(this.generationFor(facts), rendered);
+      this.clearDirtyMarker();
+      return rendered;
+    } catch (e) {
+      this.markDirty();
+      throw e;
+    }
   }
 
   /**
@@ -141,11 +194,49 @@ export class SafetyView {
    * rather than shipping a prompt with no SAFETY (H-1; medical-safety > resilience).
    */
   async read(): Promise<string | null> {
+    if (this.dirtyMarkerExists()) {
+      throw new SafetyProjectionDirtyError();
+    }
     try {
-      return await fs.promises.readFile(this.filePath(), 'utf-8');
+      const content = await fs.promises.readFile(this.filePath(), 'utf-8');
+      const state = this.readState();
+      if (state && state.contentHash !== this.contentHash(content)) {
+        this.markDirty();
+        throw new SafetyProjectionDirtyError();
+      }
+      if (this.source) {
+        let facts: LedgerFact[];
+        try {
+          facts = await this.source();
+        } catch {
+          this.markDirty();
+          throw new SafetyProjectionDirtyError();
+        }
+        if (
+          state === null
+          || state.sourceGeneration === null
+          || state.sourceGeneration !== this.generationFor(facts)
+          || state.contentHash !== this.contentHash(content)
+        ) {
+          this.markDirty();
+          throw new SafetyProjectionDirtyError();
+        }
+      }
+      return content;
     } catch (err) {
       const nodeErr = err as NodeJS.ErrnoException;
-      if (nodeErr.code === 'ENOENT') return null;
+      if (nodeErr.code === 'ENOENT') {
+        if (!this.source) return null;
+        try {
+          const facts = await this.source();
+          if (facts.length === 0) return null;
+        } catch {
+          // An unavailable source is also a fail-closed condition below.
+        }
+        this.markDirty();
+        throw new SafetyProjectionDirtyError();
+      }
+      if (err instanceof SafetyProjectionDirtyError) throw err;
       console.warn(`[safety-view] read failed (failing closed): ${summarizeErrorForLog(err)}`);
       throw err;
     }
@@ -298,8 +389,87 @@ export class SafetyView {
 
   private writeItems(items: ParsedItem[]): string {
     const text = this.assembleText(items);
-    secureWriteViaTmp(this.filePath(), text);
-    return text;
+    try {
+      secureWriteViaTmp(this.filePath(), text);
+      const previous = this.readState();
+      this.writeState(previous?.sourceGeneration ?? null, text);
+      return text;
+    } catch (e) {
+      this.markDirty();
+      throw e;
+    }
+  }
+
+  private dirtyMarkerExists(): boolean {
+    try {
+      fs.statSync(this.dirtyMarkerPath());
+      return true;
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') return false;
+      throw e;
+    }
+  }
+
+  private clearDirtyMarker(): void {
+    try {
+      fs.rmSync(this.dirtyMarkerPath(), { force: true });
+    } catch (e) {
+      // A failed clear is safe: the next read remains fail-closed and a later boot can retry.
+      console.warn('[safety-view] could not clear dirty marker:', summarizeErrorForLog(e));
+    }
+  }
+
+  private readState(): SafetyProjectionState | null {
+    try {
+      const raw = fs.readFileSync(this.generationPath(), 'utf-8').trim();
+      if (!raw) return null;
+      const parsed: unknown = JSON.parse(raw);
+      if (
+        typeof parsed !== 'object'
+        || parsed === null
+        || typeof (parsed as { contentHash?: unknown }).contentHash !== 'string'
+        || !(
+          (parsed as { sourceGeneration?: unknown }).sourceGeneration === null
+          || typeof (parsed as { sourceGeneration?: unknown }).sourceGeneration === 'string'
+        )
+      ) {
+        throw new Error('invalid SAFETY projection state');
+      }
+      return parsed as SafetyProjectionState;
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') return null;
+      throw e;
+    }
+  }
+
+  private writeState(sourceGeneration: string | null, content: string): void {
+    const state: SafetyProjectionState = {
+      sourceGeneration,
+      contentHash: this.contentHash(content),
+    };
+    secureWriteViaTmp(this.generationPath(), JSON.stringify(state) + '\n');
+  }
+
+  private contentHash(content: string): string {
+    return crypto.createHash('sha256').update(content).digest('hex');
+  }
+
+  private generationFor(facts: LedgerFact[]): string {
+    const canonical = facts
+      .map(f => ({
+        id: f.id,
+        entity: f.entity,
+        type: f.type,
+        version: f.version,
+        status: f.status,
+        fields: stableValue(f.fields),
+        safetyRelevant: f.safetyRelevant,
+        provenance: stableValue(f.provenance),
+      }))
+      .sort((a, b) => `${a.type}::${a.entity}::${a.id}`.localeCompare(`${b.type}::${b.entity}::${b.id}`));
+    return crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
   }
 
   private assembleText(items: ParsedItem[]): string {

@@ -298,13 +298,13 @@ describe('RecallEngine — Stage 4 (feedback + auto-mute)', () => {
 });
 
 describe('RecallEngine — resilience (never crashes the turn)', () => {
-  it('a throwing factMirror degrades each stage rather than crashing', async () => {
+  it('a throwing factMirror fails closed for narrative suppression while preserving turn safety', async () => {
     // An async-iterable that rejects on iteration (avoids a yield-less generator, require-yield).
     const boom = (): AsyncIterable<FactRecord> => ({
       [Symbol.asyncIterator]: () => ({ next: () => Promise.reject(new Error('boom')) }),
     });
     const throwingMirror: FactMirror = {
-      upsert: async () => {}, rebuild: async () => {},
+      upsert: async () => {}, replaceType: async () => {}, rebuild: async () => {},
       queryActive: boom, queryPaused: boom, queryEntityHeads: boom,
     };
     const chunk = chunkHit({ id: 'c', content: 'a note that scores well enough here', createdAt: '2026-10-01T00:00:00.000Z', score: 0.9 });
@@ -312,8 +312,9 @@ describe('RecallEngine — resilience (never crashes the turn)', () => {
       .run({ profileId: 'default', userMessage: 'note' });
     expect(r.ledger).toBe('');  // stage 1 degraded
     expect(r.checkNotes).toBe('');  // stage 3 degraded
-    // stage 2 heads-load caught → no suppression → the chunk still surfaces (best-effort)
-    expect(r.narrative).toContain('a note that scores well enough');
+    // A failed head read must never disable stale suppression and look healthy.
+    expect(r.narrative).toBe('');
+    expect(r.indexStatus).toBe('failed');
   });
 });
 
@@ -394,6 +395,17 @@ describe('RecallEngine — Wave B fix-pass (panel findings)', () => {
     const r = await makeEngine({ factMirror: mirror, vectorIndex: new FakeVectorIndex([chunk]) })
       .run({ profileId: 'default', userMessage: 'urinary problems' });
     expect(r.injectedChunkIds).not.toContain('utick');
+  });
+
+  it('C-21: a disputed entity is suppressed from automatic narrative recall', async () => {
+    const mirror = new FakeFactMirror([
+      frec({ id: 'dose-change@v2', entity: 'dose-change', type: 'medication', version: 2, status: 'disputed' }),
+    ]);
+    const chunk = chunkHit({ id: 'disputed-ck', content: 'dose-change was 10mg yesterday', lane: 'narrative', score: 0.95 });
+    const r = await makeEngine({ factMirror: mirror, vectorIndex: new FakeVectorIndex([chunk]) })
+      .run({ profileId: 'default', userMessage: 'what was the dose change' });
+    expect(r.injectedChunkIds).not.toContain('disputed-ck');
+    expect(r.narrative).not.toContain('dose-change was 10mg');
   });
 
   // F8: a throwing chunkStats.get must not sink the whole turn (per-dependency resilience).

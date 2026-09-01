@@ -263,4 +263,56 @@ describe('SafetyView.read', () => {
     fs.mkdirSync(safetyFile());
     await expect(sv.read()).rejects.toThrow();
   });
+
+  it('refuses to serve a known-dirty SAFETY projection', async () => {
+    const sv = new SafetyView(tmpDir);
+    await sv.render([fact('penicillin', 'allergy', { status: 'active', safetyRelevant: true })]);
+    const stateDir = path.join(tmpDir, '.state');
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, 'safety-view.dirty'), 'dirty\n');
+
+    await expect(sv.read()).rejects.toThrow(/dirty|stale|projection/i);
+  });
+
+  it('refuses a SAFETY file whose stored generation no longer matches the source facts', async () => {
+    let currentFacts = [fact('penicillin', 'allergy', { status: 'active', safetyRelevant: true })];
+    const SafetyViewWithSource = SafetyView as unknown as new (
+      rootDir: string,
+      clock: undefined,
+      source: () => Promise<typeof currentFacts>,
+    ) => SafetyView;
+    const sv = new SafetyViewWithSource(tmpDir, undefined, async () => currentFacts);
+    await sv.render(currentFacts);
+    currentFacts = [fact('lisinopril', 'medication', { status: 'active', safetyRelevant: true })];
+
+    await expect(sv.read()).rejects.toThrow(/dirty|stale|generation|projection/i);
+  });
+
+  it('refuses externally changed SAFETY bytes even when the source facts are unchanged', async () => {
+    const facts = [fact('penicillin', 'allergy', { status: 'active', safetyRelevant: true })];
+    const SafetyViewWithSource = SafetyView as unknown as new (
+      rootDir: string,
+      clock: undefined,
+      source: () => Promise<typeof facts>,
+    ) => SafetyView;
+    const sv = new SafetyViewWithSource(tmpDir, undefined, async () => facts);
+    await sv.render(facts);
+    fs.appendFileSync(safetyFile(), '\nexternally changed\n');
+
+    await expect(sv.read()).rejects.toThrow(/dirty|stale|generation|projection/i);
+  });
+
+  it('refuses a missing SAFETY file when the source still has safety facts', async () => {
+    const facts = [fact('penicillin', 'allergy', { status: 'active', safetyRelevant: true })];
+    const SafetyViewWithSource = SafetyView as unknown as new (
+      rootDir: string,
+      clock: undefined,
+      source: () => Promise<typeof facts>,
+    ) => SafetyView;
+    const sv = new SafetyViewWithSource(tmpDir, undefined, async () => facts);
+    await sv.render(facts);
+    fs.unlinkSync(safetyFile());
+
+    await expect(sv.read()).rejects.toThrow(/dirty|stale|generation|projection/i);
+  });
 });

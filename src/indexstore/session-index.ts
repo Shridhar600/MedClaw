@@ -84,8 +84,7 @@ export class SqliteSessionIndex {
     try {
       if (this.sessionsDir && (this.isEmpty() || this.dirtyMarkerExists() || this.ftsParityBroken())) {
         this.resetDerivedTables();
-        this.rebuildFromDayFiles();
-        this.clearDirtyMarker();
+        if (this.rebuildFromDayFiles()) this.clearDirtyMarker();
       }
     } catch (e) {
       console.warn('[session-index] boot rebuild skipped:', summarizeErrorForLog(e));
@@ -127,9 +126,9 @@ export class SqliteSessionIndex {
           // H8: a dropped/damaged derived table is not repaired by an upsert — reset both tables, then
           // rebuild the whole archive before retrying.
           this.resetDerivedTables();
-          this.rebuildFromDayFiles();
-          this.clearDirtyMarker();
-          return { hits: this.runSearch(query, limit, opts?.chatId), status: 'full' };
+          const complete = this.rebuildFromDayFiles();
+          if (complete) this.clearDirtyMarker();
+          return { hits: this.runSearch(query, limit, opts?.chatId), status: complete ? 'full' : 'failed' };
         } catch (e2) {
           console.warn('[session-index] search failed after rebuild:', summarizeErrorForLog(e2));
           return { hits: [], status: 'failed' };
@@ -147,10 +146,12 @@ export class SqliteSessionIndex {
    * path's anchor assignment. In a per-chat layout the containing directory supplies the chat scope; a
    * flat legacy file falls back to its embedded chatId. Idempotent via the `<chatId>#<file>#<line>` upsert.
    */
-  rebuildFromDayFiles(sessionsDir?: string): void {
+  rebuildFromDayFiles(sessionsDir?: string): boolean {
     const root = sessionsDir ?? this.sessionsDir;
-    if (!root) return;
-    const files = SqliteSessionIndex.listDayFilePaths(root);
+    if (!root) return true;
+    const listing = SqliteSessionIndex.listDayFilePaths(root);
+    const files = listing.paths;
+    let complete = listing.complete;
     this.db.transaction(() => {
       for (const fp of files) {
         const base = path.basename(fp);
@@ -160,6 +161,7 @@ export class SqliteSessionIndex {
           lines = fs.readFileSync(fp, 'utf-8').split('\n').filter((l) => l.length > 0);
         } catch (e) {
           console.warn('[session-index] rebuild: unreadable day file skipped:', summarizeErrorForLog(e));
+          complete = false;
           continue;
         }
         for (let i = 0; i < lines.length; i++) {
@@ -184,13 +186,16 @@ export class SqliteSessionIndex {
         }
       }
     })();
+    if (!complete) this.markDirty();
+    return complete;
   }
 
   /** C-12: reset stale derived anchors, rebuild from the append-only archive, then clear dirty state. */
-  reconcileFromDayFiles(): void {
+  reconcileFromDayFiles(): boolean {
     this.resetDerivedTables();
-    this.rebuildFromDayFiles();
-    this.clearDirtyMarker();
+    const complete = this.rebuildFromDayFiles();
+    if (complete) this.clearDirtyMarker();
+    return complete;
   }
 
   isEmpty(): boolean {
@@ -268,13 +273,27 @@ export class SqliteSessionIndex {
     this.initSchema();
   }
 
-  // H8: the metadata has rows but the derived FTS is empty (a dropped/recreated FTS table) — the index is
-  // silently broken and would return healthy-looking empty results. Treat an unreadable table as broken.
+  // H8/C-11: metadata and derived FTS must have the same ids in both directions. Counts catch a lost
+  // row; the anti-joins catch an orphan FTS row with equal counts.
   private ftsParityBroken(): boolean {
     try {
       const meta = (this.db.prepare('SELECT COUNT(*) AS c FROM session_turns').get() as { c: number }).c;
       const fts = (this.db.prepare('SELECT COUNT(*) AS c FROM session_turns_fts').get() as { c: number }).c;
-      return meta > 0 && fts === 0;
+      if (meta !== fts) return true;
+      const missingFts = this.db.prepare(`
+        SELECT 1 AS broken
+        FROM session_turns m
+        WHERE NOT EXISTS (SELECT 1 FROM session_turns_fts f WHERE f.id = m.id)
+        LIMIT 1
+      `).get() as { broken: number } | undefined;
+      if (missingFts) return true;
+      const orphanFts = this.db.prepare(`
+        SELECT 1 AS broken
+        FROM session_turns_fts f
+        WHERE NOT EXISTS (SELECT 1 FROM session_turns m WHERE m.id = f.id)
+        LIMIT 1
+      `).get() as { broken: number } | undefined;
+      return Boolean(orphanFts);
     } catch {
       return true;
     }
@@ -310,14 +329,16 @@ export class SqliteSessionIndex {
     return parts.length > 1 ? parts[0] : '';
   }
 
-  private static listDayFilePaths(root: string): string[] {
+  private static listDayFilePaths(root: string): { paths: string[]; complete: boolean } {
     const out: string[] = [];
+    let complete = true;
     const walk = (dir: string): void => {
       let entries: fs.Dirent[];
       try {
         entries = fs.readdirSync(dir, { withFileTypes: true });
       } catch {
-        return; // unreadable dir — skip (resilience)
+        complete = false;
+        return; // unreadable dir — skip but retain the durable retry marker
       }
       for (const e of entries) {
         const full = path.join(dir, e.name);
@@ -332,7 +353,7 @@ export class SqliteSessionIndex {
       }
     };
     walk(root);
-    return out.sort();
+    return { paths: out.sort(), complete };
   }
 
   private static escapeFts(token: string): string {

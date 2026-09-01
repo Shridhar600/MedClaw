@@ -18,11 +18,15 @@ export interface SqliteFactMirrorConfig {
 }
 
 /**
- * Deterministic entity-head tiebreak (F11): higher version wins; on a version tie the later
+ * Deterministic entity-head selection: an active lifecycle winner beats a terminal/non-active
+ * record; within the same lifecycle state, higher version wins; on a version tie the later
  * createdAt wins; on a createdAt tie the higher id wins. `cur` undefined ⇒ candidate wins.
  */
 export function headWins(cand: FactRecord, cur: FactRecord | undefined): boolean {
   if (!cur) return true;
+  const candActive = cand.status === 'active';
+  const curActive = cur.status === 'active';
+  if (candActive !== curActive) return candActive;
   if (cand.version !== cur.version) return cand.version > cur.version;
   if (cand.createdAt !== cur.createdAt) return cand.createdAt > cur.createdAt;
   return cand.id > cur.id;
@@ -49,6 +53,15 @@ export class SqliteFactMirror implements FactMirror {
       for (const f of rows) stmt.run(this.toParams(f));
     });
     run(facts);
+  }
+
+  async replaceType(type: string, facts: FactRecord[]): Promise<void> {
+    const replace = this.db.transaction((scope: string, rows: FactRecord[]) => {
+      this.db.prepare('DELETE FROM facts WHERE type = ?').run(scope);
+      const stmt = this.upsertStmt();
+      for (const f of rows) stmt.run(this.toParams(f));
+    });
+    replace(type, facts);
   }
 
   async *queryActive(type?: string, entity?: string): AsyncIterable<FactRecord> {
@@ -86,19 +99,19 @@ export class SqliteFactMirror implements FactMirror {
   }
 
   async *queryEntityHeads(): AsyncIterable<FactRecord> {
-    // ONE head per entity: max version across all statuses (version >= 1 → excludes v0 sentinels,
-    // M-5). The correlated MAX can match multiple rows on a version tie, so we resolve to a single
-    // deterministic head (latest createdAt, then highest id) — pinned by the contract (F11). Bounded
-    // by entity count (per-profile) — not a full-table slurp.
+    // One lifecycle head per (type, entity): active wins over terminal/non-active records, then
+    // version/createdAt/id provide deterministic ordering. v0 quarantine sentinels are excluded.
+    // The mirror is per-profile and this is the existing bounded head-read seam.
     const rows = this.db.prepare(`
       SELECT f.json AS json FROM facts f
       WHERE f.version >= 1
-        AND f.version = (SELECT MAX(f2.version) FROM facts f2 WHERE f2.entity = f.entity AND f2.version >= 1)
     `).all() as FactRow[];
     const byEntity = new Map<string, FactRecord>();
     for (const r of rows) {
       const parsed = this.parseRow(r);
-      if (parsed && headWins(parsed, byEntity.get(parsed.entity))) byEntity.set(parsed.entity, parsed);
+      if (!parsed) continue;
+      const key = `${parsed.type}::${parsed.entity}`;
+      if (headWins(parsed, byEntity.get(key))) byEntity.set(key, parsed);
     }
     for (const h of byEntity.values()) yield h;
   }
@@ -126,7 +139,7 @@ export class SqliteFactMirror implements FactMirror {
   private initSchema(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS facts (
-        id TEXT PRIMARY KEY,
+        id TEXT NOT NULL,
         profile_id TEXT,
         entity TEXT,
         type TEXT,
@@ -139,11 +152,56 @@ export class SqliteFactMirror implements FactMirror {
         confidence REAL,
         episode_id TEXT,
         created_at TEXT,
-        json TEXT NOT NULL
+        json TEXT NOT NULL,
+        PRIMARY KEY (type, id)
       );
+    `);
+    this.migrateLegacyPrimaryKey();
+    this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_facts_entity ON facts(entity, status);
       CREATE INDEX IF NOT EXISTS idx_facts_type ON facts(type, status);
     `);
+  }
+
+  /** Rebuild the pre-RR-5 id-only table so same-name facts in different types can coexist. */
+  private migrateLegacyPrimaryKey(): void {
+    const columns = this.db.prepare('PRAGMA table_info(facts)').all() as Array<{ name: string; pk: number }>;
+    const primaryKey = columns.filter(c => c.pk > 0).sort((a, b) => a.pk - b.pk).map(c => c.name);
+    if (primaryKey.length !== 1 || primaryKey[0] !== 'id') return;
+
+    const migrate = this.db.transaction(() => {
+      this.db.exec('DROP TABLE IF EXISTS facts_rr5_new');
+      this.db.exec(`
+        CREATE TABLE facts_rr5_new (
+          id TEXT NOT NULL,
+          profile_id TEXT,
+          entity TEXT,
+          type TEXT,
+          version INTEGER NOT NULL DEFAULT 0,
+          status TEXT,
+          supersedes TEXT,
+          superseded_by TEXT,
+          safety_relevant INTEGER NOT NULL DEFAULT 0,
+          authority TEXT,
+          confidence REAL,
+          episode_id TEXT,
+          created_at TEXT,
+          json TEXT NOT NULL,
+          PRIMARY KEY (type, id)
+        )
+      `);
+      this.db.exec(`
+        INSERT OR REPLACE INTO facts_rr5_new
+          (id, profile_id, entity, type, version, status, supersedes, superseded_by,
+           safety_relevant, authority, confidence, episode_id, created_at, json)
+        SELECT id, profile_id, entity, type, version, status, supersedes, superseded_by,
+               safety_relevant, authority, confidence, episode_id, created_at, json
+        FROM facts
+      `);
+      this.db.exec('DROP TABLE facts');
+      this.db.exec('ALTER TABLE facts_rr5_new RENAME TO facts');
+    });
+    migrate();
   }
 
   private upsertStmt(): Database.Statement {
@@ -154,7 +212,7 @@ export class SqliteFactMirror implements FactMirror {
       VALUES
         (@id, @profileId, @entity, @type, @version, @status, @supersedes, @supersededBy,
          @safetyRelevant, @authority, @confidence, @episodeId, @createdAt, @json)
-      ON CONFLICT(id) DO UPDATE SET
+      ON CONFLICT(type, id) DO UPDATE SET
         profile_id = excluded.profile_id,
         entity = excluded.entity,
         type = excluded.type,

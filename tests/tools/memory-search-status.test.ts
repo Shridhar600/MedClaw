@@ -30,6 +30,7 @@ function makeMirror(heads: FactRecord[], opts: { throws?: boolean } = {}): FactM
   }
   return {
     upsert: async () => {},
+    replaceType: async () => {},
     queryActive: async function* () {},
     queryPaused: async function* () {},
     queryEntityHeads: headsGen,
@@ -70,6 +71,12 @@ describe('memory_search status filter (CONTRA-06/08)', () => {
 
   it('defaults to active when status is omitted', async () => {
     const r = await tool(makeMirror(staleHeads)).execute({ query: 'metformin' });
+    expect(r.content[0].text).not.toContain('metformin');
+    expect(r.content[0].text).toContain('lisinopril');
+  });
+
+  it('status:active drops chunks whose entity head is disputed', async () => {
+    const r = await tool(makeMirror([headRec('metformin', 'disputed')])).execute({ query: 'metformin', status: 'active' });
     expect(r.content[0].text).not.toContain('metformin');
     expect(r.content[0].text).toContain('lisinopril');
   });

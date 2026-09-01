@@ -5,6 +5,7 @@ import * as os from 'os';
 import { MemoryIndexer } from '../../src/memory/indexer';
 import { SqliteStore } from '../../src/memory/sqlite-store';
 import type { LLMProvider } from '../../src/providers/types';
+import { SqliteKeywordIndex } from '../../src/indexstore';
 
 describe('MemoryIndexer', () => {
   let tmpDir: string;
@@ -186,5 +187,119 @@ describe('MemoryIndexer', () => {
     expect(store.getChunksByPath('delete.md')).toHaveLength(0);
     expect(store.getFileHash('delete.md')).toBeUndefined();
     expect(store.getChunksByPath('keep.md').length).toBeGreaterThan(0);
+  });
+
+  it('writes canonical lane and created_at metadata for live v2 adapter reads', async () => {
+    fs.mkdirSync(path.join(workspaceDir, 'ledger'), { recursive: true });
+    fs.writeFileSync(path.join(workspaceDir, 'ledger', 'medications.md'), '## metformin\n- dose: 500mg\n');
+
+    await new MemoryIndexer(store, mockProvider, workspaceDir).indexAll();
+
+    const keyword = new SqliteKeywordIndex({ dbPath: path.join(tmpDir, 'test.db') });
+    try {
+      const hits = [];
+      for await (const hit of keyword.match('metformin', 5)) hits.push(hit);
+      expect(hits).toEqual(expect.arrayContaining([
+        expect.objectContaining({ lane: 'ledger', createdAt: expect.stringMatching(/\S/) }),
+      ]));
+    } finally {
+      keyword.close();
+    }
+  });
+
+  it('re-embeds an unchanged file when the embedding model changes', async () => {
+    const filePath = path.join(workspaceDir, 'model-change.md');
+    fs.writeFileSync(filePath, '# Model change\n\nmodel identity must invalidate old vectors.');
+
+    const oldProvider: LLMProvider = {
+      modelName: 'model-old',
+      chat: jest.fn(),
+      embed: jest.fn().mockResolvedValue([1, 0]),
+    };
+    await new MemoryIndexer(store, oldProvider, workspaceDir).indexAll();
+
+    const newProvider: LLMProvider = {
+      modelName: 'model-new',
+      chat: jest.fn(),
+      embed: jest.fn().mockResolvedValue([0, 1]),
+    };
+    await new MemoryIndexer(store, newProvider, workspaceDir).indexAll();
+
+    expect((newProvider.embed as jest.Mock).mock.calls.some(([text]) => text !== 'test')).toBe(true);
+    expect(store.getAllChunksWithEmbeddings()[0].embedding).toEqual([0, 1]);
+  });
+
+  it('leaves an empty resolved embedding file dirty instead of marking it current', async () => {
+    const filePath = path.join(workspaceDir, 'empty-vector.md');
+    fs.writeFileSync(filePath, '# Empty vector\n\nThis chunk has no usable embedding.');
+    const provider: LLMProvider = {
+      modelName: 'empty-vector-model',
+      chat: jest.fn(),
+      embed: jest.fn().mockImplementation(async (text: string) => text === 'test' ? [1, 0] : []),
+    };
+
+    await new MemoryIndexer(store, provider, workspaceDir).indexAll();
+
+    expect(store.getFileHash('empty-vector.md')).toMatch(/^embedding-partial:/);
+    expect(store.getAllChunksWithEmbeddings().find(chunk => chunk.path === 'empty-vector.md')?.embedding)
+      .toBeUndefined();
+  });
+
+  it('does not destroy an existing vector table when the dimension probe fails', async () => {
+    const filePath = path.join(workspaceDir, 'probe-outage.md');
+    fs.writeFileSync(filePath, '# Probe outage\n\nExisting vector content.');
+    const healthy: LLMProvider = {
+      modelName: 'stable-model',
+      chat: jest.fn(),
+      embed: jest.fn().mockResolvedValue([1, 0, 0, 0]),
+    };
+    await new MemoryIndexer(store, healthy, workspaceDir).indexAll();
+    const beforeDimension = (store.db.prepare("SELECT value FROM meta WHERE key = 'embedding_dimension'").get() as { value: string }).value;
+    const beforeVectors = (store.db.prepare('SELECT COUNT(*) AS count FROM chunks_vec0').get() as { count: number }).count;
+
+    const outage: LLMProvider = {
+      modelName: 'stable-model',
+      chat: jest.fn(),
+      embed: jest.fn().mockRejectedValue(new Error('embedding outage')),
+    };
+    await new MemoryIndexer(store, outage, workspaceDir).indexAll();
+
+    const afterDimension = (store.db.prepare("SELECT value FROM meta WHERE key = 'embedding_dimension'").get() as { value: string }).value;
+    const afterVectors = (store.db.prepare('SELECT COUNT(*) AS count FROM chunks_vec0').get() as { count: number }).count;
+    expect(afterDimension).toBe(beforeDimension);
+    expect(afterVectors).toBe(beforeVectors);
+  });
+
+  it('does not publish an older embedding after a newer same-path index finishes', async () => {
+    const filePath = path.join(workspaceDir, 'race.md');
+    fs.writeFileSync(filePath, '# Baseline');
+    let releaseOld!: () => void;
+    let signalOldStarted!: () => void;
+    const started = new Promise<void>(resolve => { signalOldStarted = resolve; });
+    const provider: LLMProvider = {
+      modelName: 'race-model',
+      chat: jest.fn(),
+      embed: jest.fn().mockImplementation(async (text: string) => {
+        if (text === 'test') return [1, 0];
+        if (text.includes('OLD')) {
+          signalOldStarted();
+          await new Promise<void>(resolve => { releaseOld = resolve; });
+          return [1, 0];
+        }
+        return [0, 1];
+      }),
+    };
+    await new MemoryIndexer(store, provider, workspaceDir).indexAll();
+
+    fs.writeFileSync(filePath, '# OLD content');
+    const indexOld = new MemoryIndexer(store, provider, workspaceDir).indexFile('race.md');
+    await started;
+    fs.writeFileSync(filePath, '# NEW content');
+    const indexNew = new MemoryIndexer(store, provider, workspaceDir).indexFile('race.md');
+    await indexNew;
+    releaseOld();
+    await indexOld;
+
+    expect(store.getChunksByPath('race.md')[0].content).toContain('NEW content');
   });
 });

@@ -30,6 +30,8 @@ export interface SafetyReader {
 export interface AssemblerRecall {
   /** Stage-1 active-ledger one-liners (all active health facts). */
   ledger: string;
+  /** Stage-1 dropped one or more facts at its own budget boundary. */
+  ledgerTruncated?: boolean;
   /** Stage-2 hybrid-recall hits, budget-bounded by the engine. */
   hits: readonly { id: string; content: string }[];
   /** Stage-3 deterministic side-effect CHECK: lines. */
@@ -176,8 +178,11 @@ export class ContextAssembler {
     //    live in the SessionManager-owned history row).
     let hitsShown = false;
     if (recall) {
-      if (vol.ledger && recall.ledger && recall.ledger.trim() !== '') {
-        raw.push({ key: 'active-ledger', title: 'ACTIVE HEALTH FACTS', layer: 3, cacheStable: false, content: recall.ledger });
+      if (vol.ledger && (recall.ledger.trim() !== '' || recall.ledgerTruncated)) {
+        const ledger = recall.ledgerTruncated
+          ? (recall.ledger.trim() !== '' ? `${recall.ledger}\n… (truncated)` : '… (truncated)')
+          : recall.ledger;
+        raw.push({ key: 'active-ledger', title: 'ACTIVE HEALTH FACTS', layer: 3, cacheStable: false, content: ledger });
       }
       if (vol.hits && recall.hits.length > 0) {
         const body = recall.hits.map(h => `- [${h.id}] ${h.content}`).join('\n');

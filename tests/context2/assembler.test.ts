@@ -117,6 +117,25 @@ describe('ContextAssembler v2 — chat-mode injection map (C1)', () => {
     expect(check.cacheStable).toBe(false);
   });
 
+  it('marks an active-ledger section as truncated when RecallEngine hit its ledger budget', async () => {
+    const report = await make(FULL_FILES, SAFETY).assemble('default', 'chat', {
+      ...RECALL,
+      ledgerTruncated: true,
+    });
+    const ledger = report.sections.find(s => s.key === 'active-ledger')!;
+    expect(ledger.content).toContain('… (truncated)');
+  });
+
+  it('keeps a truncation marker when the ledger budget retains no fact lines', async () => {
+    const report = await make(FULL_FILES, SAFETY).assemble('default', 'chat', {
+      ...RECALL,
+      ledger: '',
+      ledgerTruncated: true,
+    });
+    const ledger = report.sections.find(s => s.key === 'active-ledger');
+    expect(ledger?.content).toContain('… (truncated)');
+  });
+
   it('the runtime clock date lives ONLY below the cache boundary (PLAT-22 / H-2)', async () => {
     const report = await make(FULL_FILES, SAFETY).assemble('default', 'chat', RECALL);
     const above = aboveBoundary(report).map(s => s.content).join('\n');

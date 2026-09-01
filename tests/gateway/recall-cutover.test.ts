@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
+import { SafetyView } from '../../src/memcore';
 import type { AppConfig } from '../../src/config/types';
 import type { LLMProvider, LLMResponse, Message } from '../../src/providers/types';
 
@@ -150,5 +151,25 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
     // SAFETY.md exists on disk and is injected fresh; the turn did not throw despite no embeddings.
     expect(fs.readFileSync(path.join(workspace, 'SAFETY.md'), 'utf8')).toContain('lisinopril');
     expect(lastSystem(seen)).toContain('lisinopril');
+  });
+
+  it('fails closed on the next live turn after SAFETY publication fails', async () => {
+    gateway = await startGateway(tmpDir);
+    const seen = captureProvider(gateway);
+    const renderSpy = jest.spyOn(SafetyView.prototype, 'render').mockRejectedValueOnce(new Error('render failure'));
+    try {
+      const result = await registryOf().execute('ledger_record', {
+        entity: 'penicillin', type: 'allergy', fields: { reaction: 'hives' }, note: 'penicillin allergy',
+      });
+      expect(result.isError).toBe(true);
+      expect(fs.existsSync(path.join(workspace, '.state', 'safety-view.dirty'))).toBe(true);
+
+      const providerCallsBefore = seen.length;
+      const reply = await gateway.handleTestMessage('chat-1', 'what should I know about antibiotics');
+      expect(reply).toContain("trouble right now");
+      expect(seen.length).toBe(providerCallsBefore);
+    } finally {
+      renderSpy.mockRestore();
+    }
   });
 });

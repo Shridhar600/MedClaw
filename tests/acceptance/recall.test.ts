@@ -208,6 +208,25 @@ describe('P2 recall acceptance (real adapters, disk-backed → assembled prompt)
     expect(ctx).toContain('metformin (medication) active'); // the active head still shows via Stage-1
   });
 
+  it('C-22 — a resolved lower-version active winner does not suppress its narrative entity', async () => {
+    await mirror.upsert([
+      {
+        id: 'metformin@v2', profileId: 'default', entity: 'metformin', type: 'medication', version: 2,
+        status: 'active', fields: { dose: '850mg' }, safetyRelevant: true, authority: 'doctor', confidence: 0.95,
+        createdAt: '2026-08-22T00:00:00.000Z',
+      },
+      {
+        id: 'metformin@v3', profileId: 'default', entity: 'metformin', type: 'medication', version: 3,
+        status: 'superseded', fields: { dose: '500mg' }, safetyRelevant: true, authority: 'doctor', confidence: 0.95,
+        createdAt: '2026-08-23T00:00:00.000Z',
+      },
+    ]);
+    seedChunk('resolved-metformin', 'metformin narrative history remains relevant', { createdAt: NOW });
+
+    const report = await build().run({ profileId: 'default', userMessage: 'tell me about metformin history' });
+    expect(report.narrative).toContain('metformin narrative history remains relevant');
+  });
+
   it('CHAT-08 — dormant recall stays within budget: at most finalTopK hits, under the narrative budget', async () => {
     for (let i = 0; i < 8; i++) seedChunk(`knee-${i}`, `knee soreness note number ${i} after a gym workout session`, { createdAt: NOW });
     const report = await build().run({ profileId: 'default', userMessage: 'knee and workout' });

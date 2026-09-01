@@ -24,6 +24,22 @@ export class VectorDimensionMismatchError extends Error {
   }
 }
 
+/** A vector arm cannot answer queries and must be reported as degraded by RecallEngine. */
+export class VectorIndexUnavailableError extends Error {
+  constructor(message = 'vector index is unavailable') {
+    super(message);
+    this.name = 'VectorIndexUnavailableError';
+  }
+}
+
+/** The vector query failed after the arm was selected; callers must not treat completion as healthy. */
+export class VectorQueryFailedError extends Error {
+  constructor() {
+    super('vector index query failed');
+    this.name = 'VectorQueryFailedError';
+  }
+}
+
 export interface SqliteVecIndexConfig {
   dbPath: string;
   /** Fix the vector dimension eagerly; otherwise it is fixed by the first embedded upsert. */
@@ -62,7 +78,17 @@ export class SqliteVecIndex implements VectorIndex {
       console.warn('[sqlite-vec-index] sqlite-vec unavailable, vector ops disabled:', summarizeErrorForLog(e));
     }
     this.initSchema();
-    if (this.dimension !== null) this.ensureVecTable(this.dimension);
+    const existingDimension = this.readExistingDimension();
+    if (existingDimension !== null) {
+      if (this.dimension !== null && this.dimension !== existingDimension) {
+        throw new VectorDimensionMismatchError(
+          `configured vector dimension ${this.dimension} != existing index dimension ${existingDimension}`,
+        );
+      }
+      this.dimension = existingDimension;
+    } else if (this.dimension !== null) {
+      this.ensureVecTable(this.dimension);
+    }
   }
 
   async upsert(chunks: Chunk[]): Promise<void> {
@@ -115,19 +141,22 @@ export class SqliteVecIndex implements VectorIndex {
   }
 
   async *queryKnn(embedding: number[], k: number, filter?: Record<string, unknown>): AsyncIterable<ChunkWithScore> {
-    // Live-path lazy dimension adoption (C-1): the recall READ adapter is constructed without a
-    // dimension and never upserts (the P0 store is the sole chunk writer), so `this.dimension` would
-    // otherwise stay null and this method would silently yield zero rows forever. Adopt the query
-    // embedding's length — the existing chunks_vec0 (created by the store) is matched IF NOT EXISTS.
-    if (this.dimension === null && this.hasVec && embedding.length > 0) {
-      this.ensureVecTable(embedding.length);
+    if (k <= 0) return;
+    if (!this.hasVec) throw new VectorIndexUnavailableError();
+    // The live read adapter has no configured dimension. Read the dimension from the existing
+    // table/meta before validating the query; never adopt a mismatching query length as truth.
+    if (this.dimension === null) {
+      const existingDimension = this.readExistingDimension();
+      if (existingDimension !== null) this.dimension = existingDimension;
+      else if (!this.vectorTableExists()) this.ensureVecTable(embedding.length);
+      else throw new VectorIndexUnavailableError('vector index dimension is unavailable');
     }
     if (this.dimension !== null && embedding.length !== this.dimension) {
       throw new VectorDimensionMismatchError(
         `query embedding dimension ${embedding.length} != index dimension ${this.dimension}`,
       );
     }
-    if (!this.hasVec || this.dimension === null || k <= 0) return;
+    if (this.dimension === null) throw new VectorIndexUnavailableError('vector index dimension is unavailable');
 
     let rows: ChunkRow[];
     try {
@@ -141,7 +170,7 @@ export class SqliteVecIndex implements VectorIndex {
     } catch (e) {
       // A vec query error object can echo the embedding — sanitized frame only.
       console.warn('[sqlite-vec-index] knn query failed:', summarizeErrorForLog(e));
-      return;
+      throw new VectorQueryFailedError();
     }
 
     for (const r of rows) {
@@ -215,10 +244,40 @@ export class SqliteVecIndex implements VectorIndex {
 
   private ensureVecTable(dim: number): void {
     if (!this.hasVec) return;
+    const existingDimension = this.readExistingDimension();
+    if (existingDimension !== null && existingDimension !== dim) {
+      this.dimension = existingDimension;
+      throw new VectorDimensionMismatchError(
+        `query embedding dimension ${dim} != index dimension ${existingDimension}`,
+      );
+    }
     this.db.exec(
       `CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec0 USING vec0(chunk_id TEXT, embedding FLOAT[${dim}] distance_metric=cosine)`,
     );
     this.dimension = dim;
+  }
+
+  private vectorTableExists(): boolean {
+    const row = this.db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'chunks_vec0'").get() as { present: number } | undefined;
+    return row?.present === 1;
+  }
+
+  private readExistingDimension(): number | null {
+    if (this.vectorTableExists()) {
+      const row = this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chunks_vec0'").get() as { sql: string | null } | undefined;
+      const match = row?.sql?.match(/FLOAT\[(\d+)\]/i);
+      const dimension = match ? Number.parseInt(match[1], 10) : NaN;
+      if (Number.isInteger(dimension) && dimension > 0) return dimension;
+    }
+    try {
+      const meta = this.db.prepare("SELECT value FROM meta WHERE key = 'embedding_dimension'").get() as { value: string } | undefined;
+      const fromMeta = meta ? Number.parseInt(meta.value, 10) : NaN;
+      if (Number.isInteger(fromMeta) && fromMeta > 0) return fromMeta;
+    } catch {
+      // Standalone adapter databases do not have the P0 meta table; inspect sqlite_master below.
+    }
+    if (!this.vectorTableExists()) return null;
+    return null;
   }
 
   /** Fix the dimension on first embedded upsert, or reject a mismatch (B3). */

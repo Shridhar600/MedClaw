@@ -146,7 +146,7 @@ export function runFactMirrorContract(makeMirror: MakeMirror): void {
 
     // --- queryEntityHeads (recall Stage 2 suppression CONTRA-10 + stale fail-closed KNEE-10) -
 
-    it('queryEntityHeads returns the max-version row per entity across all statuses', async () => {
+    it('queryEntityHeads prefers an active lifecycle winner over a higher terminal version', async () => {
       await mirror.upsert([
         fact('metformin@v1', { entity: 'metformin', version: 1, status: 'retracted', createdAt: '2026-01-01T00:00:00.000Z' }),
         fact('metformin@v2', { entity: 'metformin', version: 2, status: 'superseded', createdAt: '2026-02-01T00:00:00.000Z' }),
@@ -159,8 +159,8 @@ export function runFactMirrorContract(makeMirror: MakeMirror): void {
       expect(byEntity.metformin.version).toBe(3);
       expect(byEntity.metformin.status).toBe('active');
       expect(byEntity.metformin.createdAt).toBe('2026-03-01T00:00:00.000Z');
-      expect(byEntity.naproxen.version).toBe(2);
-      expect(byEntity.naproxen.status).toBe('discontinued');
+      expect(byEntity.naproxen.version).toBe(1);
+      expect(byEntity.naproxen.status).toBe('active');
     });
 
     it('queryEntityHeads excludes v0 quarantine sentinels', async () => {

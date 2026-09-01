@@ -61,6 +61,8 @@ export interface NarrativeWriter {
 export interface SafetyRenderer {
   render(safetyRelevantFacts: LedgerFact[]): Promise<string>;
   listSafetyRelevant(): Promise<LedgerFact[]>;
+  /** Persist a PHI-free fail-closed signal when publication cannot complete. */
+  markDirty?(): void;
 }
 
 /** The durable follow-up queue (consumed P4). Mirrors CuriosityQueue.add. */
@@ -340,8 +342,17 @@ export class CapturePipeline {
 
   /** Re-render SAFETY.md from the current safety-relevant set (D8). */
   private async reRenderSafety(): Promise<void> {
-    const facts = await this.deps.safety.listSafetyRelevant();
-    await this.deps.safety.render(facts);
+    try {
+      const facts = await this.deps.safety.listSafetyRelevant();
+      await this.deps.safety.render(facts);
+    } catch (e) {
+      try {
+        this.deps.safety.markDirty?.();
+      } catch (markError) {
+        console.warn('[capture] SAFETY dirty marker failed:', summarizeErrorForLog(markError));
+      }
+      throw e;
+    }
   }
 
   /** Best-effort event mirror (P2 no-op when no sink is injected). Never throws. */

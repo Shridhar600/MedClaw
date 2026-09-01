@@ -122,8 +122,8 @@ const AUTHORITY_RANK: Record<string, number> = {
   doctor: 5, lab: 5, report: 4, sensor: 3, user: 2, inference: 1,
 };
 
-// A terminal head status → any chunk for that entity is stale and fail-closed dropped (KNEE-10).
-const STALE_STATUSES = new Set(['retracted', 'discontinued', 'superseded']);
+// A stale/disputed head status → any chunk for that entity is stale and fail-closed dropped (KNEE-10).
+const STALE_STATUSES = new Set(['retracted', 'discontinued', 'superseded', 'disputed']);
 const MS_PER_DAY = 86_400_000;
 
 function estimateTokens(s: string): number {
@@ -332,7 +332,13 @@ export class RecallEngine {
       if (candidates.size === 0) {
         return { text: '', tokens: 0, hits: [], injectedChunkIds: [], indexStatus };
       }
-      const heads = await this.loadEntityHeads();
+      const headRead = await this.loadEntityHeads();
+      if (!headRead.available) {
+        // Head status is the safety filter. An unavailable mirror is not an empty mirror:
+        // suppress every candidate rather than allowing stale clinical narrative through.
+        return { text: '', tokens: 0, hits: [], injectedChunkIds: [], indexStatus: 'failed' };
+      }
+      const heads = headRead.heads;
       const now = clock.now();
 
       const scored: RecallHit[] = [];
@@ -460,15 +466,16 @@ export class RecallEngine {
     }
   }
 
-  private async loadEntityHeads(): Promise<FactRecord[]> {
+  private async loadEntityHeads(): Promise<{ heads: FactRecord[]; available: boolean }> {
     try {
       const heads: FactRecord[] = [];
       for await (const h of this.deps.factMirror.queryEntityHeads()) heads.push(h);
-      return heads;
+      return { heads, available: true };
     } catch (e) {
-      // No heads ⇒ no suppression this turn (best-effort; never crash the turn).
+      // No heads is not an empty working mirror. A safety filter that cannot read its source
+      // must fail closed for this turn.
       console.warn('[recall] entity-heads load failed:', summarizeErrorForLog(e));
-      return [];
+      return { heads: [], available: false };
     }
   }
 

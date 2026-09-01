@@ -5,7 +5,7 @@
 
 import type { Tool, ToolResult } from './types';
 import type { EpisodeStore, Episode, EpisodeStatus } from '../memcore';
-import { contentContainsCredentials } from '../security';
+import { contentContainsCredentials, PathContainmentError } from '../security';
 
 const EPISODE_STATUSES: EpisodeStatus[] = ['open', 'resolving', 'resolved', 'reopened'];
 
@@ -19,6 +19,11 @@ function ok(text: string): ToolResult {
 }
 function err(text: string): ToolResult {
   return { content: [{ type: 'text', text }], isError: true };
+}
+
+function isPathContainmentError(error: unknown): boolean {
+  return error instanceof PathContainmentError
+    || (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'ERR_PATH_CONTAINMENT');
 }
 
 /**
@@ -67,7 +72,8 @@ export function createEpisodeTools(deps: EpisodeToolsDeps): Tool[] {
       const action = params.action as string;
       const id = params.id as string | undefined;
 
-      switch (action) {
+      try {
+        switch (action) {
         case 'create': {
           const title = params.title as string | undefined;
           if (!title) return err('episode_manage create needs a title.');
@@ -122,8 +128,14 @@ export function createEpisodeTools(deps: EpisodeToolsDeps): Tool[] {
           const cursorLine = page.nextCursor ? `\n(next cursor: ${page.nextCursor})` : '';
           return ok(body + cursorLine);
         }
-        default:
-          return err(`Unknown episode_manage action "${action}".`);
+          default:
+            return err(`Unknown episode_manage action "${action}".`);
+        }
+      } catch (error) {
+        if (isPathContainmentError(error)) {
+          return err('Invalid id/date: it must not contain path separators or "..".');
+        }
+        throw error;
       }
     },
   };

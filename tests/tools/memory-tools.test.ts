@@ -43,6 +43,15 @@ describe('Memory Tools', () => {
     expect(result.content[0].text).toContain('medications');
   });
 
+  it('memory_get returns a clean error for a traversal path', async () => {
+    const tool = tools.find(t => t.name === 'memory_get')!;
+    const result = await tool.execute({ path: '../SAFETY' });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Invalid path');
+    expect(result.content[0].text).not.toContain('SAFETY');
+  });
+
   it('memory_write creates a file', async () => {
     const tool = tools.find(t => t.name === 'memory_write')!;
     await tool.execute({ path: 'goals/bulking.md', content: '# Bulking Plan', mode: 'overwrite' });

@@ -5,7 +5,7 @@ import type { MemoryIndexer } from '../memory/indexer';
 import type { FactMirror, FactRecord } from '../ports';
 import { chunkHasStaleEntity } from '../recall';
 import * as path from 'path';
-import { contentContainsCredentials, summarizeErrorForLog } from '../security';
+import { contentContainsCredentials, summarizeErrorForLog, PathContainmentError } from '../security';
 
 // --- Managed-lane write guard (Task 12.6 / G1) -------------------------------------------
 // `memory_write` must never raw-overwrite an invariant-bearing managed path — that would
@@ -49,6 +49,18 @@ function normalizeManagedPath(p: string): string | null {
 
 function rejection(text: string): ToolResult {
   return { content: [{ type: 'text', text }], isError: true };
+}
+
+function isPathError(error: unknown): boolean {
+  if (error instanceof PathContainmentError) return true;
+  if (typeof error !== 'object' || error === null) return false;
+  if ((error as { code?: unknown }).code === 'ERR_PATH_CONTAINMENT') return true;
+  const message = error instanceof Error ? error.message : '';
+  return message === 'Absolute paths are not allowed' || message.startsWith('Path traversal detected:');
+}
+
+function invalidPathResult(): ToolResult {
+  return rejection('Invalid path: it must stay inside the memory workspace and must not contain path separators or "..".');
 }
 
 /**
@@ -169,6 +181,7 @@ export function createMemoryTools(
       try {
         content = await engine.readFile(filePath);
       } catch (e) {
+        if (isPathError(e)) return invalidPathResult();
         const msg = e instanceof Error ? e.message : String(e);
         if (msg.startsWith('Path is a directory')) {
           return { content: [{ type: 'text', text: msg }], isError: true };
@@ -196,9 +209,10 @@ export function createMemoryTools(
       required: ['path', 'content'],
     },
     async execute(params): Promise<ToolResult> {
-      const filePath = params.path as string;
-      const content = params.content as string;
-      const mode = (params.mode as string) ?? 'overwrite';
+      try {
+        const filePath = params.path as string;
+        const content = params.content as string;
+        const mode = (params.mode as string) ?? 'overwrite';
 
       // Managed-lane guard (G1): refuse invariant-bearing paths before any write.
       const managed = await classifyManagedWrite(engine, filePath, mode, content);
@@ -276,7 +290,11 @@ export function createMemoryTools(
           console.warn(`[memory-tools] Reindex failed for ${filePath}:`, summarizeErrorForLog(e)),
         );
       }
-      return { content: [{ type: 'text', text: `Written to ${filePath}` }] };
+        return { content: [{ type: 'text', text: `Written to ${filePath}` }] };
+      } catch (e) {
+        if (isPathError(e)) return invalidPathResult();
+        throw e;
+      }
     },
   };
 

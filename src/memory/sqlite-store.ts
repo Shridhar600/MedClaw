@@ -11,9 +11,16 @@ function serializeFloat32(arr: Float32Array): Buffer {
 
 function hasNaN(values: number[] | Float32Array): boolean {
   for (let i = 0; i < values.length; i++) {
-    if (isNaN(values[i])) return true;
+    if (!Number.isFinite(values[i])) return true;
   }
   return false;
+}
+
+function isUsableEmbedding(values: number[] | undefined, expectedDimension?: number): boolean {
+  return values !== undefined
+    && values.length > 0
+    && !hasNaN(values)
+    && (expectedDimension === undefined || values.length === expectedDimension);
 }
 
 export class SqliteStore {
@@ -189,9 +196,11 @@ export class SqliteStore {
       CREATE TABLE IF NOT EXISTS chunks (
         id TEXT PRIMARY KEY,
         path TEXT NOT NULL,
+        lane TEXT NOT NULL DEFAULT '',
         content TEXT NOT NULL,
         start_line INTEGER NOT NULL DEFAULT 0,
         end_line INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT '',
         embedding BLOB
       );
       CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
@@ -226,6 +235,8 @@ export class SqliteStore {
     } catch {
       // Column already exists
     }
+    this.ensureColumn('chunks', 'lane', "lane TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn('chunks', 'created_at', "created_at TEXT NOT NULL DEFAULT ''");
 
     // Migrate legacy vec_meta table (pre-consolidation) into meta, then drop it.
     const vecMetaExists = this.db.prepare(
@@ -251,6 +262,11 @@ export class SqliteStore {
 
   private setStoredDimension(dim: number): void {
     this.db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('embedding_dimension', ?)").run(String(dim));
+  }
+
+  private ensureColumn(table: string, column: string, ddl: string): void {
+    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (!cols.some(c => c.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
   }
 
   ensureVecTable(dimension: number): void {
@@ -325,15 +341,17 @@ export class SqliteStore {
       : null;
 
     this.db.prepare(`
-      INSERT INTO chunks (id, path, content, start_line, end_line, embedding)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO chunks (id, path, lane, content, start_line, end_line, created_at, embedding)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         path = excluded.path,
+        lane = excluded.lane,
         content = excluded.content,
         start_line = excluded.start_line,
         end_line = excluded.end_line,
+        created_at = excluded.created_at,
         embedding = excluded.embedding
-    `).run(chunk.id, chunk.path, chunk.content, chunk.startLine, chunk.endLine, embeddingBuffer);
+    `).run(chunk.id, chunk.path, chunk.lane ?? '', chunk.content, chunk.startLine, chunk.endLine, chunk.createdAt ?? '', embeddingBuffer);
 
     this.db.prepare("DELETE FROM chunks_fts WHERE id = ?").run(chunk.id);
     this.db.prepare(`
@@ -391,10 +409,10 @@ export class SqliteStore {
   }
 
   getChunksByPath(filePath: string): Chunk[] {
-    const rows = this.db.prepare('SELECT id, path, content, start_line, end_line FROM chunks WHERE path = ?').all(filePath) as Array<{
-      id: string; path: string; content: string; start_line: number; end_line: number;
+    const rows = this.db.prepare('SELECT id, path, lane, content, start_line, end_line, created_at FROM chunks WHERE path = ?').all(filePath) as Array<{
+      id: string; path: string; lane: string; content: string; start_line: number; end_line: number; created_at: string;
     }>;
-    return rows.map(r => ({ id: r.id, path: r.path, content: r.content, startLine: r.start_line, endLine: r.end_line }));
+    return rows.map(r => ({ id: r.id, path: r.path, lane: r.lane, content: r.content, startLine: r.start_line, endLine: r.end_line, createdAt: r.created_at }));
   }
 
   private toFtsMatchQuery(query: string): string | null {
@@ -446,15 +464,17 @@ export class SqliteStore {
   }
 
   getAllChunksWithEmbeddings(): Array<Chunk & { embedding: number[] | undefined }> {
-    const rows = this.db.prepare('SELECT id, path, content, start_line, end_line, embedding FROM chunks').all() as Array<{
-      id: string; path: string; content: string; start_line: number; end_line: number; embedding: Buffer | null;
+    const rows = this.db.prepare('SELECT id, path, lane, content, start_line, end_line, created_at, embedding FROM chunks').all() as Array<{
+      id: string; path: string; lane: string; content: string; start_line: number; end_line: number; created_at: string; embedding: Buffer | null;
     }>;
     return rows.map(r => ({
       id: r.id,
       path: r.path,
+      lane: r.lane,
       content: r.content,
       startLine: r.start_line,
       endLine: r.end_line,
+      createdAt: r.created_at,
       embedding: r.embedding
         ? Array.from(
           new Float32Array(
@@ -481,39 +501,43 @@ export class SqliteStore {
       }
 
       const chunkStmt = this.db.prepare(`
-        INSERT INTO chunks (id, path, content, start_line, end_line, embedding)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO chunks (id, path, lane, content, start_line, end_line, created_at, embedding)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           path = excluded.path,
+          lane = excluded.lane,
           content = excluded.content,
           start_line = excluded.start_line,
           end_line = excluded.end_line,
+          created_at = excluded.created_at,
           embedding = excluded.embedding
       `);
       const ftsDeleteStmt = this.db.prepare('DELETE FROM chunks_fts WHERE id = ?');
       const ftsInsertStmt = this.db.prepare('INSERT INTO chunks_fts(id, path, content) VALUES (?, ?, ?)');
 
+      const expectedDimension = this.hasVec ? this.getStoredDimension() : undefined;
+      const embeddingsReady = nextChunks.every(chunk => isUsableEmbedding(chunk.embedding, expectedDimension));
       for (const chunk of nextChunks) {
-        const embeddingBuffer = chunk.embedding
-          ? Buffer.from(new Float32Array(chunk.embedding).buffer)
+        const usable = isUsableEmbedding(chunk.embedding, expectedDimension);
+        const embeddingBuffer = usable
+          ? Buffer.from(new Float32Array(chunk.embedding as number[]).buffer)
           : null;
-        chunkStmt.run(chunk.id, chunk.path, chunk.content, chunk.startLine, chunk.endLine, embeddingBuffer);
+        chunkStmt.run(chunk.id, chunk.path, chunk.lane ?? '', chunk.content, chunk.startLine, chunk.endLine, chunk.createdAt ?? '', embeddingBuffer);
         ftsDeleteStmt.run(chunk.id);
         ftsInsertStmt.run(chunk.id, chunk.path, chunk.content);
 
-        if (this.hasVec && chunk.embedding && chunk.embedding.length > 0 && !hasNaN(chunk.embedding)) {
-          const dim = this.getStoredDimension();
-          if (chunk.embedding.length === dim) {
-            this.db.prepare('DELETE FROM chunks_vec0 WHERE chunk_id = ?').run(chunk.id);
-            this.db.prepare('INSERT INTO chunks_vec0(chunk_id, embedding) VALUES (?, ?)').run(
-              chunk.id, serializeFloat32(new Float32Array(chunk.embedding)),
-            );
-          } else {
-            console.warn(`[sqlite-store] Skipping vec0 in replaceFileIndex for ${chunk.id}: dimension ${chunk.embedding.length}, expected ${dim}`);
-          }
+        if (this.hasVec && usable) {
+          this.db.prepare('DELETE FROM chunks_vec0 WHERE chunk_id = ?').run(chunk.id);
+          this.db.prepare('INSERT INTO chunks_vec0(chunk_id, embedding) VALUES (?, ?)').run(
+            chunk.id, serializeFloat32(new Float32Array(chunk.embedding as number[])),
+          );
         }
       }
 
+      const cleanHash = nextHash.startsWith('embedding-partial:')
+        ? nextHash.slice('embedding-partial:'.length)
+        : nextHash;
+      const persistedHash = embeddingsReady ? cleanHash : `embedding-partial:${cleanHash}`;
       const modelValue = model ?? null;
       this.db.prepare(`
         INSERT INTO file_hashes (path, hash, indexed_at, embedding_model)
@@ -522,7 +546,7 @@ export class SqliteStore {
           hash = excluded.hash,
           indexed_at = excluded.indexed_at,
           embedding_model = excluded.embedding_model
-      `).run(pathToReplace, nextHash, new Date().toISOString(), modelValue);
+      `).run(pathToReplace, persistedHash, new Date().toISOString(), modelValue);
     });
 
     tx(filePath, chunks, hash, embeddingModel);
@@ -541,6 +565,29 @@ export class SqliteStore {
   getFileHash(filePath: string): string | undefined {
     const row = this.db.prepare('SELECT hash FROM file_hashes WHERE path = ?').get(filePath) as { hash: string } | undefined;
     return row?.hash;
+  }
+
+  getFileEmbeddingModel(filePath: string): string | undefined {
+    const row = this.db.prepare('SELECT embedding_model FROM file_hashes WHERE path = ?').get(filePath) as { embedding_model: string | null } | undefined;
+    return row?.embedding_model ?? undefined;
+  }
+
+  /** Freshness requires metadata and, when sqlite-vec is available, one vector row per chunk. */
+  isFileIndexCurrent(filePath: string, hash: string, embeddingModel: string): boolean {
+    const row = this.db.prepare('SELECT hash, embedding_model FROM file_hashes WHERE path = ?').get(filePath) as
+      { hash: string; embedding_model: string | null } | undefined;
+    if (!row || row.hash !== hash || row.embedding_model !== embeddingModel) return false;
+
+    const chunks = this.db.prepare('SELECT COUNT(*) AS count FROM chunks WHERE path = ?').get(filePath) as { count: number };
+    const metadata = this.db.prepare("SELECT COUNT(*) AS count FROM chunks WHERE path = ? AND lane <> '' AND created_at <> ''").get(filePath) as { count: number };
+    if (metadata.count !== chunks.count) return false;
+    if (!this.hasVec) return true;
+    const vectors = this.db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM chunks c JOIN chunks_vec0 v ON v.chunk_id = c.id
+      WHERE c.path = ?
+    `).get(filePath) as { count: number };
+    return vectors.count === chunks.count;
   }
 
   close(): void {

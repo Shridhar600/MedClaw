@@ -48,6 +48,13 @@ describe('episode_manage (Task 12.4)', () => {
     expect(missing.isError).toBe(true);
   });
 
+  it('returns a clean self-correctable error for a traversal id', async () => {
+    const result = await tool.execute({ action: 'get', id: '../SAFETY' });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.toLowerCase()).toContain('invalid id/date');
+    expect(result.content[0].text).not.toContain('SAFETY');
+  });
+
   it('lists episodes with pagination (limit + cursor)', async () => {
     await store.create({ title: 'a', profileId: 'default' });
     await store.create({ title: 'b', profileId: 'default' });

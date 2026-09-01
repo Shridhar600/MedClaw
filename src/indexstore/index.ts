@@ -1,4 +1,9 @@
-export { SqliteVecIndex, VectorDimensionMismatchError } from './adapters/sqlite-vec-index';
+export {
+  SqliteVecIndex,
+  VectorDimensionMismatchError,
+  VectorIndexUnavailableError,
+  VectorQueryFailedError,
+} from './adapters/sqlite-vec-index';
 export type { SqliteVecIndexConfig } from './adapters/sqlite-vec-index';
 export { SqliteFactMirror } from './adapters/sqlite-fact-mirror';
 export type { SqliteFactMirrorConfig } from './adapters/sqlite-fact-mirror';

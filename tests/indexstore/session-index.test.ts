@@ -322,4 +322,44 @@ describe('SqliteSessionIndex', () => {
     expect(res.hits).toHaveLength(1);
     expect(cleared).toBe(false); // the marker is cleared after a successful reconcile
   });
+
+  test('detects and rebuilds when only part of the FTS content is lost', () => {
+    const { dbPath, sessionsDir } = tmp();
+    fs.writeFileSync(
+      path.join(sessionsDir, '2026-08-27.jsonl'),
+      entry('user', 'alpha archived marker', '2026-08-27T10:00:00.000Z') + '\n' +
+        entry('user', 'beta archived marker', '2026-08-27T10:01:00.000Z') + '\n',
+    );
+    const first = new SqliteSessionIndex({ dbPath, sessionsDir });
+    (first as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): void } } }).db
+      .prepare('DELETE FROM session_turns_fts WHERE id = ?')
+      .run('chat1#2026-08-27.jsonl#1');
+    first.close();
+
+    const rebuilt = new SqliteSessionIndex({ dbPath, sessionsDir });
+    const alpha = rebuilt.search('alpha', { chatId: 'chat1' });
+    const beta = rebuilt.search('beta', { chatId: 'chat1' });
+    rebuilt.close();
+
+    expect(alpha.hits).toHaveLength(1);
+    expect(beta.hits).toHaveLength(1);
+  });
+
+  test('keeps the durable dirty marker when a rebuild skips an unreadable archive file', () => {
+    const { dir, dbPath, sessionsDir } = tmp();
+    const good = path.join(sessionsDir, '2026-08-27.jsonl');
+    const unreadable = path.join(sessionsDir, '2026-08-28.jsonl');
+    fs.writeFileSync(good, entry('user', 'readable archive marker', '2026-08-27T10:00:00.000Z') + '\n');
+    fs.writeFileSync(unreadable, entry('user', 'temporary read failure marker', '2026-08-28T10:00:00.000Z') + '\n');
+    const idx = new SqliteSessionIndex({ dbPath });
+    fs.chmodSync(unreadable, 0o000);
+    try {
+      const complete = idx.rebuildFromDayFiles(sessionsDir);
+      expect(complete).toBe(false);
+      expect(fs.existsSync(path.join(dir, 'search.db.session-dirty'))).toBe(true);
+    } finally {
+      fs.chmodSync(unreadable, 0o600);
+      idx.close();
+    }
+  });
 });

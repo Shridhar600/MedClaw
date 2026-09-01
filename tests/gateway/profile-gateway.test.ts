@@ -225,7 +225,8 @@ describe('Gateway chat→profile pairing', () => {
     const agent = (gateway as any).agentLoop;
     const reply = await gateway.handleTestMessage('work-chat-42', 'show my private health history');
 
-    expect(reply).toContain('not recognized');
+    expect(reply).toContain("can't serve");
+    expect(reply).not.toContain('not recognized');
     expect(agent.run).not.toHaveBeenCalled();
     expect(sessions.getHistory('work-chat-42')).toEqual([]);
   });
@@ -240,7 +241,8 @@ describe('Gateway chat→profile pairing', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({ chatId: 'work-chat-42', text: 'show my private health history' });
-    expect(send.mock.calls.at(-1)?.[1].text).toContain('not recognized');
+    expect(send.mock.calls.at(-1)?.[1].text).toContain("can't serve");
+    expect(send.mock.calls.at(-1)?.[1].text).not.toContain('not recognized');
 
     send.mockClear();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

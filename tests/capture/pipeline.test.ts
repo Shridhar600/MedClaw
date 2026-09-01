@@ -136,6 +136,29 @@ describe('CapturePipeline (Task 10 — both-lane, cross-anchored, port-injected)
     expect(queueCalls[0].priority).toBe('turn');
   });
 
+  it('marks the SAFETY projection dirty when a safety publication fails', async () => {
+    const markDirty = jest.fn();
+    const failingSafety = {
+      listSafetyRelevant: () => ledger.listSafetyRelevant(),
+      render: jest.fn().mockRejectedValue(new Error('render failed')),
+      markDirty,
+    } as unknown as SafetyRenderer;
+    pipeline = new CapturePipeline({ queue, ledger, narrative, safety: failingSafety, curiosity });
+
+    await expect(pipeline.ingest({
+      profileId: 'default',
+      source: 'chat',
+      kind: 'ledger-fact',
+      payload: {
+        entity: 'lisinopril',
+        type: 'medication',
+        fields: { dose: '10mg' },
+        provenance: prov(CAPTURED),
+      },
+    })).rejects.toThrow('render failed');
+    expect(markDirty).toHaveBeenCalledTimes(1);
+  });
+
   it('derives the day from the event capturedAt, not the store clock (F20)', async () => {
     await pipeline.ingest({
       profileId: 'default', source: 'chat', kind: 'ledger-fact',

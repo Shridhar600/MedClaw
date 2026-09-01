@@ -56,6 +56,8 @@ import { EMERGENCY_RESPONSE, isEmergencyInput } from '../safety/emergency-detect
 
 const UNRECOGNIZED_CHAT_RESPONSE =
   'This chat is not recognized. This is a private health assistant; new chats cannot be added over this channel.';
+const PROFILE_UNAVAILABLE_RESPONSE =
+  "This chat belongs to a profile this assistant instance can't serve yet.";
 // PROD-P1-6: an empty or whitespace-only text message with no media gets a
 // short canned reply — no agent run, no session write. Matches the test-cli's
 // existing empty-input guard so the dev web UI exercises the same boundary.
@@ -230,13 +232,18 @@ export class Gateway {
       const ledgerStore = new LedgerStore(memoryWorkspace);
       this.ledgerStore = ledgerStore;
       const narrativeStore = new NarrativeStore(memoryWorkspace);
-      const safetyView = new SafetyView(memoryWorkspace);
+      const safetyView = new SafetyView(
+        memoryWorkspace,
+        systemClock,
+        () => ledgerStore.listSafetyRelevant(),
+      );
       const episodeStore = new EpisodeStore(memoryWorkspace);
       const curiosityQueue = new CuriosityQueue(memoryWorkspace, undefined, undefined, profileId);
       this.curiosity = curiosityQueue;
       const safetyRenderer = makeSafetyRenderer({
         render: (facts) => safetyView.render(facts),
         listSafetyRelevant: () => ledgerStore.listSafetyRelevant(),
+        markDirty: () => safetyView.markDirty(),
       });
 
       // D3.4/C-29: the compaction-summary → chat-scoped sink. The write goes through
@@ -273,7 +280,7 @@ export class Gateway {
               if (type) {
                 try {
                   const facts = await ledgerStore.listAllOfType(type);
-                  await factMirror.upsert(facts.map(ledgerFactToRecord));
+                  await factMirror.replaceType(type, facts.map(ledgerFactToRecord));
                 } catch (e) {
                   console.warn('[gateway] fact-mirror re-derive failed (rebuildable at boot):', summarizeErrorForLog(e));
                 }
@@ -672,7 +679,7 @@ export class Gateway {
       // C-01 interim: this Gateway instance owns stores for the configured default profile only.
       // Refuse a paired non-default chat rather than serving it with the wrong profile's stores.
       const emergency = this.handleEmergencyInput(text);
-      return emergency ?? UNRECOGNIZED_CHAT_RESPONSE;
+      return emergency ?? PROFILE_UNAVAILABLE_RESPONSE;
     }
 
     if (text.trim() === '/status') {
@@ -781,7 +788,7 @@ export class Gateway {
       // C-01 interim: never dispatch a non-default profile into this default-bound pipeline.
       const emergency = this.handleEmergencyInput(text);
       try {
-        await this.channel!.send(chatId, { text: emergency ?? UNRECOGNIZED_CHAT_RESPONSE });
+        await this.channel!.send(chatId, { text: emergency ?? PROFILE_UNAVAILABLE_RESPONSE });
       } catch (e) {
         console.error('[gateway] Failed to respond to unavailable profile chat:', summarizeErrorForLog(e));
       }

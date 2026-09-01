@@ -18,6 +18,11 @@ export class FakeFactMirror implements FactMirror {
     }
   }
 
+  async replaceType(type: string, facts: FactRecord[]): Promise<void> {
+    this.records = this.records.filter(r => r.type !== type);
+    this.records.push(...facts);
+  }
+
   async *queryActive(type?: string, entity?: string): AsyncIterable<FactRecord> {
     for (const r of this.records) {
       if (r.status !== 'active' || r.version < 1) continue;
@@ -36,15 +41,17 @@ export class FakeFactMirror implements FactMirror {
   }
 
   async *queryEntityHeads(): AsyncIterable<FactRecord> {
-    // Deterministic head per entity (F11): version, then later createdAt, then higher id.
+    // Deterministic head per type/entity: active wins, then version, createdAt, and id.
     const heads = new Map<string, FactRecord>();
     for (const r of this.records) {
       if (r.version < 1) continue;
-      const cur = heads.get(r.entity);
-      const wins = !cur || r.version > cur.version
-        || (r.version === cur.version && r.createdAt > cur.createdAt)
-        || (r.version === cur.version && r.createdAt === cur.createdAt && r.id > cur.id);
-      if (wins) heads.set(r.entity, r);
+      const key = `${r.type}::${r.entity}`;
+      const cur = heads.get(key);
+      const wins = !cur || (r.status === 'active' && cur.status !== 'active')
+        || (r.status === cur.status && r.version > cur.version)
+        || (r.status === cur.status && r.version === cur.version && r.createdAt > cur.createdAt)
+        || (r.status === cur.status && r.version === cur.version && r.createdAt === cur.createdAt && r.id > cur.id);
+      if (wins) heads.set(key, r);
     }
     for (const h of heads.values()) yield h;
   }
