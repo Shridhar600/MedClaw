@@ -16,6 +16,9 @@ import {
 import {
   dateKey,
   countDayFileLines,
+  deriveWindowAnchor,
+  isArchiveTailCurrent,
+  latestDayFileTail,
   listDayFiles,
   walkBackAnchor,
   anchorBefore,
@@ -24,6 +27,7 @@ import {
   resolveWindow,
   saveWindow,
   type Anchor,
+  type ArchiveTail,
   type SessionWindow,
 } from './session-window';
 
@@ -178,6 +182,8 @@ export function estimateTokens(messages: Message[]): number {
 const FALLBACK_SYSTEM_OVERHEAD_TOKENS = 3000;
 
 export type WindowTrigger = 'none' | 'prune' | 'compact' | 'emergency';
+
+export type WindowDerivationStatus = 'watermark' | 'fallback';
 
 /**
  * spec 14 §3 threshold table — the window-fill percentage maps to the compaction action. Bounds are
@@ -392,6 +398,11 @@ export class SessionManager {
   // `secureAppend` does not fsync), then advanced as we append. Every anchor is computed from this
   // count, so a fresh manager continues the numbering instead of restarting at 1.
   private readonly dayFileLineCounts: Map<string, number> = new Map();
+  // C-38: durable EOF watermarks are stored in SessionWindow; this process-local map avoids rereading
+  // even the current day file between successive window saves. The key is the resolved archive lane,
+  // which is per-chat in the Gateway's normal layout and per-profile in legacy flat mode.
+  private readonly archiveTailsByDir: Map<string, ArchiveTail> = new Map();
+  private readonly windowDerivationStatusByChat: Map<string, WindowDerivationStatus> = new Map();
   // F8: compaction LLM calls run at 'background' semaphore priority so they never starve or collide
   // with user turns. Injected by the Gateway (setter — the semaphore is created alongside). When
   // unset (tests / no semaphore), the call runs directly. prepareHistory always runs BEFORE the
@@ -664,6 +675,11 @@ export class SessionManager {
     return latest?.chatId;
   }
 
+  /** C-38 observability: whether the last derived window used its EOF watermark or recovery walk. */
+  getWindowDerivationStatus(chatId: string): WindowDerivationStatus | undefined {
+    return this.windowDerivationStatusByChat.get(chatId);
+  }
+
   async prepareHistory(chatId: string): Promise<Message[]> {
     // Three phases so the compaction LLM runs OFF the per-chat write queue (H2): a fast queued
     // evaluate+prune, then (for compact/emergency) the pipeline whose LLM is off-queue and whose apply
@@ -843,11 +859,15 @@ export class SessionManager {
   async resetSession(chatId: string): Promise<void> {
     await this.enqueue(chatId, async () => {
       const pendingSummary = this.pendingSummariesByChat.get(chatId);
+      const tail = this.archiveTailFor(chatId);
       const replacement: SessionWindow = {
         summaryBlock: '',
-        verbatimFrom: latestDayFileEof(this.archiveDir(chatId)),
+        verbatimFrom: tail
+          ? { file: tail.file, line: tail.line }
+          : latestDayFileEof(this.archiveDir(chatId)),
         ...(pendingSummary ? { pendingSummary } : {}),
       };
+      if (tail?.file) replacement.archiveTail = tail;
       // Persist the replacement first. The old window remains authoritative until this atomic write
       // succeeds, so a crash or unlink failure cannot resurrect pre-/new context.
       saveWindow(this.windowPath(chatId), replacement);
@@ -1119,7 +1139,19 @@ Keep it concise and structured.`;
     // is ended, and day files are NEVER size-rotated (DD8; anchors must stay stable). Persist-first still
     // holds: a failed append rejects the enqueue and `recordTurn` never mutates in-memory state.
     secureAppend(dayFilePath, block);
-    this.dayFileLineCounts.set(dayFilePath, startLine + lines.length);
+    const endLine = startLine + lines.length;
+    this.dayFileLineCounts.set(dayFilePath, endLine);
+    try {
+      this.archiveTailsByDir.set(this.archiveDir(chatId), {
+        file: dayFile,
+        line: endLine,
+        byteLength: fs.statSync(dayFilePath).size,
+      });
+    } catch {
+      // The source append succeeded. If the metadata stat is unavailable, discard the cached
+      // watermark and let the next window derivation recover from the newest day file.
+      this.archiveTailsByDir.delete(this.archiveDir(chatId));
+    }
     // D2.5: incrementally index each appended line for session_search (best-effort — an index failure
     // degrades and never blocks the turn). The `{file, line}` anchor is the day-file's physical line, so
     // an incrementally-indexed row and a disk rebuild resolve to the same JSONL line (idempotent upsert).
@@ -1246,10 +1278,21 @@ Keep it concise and structured.`;
     const summaryBlock = hasSummary ? (first.content as string).slice(SUMMARY_PREFIX.length) : '';
     const realTailLength = history.length - firstRealIndex;
     const firstAnchor = historyAnchors[firstRealIndex];
-    const verbatimFrom = realTailLength > 0 && firstAnchor
-      ? anchorBefore(firstAnchor)
-      : walkBackAnchor(this.archiveDir(chatId), realTailLength);
+    let verbatimFrom: Anchor;
+    if (realTailLength > 0 && firstAnchor) {
+      verbatimFrom = anchorBefore(firstAnchor);
+      this.windowDerivationStatusByChat.set(chatId, 'watermark');
+    } else {
+      const resolution = deriveWindowAnchor(this.archiveDir(chatId), realTailLength, this.archiveTailFor(chatId));
+      verbatimFrom = resolution.anchor;
+      this.windowDerivationStatusByChat.set(chatId, resolution.source);
+      if (resolution.source === 'fallback') {
+        console.warn(`[session:${chatId}] archive tail watermark unavailable; using bounded recovery walk`);
+      }
+    }
     const window: SessionWindow = { summaryBlock, verbatimFrom };
+    const tail = this.archiveTailFor(chatId);
+    if (tail?.file) window.archiveTail = tail;
     if (pendingSummary) window.pendingSummary = pendingSummary;
     // DD3: carry the last window-fill reading so a restart resumes the trigger signal (A3).
     const usage = this.lastPromptTokensByChat.get(chatId);
@@ -1270,6 +1313,41 @@ Keep it concise and structured.`;
       session?.historyAnchors ?? [],
       this.pendingSummariesByChat.get(chatId),
     );
+  }
+
+  /** Resolve the current archive EOF without rereading older day files. */
+  private archiveTailFor(chatId: string): ArchiveTail | undefined {
+    const archiveDir = this.archiveDir(chatId);
+    const cached = this.archiveTailsByDir.get(archiveDir);
+    if (cached && isArchiveTailCurrent(archiveDir, cached)) {
+      return cached;
+    }
+    const current = latestDayFileTail(archiveDir);
+    if (current.file === '') return undefined;
+    this.archiveTailsByDir.set(archiveDir, current);
+    return current;
+  }
+
+  private restoreArchiveTail(chatId: string, archiveDir: string, persisted?: ArchiveTail): void {
+    const current = latestDayFileTail(archiveDir);
+    if (current.file === '') {
+      this.archiveTailsByDir.delete(archiveDir);
+      return;
+    }
+    if (persisted
+      && persisted.file === current.file
+      && persisted.line === current.line
+      && persisted.byteLength === current.byteLength) {
+      this.archiveTailsByDir.set(archiveDir, persisted);
+      return;
+    }
+    // A missing/stale watermark is recoverable from the newest day file. The source archive remains
+    // authoritative; the next successful window save publishes the repaired tail metadata.
+    this.archiveTailsByDir.set(archiveDir, current);
+    if (persisted) {
+      this.windowDerivationStatusByChat.set(chatId, 'fallback');
+      console.warn(`[session:${chatId}] archive tail watermark stale; using recovery metadata`);
+    }
   }
 
   // D1.5: persist the window snapshot (best-effort — a save failure must never break the turn, per
@@ -1325,6 +1403,7 @@ Keep it concise and structured.`;
   // tail is the day-file lines after `verbatimFrom`. Sanitize torn appends (#16). Skip empty sessions.
   private resumeChat(chatId: string): void {
     const window = resolveWindow(this.windowPath(chatId), this.archiveDir(chatId));
+    this.restoreArchiveTail(chatId, this.archiveDir(chatId), window.archiveTail);
     // DD3/A3: restore the last window-fill reading so the first post-restart turn evaluates triggers
     // against the persisted signal (not a cold zero).
     if (window.lastPromptTokens !== undefined) {
@@ -1442,43 +1521,45 @@ Keep it concise and structured.`;
 
       // Bucket by target day file, sort each day stably by (timestamp, then source order for ties), and
       // write it WRITE-IF-ABSENT. The raw serialized line is preserved verbatim (no re-serialization).
-      const buckets = new Map<string, Row[]>();
+      const buckets = new Map<string, Map<string, Row[]>>();
       for (const r of rows) {
         const targetDir = this.perChatArchive
           ? resolveContainedPath(this.sessionsPath, r.chatId)
           : this.sessionsPath;
-        const key = `${targetDir} ${r.day}`;
-        (buckets.get(key) ?? buckets.set(key, []).get(key)!).push(r);
+        const byDay = buckets.get(targetDir) ?? new Map<string, Row[]>();
+        const bucket = byDay.get(r.day) ?? [];
+        bucket.push(r);
+        byDay.set(r.day, bucket);
+        buckets.set(targetDir, byDay);
       }
       const archiveDirs = new Set<string>();
-      for (const [key, arr] of buckets) {
-        const sep = key.indexOf(' ');
-        const targetDir = key.slice(0, sep);
-        const day = key.slice(sep + 1);
-        arr.sort((x, y) => x.ts - y.ts || x.order - y.order); // Array.sort is stable ⇒ ties keep source order
-        const dayPath = this.perChatArchive
-          ? resolveContainedPath(this.sessionsPath, path.basename(targetDir), `${day}.jsonl`)
-          : resolveContainedPath(this.sessionsPath, `${day}.jsonl`);
-        this.assertRegularFileIfPresent(dayPath);
-        const legacyRaws = arr.map((r) => r.raw);
-        if (!fs.existsSync(dayPath)) {
-          secureMkdir(targetDir);
-          secureWriteViaTmp(dayPath, legacyRaws.join('\n') + '\n');
-        } else {
-          // F-3/C-12: the target day file already exists — a live turn was appended to it after a PRIOR
-          // failed migration (sentinel absent). A blind skip would LOSE every legacy row for this day.
-          // Append only legacy lines not already present (dedup by exact serialized line ⇒ idempotent on
-          // re-run). Never reorder or rewrite existing bytes: physical #L<n> anchors are immutable.
-          const existing = fs.readFileSync(dayPath, 'utf-8').split('\n').filter((l) => l.length > 0);
-          const existingSet = new Set(existing);
-          const additions = legacyRaws.filter((r) => !existingSet.has(r));
-          if (additions.length > 0) {
-            const separator = dayFileEndsWithoutNewline(dayPath) ? '\n' : '';
-            secureAppend(dayPath, `${separator}${additions.join('\n')}\n`);
-            this.migrationAppendedRows = true;
+      for (const [targetDir, byDay] of buckets) {
+        for (const [day, arr] of byDay) {
+          arr.sort((x, y) => x.ts - y.ts || x.order - y.order); // Array.sort is stable ⇒ ties keep source order
+          const dayPath = this.perChatArchive
+            ? resolveContainedPath(this.sessionsPath, path.basename(targetDir), `${day}.jsonl`)
+            : resolveContainedPath(this.sessionsPath, `${day}.jsonl`);
+          this.assertRegularFileIfPresent(dayPath);
+          const legacyRaws = arr.map((r) => r.raw);
+          if (!fs.existsSync(dayPath)) {
+            secureMkdir(targetDir);
+            secureWriteViaTmp(dayPath, legacyRaws.join('\n') + '\n');
+          } else {
+            // F-3/C-12: the target day file already exists — a live turn was appended to it after a PRIOR
+            // failed migration (sentinel absent). A blind skip would LOSE every legacy row for this day.
+            // Append only legacy lines not already present (dedup by exact serialized line ⇒ idempotent on
+            // re-run). Never reorder or rewrite existing bytes: physical #L<n> anchors are immutable.
+            const existing = fs.readFileSync(dayPath, 'utf-8').split('\n').filter((l) => l.length > 0);
+            const existingSet = new Set(existing);
+            const additions = legacyRaws.filter((r) => !existingSet.has(r));
+            if (additions.length > 0) {
+              const separator = dayFileEndsWithoutNewline(dayPath) ? '\n' : '';
+              secureAppend(dayPath, `${separator}${additions.join('\n')}\n`);
+              this.migrationAppendedRows = true;
+            }
           }
+          archiveDirs.add(targetDir);
         }
-        archiveDirs.add(targetDir);
       }
 
       // Seed the window(s) to the last keepRecentTurns verbatim (DD12), write-if-absent. Registry = one

@@ -1,6 +1,6 @@
 import type { AppConfig, ProviderConfig } from '../config/types';
 import { providerEnvVar } from '../config/provider-env';
-import type { LLMProvider, ToolSchema } from './types';
+import type { LLMProvider, LLMResponse, Message, ToolSchema } from './types';
 
 export type ReadinessStatus = 'ok' | 'warn' | 'fail';
 
@@ -18,6 +18,10 @@ export interface ReadinessResult {
 export interface HealthcheckOptions {
   allowNetworkChecks?: boolean;
   timeoutMs?: number;
+  /** One deadline for the complete readiness batch. Defaults to the 3-second boot target. */
+  overallTimeoutMs?: number;
+  /** Cancels every network probe in this batch when aborted. */
+  signal?: AbortSignal;
   fetchImpl?: typeof fetch;
 }
 
@@ -71,27 +75,32 @@ async function probeJson(url: string, options: HealthcheckOptions): Promise<Json
     };
   }
 
+  const controller = new AbortController();
+  const onAbort = (): void => { controller.abort(); };
+  if (options.signal) {
+    if (options.signal.aborted) controller.abort();
+    else options.signal.addEventListener('abort', onAbort, { once: true });
+  }
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 1500);
+  timeout.unref?.();
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 1500);
+    const response = await fetchImpl(url, { method: 'GET', signal: controller.signal });
+    let body: unknown;
     try {
-      const response = await fetchImpl(url, { method: 'GET', signal: controller.signal });
-      let body: unknown;
-      try {
-        body = await response.json();
-      } catch {
-        body = undefined;
-      }
-      return { ok: response.ok, status: response.status, body };
-    } finally {
-      clearTimeout(timeout);
+      body = await response.json();
+    } catch {
+      body = undefined;
     }
+    return { ok: response.ok, status: response.status, body };
   } catch (error) {
     return {
       ok: false,
       status: 0,
       error: redactTelegramTokens(error instanceof Error ? error.message : String(error)),
     };
+  } finally {
+    clearTimeout(timeout);
+    options.signal?.removeEventListener('abort', onAbort);
   }
 }
 
@@ -144,8 +153,10 @@ export async function probeOllamaCatalog(
     };
   }
 
-  const versionProbe = await probeJson(new URL('api/version', root).toString(), options);
-  const tagsProbe = await probeJson(new URL('api/tags', root).toString(), options);
+  const [versionProbe, tagsProbe] = await Promise.all([
+    probeJson(new URL('api/version', root).toString(), options),
+    probeJson(new URL('api/tags', root).toString(), options),
+  ]);
 
   if (versionProbe.error || tagsProbe.error) {
     return {
@@ -457,18 +468,31 @@ class ProbeTimeoutError extends Error {
   }
 }
 
-async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
+async function withTimeout<T>(work: Promise<T>, ms: number, signal?: AbortSignal): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new ProbeTimeoutError()), ms);
     timer.unref?.();
   });
+  let onAbort: (() => void) | undefined;
+  const aborted = signal
+    ? new Promise<never>((_, reject) => {
+      onAbort = (): void => { reject(new ProbeTimeoutError()); };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    })
+    : undefined;
   try {
-    return await Promise.race([work, timeout]);
+    return await Promise.race(aborted ? [work, timeout, aborted] : [work, timeout]);
   } finally {
     if (timer) clearTimeout(timer);
+    if (onAbort && signal) signal.removeEventListener('abort', onAbort);
   }
 }
+
+type AbortableChatProvider = Pick<LLMProvider, 'chat'> & {
+  chatWithSignal?: (messages: Message[], tools: ToolSchema[] | undefined, signal: AbortSignal) => Promise<LLMResponse>;
+};
 
 // #3: config/reachability checks over-report OK — a key-present but
 // subscription-blocked, invalid, or tool-incapable model still looks "ready".
@@ -478,7 +502,7 @@ async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
 // a fixed string + reasonCode, the prompt carries no user content).
 export async function probeChatCompletion(
   provider: Pick<LLMProvider, 'chat'>,
-  options: { timeoutMs?: number; label?: string } = {},
+  options: { timeoutMs?: number; label?: string; signal?: AbortSignal } = {},
 ): Promise<ReadinessResult> {
   const label = options.label ?? 'main provider';
   const timeoutMs = options.timeoutMs ?? 6000;
@@ -492,12 +516,15 @@ export async function probeChatCompletion(
   };
 
   try {
+    const abortable = provider as AbortableChatProvider;
+    const messages: Message[] = [{ role: 'user', content: 'Health check: reply with a short acknowledgement.' }];
+    const work = typeof abortable.chatWithSignal === 'function' && options.signal
+      ? abortable.chatWithSignal(messages, [probeTool], options.signal)
+      : provider.chat(messages, [probeTool]);
     const result = await withTimeout(
-      provider.chat(
-        [{ role: 'user', content: 'Health check: reply with a short acknowledgement.' }],
-        [probeTool],
-      ),
+      work,
       timeoutMs,
+      options.signal,
     );
     const toolVerified = result.type === 'tool_call';
     return {
@@ -539,12 +566,60 @@ export async function checkSystemReadiness(
   config: AppConfig,
   options: HealthcheckOptions = {},
 ): Promise<{ providers: ReadinessResult[]; telegram: ReadinessResult }> {
+  const controller = new AbortController();
+  const onAbort = (): void => { controller.abort(); };
+  if (options.signal) {
+    if (options.signal.aborted) controller.abort();
+    else options.signal.addEventListener('abort', onAbort, { once: true });
+  }
+  const probeOptions: HealthcheckOptions = { ...options, signal: controller.signal };
+  const work = Promise.all([
+    checkProviderReadiness('main provider', config.providers.main, probeOptions),
+    checkProviderReadiness('medical provider', config.providers.medical, probeOptions),
+    checkProviderReadiness('embeddings provider', config.providers.embeddings, probeOptions),
+    checkTelegramReadiness(config, probeOptions),
+  ]);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  const deadline = new Promise<null>((resolve) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      resolve(null);
+    }, options.overallTimeoutMs ?? 3000);
+    timer.unref?.();
+  });
+  try {
+    const result = await Promise.race([work, deadline]);
+    if (result === null) {
+      // A custom/faulty transport may ignore AbortSignal. Do not hold boot for it, but attach a
+      // rejection handler so late completion remains harmless and cannot become an unhandled error.
+      void work.catch(() => undefined);
+      return {
+        providers: ['main provider', 'medical provider', 'embeddings provider'].map(pendingReadiness),
+        telegram: pendingReadiness('telegram'),
+      };
+    }
+    return {
+      providers: result.slice(0, 3),
+      telegram: result[3],
+    };
+  } finally {
+    if (!timedOut) controller.abort();
+    if (timer) clearTimeout(timer);
+    options.signal?.removeEventListener('abort', onAbort);
+  }
+}
+
+function pendingReadiness(label: string): ReadinessResult {
   return {
-    providers: [
-      await checkProviderReadiness('main provider', config.providers.main, options),
-      await checkProviderReadiness('medical provider', config.providers.medical, options),
-      await checkProviderReadiness('embeddings provider', config.providers.embeddings, options),
-    ],
-    telegram: await checkTelegramReadiness(config, options),
+    ready: false,
+    checked: true,
+    label,
+    status: 'warn',
+    details: ['health check pending'],
+    warnings: ['not completed within the startup budget'],
+    reasonCode: 'healthcheck-timeout',
+    actionHint: 'Health checks continue in the background; retry status shortly.',
   };
 }

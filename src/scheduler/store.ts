@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import * as readline from 'readline';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { secureMkdir, secureWriteViaTmp, summarizeErrorForLog, tightenFile } from '../security';
@@ -9,8 +10,105 @@ import type {
   UpdateHeartbeatJobInput,
 } from './types';
 
+interface JobsCache {
+  mtimeMs: number;
+  size: number;
+  ino: number;
+  jobs: HeartbeatJob[];
+}
+
+/** Parse the stable JSON-array format one object at a time, without buffering the complete file. */
+async function readJsonArray(filePath: string): Promise<unknown[]> {
+  const input = fs.createReadStream(filePath, { encoding: 'utf8' });
+  const lines = readline.createInterface({ input, crlfDelay: Infinity });
+  const jobs: unknown[] = [];
+  let state: 'before-array' | 'value' | 'value-after-comma' | 'after-value' | 'done' = 'before-array';
+  let objectDepth = 0;
+  let inString = false;
+  let escaped = false;
+  let objectText = '';
+
+  const consume = (line: string): void => {
+    for (const character of line) {
+      if (objectDepth > 0) {
+        objectText += character;
+        if (inString) {
+          if (escaped) escaped = false;
+          else if (character === '\\') escaped = true;
+          else if (character === '"') inString = false;
+        } else if (character === '"') {
+          inString = true;
+        } else if (character === '{') {
+          objectDepth += 1;
+        } else if (character === '}') {
+          objectDepth -= 1;
+          if (objectDepth === 0) {
+            jobs.push(JSON.parse(objectText));
+            objectText = '';
+            state = 'after-value';
+          }
+        }
+        continue;
+      }
+
+      if (/\s/.test(character)) continue;
+      if (state === 'before-array') {
+        if (character !== '[') throw new Error('Heartbeat store payload must be an array.');
+        state = 'value';
+        continue;
+      }
+      if (state === 'value') {
+        if (character === ']' && jobs.length === 0) {
+          state = 'done';
+          continue;
+        }
+        if (character !== '{') throw new Error('Heartbeat store array contains a non-object value.');
+        objectDepth = 1;
+        objectText = '{';
+        inString = false;
+        escaped = false;
+        continue;
+      }
+      if (state === 'value-after-comma') {
+        if (character !== '{') throw new Error('Heartbeat store array contains an invalid separator.');
+        objectDepth = 1;
+        objectText = '{';
+        inString = false;
+        escaped = false;
+        state = 'value';
+        continue;
+      }
+      if (state === 'after-value') {
+        if (character === ',') {
+          state = 'value-after-comma';
+          continue;
+        }
+        if (character === ']') {
+          state = 'done';
+          continue;
+        }
+        throw new Error('Heartbeat store payload has trailing data.');
+      }
+      throw new Error('Heartbeat store payload has trailing data.');
+    }
+  };
+
+  try {
+    for await (const line of lines) consume(line);
+    if (state === 'before-array') return [];
+    if (objectDepth !== 0 || inString || state !== 'done') {
+      throw new Error('Heartbeat store payload is incomplete.');
+    }
+    return jobs;
+  } finally {
+    lines.close();
+    input.destroy();
+  }
+}
+
 export class HeartbeatStore {
   public lastCorruptionAt?: string;
+  private jobsCache?: JobsCache;
 
   constructor(
     private readonly filePath: string,
@@ -22,15 +120,15 @@ export class HeartbeatStore {
   }
 
   async get(id: string): Promise<HeartbeatJob | undefined> {
-    return this.readJobs().find((job) => job.id === id);
+    return (await this.readJobs()).find((job) => job.id === id);
   }
 
   async findByPolicyKey(policyKey: string): Promise<HeartbeatJob | undefined> {
-    return this.readJobs().find((job) => job.policyKey === policyKey);
+    return (await this.readJobs()).find((job) => job.policyKey === policyKey);
   }
 
   async create(input: CreateHeartbeatJobInput): Promise<HeartbeatJob> {
-    const jobs = this.readJobs();
+    const jobs = await this.readJobs();
     if (input.policyKey) {
       const duplicate = jobs.find((job) => job.policyKey === input.policyKey);
       if (duplicate) {
@@ -61,7 +159,7 @@ export class HeartbeatStore {
   }
 
   async update(id: string, patch: UpdateHeartbeatJobInput): Promise<HeartbeatJob> {
-    const jobs = this.readJobs();
+    const jobs = await this.readJobs();
     const index = jobs.findIndex((job) => job.id === id);
     if (index < 0) {
       throw new Error(`Heartbeat job not found: ${id}`);
@@ -79,7 +177,7 @@ export class HeartbeatStore {
   }
 
   async remove(id: string): Promise<boolean> {
-    const jobs = this.readJobs();
+    const jobs = await this.readJobs();
     const next = jobs.filter((job) => job.id !== id);
     if (next.length === jobs.length) {
       return false;
@@ -89,7 +187,7 @@ export class HeartbeatStore {
   }
 
   async markRun(id: string, at: string): Promise<void> {
-    const jobs = this.readJobs();
+    const jobs = await this.readJobs();
     const index = jobs.findIndex((job) => job.id === id);
     if (index < 0) {
       throw new Error(`Heartbeat job not found: ${id}`);
@@ -105,7 +203,7 @@ export class HeartbeatStore {
   }
 
   async markError(id: string, message: string): Promise<void> {
-    const jobs = this.readJobs();
+    const jobs = await this.readJobs();
     const index = jobs.findIndex((job) => job.id === id);
     if (index < 0) {
       throw new Error(`Heartbeat job not found: ${id}`);
@@ -122,7 +220,7 @@ export class HeartbeatStore {
   }
 
   async markOutcome(id: string, outcome: HeartbeatLastOutcome): Promise<void> {
-    const jobs = this.readJobs();
+    const jobs = await this.readJobs();
     const index = jobs.findIndex((job) => job.id === id);
     if (index < 0) {
       throw new Error(`Heartbeat job not found: ${id}`);
@@ -137,23 +235,36 @@ export class HeartbeatStore {
     this.writeJobs(jobs);
   }
 
-  private readJobs(): HeartbeatJob[] {
-    if (!fs.existsSync(this.filePath)) {
-      return [];
+  private async readJobs(): Promise<HeartbeatJob[]> {
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(this.filePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        this.jobsCache = undefined;
+        return [];
+      }
+      throw error;
     }
 
-    const raw = fs.readFileSync(this.filePath, 'utf8').trim();
-    if (raw.length === 0) {
+    if (this.jobsCache
+      && this.jobsCache.mtimeMs === stat.mtimeMs
+      && this.jobsCache.size === stat.size
+      && this.jobsCache.ino === stat.ino) {
+      return this.cloneJobs(this.jobsCache.jobs);
+    }
+
+    if (stat.size === 0) {
+      this.jobsCache = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, jobs: [] };
       return [];
     }
 
     try {
-      const parsed = JSON.parse(raw) as unknown;
-      if (!Array.isArray(parsed)) {
-        throw new Error('Heartbeat store payload must be an array.');
-      }
+      const parsed = await readJsonArray(this.filePath);
       this.lastCorruptionAt = undefined;
-      return parsed.map((job) => this.normalizeJob(job));
+      const jobs = parsed.map((job) => this.normalizeJob(job as HeartbeatJob));
+      this.jobsCache = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, jobs: this.cloneJobs(jobs) };
+      return this.cloneJobs(jobs);
     } catch (error) {
       this.lastCorruptionAt = new Date().toISOString();
       console.error(
@@ -171,12 +282,25 @@ export class HeartbeatStore {
           `[scheduler] Corrupt heartbeat store recovered: ${reason}. Quarantine failed: ${quarantineReason}. Using empty store.`,
         );
       }
+      this.jobsCache = undefined;
       return [];
     }
   }
 
   private writeJobs(jobs: HeartbeatJob[]): void {
     secureWriteViaTmp(this.filePath, JSON.stringify(jobs, null, 2));
+    try {
+      const stat = fs.statSync(this.filePath);
+      this.jobsCache = {
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+        ino: stat.ino,
+        jobs: this.cloneJobs(jobs),
+      };
+    } catch {
+      // The durable write succeeded; if fingerprinting is unavailable, the next read reopens the file.
+      this.jobsCache = undefined;
+    }
   }
 
   private quarantineCorruptFile(): string {
@@ -196,5 +320,9 @@ export class HeartbeatStore {
       retryCount: job.retryCount ?? 0,
       maxRetries: job.maxRetries ?? 0,
     };
+  }
+
+  private cloneJobs(jobs: HeartbeatJob[]): HeartbeatJob[] {
+    return jobs.map((job) => ({ ...job }));
   }
 }

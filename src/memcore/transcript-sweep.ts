@@ -150,7 +150,10 @@ function userChatContent(line: string): string | null {
 
 export function sweep(input: SweepInput): SweepResult {
   const lexicon = input.lexicon ?? DEFAULT_SWEEP_LEXICON;
-  const maxItems = input.maxItems ?? DEFAULT_MAX_ITEMS;
+  const requestedMaxItems = input.maxItems ?? DEFAULT_MAX_ITEMS;
+  const maxItems = Number.isFinite(requestedMaxItems)
+    ? Math.max(0, Math.min(DEFAULT_MAX_ITEMS, Math.floor(requestedMaxItems)))
+    : DEFAULT_MAX_ITEMS;
 
   // Entities the agent already logged yesterday, and entities we already asked about.
   const loggedSet = new Set<string>();

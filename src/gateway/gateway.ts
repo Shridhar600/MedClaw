@@ -75,6 +75,32 @@ const SHUTDOWN_RESPONSE = 'The health assistant is shutting down. Please try aga
 const INDEX_EMBED_TIMEOUT_MS = 500;
 const INDEX_EMBED_COOLDOWN_MS = 1_000;
 const HEARTBEAT_CURIOSITY_LIMIT = 5;
+const BOOT_HEALTHCHECK_BUDGET_MS = 3_000;
+
+function pendingReadiness(label: string): ReadinessResult {
+  return {
+    ready: false,
+    checked: true,
+    label,
+    status: 'warn',
+    details: ['health check pending'],
+    warnings: ['not completed within the startup budget'],
+    reasonCode: 'healthcheck-timeout',
+    actionHint: 'Health checks continue in the background; retry status shortly.',
+  };
+}
+
+function pendingBootHealth(): { providers: ReadinessResult[]; telegram: ReadinessResult } {
+  return {
+    providers: ['main provider', 'medical provider', 'embeddings provider'].map(pendingReadiness),
+    telegram: pendingReadiness('telegram'),
+  };
+}
+
+function readinessLabel(result: ReadinessResult): 'OK' | 'FAIL' | 'PENDING' {
+  if (result.reasonCode === 'healthcheck-timeout') return 'PENDING';
+  return result.ready ? 'OK' : 'FAIL';
+}
 
 type SignalEmbeddingProvider = LLMProvider & {
   embedWithSignal?: (text: string, signal: AbortSignal) => Promise<number[]>;
@@ -1834,46 +1860,87 @@ export class Gateway {
   }
 
   private async runBootHealthchecks(): Promise<void> {
+    const controller = new AbortController();
+    const readiness = checkSystemReadiness(this.config, {
+      allowNetworkChecks: true,
+      overallTimeoutMs: BOOT_HEALTHCHECK_BUDGET_MS,
+      signal: controller.signal,
+    });
+    const completion = this.mainProvider && typeof probeChatCompletion === 'function'
+      ? probeChatCompletion(this.mainProvider, {
+        label: 'main provider',
+        timeoutMs: BOOT_HEALTHCHECK_BUDGET_MS,
+        signal: controller.signal,
+      })
+      : Promise.resolve(undefined);
+    const allChecks = Promise.all([readiness, completion]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    const deadline = new Promise<null>((resolve) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+        resolve(null);
+      }, BOOT_HEALTHCHECK_BUDGET_MS);
+      timer.unref?.();
+    });
     try {
-      const healthResults = await checkSystemReadiness(this.config, { allowNetworkChecks: true });
-      // #3: config/reachability checks alone over-report OK — a key-present but
-      // subscription-blocked or tool-incapable main model still shows "OK". Fold
-      // a real, tool-bearing completion probe into the main-provider entry so
-      // /status reflects whether the model actually answers.
-      await this.probeMainCompletionInto(healthResults);
-      this.bootHealth = healthResults;
-      const allReady = healthResults.providers.every((p) => p.ready) && healthResults.telegram.ready;
-      if (!allReady) {
-        console.warn('[gateway] Boot healthcheck: NOT ALL READY');
-        for (const r of [...healthResults.providers, healthResults.telegram]) {
-          if (!r.ready) {
-            console.warn(`  ${r.label}: ${r.details.join(', ')}`);
-            if (r.actionHint) {
-              console.warn(`  → ${r.actionHint}`);
-            }
-          }
-        }
-      } else {
-        console.log('[gateway] Boot healthcheck: all systems ready');
+      const result = await Promise.race([allChecks, deadline]);
+      if (result === null) {
+        this.bootHealth = pendingBootHealth();
+        console.warn('[gateway] Boot healthcheck exceeded startup budget; continuing in degraded health-check-pending state');
+        // A transport that ignores AbortSignal may still settle later. Keep the late result useful for
+        // /status, but never let it hold boot or surface an unhandled rejection.
+        void allChecks
+          .then(([healthResults, completionResult]) => {
+            if (this.stopping) return;
+            this.finishBootHealthchecks(healthResults, completionResult);
+          })
+          .catch((error) => {
+            console.warn('[gateway] Deferred boot healthcheck failed:', summarizeErrorForLog(error));
+          });
+        return;
       }
+      this.finishBootHealthchecks(result[0], result[1]);
     } catch (error) {
       console.warn('[gateway] Boot healthcheck failed:', summarizeErrorForLog(error));
+    } finally {
+      if (!timedOut) controller.abort();
+      if (timer) clearTimeout(timer);
     }
   }
 
-  // #3: run the live completion probe on the MAIN provider only (it is the one
-  // that must support tool calling) and fold the result into its readiness
-  // entry. Skips when the config-level check already failed the main provider
-  // (nothing to probe) or the provider is unavailable. Never throws.
-  private async probeMainCompletionInto(
+  private finishBootHealthchecks(
     healthResults: { providers: ReadinessResult[]; telegram: ReadinessResult },
-  ): Promise<void> {
-    const idx = healthResults.providers.findIndex((p) => p.label === 'main provider');
-    if (idx < 0 || !this.mainProvider || !healthResults.providers[idx].ready) {
-      return;
+    completion?: ReadinessResult,
+  ): void {
+    this.mergeMainCompletionResult(healthResults, completion);
+    this.bootHealth = healthResults;
+    const allReady = healthResults.providers.every((p) => p.ready) && healthResults.telegram.ready;
+    if (!allReady) {
+      console.warn('[gateway] Boot healthcheck: NOT ALL READY');
+      for (const r of [...healthResults.providers, healthResults.telegram]) {
+        if (!r.ready) {
+          console.warn(`  ${r.label}: ${r.details.join(', ')}`);
+          if (r.actionHint) {
+            console.warn(`  → ${r.actionHint}`);
+          }
+        }
+      }
+    } else {
+      console.log('[gateway] Boot healthcheck: all systems ready');
     }
+  }
+
+  // #3: merge the live completion result for the MAIN provider only. A completion result is ignored
+  // when its config/reachability probe already failed, preserving the original skip semantics.
+  private mergeMainCompletionResult(
+    healthResults: { providers: ReadinessResult[]; telegram: ReadinessResult },
+    completion?: ReadinessResult,
+  ): void {
+    const idx = healthResults.providers.findIndex((p) => p.label === 'main provider');
+    if (idx < 0 || !completion || !healthResults.providers[idx].ready) return;
     const base = healthResults.providers[idx];
-    const completion = await probeChatCompletion(this.mainProvider, { label: 'main provider' });
     if (!completion.ready) {
       healthResults.providers[idx] = {
         ...base,
@@ -1925,10 +1992,11 @@ export class Gateway {
     if (!h) {
       return 'System health check not yet complete.';
     }
+    const pending = [...h.providers, h.telegram].some((result) => result.reasonCode === 'healthcheck-timeout');
     const lines = [
-      'System Health:',
-      ...h.providers.map((p) => `  ${p.label}: ${p.ready ? 'OK' : 'FAIL'}`),
-      `  telegram: ${h.telegram.ready ? 'OK' : 'FAIL'}`,
+      `System Health${pending ? ' (health-check-pending)' : ''}:`,
+      ...h.providers.map((p) => `  ${p.label}: ${readinessLabel(p)}`),
+      `  telegram: ${readinessLabel(h.telegram)}`,
       `  prompt: ${this.promptMode}${this.promptMode === 'boot-cached' ? ' (recall off — degraded)' : ''}`,
     ];
     // Security warnings carry config internals (provider baseUrls, workspace

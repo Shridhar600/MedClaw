@@ -10,6 +10,7 @@ import type {
 } from './types';
 
 const ROTATION_CHECK_INTERVAL = 100;
+const TAIL_READ_CHUNK_BYTES = 64 * 1024;
 
 export class SchedulerAuditLog {
   private appendCount = 0;
@@ -56,15 +57,65 @@ export class SchedulerAuditLog {
    * this read path is a known limitation and future work.
    */
   async readRecent(query: SchedulerAuditLogQuery = {}): Promise<SchedulerAuditEvent[]> {
-    const events = this.readAll();
-    const filtered = query.jobId ? events.filter((event) => event.jobId === query.jobId) : events;
     if (query.limit === undefined) {
-      return filtered;
+      const events = this.readAll();
+      return query.jobId ? events.filter((event) => event.jobId === query.jobId) : events;
     }
     if (query.limit <= 0) {
       return [];
     }
-    return filtered.slice(-query.limit);
+    return this.readTail(query.limit, query.jobId);
+  }
+
+  /** Read only enough of the active JSONL tail to satisfy the requested recent-event window. */
+  private readTail(limit: number, jobId?: string): SchedulerAuditEvent[] {
+    if (!fs.existsSync(this.filePath)) return [];
+
+    const fd = fs.openSync(this.filePath, 'r');
+    try {
+      const size = fs.fstatSync(fd).size;
+      let position = size;
+      const parts: Buffer[] = [];
+      let partBytes = 0;
+      const newestFirst: SchedulerAuditEvent[] = [];
+      const finishLine = (): void => {
+        if (partBytes === 0) return;
+        const raw = Buffer.concat(parts, partBytes).toString('utf8');
+        parts.length = 0;
+        partBytes = 0;
+        if (raw.trim().length === 0) return;
+        const event = this.parseLine(raw, 0);
+        if (!jobId || event.jobId === jobId) newestFirst.push(event);
+      };
+
+      while (position > 0 && newestFirst.length < limit) {
+        const length = Math.min(TAIL_READ_CHUNK_BYTES, position);
+        position -= length;
+        const chunk = Buffer.allocUnsafe(length);
+        const bytesRead = fs.readSync(fd, chunk, 0, length, position);
+        let end = bytesRead;
+        for (let i = bytesRead - 1; i >= 0 && newestFirst.length < limit; i--) {
+          if (chunk[i] !== 0x0a) continue;
+          if (i + 1 < end) {
+            const part = chunk.subarray(i + 1, end);
+            parts.unshift(part);
+            partBytes += part.length;
+          }
+          finishLine();
+          end = i;
+        }
+        if (newestFirst.length < limit && end > 0) {
+          const part = chunk.subarray(0, end);
+          parts.unshift(part);
+          partBytes += part.length;
+        }
+      }
+      if (newestFirst.length < limit) finishLine();
+      newestFirst.reverse();
+      return newestFirst;
+    } finally {
+      fs.closeSync(fd);
+    }
   }
 
   private readAll(): SchedulerAuditEvent[] {

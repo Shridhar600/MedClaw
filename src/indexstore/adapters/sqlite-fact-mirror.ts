@@ -101,10 +101,24 @@ export class SqliteFactMirror implements FactMirror {
   async *queryEntityHeads(): AsyncIterable<FactRecord> {
     // One lifecycle head per (type, entity): active wins over terminal/non-active records, then
     // version/createdAt/id provide deterministic ordering. v0 quarantine sentinels are excluded.
-    // The mirror is per-profile and this is the existing bounded head-read seam.
+    // The window query selects only one candidate JSON row per group. The JS reducer remains as a
+    // defensive semantic belt-and-braces check, but it now sees a bounded result set rather than
+    // parsing every historical version on every recall turn.
     const rows = this.db.prepare(`
-      SELECT f.json AS json FROM facts f
-      WHERE f.version >= 1
+      SELECT json FROM (
+        SELECT f.json AS json,
+          ROW_NUMBER() OVER (
+            PARTITION BY f.type, f.entity
+            ORDER BY
+              CASE WHEN f.status = 'active' THEN 1 ELSE 0 END DESC,
+              f.version DESC,
+              f.created_at DESC,
+              f.id DESC
+          ) AS head_rank
+        FROM facts f
+        WHERE f.version >= 1
+      )
+      WHERE head_rank = 1
     `).all() as FactRow[];
     const byEntity = new Map<string, FactRecord>();
     for (const r of rows) {
@@ -160,6 +174,8 @@ export class SqliteFactMirror implements FactMirror {
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_facts_entity ON facts(entity, status);
       CREATE INDEX IF NOT EXISTS idx_facts_type ON facts(type, status);
+      CREATE INDEX IF NOT EXISTS idx_facts_entity_head
+        ON facts(type, entity, status, version DESC, created_at DESC, id DESC);
     `);
   }
 

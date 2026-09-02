@@ -60,6 +60,17 @@ interface HitRow {
 
 const DAY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.jsonl$/;
 const DEFAULT_LIMIT = 20;
+const REBUILD_BATCH_SIZE = 500;
+const REBUILD_READ_CHUNK_BYTES = 64 * 1024;
+
+interface RebuildRow {
+  chatId: string;
+  file: string;
+  line: number;
+  role: string;
+  ts: string;
+  content: string;
+}
 
 export class SqliteSessionIndex {
   private readonly db: Database.Database;
@@ -83,6 +94,9 @@ export class SqliteSessionIndex {
     // parity is broken (a dropped derived table left stale metadata — H8). Never throws out of the ctor.
     try {
       if (this.sessionsDir && (this.isEmpty() || this.dirtyMarkerExists() || this.ftsParityBroken())) {
+        // Batches below intentionally bound transaction and allocation size. Set the durable marker
+        // before dropping derived rows so a crash at any point cannot look healthy on the next boot.
+        this.markDirty();
         this.resetDerivedTables();
         if (this.rebuildFromDayFiles()) this.clearDirtyMarker();
       }
@@ -140,53 +154,60 @@ export class SqliteSessionIndex {
   }
 
   /**
-   * Re-index every day file under `sessionsDir` in ONE transaction (N-4: a crash mid-rebuild leaves the
-   * index untouched, so the emptiness trigger can re-fire — no partial index). Line numbers are physical
-   * non-empty positions (malformed lines occupy their slot but are not indexed), matching the append
-   * path's anchor assignment. In a per-chat layout the containing directory supplies the chat scope; a
-   * flat legacy file falls back to its embedded chatId. Idempotent via the `<chatId>#<file>#<line>` upsert.
+   * Re-index every day file under `sessionsDir` in bounded batches. A durable dirty marker covers crashes
+   * or unreadable files, so an incomplete rebuild cannot look healthy on the next boot. The line numbers
+   * remain physical non-empty positions and the archive stays the source of truth.
+   * In a per-chat layout the containing directory supplies the chat scope; a flat legacy file falls back
+   * to the embedded chatId. Idempotent via the `<chatId>#<file>#<line>` upsert.
    */
   rebuildFromDayFiles(sessionsDir?: string): boolean {
     const root = sessionsDir ?? this.sessionsDir;
     if (!root) return true;
+    this.markDirty();
     const listing = SqliteSessionIndex.listDayFilePaths(root);
     const files = listing.paths;
     let complete = listing.complete;
-    this.db.transaction(() => {
-      for (const fp of files) {
-        const base = path.basename(fp);
-        const subdir = SqliteSessionIndex.subdirChatId(root, fp);
-        let lines: string[];
+    const pending: RebuildRow[] = [];
+    const flush = (): void => {
+      if (pending.length === 0) return;
+      const batch = pending.splice(0, pending.length);
+      this.db.transaction(() => {
+        for (const row of batch) {
+          this.writeTurn(row.chatId, row.file, row.line, row.role, row.ts, row.content);
+        }
+      })();
+    };
+
+    for (const fp of files) {
+      const base = path.basename(fp);
+      const subdir = SqliteSessionIndex.subdirChatId(root, fp);
+      const readable = SqliteSessionIndex.forEachNonEmptyLine(fp, (raw, lineNo) => {
+        let entry: { role?: unknown; content?: unknown; timestamp?: unknown; chatId?: unknown };
         try {
-          lines = fs.readFileSync(fp, 'utf-8').split('\n').filter((l) => l.length > 0);
-        } catch (e) {
-          console.warn('[session-index] rebuild: unreadable day file skipped:', summarizeErrorForLog(e));
-          complete = false;
-          continue;
+          entry = JSON.parse(raw);
+        } catch {
+          return; // malformed slot: lineNo already advanced, so the physical anchor stays aligned
         }
-        for (let i = 0; i < lines.length; i++) {
-          const lineNo = i + 1; // 1-based physical non-empty line — the anchor the append path assigns
-          let entry: { role?: unknown; content?: unknown; timestamp?: unknown; chatId?: unknown };
-          try {
-            entry = JSON.parse(lines[i]);
-          } catch {
-            continue; // malformed slot: not indexable, but lineNo already advanced (anchor stays aligned)
-          }
-          const content = entry.content;
-          if (typeof content !== 'string' || content.length === 0) continue; // nothing textual to index
-          const role = typeof entry.role === 'string' ? entry.role : '';
-          const ts = typeof entry.timestamp === 'string' ? entry.timestamp : '';
-          // A per-chat directory is the trust boundary. Never let a JSONL field reassign a line to a
-          // different chat. Flat legacy archives have no directory scope, so use their embedded field.
-          const chatId = subdir || (typeof entry.chatId === 'string' && entry.chatId.length > 0
-            ? entry.chatId
-            : undefined);
-          if (!chatId) continue;
-          this.writeTurn(chatId, base, lineNo, role, ts, content);
-        }
+        const content = entry.content;
+        if (typeof content !== 'string' || content.length === 0) return; // nothing textual to index
+        const role = typeof entry.role === 'string' ? entry.role : '';
+        const ts = typeof entry.timestamp === 'string' ? entry.timestamp : '';
+        // A per-chat directory is the trust boundary. Never let a JSONL field reassign a line to a
+        // different chat. Flat legacy archives have no directory scope, so use their embedded field.
+        const chatId = subdir || (typeof entry.chatId === 'string' && entry.chatId.length > 0
+          ? entry.chatId
+          : undefined);
+        if (!chatId) return;
+        pending.push({ chatId, file: base, line: lineNo, role, ts, content });
+        if (pending.length >= REBUILD_BATCH_SIZE) flush();
+      });
+      if (!readable) {
+        console.warn('[session-index] rebuild: unreadable day file skipped:', summarizeErrorForLog(new Error('day file read failed')));
+        complete = false;
       }
-    })();
-    if (!complete) this.markDirty();
+    }
+    flush();
+    if (complete) this.clearDirtyMarker();
     return complete;
   }
 
@@ -327,6 +348,65 @@ export class SqliteSessionIndex {
     const rel = path.relative(root, fp);
     const parts = rel.split(path.sep);
     return parts.length > 1 ? parts[0] : '';
+  }
+
+  /** Visit non-empty physical JSONL lines with fixed memory; callback failures propagate to the caller. */
+  private static forEachNonEmptyLine(filePath: string, visit: (raw: string, line: number) => void): boolean {
+    let fd: number | undefined;
+    try {
+      if (!fs.lstatSync(filePath).isFile()) return false;
+      fd = fs.openSync(filePath, 'r');
+    } catch {
+      return false;
+    }
+
+    const parts: Buffer[] = [];
+    let partBytes = 0;
+    let line = 0;
+    let position = 0;
+    const finishLine = (): void => {
+      if (partBytes === 0) return;
+      line += 1;
+      visit(Buffer.concat(parts, partBytes).toString('utf8'), line);
+      parts.length = 0;
+      partBytes = 0;
+    };
+
+    try {
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const chunk = Buffer.allocUnsafe(REBUILD_READ_CHUNK_BYTES);
+        let bytesRead: number;
+        try {
+          bytesRead = fs.readSync(fd, chunk, 0, chunk.length, position);
+        } catch {
+          return false;
+        }
+        if (bytesRead === 0) break;
+        position += bytesRead;
+        let start = 0;
+        while (start < bytesRead) {
+          const newline = chunk.indexOf(0x0a, start);
+          if (newline < 0 || newline >= bytesRead) {
+            const part = chunk.subarray(start, bytesRead);
+            parts.push(part);
+            partBytes += part.length;
+            break;
+          }
+          if (newline > start) {
+            const part = chunk.subarray(start, newline);
+            parts.push(part);
+            partBytes += part.length;
+          }
+          finishLine();
+          start = newline + 1;
+        }
+      }
+      finishLine();
+      return true;
+    } finally {
+      try { fs.closeSync(fd); } catch { /* best-effort */ }
+    }
   }
 
   private static listDayFilePaths(root: string): { paths: string[]; complete: boolean } {
