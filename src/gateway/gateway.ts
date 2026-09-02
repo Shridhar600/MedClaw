@@ -23,8 +23,8 @@ import { createLedgerTools } from '../tools/ledger-tools';
 import { createEpisodeTools } from '../tools/episode-tools';
 import { createSafetyTools } from '../tools/safety-tools';
 import { WriteQueue, replayJournal } from '../profiles';
-import { LedgerStore, NarrativeStore, SafetyView, EpisodeStore, CuriosityQueue, TYPE_TO_FILE, normalizeEntity } from '../memcore';
-import type { FactType } from '../memcore';
+import { LedgerStore, NarrativeStore, SafetyView, EpisodeStore, CuriosityQueue, CuratedMemory, TYPE_TO_FILE, normalizeEntity } from '../memcore';
+import type { CuriosityItem, FactType } from '../memcore';
 import { SqliteFactMirror, SqliteEventSink, SqliteVecIndex, SqliteKeywordIndex, SqliteChunkStats, SqliteSessionIndex, ledgerFactToRecord, isRemoteEmbeddingBaseUrl } from '../indexstore';
 import { createSessionTools } from '../tools/session-tools';
 import { deprecatedSessionWarnings } from '../config/deprecations';
@@ -74,6 +74,7 @@ const SESSION_RESET_FAILURE_RESPONSE = "I couldn't start a fresh session right n
 const SHUTDOWN_RESPONSE = 'The health assistant is shutting down. Please try again in a moment.';
 const INDEX_EMBED_TIMEOUT_MS = 500;
 const INDEX_EMBED_COOLDOWN_MS = 1_000;
+const HEARTBEAT_CURIOSITY_LIMIT = 5;
 
 type SignalEmbeddingProvider = LLMProvider & {
   embedWithSignal?: (text: string, signal: AbortSignal) => Promise<number[]>;
@@ -109,6 +110,28 @@ function makeBoundedEmbeddingProvider(provider: LLMProvider): LLMProvider {
       }
     },
   };
+}
+
+function dueCuriosityItems(items: CuriosityItem[], now: Date): CuriosityItem[] {
+  const clinicalKinds = new Set(['follow-up', 'medication-reminder', 'lab-correlation', 'missing-data']);
+  return items
+    .filter(item => {
+      if (!item.dueAt) return true;
+      const dueAt = Date.parse(item.dueAt);
+      return Number.isNaN(dueAt) || dueAt <= now.getTime();
+    })
+    .sort((a, b) => {
+      const priority = (item: CuriosityItem): number => item.critical || clinicalKinds.has(item.kind) ? 0 : 1;
+      const dueRank = (item: CuriosityItem): number => {
+        const value = item.dueAt ? Date.parse(item.dueAt) : Date.parse(item.createdAt);
+        return Number.isNaN(value) ? Number.MAX_SAFE_INTEGER : value;
+      };
+      return priority(a) - priority(b)
+        || dueRank(a) - dueRank(b)
+        || a.createdAt.localeCompare(b.createdAt)
+        || a.id.localeCompare(b.id);
+    })
+    .slice(0, HEARTBEAT_CURIOSITY_LIMIT);
 }
 
 export class Gateway {
@@ -315,6 +338,10 @@ export class Gateway {
       const episodeStore = new EpisodeStore(memoryWorkspace);
       const curiosityQueue = new CuriosityQueue(memoryWorkspace, undefined, undefined, profileId);
       this.curiosity = curiosityQueue;
+      const curatedMemory = new CuratedMemory(memoryWorkspace, {
+        budgetChars: config.memory.bootstrapMaxChars,
+        budgetRatios: config.memory.budgetRatios,
+      });
       const safetyRenderer = makeSafetyRenderer({
         render: (facts) => safetyView.render(facts),
         listSafetyRelevant: () => ledgerStore.listSafetyRelevant(),
@@ -461,20 +488,29 @@ export class Gateway {
           safety: safetyView,
           maxChars: config.memory.bootstrapMaxChars,
           clock: systemClock,
+          curatedMemory: {
+            readForContext: (maxChars, budgetRatios) => curatedMemory.readForContext(maxChars, budgetRatios),
+          },
+          budgetRatios: config.memory.budgetRatios,
         });
         medicalContextProvider = async (userMessage) => {
           let recall = null as Awaited<ReturnType<typeof recallEngine.run>> | null;
+          let status: 'available' | 'unreadable' | 'provider-unavailable' = 'available';
           try {
             recall = await recallEngine.run({ profileId, userMessage }, { narrative: true });
           } catch (e) {
+            status = 'provider-unavailable';
             console.warn('[gateway] medical recall failed (using SAFETY/profile only):', summarizeErrorForLog(e));
           }
           const report = await v2Assembler.assemble(profileId, 'chat', recall);
           const medicalKeys = new Set(['SAFETY.md', 'active-ledger', 'recall', 'check']);
-          return report.sections
+          const content = report.sections
             .filter((section) => medicalKeys.has(section.key))
             .map((section) => `## ${section.title}\n${section.content}`)
             .join('\n\n');
+          if (status === 'available' && report.degraded.length > 0) status = 'unreadable';
+          if (status === 'available' && recall?.indexStatus === 'failed') status = 'provider-unavailable';
+          return { content, status };
         };
         prepareSystem = async (mode, userMessage) => {
           // Recall is best-effort: any failure degrades to no recall, never blocks the turn
@@ -489,14 +525,35 @@ export class Gateway {
             console.warn('[gateway] recall failed (assembling without recall):', summarizeErrorForLog(e));
             recall = null;
           }
+          if (mode === 'heartbeat') {
+            try {
+              const items = dueCuriosityItems(await curiosityQueue.list(), systemClock.now());
+              recall = recall
+                ? { ...recall, curiosity: items }
+                : {
+                  ledger: '', ledgerTokens: 0, ledgerTruncated: false,
+                  narrative: '', narrativeTokens: 0, hits: [], injectedChunkIds: [],
+                  indexStatus: 'failed' as const, checkNotes: '', curiosity: items,
+                };
+            } catch (e) {
+              console.warn('[gateway] heartbeat curiosity read unavailable:', summarizeErrorForLog(e));
+              recall = recall
+                ? { ...recall, curiosityStatus: 'unreadable' }
+                : {
+                  ledger: '', ledgerTokens: 0, ledgerTruncated: false,
+                  narrative: '', narrativeTokens: 0, hits: [], injectedChunkIds: [],
+                  indexStatus: 'failed' as const, checkNotes: '', curiosityStatus: 'unreadable' as const,
+                };
+            }
+          }
           const report = await v2Assembler.assemble(profileId, mode, recall);
           return {
             messages: [{ role: 'system', content: report.content }],
             recordUsed: recall
-              ? (ids) => recallEngine.recordUsage(ids, systemClock.now().toISOString())
+              ? (ids) => recallEngine.recordUsage(ids, systemClock.now().toISOString(), recall!.injectedChunkIds)
               : undefined,
             healthContextTouched: report.sections.some((section) =>
-              ['SAFETY.md', 'HEALTH_PROFILE.md', 'active-ledger', 'recall', 'check'].includes(section.key)),
+              ['SAFETY.md', 'HEALTH_PROFILE.md', 'active-ledger', 'recall', 'check', 'curiosity'].includes(section.key)),
           };
         };
         console.log('[gateway] Per-turn recall + v2 context assembler ready (D9)');

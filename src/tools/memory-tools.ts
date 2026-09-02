@@ -35,6 +35,11 @@ const MANAGED_REJECT = {
   traversal: 'Path traversal is not allowed.',
 } as const;
 
+/** Generic tool-path limits. The ReAct loop receives tool results verbatim, so keep this boundary
+ * finite even when a caller bypasses the context assembler. */
+export const MEMORY_TOOL_MAX_BYTES = 16 * 1024;
+export const MEMORY_TOOL_MAX_TOKENS = 4_000;
+
 /**
  * Normalize a raw workspace-relative path to its RESOLVED form (PT / SB-1):
  * backslashes → slashes, then `path.posix.normalize` collapses `.` and `..`
@@ -61,6 +66,44 @@ function isPathError(error: unknown): boolean {
 
 function invalidPathResult(): ToolResult {
   return rejection('Invalid path: it must stay inside the memory workspace and must not contain path separators or "..".');
+}
+
+function estimateToolTokens(value: string): number {
+  return Math.ceil(value.length / 4);
+}
+
+function safeToolSlice(value: string, maxChars: number): string {
+  if (maxChars <= 0) return '';
+  if (value.length <= maxChars) return value;
+  let sliced = value.slice(0, maxChars);
+  const last = sliced.charCodeAt(sliced.length - 1);
+  if (last >= 0xD800 && last <= 0xDBFF) sliced = sliced.slice(0, -1);
+  return sliced;
+}
+
+function truncateToolText(value: string, label: string): string {
+  if (Buffer.byteLength(value, 'utf8') <= MEMORY_TOOL_MAX_BYTES && estimateToolTokens(value) <= MEMORY_TOOL_MAX_TOKENS) {
+    return value;
+  }
+
+  let end = Math.min(value.length, MEMORY_TOOL_MAX_BYTES, MEMORY_TOOL_MAX_TOKENS * 4);
+  const markerFor = (omittedBytes: number): string => `\n\n[TRUNCATED ${label}: ${omittedBytes} bytes omitted]`;
+  while (end > 0) {
+    const prefix = safeToolSlice(value, end);
+    const marker = markerFor(Buffer.byteLength(value.slice(prefix.length), 'utf8'));
+    const candidate = `${prefix}${marker}`;
+    if (Buffer.byteLength(candidate, 'utf8') <= MEMORY_TOOL_MAX_BYTES
+      && estimateToolTokens(candidate) <= MEMORY_TOOL_MAX_TOKENS) {
+      return candidate;
+    }
+    end--;
+  }
+  return safeToolSlice(markerFor(Buffer.byteLength(value, 'utf8')), MEMORY_TOOL_MAX_BYTES);
+}
+
+function exceedsMemoryWriteLimit(value: string): boolean {
+  return Buffer.byteLength(value, 'utf8') > MEMORY_TOOL_MAX_BYTES
+    || estimateToolTokens(value) > MEMORY_TOOL_MAX_TOKENS;
 }
 
 /**
@@ -167,11 +210,11 @@ export function createMemoryTools(
   const memoryGet: Tool = {
     name: 'memory_get',
     group: 'group:memory',
-    description: 'Read the contents of a health memory file by path (e.g., "SOUL.md", "conditions/diabetes.md")',
+    description: 'Read a bounded portion of a health memory file by path (e.g., "SOUL.md", "conditions/diabetes.md")',
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Relative path within workspace' },
+        path: { type: 'string', maxLength: 512, description: 'Relative path within workspace' },
       },
       required: ['path'],
     },
@@ -191,7 +234,7 @@ export function createMemoryTools(
       if (content === null) {
         return { content: [{ type: 'text', text: `File not found: ${filePath}` }], isError: true };
       }
-      return { content: [{ type: 'text', text: content }] };
+      return { content: [{ type: 'text', text: truncateToolText(content, 'memory_get') }] };
     },
   };
 
@@ -202,8 +245,8 @@ export function createMemoryTools(
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Relative path within workspace' },
-        content: { type: 'string', description: 'Content to write' },
+        path: { type: 'string', maxLength: 512, description: 'Relative path within workspace' },
+        content: { type: 'string', maxLength: MEMORY_TOOL_MAX_TOKENS * 4, description: 'Content to write' },
         mode: { type: 'string', enum: ['overwrite', 'append'], description: 'Write mode (default: overwrite)' },
       },
       required: ['path', 'content'],
@@ -213,6 +256,13 @@ export function createMemoryTools(
         const filePath = params.path as string;
         const content = params.content as string;
         const mode = (params.mode as string) ?? 'overwrite';
+
+        if (typeof filePath !== 'string' || typeof content !== 'string') {
+          return rejection('Invalid memory_write parameters: path and content must be strings.');
+        }
+        if (exceedsMemoryWriteLimit(content)) {
+          return rejection(`Write rejected: content exceeds the ${MEMORY_TOOL_MAX_BYTES}-byte / ${MEMORY_TOOL_MAX_TOKENS}-token memory tool limit.`);
+        }
 
       // Managed-lane guard (G1): refuse invariant-bearing paths before any write.
       const managed = await classifyManagedWrite(engine, filePath, mode, content);
@@ -305,7 +355,7 @@ export function createMemoryTools(
     parameters: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Search query' },
+        query: { type: 'string', maxLength: 2_000, description: 'Search query' },
         limit: { type: 'number', description: 'Max results (default: 5)' },
         lane: { type: 'string', enum: Object.keys(LANE_PREFIX), description: 'Restrict results to one memory lane (path prefix)' },
         status: { type: 'string', enum: ['active', 'all'], description: 'Fact-status filter: "active" (default) drops results whose ledger entity is stale (retracted/discontinued/superseded); "all" returns every version.' },
@@ -351,7 +401,7 @@ export function createMemoryTools(
       const text = statusBanner + qualityBanner + results
         .map(r => `## ${r.path} [${r.chunkId}] lines ${r.startLine}-${r.endLine} (score: ${r.score.toFixed(3)})\n${r.content}`)
         .join('\n\n---\n\n');
-      return { content: [{ type: 'text', text }] };
+      return { content: [{ type: 'text', text: truncateToolText(text, 'memory_search') }] };
     },
   };
 
@@ -374,7 +424,7 @@ export function createMemoryTools(
       if (files.length === 0) {
         return { content: [{ type: 'text', text: 'No files found' }] };
       }
-      return { content: [{ type: 'text', text: files.join('\n') }] };
+      return { content: [{ type: 'text', text: truncateToolText(files.join('\n'), 'memory_list') }] };
     },
   };
 

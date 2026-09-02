@@ -249,15 +249,97 @@ describe('ContextAssembler v2 — turn modes (C2)', () => {
     await expect(make(FULL_FILES, SAFETY).assemble('default', 'subagent', RECALL)).resolves.toBeDefined();
   });
 
-  it('dreaming excludes persona/user/memory and user-recall (consolidation turn)', async () => {
-    const report = await make(FULL_FILES, SAFETY).assemble('default', 'dream', RECALL);
+  it('dreaming excludes persona/user/memory/SAFETY and user-recall (narrative-only turn)', async () => {
+    const readSafety = jest.fn(async () => SAFETY);
+    const report = await new ContextAssembler({
+      reader: makeReader(FULL_FILES),
+      safety: { read: readSafety },
+      maxChars: 100_000,
+      clock: CLOCK,
+    }).assemble('default', 'dream', RECALL);
     const k = keys(report.sections);
     expect(k).not.toContain('SOUL.md');
     expect(k).not.toContain('USER.md');
     expect(k).not.toContain('MEMORY.md');
     expect(k).not.toContain('recall');
-    // Safety context is retained for a consolidation turn over the user's own health memory.
-    expect(k).toContain('SAFETY.md');
+    expect(k).not.toContain('SAFETY.md');
+    expect(report.content).not.toContain('penicillin');
+    expect(readSafety).not.toHaveBeenCalled();
+  });
+
+  it('reserves volatile ledger and recall content before a large stable MEMORY file', async () => {
+    const stable = 'stable prose '.repeat(2_000);
+    const report = await make({ ...FULL_FILES, 'MEMORY.md': stable }, SAFETY, 900).assemble('default', 'chat', {
+      ...RECALL,
+      ledger: 'ACTIVE_LEDGER_UNIQUE',
+      hits: [{ id: 'recall-1', content: 'RECALL_UNIQUE' }],
+      checkNotes: 'CHECK_UNIQUE',
+    });
+
+    expect(report.content).toContain('ACTIVE_LEDGER_UNIQUE');
+    expect(report.content).toContain('RECALL_UNIQUE');
+    expect(report.content).toContain('Today is 2026-08-24');
+    expect(report.content.length).toBeLessThanOrEqual(900);
+    expect(report.content).not.toContain(stable);
+  });
+
+  it('uses the budgeted curated-memory reader for the live MEMORY section', async () => {
+    const readForContext = jest.fn().mockResolvedValue({
+      content: 'CURATED_MEMORY_UNIQUE',
+      status: 'present',
+      truncated: false,
+    });
+    const report = await new ContextAssembler({
+      reader: makeReader({ ...FULL_FILES, 'MEMORY.md': 'UNBOUNDED_MEMORY_SOURCE' }),
+      safety: makeSafety(SAFETY),
+      maxChars: 900,
+      clock: CLOCK,
+      curatedMemory: { readForContext },
+      budgetRatios: { health: 0.7, life: 0.2, agent: 0.1 },
+    }).assemble('default', 'chat', {
+      ...RECALL,
+      ledger: 'ACTIVE_LEDGER_UNIQUE',
+    });
+
+    expect(readForContext).toHaveBeenCalled();
+    expect(readForContext).toHaveBeenCalledWith(expect.any(Number), { health: 0.7, life: 0.2, agent: 0.1 });
+    expect(report.content).toContain('CURATED_MEMORY_UNIQUE');
+    expect(report.content).not.toContain('UNBOUNDED_MEMORY_SOURCE');
+    expect(report.content).toContain('ACTIVE_LEDGER_UNIQUE');
+  });
+
+  it('surfaces an unreadable optional context file instead of treating it as absent', async () => {
+    const reader: WorkspaceReader = {
+      async readFile(relPath) {
+        if (relPath === 'USER.md') throw new Error('EACCES: permission denied');
+        return FULL_FILES[relPath] ?? null;
+      },
+    };
+    const report = await new ContextAssembler({ reader, safety: makeSafety(SAFETY), maxChars: 100_000, clock: CLOCK })
+      .assemble('default', 'chat', RECALL);
+
+    expect(report.content).toContain('USER.md');
+    expect(report.content).toMatch(/unreadable/i);
+    expect(report.degraded).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: 'USER.md', status: 'unreadable' }),
+    ]));
+  });
+
+  it('surfaces bounded due curiosity items in heartbeat mode', async () => {
+    const report = await make(FULL_FILES, SAFETY).assemble('default', 'heartbeat', {
+      ...RECALL,
+      curiosity: [{
+        id: 'curiosity-1',
+        kind: 'missing-data',
+        description: 'Did I miss logging naproxen yesterday?',
+        critical: true,
+      }],
+    });
+
+    expect(report.content).toContain('Did I miss logging naproxen yesterday?');
+    expect(keys(report.sections)).toContain('curiosity');
+    expect(keys(report.sections)).not.toContain('MEMORY.md');
+    expect(keys(report.sections)).not.toContain('recall');
   });
 });
 

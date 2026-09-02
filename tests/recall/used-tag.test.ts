@@ -53,4 +53,9 @@ describe('parseUsedTag', () => {
     expect(stripped).not.toContain('<used>');
     expect(stripped).not.toContain('</used>');
   });
+
+  it('deduplicates ids before usage accounting', () => {
+    const { ids } = parseUsedTag('Answer.\n<used>c1,c1,c2,c1</used>');
+    expect(ids).toEqual(['c1', 'c2']);
+  });
 });

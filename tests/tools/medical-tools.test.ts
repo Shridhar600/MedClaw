@@ -188,6 +188,23 @@ describe('Medical Tools', () => {
       expect(messages[1].content).not.toContain('naproxen');
     });
 
+    it('surfaces provider-unavailable health context instead of presenting a clean empty profile', async () => {
+      const unavailable = jest.fn().mockRejectedValue(new Error('health search unavailable'));
+      const tools = createMedicalTools(
+        engine,
+        unavailable,
+        mockMedicalProvider,
+        mockMainProvider,
+        tmpDir,
+      );
+
+      await tools.find((tool) => tool.name === 'medgemma_query')!.execute({ question: 'Check my health context' });
+
+      const messages = (mockMedicalProvider.chat as jest.Mock).mock.calls[0][0];
+      expect(messages[1].content).toContain('provider-unavailable');
+      expect(messages[1].content).toContain('No verified active health context is available.');
+    });
+
     it('assembles health context and queries medical provider', async () => {
       const tools: Tool[] = createMedicalTools(
         engine,

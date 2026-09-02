@@ -132,6 +132,49 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
     expect(sys).not.toContain('## MEMORY');
   });
 
+  it('surfaces a due curiosity follow-up on the live heartbeat path', async () => {
+    gateway = await startGateway(tmpDir);
+    const seen = captureProvider(gateway);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const curiosity = (gateway as any).curiosity;
+    await curiosity.add({
+      kind: 'missing-data',
+      description: 'Did I miss logging naproxen yesterday?',
+      relatedEntity: 'naproxen',
+      critical: true,
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (gateway as any).agentLoop.run(
+      'heartbeat check-in',
+      [],
+      { chatId: 'chat-1', origin: 'heartbeat', mode: 'heartbeat' },
+    );
+
+    expect(lastSystem(seen)).toContain('Did I miss logging naproxen yesterday?');
+  });
+
+  it('keeps live volatile health recall when MEMORY.md is oversized', async () => {
+    gateway = await startGateway(tmpDir);
+    const seen = captureProvider(gateway);
+    fs.writeFileSync(
+      path.join(workspace, 'MEMORY.md'),
+      `# Memory\n\n## Health\n- ${'stable prose '.repeat(4_000)}\n`,
+      'utf8',
+    );
+
+    const result = await registryOf().execute('ledger_record', {
+      entity: 'lisinopril', type: 'medication', fields: { dose: '10mg' }, note: 'lisinopril 10mg',
+    });
+    expect(result.isError).toBeFalsy();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (gateway as any).agentLoop.run('what should I know today', [], { chatId: 'chat-1', mode: 'chat' });
+    const system = lastSystem(seen);
+    expect(system).toContain('lisinopril');
+    expect(system).not.toContain('stable prose '.repeat(4_000));
+  });
+
   it('reports per-turn prompt mode in /status when the recall path is wired (L-2)', async () => {
     gateway = await startGateway(tmpDir);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

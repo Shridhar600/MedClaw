@@ -106,6 +106,15 @@ export interface RecallReport {
   indexStatus: IndexStatus;
   /** Stage-3 deterministic correlation output — `CHECK:` lines (was `entity`, F13 rename). */
   checkNotes: string;
+  /** Optional heartbeat-only follow-up surface attached by the composition root. */
+  curiosity?: readonly {
+    id: string;
+    description: string;
+    kind?: string;
+    critical?: boolean;
+    dueAt?: string;
+  }[];
+  curiosityStatus?: 'unreadable' | 'provider-unavailable';
 }
 
 interface Stage2Result {
@@ -125,6 +134,7 @@ const AUTHORITY_RANK: Record<string, number> = {
 // A stale/disputed head status → any chunk for that entity is stale and fail-closed dropped (KNEE-10).
 const STALE_STATUSES = new Set(['retracted', 'discontinued', 'superseded', 'disputed']);
 const MS_PER_DAY = 86_400_000;
+const CHECK_BUDGET_TOKENS = 200;
 
 function estimateTokens(s: string): number {
   return Math.ceil(s.length / 4);
@@ -215,6 +225,43 @@ function renderCheck(entity: string, started: string, sideEffect: string, now: D
     + `Temporal correlation window: ${windowClause}. No diagnostic certainty.`;
 }
 
+interface CheckCandidate {
+  entity: string;
+  started: string;
+  sideEffect: string;
+  line: string;
+}
+
+function checkCandidateOrder(a: CheckCandidate, b: CheckCandidate): number {
+  const aTime = Date.parse(a.started);
+  const bTime = Date.parse(b.started);
+  const aRank = Number.isNaN(aTime) ? Number.NEGATIVE_INFINITY : aTime;
+  const bRank = Number.isNaN(bTime) ? Number.NEGATIVE_INFINITY : bTime;
+  return bRank - aRank
+    || a.entity.localeCompare(b.entity)
+    || a.sideEffect.localeCompare(b.sideEffect);
+}
+
+function fitCheckLines(lines: string[]): string {
+  if (lines.length === 0) return '';
+  const markerFor = (omitted: number): string => `… [CHECK truncated: ${omitted} additional checks omitted]`;
+  const kept: string[] = [];
+  for (const line of lines) {
+    const omitted = lines.length - kept.length - 1;
+    const candidate = omitted > 0
+      ? [...kept, line, markerFor(omitted)].join('\n')
+      : [...kept, line].join('\n');
+    if (estimateTokens(candidate) > CHECK_BUDGET_TOKENS) break;
+    kept.push(line);
+  }
+  if (kept.length === lines.length) return kept.join('\n');
+
+  const marker = markerFor(lines.length - kept.length);
+  while (kept.length > 0 && estimateTokens([...kept, marker].join('\n')) > CHECK_BUDGET_TOKENS) kept.pop();
+  if (estimateTokens(marker) > CHECK_BUDGET_TOKENS) return marker.slice(0, CHECK_BUDGET_TOKENS * 4);
+  return [...kept, marker].join('\n');
+}
+
 export class RecallEngine {
   constructor(private deps: RecallDeps) {}
 
@@ -254,10 +301,12 @@ export class RecallEngine {
    * Stage 4b — record that the model used these recall chunks this turn (from the stripped B7
    * `<used>` tag; the AgentLoop parses it via {@link parseUsedTag}). Best-effort; never throws.
    */
-  async recordUsage(chunkIds: string[], at: string): Promise<void> {
-    if (chunkIds.length === 0) return;
+  async recordUsage(chunkIds: string[], at: string, injectedChunkIds?: readonly string[]): Promise<void> {
+    const injected = injectedChunkIds === undefined ? undefined : new Set(injectedChunkIds);
+    const accepted = [...new Set(chunkIds)].filter(id => injected === undefined || injected.has(id));
+    if (accepted.length === 0) return;
     try {
-      await this.deps.chunkStats.bumpUsed(chunkIds, at);
+      await this.deps.chunkStats.bumpUsed(accepted, at);
     } catch (e) {
       console.warn('[recall] recordUsage failed:', summarizeErrorForLog(e));
     }
@@ -546,7 +595,7 @@ export class RecallEngine {
     try {
       const msgWords = normalizeMessageWords(input.userMessage);
       const now = clock.now();
-      const lines: string[] = [];
+      const candidates = new Map<string, CheckCandidate>();
       for await (const med of factMirror.queryActive('medication')) {
         const sideEffects = med.fields['known_side_effects'];
         if (!Array.isArray(sideEffects)) continue;
@@ -557,10 +606,18 @@ export class RecallEngine {
         for (const se of sideEffects) {
           if (typeof se !== 'string') continue;
           if (!sideEffectMatches(se, msgWords)) continue;
-          lines.push(renderCheck(med.entity, started, se, now));
+          const key = `${med.entity.trim().toLowerCase()}::${se.trim().toLowerCase()}`;
+          if (!candidates.has(key)) {
+            candidates.set(key, {
+              entity: med.entity,
+              started,
+              sideEffect: se,
+              line: renderCheck(med.entity, started, se, now),
+            });
+          }
         }
       }
-      return lines.join('\n');
+      return fitCheckLines([...candidates.values()].sort(checkCandidateOrder).map(candidate => candidate.line));
     } catch (e) {
       console.warn('[recall] stage3 entity correlation failed:', summarizeErrorForLog(e));
       return '';

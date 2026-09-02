@@ -270,6 +270,30 @@ describe('MemoryIndexer', () => {
     expect(afterVectors).toBe(beforeVectors);
   });
 
+  it('reports a typed provider outage, retries the dimension probe, and does not publish a clean checkpoint', async () => {
+    const filePath = path.join(workspaceDir, 'probe-retry.md');
+    fs.writeFileSync(filePath, '# Probe retry\n\nRetry after the provider returns.');
+    let probeCalls = 0;
+    const provider: LLMProvider = {
+      modelName: 'probe-retry-model',
+      chat: jest.fn(),
+      embed: jest.fn().mockImplementation(async (text: string) => {
+        if (text === 'test' && probeCalls++ === 0) throw new Error('provider unavailable');
+        return [0.1, 0.2, 0.3];
+      }),
+    };
+    const indexer = new MemoryIndexer(store, provider, workspaceDir);
+
+    await indexer.indexAll();
+    expect(indexer.getStatus()).toMatchObject({ status: 'provider-unavailable' });
+    expect(store.getFileHash('probe-retry.md')).toMatch(/^embedding-partial:/);
+
+    await indexer.indexAll();
+    expect(indexer.getStatus()).toMatchObject({ status: 'available', dimension: 3 });
+    expect((provider.embed as jest.Mock).mock.calls.filter(([text]) => text === 'test')).toHaveLength(2);
+    expect(store.getAllChunksWithEmbeddings().some(chunk => chunk.path === 'probe-retry.md')).toBe(true);
+  });
+
   it('does not publish an older embedding after a newer same-path index finishes', async () => {
     const filePath = path.join(workspaceDir, 'race.md');
     fs.writeFileSync(filePath, '# Baseline');

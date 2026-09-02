@@ -12,9 +12,27 @@ import { InvariantViolationError } from '../shared/errors';
 
 export type AssemblerMode = 'chat' | 'heartbeat' | 'dream' | 'subagent';
 
+export type ContextReadStatus = 'present' | 'absent' | 'unreadable' | 'provider-unavailable';
+
+export interface ContextReadResult {
+  content: string | null;
+  status: ContextReadStatus;
+  /** The source was readable, but its content was bounded before assembly. */
+  truncated?: boolean;
+}
+
+export type MemoryBudgetRatios = Partial<Record<'health' | 'life' | 'agent', number>>;
+
 /** Reads workspace skeleton files (SOUL/USER/MEMORY/…). MemoryEngine satisfies this structurally. */
 export interface WorkspaceReader {
   readFile(relPath: string): Promise<string | null>;
+  /** Optional typed read seam for callers that can distinguish absence from an outage. */
+  readFileWithStatus?(relPath: string): Promise<ContextReadResult>;
+}
+
+/** Bounded MEMORY.md reader supplied by the composition root. */
+export interface CuratedMemoryReader {
+  readForContext(maxChars: number, budgetRatios?: MemoryBudgetRatios): Promise<ContextReadResult>;
 }
 
 /** Provides the current rendered SAFETY.md. SafetyView satisfies this structurally. */
@@ -36,6 +54,16 @@ export interface AssemblerRecall {
   hits: readonly { id: string; content: string }[];
   /** Stage-3 deterministic side-effect CHECK: lines. */
   checkNotes: string;
+  /** Due curiosity follow-ups for the heartbeat-only surface. */
+  curiosity?: readonly {
+    id: string;
+    description: string;
+    kind?: string;
+    critical?: boolean;
+    dueAt?: string;
+  }[];
+  /** Read status for the heartbeat curiosity source, when it could not be read. */
+  curiosityStatus?: Exclude<ContextReadStatus, 'present' | 'absent'>;
 }
 
 export interface ContextSection {
@@ -51,6 +79,15 @@ export interface ContextSection {
   content: string;
   /** SAFETY: emitted in full regardless of budget (PLAT-05). */
   nonTruncatable?: boolean;
+  /** Typed degradation status for an optional source. */
+  status?: ContextReadStatus;
+  /** The source reader bounded this section before assembly. */
+  truncated?: boolean;
+}
+
+export interface ContextDegraded {
+  key: string;
+  status: Exclude<ContextReadStatus, 'present' | 'absent'>;
 }
 
 export interface ContextReport {
@@ -60,6 +97,8 @@ export interface ContextReport {
   totalChars: number;
   totalTokens: number;
   truncated: boolean;
+  /** Optional context sources that were unavailable; absence is deliberately not reported. */
+  degraded: ContextDegraded[];
   /** sections[0..cacheBoundaryIndex-1] are cacheStable; [cacheBoundaryIndex..] are volatile. */
   cacheBoundaryIndex: number;
 }
@@ -69,6 +108,8 @@ export interface AssemblerDeps {
   safety: SafetyReader;
   maxChars: number;
   clock?: Clock;
+  curatedMemory?: CuratedMemoryReader;
+  budgetRatios?: MemoryBudgetRatios;
 }
 
 const SEPARATOR = '\n\n---\n\n';
@@ -102,6 +143,10 @@ const VOLATILE_BY_MODE: Record<AssemblerMode, { ledger: boolean; hits: boolean; 
   subagent: { ledger: false, hits: false, check: false },
 };
 
+const MAX_HEARTBEAT_CURIOSITY_ITEMS = 5;
+const MAX_HEARTBEAT_CURIOSITY_ID_CHARS = 128;
+const MAX_HEARTBEAT_CURIOSITY_DESCRIPTION_CHARS = 512;
+
 function estimateTokens(s: string): number {
   return Math.ceil(s.length / 4);
 }
@@ -134,6 +179,8 @@ interface RawSection {
   cacheStable: boolean;
   content: string;
   nonTruncatable?: boolean;
+  status?: ContextReadStatus;
+  truncated?: boolean;
 }
 
 export class ContextAssembler {
@@ -153,53 +200,57 @@ export class ContextAssembler {
     void profileId;
 
     const raw: RawSection[] = [];
+    const degraded: ContextDegraded[] = [];
     const vol = VOLATILE_BY_MODE[mode];
 
     // 1. SAFETY first, in full, non-truncatable, above the boundary (KNEE-07 SAFETY-first mechanism).
-    //    Re-read every turn (D9). Empty / whitespace-only => skipped (PLAT-04). A subagent turn is
-    //    PHI-minimal (KNEE-05) — SAFETY is health data, so it is intentionally NOT read/injected and
-    //    the non-omission invariant does not apply.
-    const safetyContent = mode === 'subagent' ? null : await this.readSafety();
+    //    Re-read every turn (D9). Empty / whitespace-only => skipped (PLAT-04). Dream and subagent
+    //    turns are PHI-minimal: they must not even read SAFETY (spec 03 §3 / PLAT-21).
+    const safetyContent = mode === 'chat' || mode === 'heartbeat' ? await this.readSafety() : null;
     if (safetyContent && safetyContent.trim() !== '') {
       raw.push({ key: 'SAFETY.md', title: 'SAFETY', layer: 1, cacheStable: true, content: safetyContent, nonTruncatable: true });
     }
 
-    // 2. Skeleton files (cacheStable), narrowed by mode. Missing / empty files are skipped.
+    // 2. Build volatile sections before reading optional stable prose. Their complete framed size
+    //    is reserved so a large MEMORY.md cannot consume the ledger/recall allocation.
+    const volatile = this.volatileSections(mode, recall, vol);
+    const reservedVolatile = this.reserveVolatile(volatile);
+
+    // 3. Skeleton files (cacheStable), narrowed by mode. Missing / empty files are skipped.
     for (const { key, title } of this.skeletonFor(mode)) {
-      const content = await this.readFile(key);
-      if (content && content.trim() !== '') {
-        raw.push({ key, title, layer: 2, cacheStable: true, content });
+      const result = key === MEMORY.key && this.deps.curatedMemory
+        ? await this.readCuratedMemory(Math.max(0, this.deps.maxChars - reservedVolatile))
+        : await this.readFile(key);
+      if (result.status === 'present' && result.content && result.content.trim() !== '') {
+        raw.push({
+          key,
+          title,
+          layer: 2,
+          cacheStable: true,
+          content: result.content,
+          truncated: result.truncated,
+        });
+      } else if (result.status !== 'present' && result.status !== 'absent') {
+        degraded.push({ key, status: result.status });
+        raw.push({
+          key,
+          title: `${title} STATUS`,
+          layer: 2,
+          cacheStable: true,
+          content: `[context-degraded: ${key} ${result.status}]`,
+          nonTruncatable: true,
+          status: result.status,
+        });
       }
     }
 
-    // 3. Volatile recall sections (below the boundary), gated by mode + present only when recall is
-    //    supplied. Today's/yesterday's blanket daily-log dump is RETIRED in favor of RECALL (parity
+    // 4. Volatile recall sections are below the boundary. Today's/yesterday's blanket daily-log dump
+    //    is RETIRED in favor of RECALL (parity
     //    decision, recorded — active facts still injected via SAFETY + Stage-1 ledger; recent turns
     //    live in the SessionManager-owned history row).
-    let hitsShown = false;
-    if (recall) {
-      if (vol.ledger && (recall.ledger.trim() !== '' || recall.ledgerTruncated)) {
-        const ledger = recall.ledgerTruncated
-          ? (recall.ledger.trim() !== '' ? `${recall.ledger}\n… (truncated)` : '… (truncated)')
-          : recall.ledger;
-        raw.push({ key: 'active-ledger', title: 'ACTIVE HEALTH FACTS', layer: 3, cacheStable: false, content: ledger });
-      }
-      if (vol.hits && recall.hits.length > 0) {
-        const body = recall.hits.map(h => `- [${h.id}] ${h.content}`).join('\n');
-        raw.push({ key: 'recall', title: 'RECALL', layer: 3, cacheStable: false, content: body });
-        hitsShown = true;
-      }
-      if (vol.check && recall.checkNotes && recall.checkNotes.trim() !== '') {
-        raw.push({ key: 'check', title: 'CHECK', layer: 3, cacheStable: false, content: recall.checkNotes });
-      }
-    }
+    raw.push(...volatile);
 
-    // 4. Runtime line (volatile) — the ONLY place a clock/date value is composed in (H-2). Marked
-    //    non-truncatable (L-1): the day date grounds health advice and must never be evicted by
-    //    budget pressure (it is tiny). Still below the cache boundary (cacheStable:false).
-    raw.push({ key: 'runtime', title: 'RUNTIME', layer: 3, cacheStable: false, content: this.runtimeLine(hitsShown), nonTruncatable: true });
-
-    const { sections, content, truncated } = this.compose(raw);
+    const { sections, content, truncated } = this.compose(raw, reservedVolatile);
 
     // Cache discipline + SAFETY non-omission, per turn (D9 / PLAT-04/05). medical-safety > resilience.
     assertCacheDiscipline(sections);
@@ -216,6 +267,7 @@ export class ContextAssembler {
       totalChars: content.length,
       totalTokens: estimateTokens(content),
       truncated,
+      degraded,
       cacheBoundaryIndex,
     };
   }
@@ -238,11 +290,11 @@ export class ContextAssembler {
     return line;
   }
 
-  private compose(raw: RawSection[]): { sections: ContextSection[]; content: string; truncated: boolean } {
+  private compose(raw: RawSection[], reservedVolatile = 0): { sections: ContextSection[]; content: string; truncated: boolean } {
     const sections: ContextSection[] = [];
     const parts: string[] = [];
     let used = 0;
-    let truncated = false;
+    let truncated = raw.some(cand => cand.truncated === true);
 
     for (const cand of raw) {
       const separator = parts.length > 0 ? SEPARATOR : '';
@@ -256,7 +308,9 @@ export class ContextAssembler {
         continue;
       }
 
-      const remaining = this.deps.maxChars - used;
+      const remaining = cand.cacheStable && reservedVolatile > 0
+        ? Math.min(this.deps.maxChars - used, this.deps.maxChars - used - reservedVolatile)
+        : this.deps.maxChars - used;
       const framing = separator.length + header.length;
       if (remaining <= 0 || framing >= remaining) {
         truncated = true;
@@ -287,6 +341,8 @@ export class ContextAssembler {
       budget,
       content,
       ...(cand.nonTruncatable ? { nonTruncatable: true } : {}),
+      ...(cand.status ? { status: cand.status } : {}),
+      ...(cand.truncated ? { truncated: true } : {}),
     };
   }
 
@@ -298,12 +354,113 @@ export class ContextAssembler {
     return this.deps.safety.read();
   }
 
-  private async readFile(relPath: string): Promise<string | null> {
+  private async readFile(relPath: string): Promise<ContextReadResult> {
     try {
-      return await this.deps.reader.readFile(relPath);
-    } catch {
-      return null;
+      if (this.deps.reader.readFileWithStatus) {
+        return this.normalizeReadResult(await this.deps.reader.readFileWithStatus(relPath));
+      }
+      const content = await this.deps.reader.readFile(relPath);
+      return { content, status: content === null ? 'absent' : 'present' };
+    } catch (error) {
+      return { content: null, status: this.classifyReadError(error) };
     }
+  }
+
+  private async readCuratedMemory(maxChars: number): Promise<ContextReadResult> {
+    try {
+      return this.normalizeReadResult(
+        await this.deps.curatedMemory!.readForContext(maxChars, this.deps.budgetRatios),
+      );
+    } catch (error) {
+      return { content: null, status: this.classifyReadError(error) };
+    }
+  }
+
+  private normalizeReadResult(result: ContextReadResult): ContextReadResult {
+    if (result.status === 'absent') return { ...result, content: null };
+    if (result.status === 'present' && (result.content === null || result.content === undefined)) {
+      return { ...result, content: null, status: 'absent' };
+    }
+    return result;
+  }
+
+  private classifyReadError(error: unknown): Exclude<ContextReadStatus, 'present' | 'absent'> {
+    if (typeof error === 'object' && error !== null) {
+      const status = (error as { status?: unknown }).status;
+      if (status === 'provider-unavailable' || status === 'unreadable') return status;
+      const code = (error as { code?: unknown }).code;
+      if (code === 'ERR_PROVIDER_UNAVAILABLE' || code === 'PROVIDER_UNAVAILABLE') return 'provider-unavailable';
+    }
+    return 'unreadable';
+  }
+
+  private volatileSections(
+    mode: AssemblerMode,
+    recall: AssemblerRecall | null,
+    vol: { ledger: boolean; hits: boolean; check: boolean },
+  ): RawSection[] {
+    const sections: RawSection[] = [];
+    let hitsShown = false;
+    if (recall) {
+      if (vol.ledger && (recall.ledger.trim() !== '' || recall.ledgerTruncated)) {
+        const ledger = recall.ledgerTruncated
+          ? (recall.ledger.trim() !== '' ? `${recall.ledger}\n… (truncated)` : '… (truncated)')
+          : recall.ledger;
+        sections.push({ key: 'active-ledger', title: 'ACTIVE HEALTH FACTS', layer: 3, cacheStable: false, content: ledger });
+      }
+      if (vol.hits && recall.hits.length > 0) {
+        const body = recall.hits.map(h => `- [${h.id}] ${h.content}`).join('\n');
+        sections.push({ key: 'recall', title: 'RECALL', layer: 3, cacheStable: false, content: body });
+        hitsShown = true;
+      }
+      if (vol.check && recall.checkNotes && recall.checkNotes.trim() !== '') {
+        sections.push({ key: 'check', title: 'CHECK', layer: 3, cacheStable: false, content: recall.checkNotes });
+      }
+      if (mode === 'heartbeat' && recall.curiosityStatus) {
+        sections.push({
+          key: 'curiosity-status',
+          title: 'FOLLOW-UP STATUS',
+          layer: 3,
+          cacheStable: false,
+          content: `[context-degraded: curiosity ${recall.curiosityStatus}]`,
+          status: recall.curiosityStatus,
+        });
+      } else if (mode === 'heartbeat' && recall.curiosity && recall.curiosity.length > 0) {
+        const items = recall.curiosity.slice(0, MAX_HEARTBEAT_CURIOSITY_ITEMS);
+        const body = items.map(item => {
+          const id = this.safeSlice(item.id, MAX_HEARTBEAT_CURIOSITY_ID_CHARS);
+          const description = item.description.length > MAX_HEARTBEAT_CURIOSITY_DESCRIPTION_CHARS
+            ? `${this.safeSlice(item.description, MAX_HEARTBEAT_CURIOSITY_DESCRIPTION_CHARS)}… (truncated)`
+            : item.description;
+          return `- [${id}] ${description}`;
+        }).join('\n');
+        sections.push({ key: 'curiosity', title: 'DUE FOLLOW-UPS', layer: 3, cacheStable: false, content: body });
+      }
+    }
+
+    // Runtime line (volatile) — the ONLY place a clock/date value is composed in (H-2). Marked
+    // non-truncatable (L-1): the day date grounds health advice and must never be evicted by
+    // budget pressure (it is tiny). Still below the cache boundary (cacheStable:false).
+    sections.push({
+      key: 'runtime',
+      title: 'RUNTIME',
+      layer: 3,
+      cacheStable: false,
+      content: this.runtimeLine(hitsShown),
+      nonTruncatable: true,
+    });
+    return sections;
+  }
+
+  private reserveVolatile(sections: RawSection[]): number {
+    if (sections.length === 0) return 0;
+    const framed = sections.reduce((sum, section) => {
+      const header = `## ${section.title}\n\n`;
+      return sum + header.length + section.content.length;
+    }, 0);
+    // One separator per volatile section is conservative: the first one separates it from the
+    // stable prefix and every later one separates it from its predecessor.
+    return framed + sections.length * SEPARATOR.length;
   }
 
   private fitContent(sectionKey: string, content: string, contentBudget: number): string {

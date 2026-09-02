@@ -9,10 +9,17 @@ import { summarizeErrorForLog } from '../security';
 const CHUNK_SIZE_TOKENS = 400;
 const OVERLAP_TOKENS = 80;
 
+export type MemoryIndexerStatus =
+  | { status: 'unknown' }
+  | { status: 'available'; dimension: number }
+  | { status: 'provider-unavailable' }
+  | { status: 'unreadable' };
+
 export class MemoryIndexer {
   private isIndexing = false;
   private dimensionProbeState: 'unknown' | 'available' | 'unavailable' = 'unknown';
   private embeddingDimension: number | undefined;
+  private status: MemoryIndexerStatus = { status: 'unknown' };
   private readonly embeddingModelName: string;
 
   constructor(
@@ -22,6 +29,11 @@ export class MemoryIndexer {
     private readonly profileId: string = 'default',
   ) {
     this.embeddingModelName = embeddingProvider.modelName ?? 'unknown';
+  }
+
+  /** Current dimension-probe state; a failed probe is explicit and is never treated as a dimension. */
+  getStatus(): MemoryIndexerStatus {
+    return { ...this.status };
   }
 
   async indexAll(): Promise<void> {
@@ -71,9 +83,13 @@ export class MemoryIndexer {
     const lane = this.laneFor(relativePath);
     const chunks = this.chunkContent(content, relativePath, lane, createdAt).filter(chunk => chunk.content.trim().length > 0);
     const preparedChunks: Chunk[] = [];
-    let hadEmbeddingFailure = false;
+    let hadEmbeddingFailure = !_dimensionAvailable;
     const expectedDimension = _dimensionAvailable ? this.embeddingDimension : undefined;
     for (const chunk of chunks) {
+      if (!_dimensionAvailable) {
+        preparedChunks.push(chunk);
+        continue;
+      }
       try {
         const embedding = await this.embeddingProvider.embed(chunk.content);
         if (!this.isUsableEmbedding(embedding, expectedDimension)) {
@@ -104,19 +120,36 @@ export class MemoryIndexer {
 
   private async ensureDimension(): Promise<boolean> {
     if (this.dimensionProbeState === 'available') return true;
+    let probe: number[];
     try {
-      const probe = await this.embeddingProvider.embed('test');
-      if (!this.isUsableEmbedding(probe, undefined)) throw new Error('invalid embedding dimension probe');
+      probe = await this.embeddingProvider.embed('test');
+    } catch (e) {
+      this.dimensionProbeState = 'unavailable';
+      this.embeddingDimension = undefined;
+      this.status = { status: 'provider-unavailable' };
+      console.warn('[indexer] Could not probe embedding dimension; vector indexing deferred:', summarizeErrorForLog(e));
+      return false;
+    }
+    if (!this.isUsableEmbedding(probe, undefined)) {
+      this.dimensionProbeState = 'unavailable';
+      this.embeddingDimension = undefined;
+      this.status = { status: 'provider-unavailable' };
+      console.warn('[indexer] Could not probe embedding dimension; vector indexing deferred: invalid probe');
+      return false;
+    }
+    try {
+      // A failed store operation is different from an embedding outage. Do not publish either
+      // state as a valid dimension, and let the next call retry the probe.
       this.store.ensureVecTable(probe.length);
       this.embeddingDimension = probe.length;
       this.dimensionProbeState = 'available';
+      this.status = { status: 'available', dimension: probe.length };
       return true;
     } catch (e) {
-      // A failed probe must not guess a dimension or mutate an existing vec table. The file
-      // path can still be indexed for keyword recall, but its freshness checkpoint remains dirty.
       this.dimensionProbeState = 'unavailable';
       this.embeddingDimension = undefined;
-      console.warn('[indexer] Could not probe embedding dimension; vector indexing deferred:', summarizeErrorForLog(e));
+      this.status = { status: 'unreadable' };
+      console.warn('[indexer] Could not prepare vector index; vector indexing deferred:', summarizeErrorForLog(e));
       return false;
     }
   }

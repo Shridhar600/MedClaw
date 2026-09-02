@@ -17,6 +17,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as readline from 'readline';
 import { BudgetExceededError } from '../shared/errors';
 import { secureWriteViaTmp, summarizeErrorForLog, quarantineToSideFile, QUARANTINE_POINTER_PREFIX } from '../security';
 
@@ -37,6 +38,14 @@ export interface CuratedMemoryOptions {
    * code-enforced (CHAT-02/05).
    */
   budgetRatios?: Partial<Record<MemorySection, number>>;
+}
+
+export type CuratedMemoryReadStatus = 'present' | 'absent' | 'unreadable';
+
+export interface CuratedMemoryContextResult {
+  content: string | null;
+  status: CuratedMemoryReadStatus;
+  truncated?: boolean;
 }
 
 const SECTION_SHARE: Record<MemorySection, number> = { health: 0.6, life: 0.2, agent: 0.2 };
@@ -67,6 +76,16 @@ export class CuratedMemory {
   private sectionShare(section: MemorySection): number {
     const r = this.opts.budgetRatios?.[section];
     return typeof r === 'number' && Number.isFinite(r) && r > 0 ? r : SECTION_SHARE[section];
+  }
+
+  private contextShare(
+    section: MemorySection,
+    ratios?: Partial<Record<MemorySection, number>>,
+  ): number {
+    const configured = ratios?.[section] ?? this.opts.budgetRatios?.[section];
+    return typeof configured === 'number' && Number.isFinite(configured) && configured > 0
+      ? configured
+      : SECTION_SHARE[section];
   }
 
   private sectionBudget(section: MemorySection): number {
@@ -130,6 +149,123 @@ export class CuratedMemory {
     }
   }
 
+  /**
+   * Read a bounded representation for prompt assembly. The source is consumed line-by-line so a
+   * hand-edited or damaged MEMORY.md cannot be slurped into the turn. Repeated owned headings are
+   * merged into the same category before its share is applied, so duplicate sections cannot bypass
+   * the health/life/agent budget.
+   */
+  async readForContext(
+    maxChars: number,
+    budgetRatios?: Partial<Record<MemorySection, number>>,
+  ): Promise<CuratedMemoryContextResult> {
+    const limit = Number.isFinite(maxChars) ? Math.max(0, Math.floor(maxChars)) : 0;
+    const sectionLimits = new Map<MemorySection, number>(
+      SECTION_ORDER.map(section => [section, Math.floor(limit * this.contextShare(section, budgetRatios))]),
+    );
+    const sectionLines = new Map<MemorySection, string[]>();
+    const sectionSeen = new Set<MemorySection>();
+    const sectionTruncated = new Set<MemorySection>();
+    const preamble: string[] = [];
+    const unknown: string[] = [];
+    let currentSection: MemorySection | undefined;
+    let inUnknown = false;
+    let unknownTruncated = false;
+    let invalidUtf8 = false;
+
+    let input: fs.ReadStream;
+    try {
+      input = fs.createReadStream(this.filePath(), { encoding: 'utf8' });
+    } catch (error) {
+      return this.contextReadError(error);
+    }
+    const lines = readline.createInterface({ input, crlfDelay: Infinity });
+    try {
+      for await (const line of lines) {
+        if (line.includes('\uFFFD')) invalidUtf8 = true;
+
+        if (line.startsWith('## ')) {
+          const parsed = this.parseHeading(line);
+          currentSection = this.memorySectionForHeading(parsed.heading);
+          inUnknown = currentSection === undefined;
+          if (currentSection) {
+            sectionSeen.add(currentSection);
+            if (!sectionLines.has(currentSection)) sectionLines.set(currentSection, []);
+          } else {
+            this.appendBoundedLine(unknown, line, limit, () => { unknownTruncated = true; });
+          }
+          continue;
+        }
+
+        if (currentSection) {
+          const bucket = sectionLines.get(currentSection)!;
+          const available = sectionLimits.get(currentSection)! - this.sectionSize(bucket);
+          const roomForLine = Math.max(0, available - (bucket.length > 0 ? 1 : 0));
+          if (roomForLine <= 0) {
+            sectionTruncated.add(currentSection);
+          } else if (line.length > roomForLine) {
+            bucket.push(line.slice(0, roomForLine));
+            sectionTruncated.add(currentSection);
+          } else {
+            bucket.push(line);
+          }
+          continue;
+        }
+
+        if (inUnknown) {
+          this.appendBoundedLine(unknown, line, limit, () => { unknownTruncated = true; });
+          continue;
+        }
+
+        const preambleLimit = Math.min(limit, 512);
+        const available = preambleLimit - this.sectionSize(preamble);
+        const roomForLine = Math.max(0, available - (preamble.length > 0 ? 1 : 0));
+        if (roomForLine <= 0) {
+          unknownTruncated = true;
+        } else if (line.length > roomForLine) {
+          preamble.push(line.slice(0, roomForLine));
+          unknownTruncated = true;
+        } else {
+          preamble.push(line);
+        }
+      }
+    } catch (error) {
+      return this.contextReadError(error);
+    } finally {
+      lines.close();
+    }
+
+    if (invalidUtf8) {
+      console.warn('[curated-memory] bounded read degraded: invalid UTF-8 content');
+      return { content: null, status: 'unreadable' };
+    }
+
+    const blocks: string[] = [];
+    const preambleBlock = this.trimOuterBlank(preamble);
+    if (preambleBlock.length > 0) blocks.push(preambleBlock.join('\n'));
+    for (const section of SECTION_ORDER) {
+      if (!sectionSeen.has(section)) continue;
+      const body = [...(sectionLines.get(section) ?? [])];
+      const sectionLimit = sectionLimits.get(section)!;
+      if (sectionTruncated.has(section)) {
+        const marker = `… [TRUNCATED ${SECTION_DISPLAY[section]}: additional content omitted]`;
+        while (body.length > 0 && this.sectionSize([...body, marker]) > sectionLimit) body.pop();
+        if (this.sectionSize([...body, marker]) <= sectionLimit) body.push(marker);
+      }
+      blocks.push([`## ${SECTION_HEADING[section]}`, ...this.trimOuterBlank(body)].join('\n'));
+    }
+    const unknownBlock = this.trimOuterBlank(unknown);
+    if (unknownBlock.length > 0) blocks.push(unknownBlock.join('\n'));
+
+    let content = blocks.length > 0 ? `${blocks.join('\n\n')}\n` : '';
+    let truncated = sectionTruncated.size > 0 || unknownTruncated;
+    if (content.length > limit) {
+      content = this.boundContextText(content, limit);
+      truncated = true;
+    }
+    return { content, status: 'present', truncated };
+  }
+
   // ---- internals ---------------------------------------------------------
 
   private assertFits(section: MemorySection, newLines: string[], currentLines: string[]): void {
@@ -146,6 +282,10 @@ export class CuratedMemory {
 
   private sectionItem(items: ParsedItem[], section: MemorySection): ParsedItem | undefined {
     return items.find(i => i.kind === 'section' && i.heading === SECTION_HEADING[section]);
+  }
+
+  private memorySectionForHeading(heading: string): MemorySection | undefined {
+    return SECTION_ORDER.find(section => SECTION_HEADING[section] === heading);
   }
 
   private entriesOf(sec: { lines: string[] }): string[] {
@@ -266,8 +406,17 @@ export class CuratedMemory {
       }
       if (line.startsWith('## ')) {
         const parsed = this.parseHeading(line);
-        current = { kind: 'section', heading: parsed.heading, comment: parsed.comment, lines: [] };
-        items.push(current);
+        const owned = this.memorySectionForHeading(parsed.heading);
+        const existing = owned ? this.sectionItem(items, owned) : undefined;
+        if (existing && existing.kind === 'section') {
+          // The blank line before this duplicate heading belongs to the structural separator,
+          // not to the merged category body. Remove it before continuing the same section.
+          existing.lines = this.trimOuterBlank(existing.lines);
+          current = existing;
+        } else {
+          current = { kind: 'section', heading: parsed.heading, comment: parsed.comment, lines: [] };
+          items.push(current);
+        }
         i += 1;
         continue;
       }
@@ -316,5 +465,49 @@ export class CuratedMemory {
     while (start < end && lines[start].trim() === '') start += 1;
     while (end > start && lines[end - 1].trim() === '') end -= 1;
     return lines.slice(start, end);
+  }
+
+  private appendBoundedLine(
+    target: string[],
+    line: string,
+    limit: number,
+    onTruncate: () => void,
+  ): void {
+    const available = limit - this.sectionSize(target);
+    const roomForLine = Math.max(0, available - (target.length > 0 ? 1 : 0));
+    if (roomForLine <= 0) {
+      onTruncate();
+      return;
+    }
+    if (line.length > roomForLine) {
+      target.push(line.slice(0, roomForLine));
+      onTruncate();
+      return;
+    }
+    target.push(line);
+  }
+
+  private boundContextText(value: string, limit: number): string {
+    if (limit <= 0) return '';
+    if (value.length <= limit) return value;
+    const marker = '\n… [TRUNCATED MEMORY.md: additional content omitted]';
+    if (marker.length >= limit) return this.safeSlice(marker, limit);
+    return `${this.safeSlice(value, limit - marker.length)}${marker}`;
+  }
+
+  private safeSlice(value: string, maxChars: number): string {
+    if (maxChars <= 0) return '';
+    if (value.length <= maxChars) return value;
+    let sliced = value.slice(0, maxChars);
+    const last = sliced.charCodeAt(sliced.length - 1);
+    if (last >= 0xD800 && last <= 0xDBFF) sliced = sliced.slice(0, -1);
+    return sliced;
+  }
+
+  private contextReadError(error: unknown): CuratedMemoryContextResult {
+    const nodeErr = error as NodeJS.ErrnoException;
+    if (nodeErr.code === 'ENOENT') return { content: null, status: 'absent' };
+    console.warn(`[curated-memory] bounded read failed: ${summarizeErrorForLog(error)}`);
+    return { content: null, status: 'unreadable' };
   }
 }

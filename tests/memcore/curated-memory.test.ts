@@ -178,6 +178,20 @@ describe('CuratedMemory.entries', () => {
     expect(await cm.entries('health')).toEqual(['a', 'b']);
     expect(await cm.entries('life')).toEqual([]);
   });
+
+  it('merges duplicate owned sections before budget accounting', async () => {
+    const first = 'x'.repeat(297);
+    const second = 'y'.repeat(297);
+    await fs.promises.writeFile(
+      memoryFile(),
+      `# Memory\n\n## Health\n- ${first}\n\n## Health\n- ${second}\n\n## Life\n`,
+      'utf-8',
+    );
+    const cm = new CuratedMemory(tmpDir, { budgetChars: 1000 });
+
+    await expect(cm.write('health', 'one more entry')).rejects.toBeInstanceOf(BudgetExceededError);
+    expect(await cm.entries('health')).toEqual([first, second]);
+  });
 });
 
 describe('CuratedMemory corrupt-file degradation', () => {
@@ -203,6 +217,24 @@ describe('CuratedMemory corrupt-file degradation', () => {
     } finally {
       warnSpy.mockRestore();
     }
+  });
+});
+
+describe('CuratedMemory.readForContext', () => {
+  it('streams a bounded merged view and marks duplicate-section overflow', async () => {
+    await fs.promises.writeFile(
+      memoryFile(),
+      `# Memory\n\n## Health\n- ${'x'.repeat(1_000)}\n\n## Health\n- ${'y'.repeat(1_000)}\n`,
+      'utf-8',
+    );
+    const cm = new CuratedMemory(tmpDir, { budgetChars: 10_000 });
+
+    const result = await cm.readForContext(1_000);
+
+    expect(result.status).toBe('present');
+    expect(result.truncated).toBe(true);
+    expect(result.content!.length).toBeLessThanOrEqual(1_000);
+    expect(result.content).toMatch(/TRUNCATED Health/i);
   });
 });
 

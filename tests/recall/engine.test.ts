@@ -200,6 +200,28 @@ describe('RecallEngine — Stage 3 (deterministic side-effect correlation)', () 
     expect(r.checkNotes).toBe('');
   });
 
+  it('caps CHECK output at 200 tokens, deduplicates, and orders the strongest recent checks first', async () => {
+    const meds = Array.from({ length: 40 }, (_, i) => frec({
+      id: `med-${i}`,
+      entity: `med-${String(i).padStart(2, '0')}`,
+      type: 'medication',
+      status: 'active',
+      fields: {
+        started: i === 0 ? '2026-09-30' : '2026-09-01',
+        known_side_effects: i === 0 ? ['nausea', 'nausea'] : ['nausea'],
+      },
+    }));
+    const r = await makeEngine({
+      factMirror: new FakeFactMirror(meds),
+      clock: fixedClock('2026-10-01T00:00:00.000Z'),
+    }).run({ profileId: 'default', userMessage: 'I feel nausea' });
+
+    expect(Math.ceil(r.checkNotes.length / 4)).toBeLessThanOrEqual(200);
+    expect(r.checkNotes).toMatch(/truncated/i);
+    expect(r.checkNotes.indexOf('med-00')).toBeLessThan(r.checkNotes.indexOf('med-01'));
+    expect((r.checkNotes.match(/med-00/g) ?? []).length).toBe(1);
+  });
+
   it('only correlates against ACTIVE meds (a discontinued med does not fire)', async () => {
     const mirror = new FakeFactMirror([
       frec({ id: 'jardiance@v2', entity: 'jardiance', version: 2, type: 'medication', status: 'discontinued', fields: { started: '2026-10-01', known_side_effects: ['genital-yeast-infection'] } }),
@@ -261,6 +283,20 @@ describe('RecallEngine — Stage 4 (feedback + auto-mute)', () => {
     await makeEngine({ chunkStats: stats }).recordUsage(['a', 'b'], '2026-10-01T00:00:00.000Z');
     expect(stats.used).toEqual([{ ids: ['a', 'b'], at: '2026-10-01T00:00:00.000Z' }]);
     expect((await stats.get('a'))?.usedCount).toBe(1);
+  });
+
+  it('records only deduplicated ids that were injected in the current turn', async () => {
+    const stats = new FakeChunkStats();
+    const engine = makeEngine({ chunkStats: stats });
+    await (engine.recordUsage as unknown as (ids: string[], at: string, injected: string[]) => Promise<void>)(
+      ['injected', 'forged', 'injected'],
+      '2026-10-01T00:00:00.000Z',
+      ['injected'],
+    );
+
+    expect(stats.used).toEqual([{ ids: ['injected'], at: '2026-10-01T00:00:00.000Z' }]);
+    expect(await stats.get('forged')).toBeNull();
+    expect((await stats.get('injected'))?.usedCount).toBe(1);
   });
 
   it('B4: auto-mutes a non-exempt chunk injected ≥20 with 0 uses', async () => {

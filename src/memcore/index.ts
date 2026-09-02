@@ -22,7 +22,9 @@ export type { CriticalEvent } from './safety-view';
 
 // MEMORY.md curated budget engine
 export { CuratedMemory } from './curated-memory';
-export type { MemorySection, CuratedMemoryOptions } from './curated-memory';
+export type {
+  MemorySection, CuratedMemoryOptions, CuratedMemoryReadStatus, CuratedMemoryContextResult,
+} from './curated-memory';
 
 // Episodes (health-arc grouping)
 export { EpisodeStore } from './episode-store';
