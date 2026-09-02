@@ -64,6 +64,16 @@ export class SqliteFactMirror implements FactMirror {
     replace(type, facts);
   }
 
+  /** Replace one type/entity scope while preserving every unrelated mirror row. */
+  async replaceScope(type: string, entity: string, facts: FactRecord[]): Promise<void> {
+    const replace = this.db.transaction((scopeType: string, scopeEntity: string, rows: FactRecord[]) => {
+      this.db.prepare('DELETE FROM facts WHERE type = ? AND entity = ?').run(scopeType, scopeEntity);
+      const stmt = this.upsertStmt();
+      for (const f of rows) stmt.run(this.toParams(f));
+    });
+    replace(type, entity, facts);
+  }
+
   async *queryActive(type?: string, entity?: string): AsyncIterable<FactRecord> {
     // Active head only; v0 quarantine sentinels (version < 1) are never surfaced (M-5).
     let sql = "SELECT json FROM facts WHERE status = 'active' AND version >= 1";

@@ -24,7 +24,7 @@ import { createEpisodeTools } from '../tools/episode-tools';
 import { createSafetyTools } from '../tools/safety-tools';
 import { WriteQueue, replayJournal } from '../profiles';
 import { LedgerStore, NarrativeStore, SafetyView, EpisodeStore, CuriosityQueue, CuratedMemory, TYPE_TO_FILE, normalizeEntity } from '../memcore';
-import type { CuriosityItem, FactType } from '../memcore';
+import type { CuriosityItem, FactType, LedgerIndexDelta, NarrativeIndexDelta } from '../memcore';
 import { SqliteFactMirror, SqliteEventSink, SqliteVecIndex, SqliteKeywordIndex, SqliteChunkStats, SqliteSessionIndex, ledgerFactToRecord, isRemoteEmbeddingBaseUrl } from '../indexstore';
 import { createSessionTools } from '../tools/session-tools';
 import { deprecatedSessionWarnings } from '../config/deprecations';
@@ -34,7 +34,7 @@ import { CapturePipeline, FileCaptureIdempotency } from '../capture';
 import { makeSafetyRenderer } from '../capture';
 import { SqliteStore } from '../memory/sqlite-store';
 import { MemorySearch } from '../memory/search';
-import type { MemoryIndexer as MemoryIndexerType } from '../memory/indexer';
+import type { MemoryIndexer as MemoryIndexerType, MemoryIndexDelta } from '../memory/indexer';
 import { createProvider } from '../providers/factory';
 import { SessionManager } from './session';
 import * as cron from 'node-cron';
@@ -198,6 +198,7 @@ export class Gateway {
   private chunkStats?: SqliteChunkStats;
   private semaphore?: LLMSemaphore;
   private readonly reindexTails: Map<string, Promise<void>> = new Map();
+  private readonly pendingIndexDeltas: Map<string, MemoryIndexDelta[]> = new Map();
   private readonly backgroundOperations: Set<Promise<void>> = new Set();
   private readonly inFlightOperations: Set<Promise<unknown>> = new Set();
   private readonly dirtyIndexPaths: Set<string> = new Set();
@@ -216,6 +217,7 @@ export class Gateway {
     const profileId = (profilesConfig?.defaultProfileId ?? 'default') as ProfileId;
     this.stopping = false;
     this.stopped = false;
+    this.pendingIndexDeltas.clear();
 
     console.log('[gateway] Starting Redacted...');
 
@@ -258,7 +260,13 @@ export class Gateway {
     const embeddingProvider = createProvider(config.providers.embeddings);
     const boundedEmbeddingProvider = makeBoundedEmbeddingProvider(embeddingProvider);
     const { MemoryIndexer } = await import('../memory/indexer');
-    const indexer = new MemoryIndexer(store, boundedEmbeddingProvider, memoryWorkspace, profileId);
+    const indexer = new MemoryIndexer(
+      store,
+      boundedEmbeddingProvider,
+      memoryWorkspace,
+      profileId,
+      (relativePath) => this.takePendingIndexDelta(relativePath),
+    );
     this.indexer = indexer;
     this.dirtyIndexMarkerPath = path.join(memoryWorkspace, '.state', 'index-dirty.json');
     try {
@@ -406,12 +414,18 @@ export class Gateway {
           if (this.stopping) return;
           for (const rel of new Set(relPaths)) {
             if (this.stopping) return;
-            // The source write has completed. Publish a durable partial checkpoint before
-            // scheduling any provider work, so a crash cannot make the new source look indexed.
-            this.markIndexDirty(memoryWorkspace, rel, store);
             const type = rel.startsWith('ledger/')
               ? fileToType.get(rel.slice('ledger/'.length))
               : undefined;
+            const sourceDelta = type
+              ? ledgerStore.takeIndexDelta(type)
+              : this.narrativeDeltaFor(rel, narrativeStore);
+            if (sourceDelta) {
+              this.enqueuePendingIndexDelta(rel, sourceDelta);
+            }
+            // The source write has completed. Publish a durable partial checkpoint before
+            // scheduling any provider work, so a crash cannot make the new source look indexed.
+            await this.markIndexDirty(memoryWorkspace, rel, store, sourceDelta?.hash);
             if (type) {
               // FactMirror is the fast Stage-1 safety projection. Keep it synchronous from the
               // caller's perspective, but serialize concurrent refreshes for the same type.
@@ -421,8 +435,18 @@ export class Gateway {
                 .then(async () => {
                   if (this.stopping) return;
                   try {
-                    const facts = await ledgerStore.listAllOfType(type);
-                    await factMirror.replaceType(type, facts.map(ledgerFactToRecord));
+                    const entities = sourceDelta && type && 'entities' in sourceDelta
+                      ? [...new Set((sourceDelta as LedgerIndexDelta).entities)]
+                      : [];
+                    if (entities.length > 0) {
+                      for (const entity of entities) {
+                        const facts = await ledgerStore.listAllOfEntity(type, entity);
+                        await factMirror.replaceScope(type, entity, facts.map(ledgerFactToRecord));
+                      }
+                    } else {
+                      const facts = await ledgerStore.listAllOfType(type);
+                      await factMirror.replaceType(type, facts.map(ledgerFactToRecord));
+                    }
                   } catch (e) {
                     console.warn('[gateway] fact-mirror re-derive failed (rebuildable at boot):', summarizeErrorForLog(e));
                   }
@@ -1612,6 +1636,42 @@ export class Gateway {
     );
   }
 
+  private narrativeDeltaFor(relativePath: string, narrativeStore: NarrativeStore): NarrativeIndexDelta | undefined {
+    const match = relativePath.match(/^memory\/(\d{4}-\d{2}-\d{2})\.md$/);
+    return match ? narrativeStore.takeIndexDelta(match[1]) : undefined;
+  }
+
+  private enqueuePendingIndexDelta(
+    relativePath: string,
+    sourceDelta: LedgerIndexDelta | NarrativeIndexDelta,
+  ): void {
+    const delta: MemoryIndexDelta = {
+      hash: sourceDelta.hash,
+      fingerprint: sourceDelta.fingerprint,
+      chunks: sourceDelta.chunks.map((chunk) => ({
+        id: chunk.id,
+        content: chunk.content,
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+      })),
+    };
+    const pending = this.pendingIndexDeltas.get(relativePath) ?? [];
+    pending.push(delta);
+    this.pendingIndexDeltas.set(relativePath, pending);
+  }
+
+  private takePendingIndexDelta(relativePath: string): MemoryIndexDelta | undefined {
+    const pending = this.pendingIndexDeltas.get(relativePath);
+    if (!pending || pending.length === 0) return undefined;
+    this.pendingIndexDeltas.delete(relativePath);
+    const last = pending[pending.length - 1];
+    return {
+      hash: last.hash,
+      fingerprint: last.fingerprint,
+      chunks: pending.flatMap(delta => delta.chunks),
+    };
+  }
+
   private async drainInFlightOperations(): Promise<void> {
     while (this.inFlightOperations.size > 0) {
       await Promise.allSettled([...this.inFlightOperations]);
@@ -1624,16 +1684,31 @@ export class Gateway {
     }
   }
 
-  private markIndexDirty(workspace: string, relativePath: string, store: SqliteStore): void {
+  private async markIndexDirty(
+    workspace: string,
+    relativePath: string,
+    store: SqliteStore,
+    sourceHash?: string,
+  ): Promise<void> {
     try {
-      const content = fs.readFileSync(path.join(workspace, relativePath), 'utf8');
-      const hash = createHash('sha256').update(content).digest('hex');
+      const hash = sourceHash ?? await this.hashFile(path.join(workspace, relativePath));
       store.upsertFileHash(relativePath, `embedding-partial:${hash}`);
     } catch (error) {
       console.warn('[gateway] Could not publish index dirty checkpoint:', summarizeErrorForLog(error));
     }
     this.dirtyIndexPaths.add(relativePath);
     this.persistDirtyIndexMarker();
+  }
+
+  private async hashFile(filePath: string): Promise<string> {
+    const digest = createHash('sha256');
+    const input = fs.createReadStream(filePath);
+    try {
+      for await (const chunk of input) digest.update(chunk);
+      return digest.digest('hex');
+    } finally {
+      input.destroy();
+    }
   }
 
   private clearIndexDirty(relativePath: string): void {

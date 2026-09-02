@@ -7,12 +7,32 @@ import {
   ConfirmationContext, LedgerMutationResult, PendingOp, Provenance, RecordFactResult, RetractResult, StoredToken, TYPE_TO_FILE,
 } from './types';
 import { parseLedgerFile, renderLedgerFile, canonicalFields } from './ledger-parser';
-import { normalizeEntitySlug } from './sanitize';
+import { normalizeEntitySlug, sanitizeSingleLine } from './sanitize';
 import { TokenRejectedError } from './token-errors';
 import { ParseQuarantineError } from '../shared/errors';
 import { secureWrite, secureWriteViaTmp, secureMkdir, secureChmodFile, summarizeErrorForLog, resolveContainedPath } from '../security';
 import type { Clock } from '../ports';
 import { systemClock } from '../ports';
+
+export interface LedgerIndexChunk {
+  id: string;
+  content: string;
+  startLine: number;
+  endLine: number;
+}
+
+export interface LedgerIndexDelta {
+  hash: string;
+  fingerprint?: LedgerFileFingerprint;
+  entities: string[];
+  chunks: LedgerIndexChunk[];
+}
+
+export interface LedgerFileFingerprint {
+  mtimeMs: number;
+  size: number;
+  ino: number;
+}
 
 function hash(s: string): string {
   return createHash('sha256').update(s).digest('hex').slice(0, 16);
@@ -67,8 +87,15 @@ interface RecordFactParams {
   correctedBy?: string;
 }
 
+interface LedgerFactsCache {
+  fingerprint: LedgerFileFingerprint;
+  facts: LedgerFact[];
+}
+
 export class LedgerStore {
   private tokens = new Map<string, StoredToken>();
+  private readonly factsCache = new Map<FactType, LedgerFactsCache>();
+  private readonly pendingIndexDeltas = new Map<FactType, LedgerIndexDelta[]>();
 
   constructor(private rootDir: string, private clock: Clock = systemClock) {
     secureMkdir(rootDir);
@@ -81,6 +108,33 @@ export class LedgerStore {
 
   private async readFacts(type: FactType): Promise<LedgerFact[]> {
     const fp = this.filePath(type);
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(fp);
+    } catch (err: unknown) {
+      this.invalidateFactsCache(type);
+      const nodeErr = err as NodeJS.ErrnoException;
+      if (nodeErr.code === 'ENOENT') return [];
+      throw err;
+    }
+    if (!stat.isFile()) {
+      this.invalidateFactsCache(type);
+      throw new Error('ledger source is not a regular file');
+    }
+    const fingerprint = this.fingerprint(stat);
+    const cached = this.factsCache.get(type);
+    if (cached && this.sameFingerprint(cached.fingerprint, fingerprint)) {
+      try {
+        const fd = fs.openSync(fp, 'r');
+        fs.closeSync(fd);
+        return this.cloneFacts(cached.facts);
+      } catch (err) {
+        this.invalidateFactsCache(type);
+        throw err;
+      }
+    }
+    this.invalidateFactsCache(type);
+
     let rawBytes: Buffer;
     try {
       rawBytes = await fs.promises.readFile(fp);
@@ -108,7 +162,8 @@ export class LedgerStore {
       }
       return facts.filter((fact) => fact.version >= 1 && fact.fields._quarantine === undefined);
     }
-    return facts;
+    this.factsCache.set(type, { fingerprint, facts: this.cloneFacts(facts) });
+    return this.cloneFacts(facts);
   }
 
   /** Copy corrupt source bytes to a secure sidecar so read-only callers retain usable facts. */
@@ -126,9 +181,100 @@ export class LedgerStore {
     }
   }
 
-  private async writeFacts(type: FactType, facts: LedgerFact[]): Promise<void> {
-    LedgerStore.reconcileReverseLinks(facts);
-    secureWriteViaTmp(this.filePath(type), renderLedgerFile(facts));
+  private async writeFacts(type: FactType, facts: LedgerFact[], deltaFacts: LedgerFact[] = []): Promise<void> {
+    let rendered: string;
+    try {
+      LedgerStore.reconcileReverseLinks(facts);
+      rendered = renderLedgerFile(facts);
+      secureWriteViaTmp(this.filePath(type), rendered);
+    } catch (err) {
+      this.factsCache.delete(type);
+      throw err;
+    }
+
+    let fingerprint: LedgerFileFingerprint | undefined;
+    try {
+      const stat = fs.statSync(this.filePath(type));
+      if (!stat.isFile()) throw new Error('ledger source is not a regular file');
+      fingerprint = this.fingerprint(stat);
+      this.factsCache.set(type, { fingerprint, facts: this.cloneFacts(this.orderFacts(facts)) });
+    } catch (err) {
+      this.factsCache.delete(type);
+      console.warn(`[ledger-store] write metadata unavailable for ${TYPE_TO_FILE[type]}: ${summarizeErrorForLog(err)}`);
+    }
+
+    const chunks = deltaFacts.map((fact) => this.indexChunk(type, fact, rendered));
+    const delta: LedgerIndexDelta = {
+      hash: createHash('sha256').update(rendered).digest('hex'),
+      fingerprint,
+      entities: [...new Set(deltaFacts.map((fact) => fact.entity))],
+      chunks,
+    };
+    const pending = this.pendingIndexDeltas.get(type) ?? [];
+    pending.push(delta);
+    this.pendingIndexDeltas.set(type, pending);
+  }
+
+  /** Consume source deltas for the Gateway's background indexer. */
+  takeIndexDelta(type: FactType): LedgerIndexDelta | undefined {
+    const pending = this.pendingIndexDeltas.get(type);
+    if (!pending || pending.length === 0) return undefined;
+    this.pendingIndexDeltas.delete(type);
+    const last = pending[pending.length - 1];
+    return {
+      hash: last.hash,
+      fingerprint: last.fingerprint,
+      entities: [...new Set(pending.flatMap(delta => delta.entities))],
+      chunks: pending.flatMap(delta => delta.chunks),
+    };
+  }
+
+  private indexChunk(type: FactType, fact: LedgerFact, rendered: string): LedgerIndexChunk {
+    const content = renderLedgerFile([fact]).trimEnd();
+    const entityHeader = `## ${sanitizeSingleLine(fact.entity)}\n`;
+    const sectionStart = rendered.indexOf(entityHeader);
+    const versionBlock = content.startsWith(entityHeader) ? content.slice(entityHeader.length) : content;
+    const versionStart = sectionStart >= 0
+      ? rendered.indexOf(versionBlock, sectionStart + entityHeader.length)
+      : -1;
+    const startOffset = sectionStart >= 0 ? sectionStart : (versionStart >= 0 ? versionStart : 0);
+    const startLine = rendered.slice(0, startOffset).split('\n').length;
+    return {
+      id: `ledger/${TYPE_TO_FILE[type]}:delta:${fact.id}`,
+      content,
+      startLine,
+      endLine: startLine + content.split(/\r\n|\n|\r/).length - 1,
+    };
+  }
+
+  private fingerprint(stat: fs.Stats): LedgerFileFingerprint {
+    return { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+  }
+
+  private sameFingerprint(left: LedgerFileFingerprint, right: LedgerFileFingerprint): boolean {
+    return left.mtimeMs === right.mtimeMs && left.size === right.size && left.ino === right.ino;
+  }
+
+  private cloneFacts(facts: LedgerFact[]): LedgerFact[] {
+    return facts.map((fact) => ({
+      ...fact,
+      fields: Object.fromEntries(Object.entries(fact.fields).map(([key, value]) => [
+        key,
+        Array.isArray(value) ? [...value] : value,
+      ])),
+      provenance: { ...fact.provenance },
+    }));
+  }
+
+  private orderFacts(facts: LedgerFact[]): LedgerFact[] {
+    return [...facts].sort((left, right) =>
+      left.entity.localeCompare(right.entity) || right.version - left.version,
+    );
+  }
+
+  private invalidateFactsCache(type: FactType): void {
+    this.factsCache.delete(type);
+    this.pendingIndexDeltas.delete(type);
   }
 
   /**
@@ -305,7 +451,7 @@ export class LedgerStore {
     if (!cur) {
       const fact = this.makeFact(p, 1, 'active', now);
       allFacts.push(fact);
-      await this.writeFacts(p.type, allFacts);
+      await this.writeFacts(p.type, allFacts, [fact]);
       return { kind: 'applied', fact };
     }
 
@@ -342,7 +488,7 @@ export class LedgerStore {
       cur.status = 'superseded';
       const fact = this.makeFact(p, v, 'active', now, cur);
       allFacts.push(fact);
-      await this.writeFacts(p.type, allFacts);
+      await this.writeFacts(p.type, allFacts, [fact]);
       return { kind: 'applied', fact };
     }
 
@@ -353,7 +499,7 @@ export class LedgerStore {
       active.status = 'superseded';
       const fact = this.makeFact(p, v, 'active', now, active, undefined, true);
       allFacts.push(fact);
-      await this.writeFacts(p.type, allFacts);
+      await this.writeFacts(p.type, allFacts, [fact]);
       return { kind: 'applied', fact };
     }
 
@@ -368,7 +514,7 @@ export class LedgerStore {
       active.status = 'superseded';
       const fact = this.makeFact(p, v, 'active', now, active);
       allFacts.push(fact);
-      await this.writeFacts(p.type, allFacts);
+      await this.writeFacts(p.type, allFacts, [fact]);
       return { kind: 'applied', fact };
     }
 
@@ -390,7 +536,7 @@ export class LedgerStore {
         supersedes: active.id,
       };
       allFacts.push(disputeA, disputeB);
-      await this.writeFacts(p.type, allFacts);
+      await this.writeFacts(p.type, allFacts, [disputeA, disputeB]);
       const changeHash = hash(`dispute:${p.entity}:${vA}:${vB}`);
       const token = makeToken(p.entity, changeHash, this.clock.now().getTime());
       this.tokens.set(token.uuid, {
@@ -460,7 +606,7 @@ export class LedgerStore {
       createdAt: now,
     };
     allFacts.push(fact);
-    await this.writeFacts(params.type, allFacts);
+    await this.writeFacts(params.type, allFacts, [fact]);
     return { kind: 'applied', fact };
   }
 
@@ -496,7 +642,7 @@ export class LedgerStore {
       createdAt: now,
     };
     allFacts.push(fact);
-    await this.writeFacts(type, allFacts);
+    await this.writeFacts(type, allFacts, [fact]);
     return fact;
   }
 
@@ -552,7 +698,7 @@ export class LedgerStore {
       createdAt: now,
     };
     allFacts.push(fact);
-    await this.writeFacts(type, allFacts);
+    await this.writeFacts(type, allFacts, [fact]);
     return fact;
   }
 
@@ -620,7 +766,7 @@ export class LedgerStore {
       createdAt: now,
     };
     allFacts.push(fact);
-    await this.writeFacts(type, allFacts);
+    await this.writeFacts(type, allFacts, [fact]);
     return { kind: 'applied', fact };
   }
 
@@ -770,7 +916,7 @@ export class LedgerStore {
       };
       const fact = this.makeFact(rp, v, targetStatus, now, cur, writeFields);
       allFacts.push(fact);
-      await this.writeFacts(op.type, allFacts);
+      await this.writeFacts(op.type, allFacts, [fact]);
       return fact;
     }
 
@@ -802,7 +948,7 @@ export class LedgerStore {
         createdAt: now,
       };
       allFacts.push(fact);
-      await this.writeFacts(op.type, allFacts);
+      await this.writeFacts(op.type, allFacts, [fact]);
       return fact;
     }
 
@@ -830,7 +976,7 @@ export class LedgerStore {
       // full competing content, so nothing is lost by superseding it.
       const original = allFacts.find(f => f.id === op.originalId && f.status === 'disputed' && f.version !== winner.version && f.version !== loser.version);
       if (original) original.status = 'superseded';
-      await this.writeFacts(op.type, allFacts);
+      await this.writeFacts(op.type, allFacts, [winner, loser]);
       return winner;
     }
 
@@ -891,6 +1037,12 @@ export class LedgerStore {
    */
   async listAllOfType(type: FactType): Promise<LedgerFact[]> {
     return this.readFacts(type);
+  }
+
+  /** Every fact in one entity scope, including all versions and terminal states. */
+  async listAllOfEntity(type: FactType, entity: string): Promise<LedgerFact[]> {
+    const normalized = requireEntitySlug(entity);
+    return (await this.readFacts(type)).filter((fact) => fact.entity === normalized);
   }
 
   /**

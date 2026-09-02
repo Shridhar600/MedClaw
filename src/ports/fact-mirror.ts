@@ -22,6 +22,8 @@ export interface FactMirror {
   upsert(facts: FactRecord[]): Promise<void>;
   /** Replace the complete mirror projection for one ledger type in one transaction. */
   replaceType(type: string, facts: FactRecord[]): Promise<void>;
+  /** Replace one type/entity scope in one transaction; optional for legacy adapters. */
+  replaceScope?(type: string, entity: string, facts: FactRecord[]): Promise<void>;
   queryActive(type?: string, entity?: string): AsyncIterable<FactRecord>;
   /** Paused facts (recall Stage 1 injects these with their `pre_pause_summary` — KNEE-08). */
   queryPaused(type?: string): AsyncIterable<FactRecord>;

@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as readline from 'readline';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { secureMkdir, secureWriteViaTmp, summarizeErrorForLog, tightenFile } from '../security';
@@ -15,95 +14,6 @@ interface JobsCache {
   size: number;
   ino: number;
   jobs: HeartbeatJob[];
-}
-
-/** Parse the stable JSON-array format one object at a time, without buffering the complete file. */
-async function readJsonArray(filePath: string): Promise<unknown[]> {
-  const input = fs.createReadStream(filePath, { encoding: 'utf8' });
-  const lines = readline.createInterface({ input, crlfDelay: Infinity });
-  const jobs: unknown[] = [];
-  let state: 'before-array' | 'value' | 'value-after-comma' | 'after-value' | 'done' = 'before-array';
-  let objectDepth = 0;
-  let inString = false;
-  let escaped = false;
-  let objectText = '';
-
-  const consume = (line: string): void => {
-    for (const character of line) {
-      if (objectDepth > 0) {
-        objectText += character;
-        if (inString) {
-          if (escaped) escaped = false;
-          else if (character === '\\') escaped = true;
-          else if (character === '"') inString = false;
-        } else if (character === '"') {
-          inString = true;
-        } else if (character === '{') {
-          objectDepth += 1;
-        } else if (character === '}') {
-          objectDepth -= 1;
-          if (objectDepth === 0) {
-            jobs.push(JSON.parse(objectText));
-            objectText = '';
-            state = 'after-value';
-          }
-        }
-        continue;
-      }
-
-      if (/\s/.test(character)) continue;
-      if (state === 'before-array') {
-        if (character !== '[') throw new Error('Heartbeat store payload must be an array.');
-        state = 'value';
-        continue;
-      }
-      if (state === 'value') {
-        if (character === ']' && jobs.length === 0) {
-          state = 'done';
-          continue;
-        }
-        if (character !== '{') throw new Error('Heartbeat store array contains a non-object value.');
-        objectDepth = 1;
-        objectText = '{';
-        inString = false;
-        escaped = false;
-        continue;
-      }
-      if (state === 'value-after-comma') {
-        if (character !== '{') throw new Error('Heartbeat store array contains an invalid separator.');
-        objectDepth = 1;
-        objectText = '{';
-        inString = false;
-        escaped = false;
-        state = 'value';
-        continue;
-      }
-      if (state === 'after-value') {
-        if (character === ',') {
-          state = 'value-after-comma';
-          continue;
-        }
-        if (character === ']') {
-          state = 'done';
-          continue;
-        }
-        throw new Error('Heartbeat store payload has trailing data.');
-      }
-      throw new Error('Heartbeat store payload has trailing data.');
-    }
-  };
-
-  try {
-    for await (const line of lines) consume(line);
-    if (state === 'before-array') return [];
-    if (objectDepth !== 0 || inString || state !== 'done') {
-      throw new Error('Heartbeat store payload is incomplete.');
-    }
-    return jobs;
-  } finally {
-    lines.close();
-    input.destroy();
-  }
 }
 
 export class HeartbeatStore {
@@ -260,7 +170,11 @@ export class HeartbeatStore {
     }
 
     try {
-      const parsed = await readJsonArray(this.filePath);
+      const parsed: unknown = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
+      if (!Array.isArray(parsed) || parsed.some((job) =>
+        job === null || typeof job !== 'object' || Array.isArray(job))) {
+        throw new Error('Heartbeat store payload must be an array of objects.');
+      }
       this.lastCorruptionAt = undefined;
       const jobs = parsed.map((job) => this.normalizeJob(job as HeartbeatJob));
       this.jobsCache = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, jobs: this.cloneJobs(jobs) };

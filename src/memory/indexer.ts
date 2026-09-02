@@ -15,6 +15,27 @@ export type MemoryIndexerStatus =
   | { status: 'provider-unavailable' }
   | { status: 'unreadable' };
 
+export interface MemoryIndexDeltaChunk {
+  id: string;
+  content: string;
+  startLine: number;
+  endLine: number;
+}
+
+export interface MemoryIndexDeltaFingerprint {
+  mtimeMs: number;
+  size: number;
+  ino: number;
+}
+
+export interface MemoryIndexDelta {
+  hash: string;
+  fingerprint?: MemoryIndexDeltaFingerprint;
+  chunks: MemoryIndexDeltaChunk[];
+}
+
+export type MemoryIndexDeltaProvider = (relativePath: string) => MemoryIndexDelta | undefined;
+
 export class MemoryIndexer {
   private isIndexing = false;
   private dimensionProbeState: 'unknown' | 'available' | 'unavailable' = 'unknown';
@@ -27,6 +48,7 @@ export class MemoryIndexer {
     private readonly embeddingProvider: LLMProvider,
     private readonly workspacePath: string,
     private readonly profileId: string = 'default',
+    private readonly deltaProvider?: MemoryIndexDeltaProvider,
   ) {
     this.embeddingModelName = embeddingProvider.modelName ?? 'unknown';
   }
@@ -67,7 +89,97 @@ export class MemoryIndexer {
 
   async indexFile(relativePath: string): Promise<void> {
     const dimensionAvailable = await this.ensureDimension();
+    let delta: MemoryIndexDelta | undefined;
+    try {
+      delta = this.deltaProvider?.(relativePath);
+    } catch (e) {
+      console.warn(`[indexer] Delta metadata unavailable for ${relativePath}; using full reindex:`, summarizeErrorForLog(e));
+    }
+    if (delta) {
+      await this.indexDelta(relativePath, delta, dimensionAvailable);
+      return;
+    }
     await this.indexFileInternal(relativePath, dimensionAvailable);
+  }
+
+  private async indexDelta(relativePath: string, delta: MemoryIndexDelta, dimensionAvailable: boolean): Promise<void> {
+    const absolutePath = path.join(this.workspacePath, relativePath);
+    if (!delta.fingerprint || delta.chunks.length === 0) {
+      await this.indexFileInternal(relativePath, dimensionAvailable);
+      return;
+    }
+
+    const initialStat = fs.statSync(absolutePath);
+    if (!this.sameFingerprint(initialStat, delta.fingerprint)) {
+      console.warn(`[indexer] Source changed before delta indexing ${relativePath}; using full reindex`);
+      await this.indexFileInternal(relativePath, dimensionAvailable);
+      return;
+    }
+
+    const lane = this.laneFor(relativePath);
+    const createdAt = this.createdAtFor(relativePath, absolutePath);
+    const chunks: Chunk[] = delta.chunks.map((chunk) => ({
+      id: chunk.id,
+      path: relativePath,
+      lane,
+      content: chunk.content,
+      startLine: chunk.startLine,
+      endLine: chunk.endLine,
+      createdAt,
+    }));
+    const preparedChunks: Chunk[] = [];
+    let hadEmbeddingFailure = !dimensionAvailable;
+    const expectedDimension = dimensionAvailable ? this.embeddingDimension : undefined;
+    for (const chunk of chunks) {
+      if (!dimensionAvailable) {
+        preparedChunks.push(chunk);
+        continue;
+      }
+      try {
+        const embedding = await this.embeddingProvider.embed(chunk.content);
+        if (!this.isUsableEmbedding(embedding, expectedDimension)) {
+          console.warn(`[indexer] Empty or invalid embedding for ${chunk.id}`);
+          hadEmbeddingFailure = true;
+        } else {
+          chunk.embedding = embedding;
+        }
+      } catch (e) {
+        console.warn(`[indexer] Failed to embed chunk ${chunk.id}:`, summarizeErrorForLog(e));
+        hadEmbeddingFailure = true;
+      }
+      preparedChunks.push(chunk);
+    }
+
+    const finalStat = fs.statSync(absolutePath);
+    if (!this.sameFingerprint(finalStat, delta.fingerprint)) {
+      console.warn(`[indexer] Source changed while delta indexing ${relativePath}; stale delta discarded`);
+      await this.indexFileInternal(relativePath, dimensionAvailable);
+      return;
+    }
+
+    const nextHash = hadEmbeddingFailure ? `embedding-partial:${delta.hash}` : delta.hash;
+    const existingHash = this.store.getFileHash(relativePath);
+    const existingModel = this.store.getFileEmbeddingModel(relativePath);
+    if (existingHash !== undefined && existingModel !== undefined && existingModel !== this.embeddingModelName) {
+      await this.indexFileInternal(relativePath, dimensionAvailable);
+      return;
+    }
+    if (existingHash !== undefined && existingModel === undefined && this.store.getChunksByPath(relativePath).length > 0) {
+      await this.indexFileInternal(relativePath, dimensionAvailable);
+      return;
+    }
+    if (existingHash !== undefined && existingModel === this.embeddingModelName) {
+      for (const chunk of preparedChunks) this.store.upsertChunk(chunk);
+      this.store.upsertFileHash(relativePath, nextHash);
+    } else {
+      // A newly-created source has no prior chunks. The full replacement API is
+      // safe here and also records the per-file model identity for future deltas.
+      this.store.replaceFileIndex(relativePath, preparedChunks, nextHash, this.embeddingModelName);
+    }
+    if (!hadEmbeddingFailure && !this.store.isFileIndexCurrent(relativePath, delta.hash, this.embeddingModelName)) {
+      this.store.upsertFileHash(relativePath, `embedding-partial:${delta.hash}`);
+    }
+    console.log(`[indexer] Indexed ${relativePath} (${preparedChunks.length} delta chunks)`);
   }
 
   private async indexFileInternal(relativePath: string, _dimensionAvailable: boolean): Promise<void> {
@@ -224,6 +336,10 @@ export class MemoryIndexer {
       && values.length > 0
       && values.every(value => Number.isFinite(value))
       && (expectedDimension === undefined || values.length === expectedDimension);
+  }
+
+  private sameFingerprint(stat: fs.Stats, expected: MemoryIndexDeltaFingerprint): boolean {
+    return stat.mtimeMs === expected.mtimeMs && stat.size === expected.size && stat.ino === expected.ino;
   }
 
   private laneFor(relativePath: string): string {

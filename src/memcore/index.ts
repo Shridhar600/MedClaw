@@ -3,6 +3,7 @@
 
 // Ledger (versioned health facts)
 export { LedgerStore } from './ledger-store';
+export type { LedgerIndexChunk, LedgerIndexDelta, LedgerFileFingerprint } from './ledger-store';
 export { parseLedgerFile, renderLedgerFile, canonicalFieldValue, canonicalFields } from './ledger-parser';
 
 // Render-boundary sanitizer (INJ) — single-line discipline for embedded text
@@ -14,7 +15,9 @@ export type { TokenRejectionReason } from './token-errors';
 
 // Narrative lane (daily logs)
 export { NarrativeStore } from './narrative-store';
-export type { NarrativeAppendResult } from './narrative-store';
+export type {
+  NarrativeAppendResult, NarrativeIndexChunk, NarrativeIndexDelta, NarrativeFileFingerprint,
+} from './narrative-store';
 
 // SAFETY.md rendered view
 export { SafetyView, SafetyRemovalRefusedError, SafetyProjectionDirtyError } from './safety-view';

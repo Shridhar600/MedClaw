@@ -62,7 +62,7 @@ describe('RR-9a R6-17 bounded scheduler reads', () => {
     expect(parse).toHaveBeenCalledTimes(0);
   });
 
-  it('loads a large JSON-array scheduler state without readFileSync slurping it', async () => {
+  it('loads a large JSON-array scheduler state once and caches the fingerprint', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr9a-stream-'));
     tmpDirs.push(dir);
     const storePath = path.join(dir, 'jobs.json');
@@ -83,12 +83,16 @@ describe('RR-9a R6-17 bounded scheduler reads', () => {
     const store = new HeartbeatStore(storePath);
     const fsReal = jest.requireActual<typeof import('fs')>('fs');
     const readFile = jest.spyOn(fsReal, 'readFileSync');
+    const parse = jest.spyOn(JSON, 'parse');
 
     const loaded = await store.list();
+    const warm = await store.list();
 
     expect(loaded).toHaveLength(1200);
     expect(loaded[1199].id).toBe('job-1199');
-    expect(readFile.mock.calls.filter(([file]) => String(file).endsWith('jobs.json'))).toHaveLength(0);
+    expect(warm).toHaveLength(1200);
+    expect(readFile.mock.calls.filter(([file]) => String(file).endsWith('jobs.json'))).toHaveLength(1);
+    expect(parse).toHaveBeenCalledTimes(1);
   });
 
   it('reads a large Unicode audit record across a buffer boundary without a trailing newline', async () => {
