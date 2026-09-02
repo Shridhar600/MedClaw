@@ -275,8 +275,8 @@ describe('LLMSemaphore', () => {
     await expect(overflow).rejects.toThrow('heartbeat queue full');
     await expect(overflow).rejects.toBeInstanceOf(HeartbeatQueueFullError);
 
-    // A user job must still be accepted (enqueued, not rejected) while the
-    // heartbeat queue is full — user jobs are never bounded.
+    // The independent user cap still leaves room for a user job while the
+    // heartbeat queue is full.
     const userResult = sem.run('user', async () => 'user-ok');
 
     blockerDone.resolve();
@@ -319,5 +319,139 @@ describe('LLMSemaphore', () => {
     await Promise.all(hbPromises);
 
     expect(order).toEqual(['blocker-start', 'blocker-end', 'user', 'hb0', 'hb1', 'hb2', 'hb3', 'hb4']);
+  });
+
+  it('rejects a user enqueue once the bounded user queue is full', async () => {
+    const SemaphoreWithOptions = LLMSemaphore as unknown as new (options: {
+      maxQueuedUsers: number;
+      maxQueuedHeartbeats: number;
+      maxQueuedBackground: number;
+    }) => LLMSemaphore;
+    const bounded = new SemaphoreWithOptions({ maxQueuedUsers: 1, maxQueuedHeartbeats: 10, maxQueuedBackground: 20 });
+    const blockerRunning = deferred();
+    const blockerDone = deferred();
+    const blocker = bounded.run('user', async () => {
+      blockerRunning.resolve();
+      await blockerDone.promise;
+    });
+    await blockerRunning.promise;
+
+    const queued = bounded.run('user', async () => {});
+    const overflow = bounded.run('user', async () => {});
+
+    blockerDone.resolve();
+    await blocker;
+    await expect(overflow).rejects.toMatchObject({ name: 'UserQueueFullError' });
+    await queued;
+  });
+
+  it('rejects a background enqueue once the bounded background queue is full', async () => {
+    const SemaphoreWithOptions = LLMSemaphore as unknown as new (options: {
+      maxQueuedUsers: number;
+      maxQueuedHeartbeats: number;
+      maxQueuedBackground: number;
+    }) => LLMSemaphore;
+    const bounded = new SemaphoreWithOptions({ maxQueuedUsers: 100, maxQueuedHeartbeats: 10, maxQueuedBackground: 1 });
+    const blockerRunning = deferred();
+    const blockerDone = deferred();
+    const blocker = bounded.run('user', async () => {
+      blockerRunning.resolve();
+      await blockerDone.promise;
+    });
+    await blockerRunning.promise;
+
+    const queued = bounded.run('background', async () => {});
+    const overflow = bounded.run('background', async () => {});
+
+    blockerDone.resolve();
+    await blocker;
+    await expect(overflow).rejects.toMatchObject({ name: 'BackgroundQueueFullError' });
+    await queued;
+  });
+
+  it('shutdown rejects queued work with a typed error and does not run it', async () => {
+    const blockerRunning = deferred();
+    const blockerDone = deferred();
+    const order: string[] = [];
+    const blocker = sem.run('user', async () => {
+      order.push('blocker');
+      blockerRunning.resolve();
+      await blockerDone.promise;
+    });
+    await blockerRunning.promise;
+
+    const queuedUser = sem.run('user', async () => { order.push('queued-user'); });
+    const queuedHeartbeat = sem.run('heartbeat', async () => { order.push('queued-heartbeat'); });
+    const queuedBackground = sem.run('background', async () => { order.push('queued-background'); });
+
+    try {
+      (sem as unknown as { shutdown(): void }).shutdown();
+
+      await expect(queuedUser).rejects.toMatchObject({ name: 'SemaphoreShutdownError' });
+      await expect(queuedHeartbeat).rejects.toMatchObject({ name: 'SemaphoreShutdownError' });
+      await expect(queuedBackground).rejects.toMatchObject({ name: 'SemaphoreShutdownError' });
+    } finally {
+      blockerDone.resolve();
+      await blocker;
+    }
+    expect(order).toEqual(['blocker']);
+  });
+
+  it('allows a waiting background job to run after a bounded burst of users', async () => {
+    const blockerRunning = deferred();
+    const blockerDone = deferred();
+    const order: string[] = [];
+    const blocker = sem.run('user', async () => {
+      order.push('blocker');
+      blockerRunning.resolve();
+      await blockerDone.promise;
+    });
+    await blockerRunning.promise;
+
+    const background = sem.run('background', async () => { order.push('background'); });
+    const users = Array.from({ length: 9 }, (_, i) => sem.run('user', async () => { order.push(`user-${i}`); }));
+
+    blockerDone.resolve();
+    await blocker;
+    await background;
+    await Promise.all(users);
+
+    expect(order.indexOf('background')).toBeGreaterThan(0);
+    expect(order.indexOf('background')).toBeLessThan(order.indexOf('user-8'));
+  });
+
+  it('allows a waiting background job to run after a bounded burst of heartbeats', async () => {
+    const SemaphoreWithOptions = LLMSemaphore as unknown as new (options: {
+      maxQueuedUsers: number;
+      maxQueuedHeartbeats: number;
+      maxQueuedBackground: number;
+      maxConsecutiveUserJobsWithBackground: number;
+    }) => LLMSemaphore;
+    const bounded = new SemaphoreWithOptions({
+      maxQueuedUsers: 100,
+      maxQueuedHeartbeats: 10,
+      maxQueuedBackground: 1,
+      maxConsecutiveUserJobsWithBackground: 2,
+    });
+    const blockerRunning = deferred();
+    const blockerDone = deferred();
+    const order: string[] = [];
+    const blocker = bounded.run('user', async () => {
+      order.push('blocker');
+      blockerRunning.resolve();
+      await blockerDone.promise;
+    });
+    await blockerRunning.promise;
+
+    const background = bounded.run('background', async () => { order.push('background'); });
+    const heartbeats = Array.from({ length: 3 }, (_, i) =>
+      bounded.run('heartbeat', async () => { order.push(`heartbeat-${i}`); }));
+
+    blockerDone.resolve();
+    await blocker;
+    await background;
+    await Promise.all(heartbeats);
+
+    expect(order.indexOf('background')).toBeLessThan(order.indexOf('heartbeat-2'));
   });
 });

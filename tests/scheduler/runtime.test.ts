@@ -4,6 +4,12 @@ import * as path from 'path';
 import { HeartbeatStore } from '../../src/scheduler/store';
 import { HeartbeatScheduler } from '../../src/scheduler/runtime';
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
+}
+
 describe('HeartbeatScheduler', () => {
   let tmpDir: string;
   let storePath: string;
@@ -427,6 +433,93 @@ describe('HeartbeatScheduler', () => {
       expect(trigger).toHaveBeenCalledTimes(1);
     } finally {
       logSpy.mockRestore();
+    }
+  });
+
+  it('serializes concurrent recordFailure transitions so retry attempts are not lost', async () => {
+    const store = new HeartbeatStore(storePath);
+    const job = await store.create({
+      title: 'Concurrent failure job',
+      chatId: 'chat-1',
+      cron: '* * * * *',
+      prompt: 'Retry this safely.',
+      source: 'system',
+      kind: 'routine',
+      maxRetries: 3,
+    });
+    const firstUpdateStarted = deferred();
+    const releaseFirstUpdate = deferred();
+    const originalUpdate = store.update.bind(store);
+    let first = true;
+    jest.spyOn(store, 'update').mockImplementation(async (id, patch) => {
+      if (first) {
+        first = false;
+        firstUpdateStarted.resolve();
+        await releaseFirstUpdate.promise;
+      }
+      return originalUpdate(id, patch);
+    });
+
+    const scheduler = new HeartbeatScheduler(store, async () => undefined, 'UTC', {
+      retryBackoffMinutes: 5,
+    });
+    const firstFailure = scheduler.recordFailure(job.id, 'first failure');
+    await firstUpdateStarted.promise;
+    const secondFailure = scheduler.recordFailure(job.id, 'second failure');
+
+    // Give an unsynchronized implementation a chance to read the same retryCount.
+    await Promise.resolve();
+    await Promise.resolve();
+    releaseFirstUpdate.resolve();
+    await Promise.all([firstFailure, secondFailure]);
+
+    expect((await store.get(job.id))?.retryCount).toBe(2);
+    await scheduler.stop();
+  });
+
+  it('routes an unexpected detached wakeup failure into the retry state machine', async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-04-19T08:00:00.000Z'));
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const store = new HeartbeatStore(storePath);
+      const created = await store.create({
+        title: 'Detached failure job',
+        chatId: 'chat-1',
+        cron: '0 8 * * *',
+        prompt: 'Retry detached failure.',
+        source: 'system',
+        kind: 'routine',
+        maxRetries: 1,
+      });
+      const retryAt = '2026-04-19T08:00:00.000Z';
+      const job = await store.update(created.id, {
+        deliveryState: 'retry-wait',
+        nextRetryAt: retryAt,
+      });
+      let firstGet = true;
+      const originalGet = store.get.bind(store);
+      jest.spyOn(store, 'get').mockImplementation(async (id) => {
+        if (firstGet) {
+          firstGet = false;
+          throw new Error('detached provider failure');
+        }
+        return originalGet(id);
+      });
+      const scheduler = new HeartbeatScheduler(store, async () => undefined, 'UTC', {
+        retryBackoffMinutes: 5,
+      });
+
+      await scheduler.start();
+      await jest.advanceTimersByTimeAsync(0);
+
+      const refreshed = await originalGet(job.id);
+      expect(refreshed?.retryCount).toBe(1);
+      expect(refreshed?.deliveryState).toBe('retry-wait');
+      await scheduler.stop();
+    } finally {
+      errorSpy.mockRestore();
+      jest.useRealTimers();
     }
   });
 });

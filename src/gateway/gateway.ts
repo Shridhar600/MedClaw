@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import type { AppConfig } from '../config/types';
 import { ProfileRegistry } from '../profiles';
 import type { ProfileId } from '../profiles';
@@ -33,6 +34,7 @@ import { CapturePipeline, FileCaptureIdempotency } from '../capture';
 import { makeSafetyRenderer } from '../capture';
 import { SqliteStore } from '../memory/sqlite-store';
 import { MemorySearch } from '../memory/search';
+import type { MemoryIndexer as MemoryIndexerType } from '../memory/indexer';
 import { createProvider } from '../providers/factory';
 import { SessionManager } from './session';
 import * as cron from 'node-cron';
@@ -51,7 +53,13 @@ import { ensureWorkspaceBootstrap } from '../workspace/bootstrap';
 import { checkSystemReadiness, probeChatCompletion } from '../providers/healthcheck';
 import type { ReadinessResult } from '../providers/healthcheck';
 import type { LLMProvider } from '../providers/types';
-import { checkProviderBindAddresses, verifyWorkspacePermissions, summarizeErrorForLog, secureMkdir } from '../security';
+import {
+  checkProviderBindAddresses,
+  verifyWorkspacePermissions,
+  summarizeErrorForLog,
+  secureMkdir,
+  secureWriteViaTmp,
+} from '../security';
 import { EMERGENCY_RESPONSE, isEmergencyInput } from '../safety/emergency-detector';
 
 const UNRECOGNIZED_CHAT_RESPONSE =
@@ -63,6 +71,45 @@ const PROFILE_UNAVAILABLE_RESPONSE =
 // existing empty-input guard so the dev web UI exercises the same boundary.
 const EMPTY_MESSAGE_RESPONSE = "I didn't catch any message. Send some text or an attachment and I'll take a look.";
 const SESSION_RESET_FAILURE_RESPONSE = "I couldn't start a fresh session right now. Please try again in a moment.";
+const SHUTDOWN_RESPONSE = 'The health assistant is shutting down. Please try again in a moment.';
+const INDEX_EMBED_TIMEOUT_MS = 500;
+const INDEX_EMBED_COOLDOWN_MS = 1_000;
+
+type SignalEmbeddingProvider = LLMProvider & {
+  embedWithSignal?: (text: string, signal: AbortSignal) => Promise<number[]>;
+};
+
+function makeBoundedEmbeddingProvider(provider: LLMProvider): LLMProvider {
+  let unavailableUntil = 0;
+  const signalProvider = provider as SignalEmbeddingProvider;
+  return {
+    modelName: provider.modelName,
+    chat: (messages, tools) => provider.chat(messages, tools),
+    embed: async (text: string): Promise<number[]> => {
+      if (Date.now() < unavailableUntil) {
+        throw new Error('embedding provider temporarily unavailable');
+      }
+      const controller = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const work = typeof signalProvider.embedWithSignal === 'function'
+        ? signalProvider.embedWithSignal(text, controller.signal)
+        : provider.embed(text);
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          unavailableUntil = Date.now() + INDEX_EMBED_COOLDOWN_MS;
+          controller.abort();
+          reject(new Error('embedding timeout'));
+        }, INDEX_EMBED_TIMEOUT_MS);
+        timer.unref?.();
+      });
+      try {
+        return await Promise.race([work, timeout]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    },
+  };
+}
 
 export class Gateway {
   private config: AppConfig;
@@ -95,6 +142,20 @@ export class Gateway {
   private capturePipeline?: CapturePipeline;
   private securityWarnings: string[] = [];
   private reconcileTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+  private indexer?: MemoryIndexerType;
+  private writeQueue?: WriteQueue;
+  private vectorIndex?: SqliteVecIndex;
+  private keywordIndex?: SqliteKeywordIndex;
+  private chunkStats?: SqliteChunkStats;
+  private semaphore?: LLMSemaphore;
+  private readonly reindexTails: Map<string, Promise<void>> = new Map();
+  private readonly backgroundOperations: Set<Promise<void>> = new Set();
+  private readonly inFlightOperations: Set<Promise<unknown>> = new Set();
+  private readonly dirtyIndexPaths: Set<string> = new Set();
+  private dirtyIndexMarkerPath?: string;
+  private stopping = false;
+  private stopped = false;
+  private stopPromise?: Promise<void>;
 
   constructor(config: AppConfig) {
     this.config = config;
@@ -104,6 +165,8 @@ export class Gateway {
     const { config } = this;
     const profilesConfig = config.profiles;
     const profileId = (profilesConfig?.defaultProfileId ?? 'default') as ProfileId;
+    this.stopping = false;
+    this.stopped = false;
 
     console.log('[gateway] Starting Redacted...');
 
@@ -144,10 +207,14 @@ export class Gateway {
     const store = new SqliteStore(dbPath, profileId);
     this.store = store;
     const embeddingProvider = createProvider(config.providers.embeddings);
+    const boundedEmbeddingProvider = makeBoundedEmbeddingProvider(embeddingProvider);
     const { MemoryIndexer } = await import('../memory/indexer');
-    const indexer = new MemoryIndexer(store, embeddingProvider, memoryWorkspace, profileId);
+    const indexer = new MemoryIndexer(store, boundedEmbeddingProvider, memoryWorkspace, profileId);
+    this.indexer = indexer;
+    this.dirtyIndexMarkerPath = path.join(memoryWorkspace, '.state', 'index-dirty.json');
     try {
       await indexer.indexAll();
+      this.clearAllDirtyIndexMarkers();
       console.log('[gateway] Memory index ready');
     } catch (error) {
       console.warn('[gateway] Memory index unavailable; continuing with degraded search:', summarizeErrorForLog(error));
@@ -157,7 +224,7 @@ export class Gateway {
       console.warn('[gateway] Embeddings provider is remote — the recall latency budget (p50<=300ms / p95<=800ms) assumes local embeddings; expect higher per-turn recall latency.');
     }
 
-    const search = new MemorySearch(store, embeddingProvider, config.memory.search.hybridWeights, profileId);
+    const search = new MemorySearch(store, boundedEmbeddingProvider, config.memory.search.hybridWeights, profileId);
 
     // Providers
     const mainProvider = createProvider(config.providers.main);
@@ -224,6 +291,7 @@ export class Gateway {
           console.warn('[gateway] unresolved write-queue intent detected:', record.label);
         },
       });
+      this.writeQueue = writeQueue;
       // A4 / 13.4: reconcile any begin-without-commit intent before serving. The later boot rebuilds
       // repair derived state; the append-only source journal remains available for another reconcile.
       try {
@@ -279,28 +347,48 @@ export class Gateway {
       const fileToType = new Map<string, FactType>(
         (Object.entries(TYPE_TO_FILE) as [FactType, string][]).map(([t, f]) => [f, t]),
       );
+      const mirrorTails: Map<FactType, Promise<void>> = new Map();
       const rederive = {
         rederive: async (relPaths: string[]): Promise<void> => {
-          for (const rel of relPaths) {
-            if (rel.startsWith('ledger/')) {
-              const type = fileToType.get(rel.slice('ledger/'.length));
-              if (type) {
-                try {
-                  const facts = await ledgerStore.listAllOfType(type);
-                  await factMirror.replaceType(type, facts.map(ledgerFactToRecord));
-                } catch (e) {
-                  console.warn('[gateway] fact-mirror re-derive failed (rebuildable at boot):', summarizeErrorForLog(e));
-                }
+          if (this.stopping) return;
+          for (const rel of new Set(relPaths)) {
+            if (this.stopping) return;
+            // The source write has completed. Publish a durable partial checkpoint before
+            // scheduling any provider work, so a crash cannot make the new source look indexed.
+            this.markIndexDirty(memoryWorkspace, rel, store);
+            const type = rel.startsWith('ledger/')
+              ? fileToType.get(rel.slice('ledger/'.length))
+              : undefined;
+            if (type) {
+              // FactMirror is the fast Stage-1 safety projection. Keep it synchronous from the
+              // caller's perspective, but serialize concurrent refreshes for the same type.
+              const previous = mirrorTails.get(type) ?? Promise.resolve();
+              const refresh = previous
+                .catch(() => undefined)
+                .then(async () => {
+                  if (this.stopping) return;
+                  try {
+                    const facts = await ledgerStore.listAllOfType(type);
+                    await factMirror.replaceType(type, facts.map(ledgerFactToRecord));
+                  } catch (e) {
+                    console.warn('[gateway] fact-mirror re-derive failed (rebuildable at boot):', summarizeErrorForLog(e));
+                  }
+                });
+              mirrorTails.set(type, refresh);
+              await refresh;
+              if (mirrorTails.get(type) === refresh) mirrorTails.delete(type);
+              if (this.stopping) return;
+            }
+            this.queueBackgroundReindex(rel, async () => {
+              // Reindexing is deliberately detached from the source operation. The bounded provider
+              // ensures a stuck embed becomes a partial checkpoint instead of a late DB write.
+              try {
+                await indexer.indexFile(rel);
+                this.clearIndexDirty(rel);
+              } catch (e) {
+                console.warn('[gateway] incremental reindex failed for a changed file:', summarizeErrorForLog(e));
               }
-            }
-            // Reindex the changed searchable file (ledger + narrative) so fresh writes are found
-            // the SAME session (M-2). indexFile embeds; running it here (post-op) keeps embedding
-            // off the write-queue lock (B2). Best-effort — a stale index degrades search, never crashes.
-            try {
-              await indexer.indexFile(rel);
-            } catch (e) {
-              console.warn('[gateway] incremental reindex failed for a changed file:', summarizeErrorForLog(e));
-            }
+            });
           }
         },
       };
@@ -346,19 +434,25 @@ export class Gateway {
       try {
         let cachedDim: number | null = null;
         const embeddingPort: EmbeddingPort = {
-          embed: (texts) => Promise.all(texts.map((t) => embeddingProvider.embed(t))),
+          embed: (texts) => Promise.all(texts.map((t) => boundedEmbeddingProvider.embed(t))),
           dim: async () => {
-            if (cachedDim === null) cachedDim = (await embeddingProvider.embed('')).length;
+            if (cachedDim === null) cachedDim = (await boundedEmbeddingProvider.embed('')).length;
             return cachedDim;
           },
           modelId: async () => config.providers.embeddings.model,
         };
+        const vectorIndex = new SqliteVecIndex({ dbPath });
+        this.vectorIndex = vectorIndex;
+        const keywordIndex = new SqliteKeywordIndex({ dbPath });
+        this.keywordIndex = keywordIndex;
+        const chunkStats = new SqliteChunkStats({ dbPath });
+        this.chunkStats = chunkStats;
         const recallEngine = new RecallEngine({
           embedding: embeddingPort,
-          vectorIndex: new SqliteVecIndex({ dbPath }),
-          keywordIndex: new SqliteKeywordIndex({ dbPath }),
+          vectorIndex,
+          keywordIndex,
           factMirror,
-          chunkStats: new SqliteChunkStats({ dbPath }),
+          chunkStats,
           clock: systemClock,
           config: DEFAULT_RECALL_CONFIG,
         });
@@ -462,6 +556,7 @@ export class Gateway {
 
     // Agent
     const semaphore = new LLMSemaphore();
+    this.semaphore = semaphore;
     const agentSystem: PrepareSystem = prepareSystem ?? (async () => ({
       messages: systemMessages,
       healthContextTouched: systemMessages.length > 0,
@@ -558,7 +653,7 @@ export class Gateway {
       this.sweepTask?.stop(); // MEDIUM-10: a re-`start()` must not orphan the previous cron task
       this.sweepTask = cron.schedule(
         '15 3 * * *',
-        () => { void this.runTranscriptSweep(); },
+        () => { this.launchBackgroundSweep(); },
         { scheduled: true, timezone: this.config.heartbeat.timezone },
       );
     } catch (e) {
@@ -578,7 +673,7 @@ export class Gateway {
    */
   async runTranscriptSweep(): Promise<NightlySweepResult> {
     // MEDIUM-8: a run scheduled after shutdown began does no work (never write after stop()).
-    if (this.sweepStopping) return { scanned: false, added: 0 };
+    if (this.stopping || this.sweepStopping) return { scanned: false, added: 0 };
     // MEDIUM-9: one sweep at a time — a second cron tick or manual call joins the in-flight run
     // instead of racing the list-then-add dedup boundary.
     if (this.sweepInFlight) return this.sweepInFlight;
@@ -588,6 +683,13 @@ export class Gateway {
     const run = runNightlySweep(this.buildSweepDeps()).finally(() => { this.sweepInFlight = undefined; });
     this.sweepInFlight = run;
     return run;
+  }
+
+  private launchBackgroundSweep(): void {
+    if (this.stopping) return;
+    void this.runTranscriptSweep().catch((error) => {
+      console.warn('[gateway] Transcript sweep failed:', summarizeErrorForLog(error));
+    });
   }
 
   // D4.4: compose the sweep's read/write seams from the live profile collaborators. `ledgerEntitiesForDay`
@@ -691,6 +793,11 @@ export class Gateway {
   }
 
   async handleTestMessage(chatId: string, text: string, sourceMessageId?: string): Promise<string> {
+    if (this.stopping) return SHUTDOWN_RESPONSE;
+    return this.trackOperation(() => this.handleTestMessageInternal(chatId, text, sourceMessageId));
+  }
+
+  private async handleTestMessageInternal(chatId: string, text: string, sourceMessageId?: string): Promise<string> {
     // PROD-P1-6: empty/whitespace-only text → short canned reply, no agent run,
     // no session write (mirrors the channel path in handleMessage).
     if (text.trim().length === 0) {
@@ -735,9 +842,6 @@ export class Gateway {
 
     const emergency = this.handleEmergencyInput(text);
     if (emergency) {
-      // CAP (M5): emergency utterances are the highest-value health data —
-      // capture the raw text BEFORE the canned-response early-return.
-      await this.captureUserTurn(chatId, text, sourceMessageId);
       // C-2/H9: persistence is best-effort — a failed archive must NEVER suppress emergency guidance
       // (medical-safety: reaching the user wins; divergence is logged sanitized). Mirrors handleMessage.
       try {
@@ -748,6 +852,9 @@ export class Gateway {
       } catch (e) {
         console.error('[gateway] Failed to persist emergency turn (test path; sending guidance anyway):', summarizeErrorForLog(e));
       }
+      // Emergency guidance must not wait for capture or indexing. The source capture is still
+      // retained and drained by Gateway.stop() when the process remains alive.
+      this.scheduleBackgroundCapture(chatId, text, sourceMessageId);
       return emergency;
     }
 
@@ -790,6 +897,17 @@ export class Gateway {
   }
 
   private async handleMessage(incoming: IncomingMessage): Promise<void> {
+    if (this.stopping) return;
+    try {
+      await this.trackOperation(() => this.handleMessageInternal(incoming));
+    } catch (error) {
+      // Channel callbacks are detached by the Telegram adapter. Keep the final
+      // boundary non-rejecting so a handler defect cannot become an unhandled rejection.
+      console.error('[gateway] Handler error:', summarizeErrorForLog(error));
+    }
+  }
+
+  private async handleMessageInternal(incoming: IncomingMessage): Promise<void> {
     const { chatId, text } = incoming;
     console.log(
       `[gateway] Message from ${chatId}: ${text.length} chars${incoming.mediaPath ? ', media attached' : ''}`,
@@ -864,9 +982,6 @@ export class Gateway {
 
     const emergency = this.handleEmergencyInput(text);
     if (emergency) {
-      // CAP (M5): capture raw text before the early-return (parity with
-      // handleTestMessage). Emergency utterances are the highest-value data.
-      await this.captureUserTurn(chatId, text, incoming.messageId);
       // Persist-first (RES-P0-4): record the turn BEFORE sending so a crash
       // between the two never loses the turn. The emergency text is canned
       // and carries no PHI, but ordering still matters for transcript
@@ -891,6 +1006,9 @@ export class Gateway {
       } catch (e) {
         console.error('[gateway] Failed to send emergency response:', summarizeErrorForLog(e));
       }
+      // The emergency response is independent of the capture/index projection. Start
+      // capture only after delivery and never make the user wait for it.
+      this.scheduleBackgroundCapture(chatId, text, incoming.messageId);
       return;
     }
 
@@ -928,8 +1046,6 @@ export class Gateway {
     // Emergency check after onboarding completes
     const postOnboardingEmergency = this.handleEmergencyInput(text);
     if (postOnboardingEmergency) {
-      // CAP (M5): parity — raw text lands in the lossless lane here too.
-      await this.captureUserTurn(chatId, text, incoming.messageId);
       // Persist-first (RES-P0-4), mirroring the early emergency branch above.
       try {
         await this.sessions!.recordTurn(chatId, [
@@ -947,6 +1063,7 @@ export class Gateway {
       } catch (e) {
         console.error('[gateway] Failed to send emergency response:', summarizeErrorForLog(e));
       }
+      this.scheduleBackgroundCapture(chatId, text, incoming.messageId);
       return;
     }
 
@@ -1011,25 +1128,36 @@ export class Gateway {
   }
 
   async stop(): Promise<void> {
+    if (this.stopped) return;
+    if (this.stopPromise) return this.stopPromise;
+    this.stopping = true;
+    this.sweepStopping = true;
+    const shared = this.stopResources().finally(() => {
+      this.stopped = true;
+      if (this.stopPromise === shared) this.stopPromise = undefined;
+    });
+    this.stopPromise = shared;
+    return shared;
+  }
+
+  private async stopResources(): Promise<void> {
     for (const timer of this.reconcileTimers.values()) {
       clearTimeout(timer);
     }
     this.reconcileTimers.clear();
     let firstError: unknown;
     try {
-      // Drain any in-flight background compaction BEFORE closing the store so its window/summary write
-      // completes against an open DB and never outlives the process (resilience: no work after stop()).
-      await this.sessions?.drainCompactions();
+      // Cancel queued model work before waiting for producers. An active provider call is
+      // allowed to finish; pending calls reject with the typed semaphore shutdown error.
+      this.semaphore?.shutdown();
     } catch (error) {
-      console.warn('[gateway] Failed to drain compactions:', summarizeErrorForLog(error));
+      console.warn('[gateway] Failed to stop LLM semaphore:', summarizeErrorForLog(error));
     }
     try {
-      // MEDIUM-8: stop scheduling, then AWAIT any in-flight sweep so it can never write a curiosity
-      // item after the stores close / the daemon reports stopped.
-      this.sweepStopping = true;
+      // Stop every producer before draining consumers. The stopping gate was set by stop()
+      // before this method was entered, so callbacks racing this section refuse new work.
       this.sweepTask?.stop();
       this.sweepTask = undefined;
-      await this.sweepInFlight?.catch(() => undefined);
     } catch (error) {
       console.warn('[gateway] Failed to stop transcript sweep:', summarizeErrorForLog(error));
     }
@@ -1044,6 +1172,34 @@ export class Gateway {
     } catch (error) {
       firstError = firstError ?? error;
       console.warn('[gateway] Failed to disconnect channel:', summarizeErrorForLog(error));
+    }
+
+    // Quiescent drain: all accepted Gateway turns, sweeps, reindexes, reconciles,
+    // compactions, and source writes must settle before any native handle closes.
+    try {
+      await this.drainInFlightOperations();
+    } catch (error) {
+      console.warn('[gateway] Failed to drain Gateway operations:', summarizeErrorForLog(error));
+    }
+    try {
+      await this.sweepInFlight?.catch(() => undefined);
+    } catch (error) {
+      console.warn('[gateway] Failed to drain transcript sweep:', summarizeErrorForLog(error));
+    }
+    try {
+      await this.sessions?.drainCompactions();
+    } catch (error) {
+      console.warn('[gateway] Failed to drain compactions:', summarizeErrorForLog(error));
+    }
+    try {
+      await this.drainBackgroundOperations();
+    } catch (error) {
+      console.warn('[gateway] Failed to drain background operations:', summarizeErrorForLog(error));
+    }
+    try {
+      await this.writeQueue?.drain();
+    } catch (error) {
+      console.warn('[gateway] Failed to drain write queue:', summarizeErrorForLog(error));
     }
     try {
       this.closeStore();
@@ -1090,6 +1246,7 @@ export class Gateway {
   }
 
   private async handleScheduledJob(job: HeartbeatJob, invokedByScheduler: boolean = false): Promise<void> {
+    if (this.stopping) return;
     const profileId = this.getProfileForChat(job.chatId);
     if (profileId === null || !this.isDefaultRuntimeProfile(profileId)) {
       console.warn(`[gateway] Skipping heartbeat job ${job.id}: chat is not available in this runtime.`);
@@ -1107,6 +1264,7 @@ export class Gateway {
     }
 
     const history = await this.sessions!.prepareHistory(job.chatId);
+    if (this.stopping) return;
     const input = [
       '[Heartbeat Trigger]',
       `Job id: ${job.id}`,
@@ -1128,7 +1286,7 @@ export class Gateway {
           console.warn('[gateway] Failed to persist heartbeat prompt usage; continuing to delivery:', summarizeErrorForLog(e));
         }
         await this.scheduler?.recordOutcome(job.id, 'noop');
-        await this.reconcileHeartbeatPolicies(job.chatId);
+        await this.reconcileAfterScheduledDelivery(job.chatId);
         return;
       }
 
@@ -1145,7 +1303,7 @@ export class Gateway {
       }
       await this.channel!.send(job.chatId, { text: result.text });
       await this.scheduler?.recordOutcome(job.id, 'sent');
-      await this.reconcileHeartbeatPolicies(job.chatId);
+      await this.reconcileAfterScheduledDelivery(job.chatId);
     } catch (error) {
       if (error instanceof HeartbeatQueueFullError) {
         console.warn(`[gateway] Heartbeat queue full for job ${job.id}; scheduler will retry.`);
@@ -1177,8 +1335,18 @@ export class Gateway {
     }
   }
 
+  private async reconcileAfterScheduledDelivery(chatId: string): Promise<void> {
+    try {
+      await this.reconcileHeartbeatPolicies(chatId);
+    } catch (error) {
+      // Delivery already completed. Reconciliation is maintenance and must not
+      // send the same nudge through the scheduler retry path.
+      console.warn('[gateway] Post-delivery heartbeat reconciliation failed:', summarizeErrorForLog(error));
+    }
+  }
+
   private async reconcileHeartbeatPolicies(chatId: string): Promise<void> {
-    if (!this.scheduler) {
+    if (this.stopping || !this.scheduler) {
       return;
     }
     const resolved = this.profileRegistry?.getProfileForChat(chatId);
@@ -1198,7 +1366,7 @@ export class Gateway {
   }
 
   private async debouncedReconcile(chatId: string): Promise<void> {
-    if (!this.scheduler) {
+    if (this.stopping || !this.scheduler) {
       return;
     }
 
@@ -1208,7 +1376,7 @@ export class Gateway {
     }
     const timer = setTimeout(() => {
       this.reconcileTimers.delete(chatId);
-      void this.reconcileHeartbeatPolicies(chatId);
+      this.launchBackgroundReconcile(chatId);
     }, 30_000);
     timer.unref();
     this.reconcileTimers.set(chatId, timer);
@@ -1300,35 +1468,189 @@ export class Gateway {
     return EMERGENCY_RESPONSE;
   }
 
+  private scheduleBackgroundCapture(chatId: string, text: string, sourceMessageId?: string): void {
+    this.trackBackgroundOperation('emergency capture', () => this.captureUserTurn(chatId, text, sourceMessageId));
+  }
+
+  private launchBackgroundReconcile(chatId: string): void {
+    if (this.stopping) return;
+    this.trackBackgroundOperation('heartbeat reconciliation', () => this.reconcileHeartbeatPolicies(chatId));
+  }
+
+  private trackOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const promise = Promise.resolve().then(operation);
+    this.inFlightOperations.add(promise);
+    void promise.then(
+      () => { this.inFlightOperations.delete(promise); },
+      () => { this.inFlightOperations.delete(promise); },
+    );
+    return promise;
+  }
+
+  private trackBackgroundOperation(label: string, operation: () => Promise<void>): void {
+    if (this.stopping) return;
+    let promise: Promise<void>;
+    try {
+      promise = operation().catch((error) => {
+        console.warn(`[gateway] ${label} failed:`, summarizeErrorForLog(error));
+      });
+    } catch (error) {
+      promise = Promise.resolve();
+      console.warn(`[gateway] ${label} failed:`, summarizeErrorForLog(error));
+    }
+    this.backgroundOperations.add(promise);
+    void promise.then(
+      () => { this.backgroundOperations.delete(promise); },
+      () => { this.backgroundOperations.delete(promise); },
+    );
+  }
+
+  private queueBackgroundReindex(relativePath: string, operation: () => Promise<void>): void {
+    const previous = this.reindexTails.get(relativePath) ?? Promise.resolve();
+    const task = previous
+      .catch(() => undefined)
+      .then(async () => {
+        if (this.stopping) return;
+        await operation();
+      })
+      .catch((error) => {
+        console.warn('[gateway] background reindex failed:', summarizeErrorForLog(error));
+      })
+      .finally(() => {
+        if (this.reindexTails.get(relativePath) === task) {
+          this.reindexTails.delete(relativePath);
+        }
+      });
+    this.reindexTails.set(relativePath, task);
+    this.backgroundOperations.add(task);
+    void task.then(
+      () => { this.backgroundOperations.delete(task); },
+      () => { this.backgroundOperations.delete(task); },
+    );
+  }
+
+  private async drainInFlightOperations(): Promise<void> {
+    while (this.inFlightOperations.size > 0) {
+      await Promise.allSettled([...this.inFlightOperations]);
+    }
+  }
+
+  private async drainBackgroundOperations(): Promise<void> {
+    while (this.backgroundOperations.size > 0) {
+      await Promise.allSettled([...this.backgroundOperations]);
+    }
+  }
+
+  private markIndexDirty(workspace: string, relativePath: string, store: SqliteStore): void {
+    try {
+      const content = fs.readFileSync(path.join(workspace, relativePath), 'utf8');
+      const hash = createHash('sha256').update(content).digest('hex');
+      store.upsertFileHash(relativePath, `embedding-partial:${hash}`);
+    } catch (error) {
+      console.warn('[gateway] Could not publish index dirty checkpoint:', summarizeErrorForLog(error));
+    }
+    this.dirtyIndexPaths.add(relativePath);
+    this.persistDirtyIndexMarker();
+  }
+
+  private clearIndexDirty(relativePath: string): void {
+    this.dirtyIndexPaths.delete(relativePath);
+    if (this.dirtyIndexPaths.size === 0) {
+      const marker = this.dirtyIndexMarkerPath;
+      if (!marker) return;
+      try {
+        fs.unlinkSync(marker);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          console.warn('[gateway] Could not clear index dirty marker:', summarizeErrorForLog(error));
+        }
+      }
+      return;
+    }
+    this.persistDirtyIndexMarker();
+  }
+
+  private clearAllDirtyIndexMarkers(): void {
+    this.dirtyIndexPaths.clear();
+    const marker = this.dirtyIndexMarkerPath;
+    if (!marker) return;
+    try {
+      fs.unlinkSync(marker);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        console.warn('[gateway] Could not clear index dirty marker:', summarizeErrorForLog(error));
+      }
+    }
+  }
+
+  private persistDirtyIndexMarker(): void {
+    const marker = this.dirtyIndexMarkerPath;
+    if (!marker) return;
+    try {
+      secureWriteViaTmp(marker, JSON.stringify({ version: 1, paths: [...this.dirtyIndexPaths] }));
+    } catch (error) {
+      console.warn('[gateway] Could not persist index dirty marker:', summarizeErrorForLog(error));
+    }
+  }
+
   private closeStore(): void {
+    const vectorIndex = this.vectorIndex;
+    this.vectorIndex = undefined;
     try {
-      this.store?.close();
+      vectorIndex?.close();
     } catch (error) {
-      console.warn('[gateway] Failed to close memory store:', summarizeErrorForLog(error));
-    } finally {
-      this.store = undefined;
+      console.warn('[gateway] Failed to close vector index:', summarizeErrorForLog(error));
     }
+
+    const keywordIndex = this.keywordIndex;
+    this.keywordIndex = undefined;
     try {
-      this.factMirror?.close();
+      keywordIndex?.close();
     } catch (error) {
-      console.warn('[gateway] Failed to close fact mirror:', summarizeErrorForLog(error));
-    } finally {
-      this.factMirror = undefined;
+      console.warn('[gateway] Failed to close keyword index:', summarizeErrorForLog(error));
     }
+
+    const chunkStats = this.chunkStats;
+    this.chunkStats = undefined;
     try {
-      this.eventSink?.close();
+      chunkStats?.close();
     } catch (error) {
-      console.warn('[gateway] Failed to close event sink:', summarizeErrorForLog(error));
-    } finally {
-      this.eventSink = undefined;
+      console.warn('[gateway] Failed to close chunk stats:', summarizeErrorForLog(error));
     }
+
+    const sessionIndex = this.sessionIndex;
+    this.sessionIndex = undefined;
     try {
-      this.sessionIndex?.close();
+      sessionIndex?.close();
     } catch (error) {
       console.warn('[gateway] Failed to close session index:', summarizeErrorForLog(error));
-    } finally {
-      this.sessionIndex = undefined;
     }
+
+    const factMirror = this.factMirror;
+    this.factMirror = undefined;
+    try {
+      factMirror?.close();
+    } catch (error) {
+      console.warn('[gateway] Failed to close fact mirror:', summarizeErrorForLog(error));
+    }
+
+    const eventSink = this.eventSink;
+    this.eventSink = undefined;
+    try {
+      eventSink?.close();
+    } catch (error) {
+      console.warn('[gateway] Failed to close event sink:', summarizeErrorForLog(error));
+    }
+
+    const store = this.store;
+    this.store = undefined;
+    try {
+      store?.close();
+    } catch (error) {
+      console.warn('[gateway] Failed to close memory store:', summarizeErrorForLog(error));
+    }
+    this.indexer = undefined;
+    this.writeQueue = undefined;
   }
 
   // Copies workspace template files from the project's workspace/ dir to the workspace/
