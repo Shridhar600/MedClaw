@@ -5,6 +5,7 @@
 
 import type { Tool, ToolResult } from './types';
 import type { EpisodeStore, Episode, EpisodeStatus } from '../memcore';
+import type { QueuePort } from '../capture';
 import { contentContainsCredentials, PathContainmentError } from '../security';
 
 const EPISODE_STATUSES: EpisodeStatus[] = ['open', 'resolving', 'resolved', 'reopened'];
@@ -12,6 +13,15 @@ const EPISODE_STATUSES: EpisodeStatus[] = ['open', 'resolving', 'resolved', 'reo
 export interface EpisodeToolsDeps {
   store: EpisodeStore;
   profileId: string;
+  /**
+   * RR-STRUCT R-S3 (C-46 generalization): `episode_manage` used to write DIRECTLY to
+   * `EpisodeStore` — one file per episode id, read-then-write — with no serialization against a
+   * concurrent mutation of the SAME episode (a genuine lost-update race). Routing create/update/
+   * link/close through the single-writer coordinator closes that window. Optional + falls back to
+   * the direct (pre-R-S3) call when absent, so existing single-caller test construction is
+   * unaffected — a missing coordinator degrades atomicity, never availability (resilience law).
+   */
+  queue?: QueuePort;
 }
 
 function ok(text: string): ToolResult {
@@ -49,6 +59,12 @@ function renderEpisode(e: Episode): string {
 }
 
 export function createEpisodeTools(deps: EpisodeToolsDeps): Tool[] {
+  // Serialize every mutating action against the SAME per-profile single-writer used by every
+  // other memory-domain writer (RR-STRUCT R-S3). Without an injected queue, run inline — the
+  // exact pre-R-S3 behavior (fine for a single caller; loses atomicity under real concurrency).
+  const mutate = <T>(label: string, run: () => Promise<T>): Promise<T> =>
+    deps.queue ? deps.queue.enqueue('turn', { label, scope: 'episode', run }) : run();
+
   const episodeManage: Tool = {
     name: 'episode_manage',
     group: 'group:episode',
@@ -79,25 +95,25 @@ export function createEpisodeTools(deps: EpisodeToolsDeps): Tool[] {
           if (!title) return err('episode_manage create needs a title.');
           const credCreate = scanEpisodeInputs(title, params.note as string | undefined, params.bodyRegions as string[] | undefined);
           if (credCreate) return credCreate;
-          const episode = await deps.store.create({
+          const episode = await mutate('episode:create', () => deps.store.create({
             title,
             profileId: deps.profileId,
             status: params.status as EpisodeStatus | undefined,
             bodyRegions: params.bodyRegions as string[] | undefined,
             note: params.note as string | undefined,
-          });
+          }));
           return ok(`Created episode:\n${renderEpisode(episode)}`);
         }
         case 'update': {
           if (!id) return err('episode_manage update needs an id.');
           const credUpdate = scanEpisodeInputs(params.title as string | undefined, params.note as string | undefined, params.bodyRegions as string[] | undefined);
           if (credUpdate) return credUpdate;
-          const updated = await deps.store.update(id, {
+          const updated = await mutate('episode:update', () => deps.store.update(id, {
             title: params.title as string | undefined,
             status: params.status as EpisodeStatus | undefined,
             bodyRegions: params.bodyRegions as string[] | undefined,
             note: params.note as string | undefined,
-          });
+          }));
           return updated ? ok(`Updated:\n${renderEpisode(updated)}`) : err(`Episode not found: ${id}`);
         }
         case 'link': {
@@ -105,12 +121,12 @@ export function createEpisodeTools(deps: EpisodeToolsDeps): Tool[] {
           const factIds = (params.factIds as string[] | undefined) ?? [];
           const credLink = scanEpisodeInputs(factIds);
           if (credLink) return credLink;
-          const linked = await deps.store.link(id, factIds);
+          const linked = await mutate('episode:link', () => deps.store.link(id, factIds));
           return linked ? ok(`Linked:\n${renderEpisode(linked)}`) : err(`Episode not found: ${id}`);
         }
         case 'close': {
           if (!id) return err('episode_manage close needs an id.');
-          const closed = await deps.store.update(id, { status: 'resolved' });
+          const closed = await mutate('episode:close', () => deps.store.update(id, { status: 'resolved' }));
           return closed ? ok(`Closed:\n${renderEpisode(closed)}`) : err(`Episode not found: ${id}`);
         }
         case 'get': {

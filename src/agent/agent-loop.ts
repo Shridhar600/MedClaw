@@ -155,7 +155,9 @@ export class AgentLoop {
         // stays valid) and the good calls' work is not discarded by one bad name.
         let resultText: string;
         try {
-          const toolResult = await this.registry.execute(c.name, c.arguments, runContext);
+          // RR-STRUCT R-S3: thread the provider's per-call id through so a tool can build a
+          // collision-free idempotency key for two parallel same-tool calls in this turn.
+          const toolResult = await this.registry.execute(c.name, c.arguments, { ...runContext, toolCallId: c.id });
           resultText = toolResult.content.map(r => r.text).join('\n');
         } catch (e) {
           console.warn('[agent] tool call failed:', summarizeErrorForLog(e));

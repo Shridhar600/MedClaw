@@ -80,10 +80,18 @@ export interface CuriosityWriter {
 }
 
 /**
- * Post-write re-derivation seam (P2 A1.4/A2.4). Given the workspace-relative paths a capture
- * op just wrote (ledger files + narrative day files), re-derive the SQLite mirror + reindex the
- * changed chunks. Called OUT of the write-queue op (embeddings run off the single-writer lock —
- * B2). Concrete injected by Gateway. Best-effort: a failure never fails the capture.
+ * Post-write re-derivation seam (P2 A1.4/A2.4; RR-STRUCT R-S3 two-tier split, mini-plan v3 §3.7).
+ * Given the workspace-relative paths a capture op just wrote, re-derive a projection. Two
+ * INSTANCES of this same shape are injected, at different tiers:
+ *   - `tier1Rederive` — SYNCHRONOUS, INSIDE the write lock (local-only, <5ms budget: SQLite
+ *     FactMirror writes, no network/LLM). Runs BEFORE the op returns, so a read that starts the
+ *     instant after this write commits sees a mirror that is already consistent with it. A
+ *     failure here warns and continues (fail-SOFT for availability — recall's injected
+ *     `fallbackActiveFacts` port covers reads regardless; the next mutation's Tier-1 step retries).
+ *   - `rederive` (Tier-2) — ASYNC, OUTSIDE the write lock (may embed — RR-7 C-09: embeddings never
+ *     run inside the single-writer lock). Reindexes narrative/ledger chunks for search. NEVER
+ *     fails closed; a lag degrades to keyword-only recall (RR-8 C-61), never wedges the turn.
+ * Concrete injected by Gateway. Both are best-effort: a failure never fails the capture itself.
  */
 export interface Rederiver {
   rederive(relPaths: string[]): Promise<void>;
@@ -97,6 +105,10 @@ export interface CapturePipelineDeps {
   curiosity?: CuriosityWriter;
   events?: EventSink;
   clock?: Clock;
+  /** Tier-1 (sync, IN the write lock). See {@link Rederiver}. Must never itself enqueue — the
+   *  coordinator's re-entrancy guard rejects that (Finding-4) rather than deadlocking. */
+  tier1Rederive?: Rederiver;
+  /** Tier-2 (async, OFF the write lock). See {@link Rederiver}. */
   rederive?: Rederiver;
   idempotency?: CaptureIdempotency;
 }
@@ -128,15 +140,31 @@ export class CapturePipeline {
       scope: `capture:${event.kind}`,
       idempotencyKey,
       run: async () => {
-        if (this.isCommitted(idempotencyKey)) return { result: undefined, changed: [] };
+        // RR-STRUCT R-S3 (Finding-5/C-39): a matched-committed key returns the CACHED ORIGINAL
+        // result, not `undefined` — a caller like `ledger_record` needs its `RecordFactResult`
+        // (e.g. to relay a needs-confirmation token) even on a replayed/duplicate delivery.
+        const cached = this.cachedResult(idempotencyKey);
+        if (cached.found) {
+          return { result: cached.result as RecordFactResult | void, changed: [] };
+        }
         const routed = await this.route(event);
-        this.markCommitted(idempotencyKey);
+        // Tier-1 (in-lock, sync, local-only): derive the FactMirror BEFORE this op returns, so
+        // the write and its safety-critical projection land atomically relative to any read.
+        if (this.deps.tier1Rederive && routed.changed.length > 0) {
+          try {
+            await this.deps.tier1Rederive.rederive(routed.changed);
+          } catch (e) {
+            console.warn(`[capture] Tier-1 fact-mirror derivation failed (recall fallback covers reads; next write repairs): ${summarizeErrorForLog(e)}`);
+          }
+        }
+        this.markCommitted(idempotencyKey, routed.result);
         return routed;
       },
     });
-    // Out-of-op (B2): re-derive the mirror + reindex chunks for the changed files. This runs
-    // OUTSIDE the single-writer queue op so embedding latency never wedges the queue. Best-effort
-    // — a re-derive failure never fails the capture (the mirror is rebuildable + A4-healed).
+    // Out-of-op (B2): Tier-2 — re-derive index bookkeeping + reindex chunks for the changed
+    // files. This runs OUTSIDE the single-writer queue op so embedding latency never wedges the
+    // queue. Best-effort — a re-derive failure never fails the capture (chunks are rebuildable +
+    // A4-healed). Skipped on an idempotent replay (`changed` is empty — nothing new to index).
     if (this.deps.rederive && outcome.changed.length > 0) {
       try {
         await this.deps.rederive.rederive(outcome.changed);
@@ -157,20 +185,21 @@ export class CapturePipeline {
     return generated;
   }
 
-  private isCommitted(key: string): boolean {
-    if (!this.deps.idempotency) return false;
+  private cachedResult(key: string): { found: boolean; result?: RecordFactResult | void } {
+    if (!this.deps.idempotency) return { found: false };
     try {
-      return this.deps.idempotency.hasCommitted(key);
+      const lookup = this.deps.idempotency.getCommittedResult(key);
+      return lookup.found ? { found: true, result: lookup.result as RecordFactResult | void } : { found: false };
     } catch (e) {
       console.warn(`[capture] idempotency read failed; source operation continues: ${summarizeErrorForLog(e)}`);
-      return false;
+      return { found: false };
     }
   }
 
-  private markCommitted(key: string): void {
+  private markCommitted(key: string, result: RecordFactResult | void): void {
     if (!this.deps.idempotency) return;
     try {
-      this.deps.idempotency.markCommitted(key);
+      this.deps.idempotency.markCommitted(key, result);
     } catch (e) {
       // The source lanes have already committed. A marker outage is a durable-recovery degradation,
       // never a reason to reject the health-data write or the caller's turn.

@@ -76,6 +76,17 @@ export interface RecallDeps {
   chunkStats: ChunkStatsWriter;
   clock: Clock;
   config: RecallConfig;
+  /**
+   * RR-STRUCT R-S3 (mini-plan v3 §3.7 Finding-3): Tier-1 fail-closed-per-role for active facts.
+   * `src/recall/` is ports-only and cannot import `LedgerStore` (arch:check `v2-core-boundary`),
+   * so when `factMirror.queryActive()` throws, Stage 1 calls this INJECTED port instead of
+   * returning an empty ledger context. An empty Stage-1 result on a mirror failure is a fail-OPEN
+   * clinical hazard (a discontinued/active medication silently vanishes from the prompt) — the
+   * fallback must NEVER be empty by construction of its wiring (composed from the ledger's own
+   * active-fact read in the composition root; see `src/gateway/runtime.ts`). Optional: when
+   * absent, Stage 1 degrades to empty on a mirror failure (pre-R-S3 behavior), same as today.
+   */
+  fallbackActiveFacts?: () => Promise<FactRecord[]>;
 }
 
 export interface RecallInput {
@@ -318,11 +329,27 @@ export class RecallEngine {
     const { factMirror, config } = this.deps;
     try {
       const byEntity = new Map<string, FactRecord[]>();
-      for await (const f of factMirror.queryActive()) {
-        if (!config.ledgerTypes.includes(f.type)) continue;
+      const groupActive = (f: FactRecord): void => {
+        if (!config.ledgerTypes.includes(f.type)) return;
         const key = `${f.type}::${f.entity}`;
         const group = byEntity.get(key);
         if (group) group.push(f); else byEntity.set(key, [f]);
+      };
+      try {
+        for await (const f of factMirror.queryActive()) groupActive(f);
+      } catch (e) {
+        // RR-STRUCT R-S3 Finding-3: the mirror is unavailable — an EMPTY Stage-1 here is fail-OPEN
+        // (a discontinued/active medication would silently vanish from the prompt). Fall back to
+        // the injected ledger-backed port, which is NEVER empty by construction of its wiring.
+        // Without a fallback configured, degrade to empty (pre-R-S3 behavior) — still resilient
+        // (never throws to the caller), just not clinically fail-closed.
+        console.warn('[recall] stage1 fact-mirror unavailable; falling back to ledger read:', summarizeErrorForLog(e));
+        if (this.deps.fallbackActiveFacts) {
+          const fallbackFacts = await this.deps.fallbackActiveFacts();
+          for (const f of fallbackFacts) groupActive(f);
+        } else {
+          console.warn('[recall] no fallbackActiveFacts port configured — stage1 ledger degrades to empty');
+        }
       }
       // Priority order so a tight budget never silently evicts a safety row (F3): safety/allergy
       // first, then the clinical ordering, stable tiebreak by entity.

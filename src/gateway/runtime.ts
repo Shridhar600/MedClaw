@@ -9,6 +9,7 @@ import {
   LedgerStore,
   NarrativeStore,
   SafetyView,
+  SafetyProjectionDirtyError,
   EpisodeStore,
   CuriosityQueue,
   CuratedMemory,
@@ -18,6 +19,7 @@ import {
 import type {
   CuriosityItem,
   FactType,
+  LedgerFact,
   LedgerIndexDelta,
   NarrativeIndexDelta,
 } from '../memcore';
@@ -31,9 +33,9 @@ import {
   ledgerFactToRecord,
   isRemoteEmbeddingBaseUrl,
 } from '../indexstore';
-import type { EmbeddingPort } from '../ports';
+import type { EmbeddingPort, FactRecord } from '../ports';
 import { systemClock } from '../ports';
-import { CapturePipeline, FileCaptureIdempotency, makeSafetyRenderer } from '../capture';
+import { CapturePipeline, FileCaptureIdempotency, makeSafetyRenderer, MutationCoordinator } from '../capture';
 import { SqliteStore } from '../memory/sqlite-store';
 import { MemorySearch } from '../memory/search';
 import { MemoryEngine } from '../memory/memory-engine';
@@ -52,6 +54,7 @@ import { AgentLoop } from '../agent/agent-loop';
 import type { PrepareSystem } from '../agent/agent-loop';
 import { ContextAssembler } from '../agent/context';
 import { ContextAssembler as ContextAssemblerV2 } from '../context2';
+import type { SafetyReader } from '../context2';
 import { RecallEngine, DEFAULT_RECALL_CONFIG } from '../recall';
 import { createProvider } from '../providers/factory';
 import type { LLMProvider } from '../providers/types';
@@ -131,6 +134,45 @@ function dueCuriosityItems(items: CuriosityItem[], now: Date): CuriosityItem[] {
     .slice(0, HEARTBEAT_CURIOSITY_LIMIT);
 }
 
+/**
+ * RR-STRUCT R-S3 Part C (mini-plan v3 §3.7): a Tier-1 SAFETY read that detects drift
+ * (`SafetyProjectionDirtyError`) attempts ONE on-demand re-projection from the authoritative
+ * Markdown BEFORE failing the turn, via a NEW top-level `MutationCoordinator` op — never
+ * re-entrant (this wraps a READ path; it is never called from inside a running write op). Loop
+ * guard: the retry after a successful heal calls `safetyView.read()` DIRECTLY (not this wrapper),
+ * so a persistent failure fails closed once and never spins. Lives here (not in `SafetyView`
+ * itself, and not in `src/context2/`) because it needs BOTH the concrete `SafetyView` and the
+ * `MutationCoordinator` — `context2` is ports-only and cannot see either concretely; `SafetyView`
+ * must not call back into the write lock (that would make ITS internals coordinator-aware and
+ * risk an unlocked write racing a locked one). The composition root is the only place both are
+ * legitimately in scope together.
+ */
+export function makeSelfHealingSafetyReader(
+  safetyView: SafetyView,
+  listSafetyRelevant: () => Promise<LedgerFact[]>,
+  coordinator: MutationCoordinator,
+): SafetyReader {
+  return {
+    async read(): Promise<string | null> {
+      try {
+        return await safetyView.read();
+      } catch (e) {
+        if (!(e instanceof SafetyProjectionDirtyError)) throw e;
+        try {
+          await coordinator.selfHeal('safety-projection', async () => {
+            const facts = await listSafetyRelevant();
+            await safetyView.render(facts);
+          });
+        } catch (healError) {
+          console.warn('[gateway] SAFETY self-heal re-projection failed (failing closed):', summarizeErrorForLog(healError));
+          throw e;
+        }
+        return await safetyView.read();
+      }
+    },
+  };
+}
+
 export interface ProfileRuntimeDeps {
   profileId: ProfileId;
   workspace: string;
@@ -162,6 +204,9 @@ export class ProfileRuntime {
   episodeStore?: EpisodeStore;
   curatedMemory?: CuratedMemory;
   writeQueue?: WriteQueue;
+  /** RR-STRUCT R-S3: the complete single-writer every model-facing mutation routes through —
+   *  wraps `writeQueue` with re-entrancy protection + the `mutate`/`selfHeal` entry points. */
+  mutationCoordinator?: MutationCoordinator;
   capturePipeline?: CapturePipeline;
   indexer?: MemoryIndexerType;
   registry?: ToolRegistry;
@@ -305,6 +350,8 @@ export class ProfileRuntime {
         },
       });
       runtime.writeQueue = writeQueue;
+      const mutationCoordinator = new MutationCoordinator(writeQueue);
+      runtime.mutationCoordinator = mutationCoordinator;
 
       try {
         await replayJournal(journalPath, (label) => {
@@ -355,8 +402,25 @@ export class ProfileRuntime {
       const fileToType = new Map<string, FactType>(
         (Object.entries(TYPE_TO_FILE) as [FactType, string][]).map(([t, f]) => [f, t]),
       );
-      const mirrorTails: Map<FactType, Promise<void>> = new Map();
-      const rederive = {
+
+      // Tier-1 (RR-STRUCT R-S3, mini-plan v3 §3.6/§3.7): SYNCHRONOUS, LOCAL-only derivation —
+      // called from INSIDE the SAME write-lock op that produced the change (CapturePipeline /
+      // ledger-tools), so the write and its projections land atomically relative to any read.
+      // Everything here is local (SQLite/fs, no network/LLM, <5ms budget): FactMirror update,
+      // the pending-chunk-delta buffer, and the index-dirty checkpoint. `takeIndexDelta` is a
+      // ONE-SHOT CONSUME (LedgerStore clears it once read) — it is taken exactly ONCE, here, and
+      // its `entities` list drives an ENTITY-SCOPED `replaceScope` (RR-9b's write-amplification
+      // optimization — a whole-type `replaceType` rewrite on every mutation was the exact thing
+      // RR-9b closed; downgrading it without cause would reopen that finding) with a whole-type
+      // `replaceType` fallback only when no delta is available (e.g. a confirm/discontinue path
+      // that does not push a pendingIndexDelta). Because every Tier-1 step is now serialized by
+      // the OUTER single-writer lock (only one can ever run at a time, period), the `mirrorTails`
+      // per-type promise chain that used to guard the — previously UNLOCKED, async — mirror write
+      // against ITSELF is redundant and was removed. A FactMirror-write failure warns and
+      // continues (fail-SOFT: recall's `fallbackActiveFacts` port covers reads regardless; the
+      // next mutation's Tier-1 step retries; boot's full rebuild is the ultimate backstop) — it
+      // must NEVER abort the write itself.
+      const tier1Rederive = {
         rederive: async (relPaths: string[]): Promise<void> => {
           if (runtime.stopping || runtime.closed) return;
           for (const rel of new Set(relPaths)) {
@@ -372,33 +436,41 @@ export class ProfileRuntime {
             }
             await runtime.markIndexDirty(memoryWorkspace, rel, store, sourceDelta?.hash);
             if (type) {
-              const previous = mirrorTails.get(type) ?? Promise.resolve();
-              const refresh = previous
-                .catch(() => undefined)
-                .then(async () => {
-                  if (runtime.stopping || runtime.closed) return;
-                  try {
-                    const entities = sourceDelta && type && 'entities' in sourceDelta
-                      ? [...new Set((sourceDelta as LedgerIndexDelta).entities)]
-                      : [];
-                    if (entities.length > 0) {
-                      for (const entity of entities) {
-                        const facts = await ledgerStore.listAllOfEntity(type, entity);
-                        await factMirror.replaceScope(type, entity, facts.map(ledgerFactToRecord));
-                      }
-                    } else {
-                      const facts = await ledgerStore.listAllOfType(type);
-                      await factMirror.replaceType(type, facts.map(ledgerFactToRecord));
-                    }
-                  } catch (e) {
-                    console.warn('[gateway] fact-mirror re-derive failed (rebuildable at boot):', summarizeErrorForLog(e));
+              try {
+                const entities = sourceDelta && 'entities' in sourceDelta
+                  ? [...new Set((sourceDelta as LedgerIndexDelta).entities)]
+                  : [];
+                if (entities.length > 0) {
+                  for (const entity of entities) {
+                    const facts = await ledgerStore.listAllOfEntity(type, entity);
+                    await factMirror.replaceScope(type, entity, facts.map(ledgerFactToRecord));
                   }
-                });
-              mirrorTails.set(type, refresh);
-              await refresh;
-              if (mirrorTails.get(type) === refresh) mirrorTails.delete(type);
-              if (runtime.stopping || runtime.closed) return;
+                } else {
+                  const facts = await ledgerStore.listAllOfType(type);
+                  await factMirror.replaceType(type, facts.map(ledgerFactToRecord));
+                }
+              } catch (e) {
+                console.warn('[gateway] Tier-1 fact-mirror derivation failed (recall fallback covers reads; next write repairs):', summarizeErrorForLog(e));
+              }
             }
+          }
+        },
+      };
+      /** ledger-tools.ts's confirm/discontinue paths key by FactType (they never had a relPath to
+       *  begin with) — thin adapter onto the SAME Tier-1 closure so both callers share identical
+       *  entity-scoped/whole-type fallback behavior. */
+      const tier1RederiveType = (type: FactType): Promise<void> =>
+        tier1Rederive.rederive([`ledger/${TYPE_TO_FILE[type]}`]);
+
+      // Tier-2 (async, OFF the write lock — RR-7 C-09: embeddings never run inside the
+      // single-writer lock). ONLY the embedding-triggering background reindex remains here — the
+      // delta-consume + FactMirror + dirty-marker bookkeeping all moved to Tier-1 above (they are
+      // local/sync and need to run exactly once, before Tier-1 returns).
+      const tier2Rederive = {
+        rederive: async (relPaths: string[]): Promise<void> => {
+          if (runtime.stopping || runtime.closed) return;
+          for (const rel of new Set(relPaths)) {
+            if (runtime.stopping || runtime.closed) return;
             runtime.queueBackgroundReindex(rel, async () => {
               try {
                 await indexer.indexFile(rel);
@@ -423,13 +495,14 @@ export class ProfileRuntime {
       }
 
       const pipeline = new CapturePipeline({
-        queue: writeQueue,
+        queue: mutationCoordinator,
         ledger: ledgerStore,
         narrative: narrativeStore,
         safety: safetyRenderer,
         curiosity: curiosityQueue,
         events: eventSink,
-        rederive,
+        tier1Rederive,
+        rederive: tier2Rederive,
         idempotency: new FileCaptureIdempotency(path.join(stateDir, 'capture-idempotency.log')),
       });
       runtime.capturePipeline = pipeline;
@@ -464,11 +537,26 @@ export class ProfileRuntime {
           chunkStats,
           clock: systemClock,
           config: DEFAULT_RECALL_CONFIG,
+          // RR-STRUCT R-S3 Finding-3: `stage1Ledger` calls this when `factMirror.queryActive()`
+          // throws, instead of failing OPEN to an empty ledger context (a clinical hazard — a
+          // discontinued/active medication would silently vanish from the prompt). Composed from
+          // LedgerStore directly (no `listAllActive()` method exists verbatim) — `listByType(t)`
+          // already filters to `status==='active' && version>=1` for one type, exactly what
+          // `factMirror.queryActive()` (no type arg) returns across ALL types. This composition
+          // lives HERE, not in `src/recall/`, because recall is ports-only and cannot import
+          // `LedgerStore` (arch:check `v2-core-boundary`) — only the composition root may.
+          fallbackActiveFacts: async (): Promise<FactRecord[]> => {
+            const out: FactRecord[] = [];
+            for (const t of Object.keys(TYPE_TO_FILE) as FactType[]) {
+              out.push(...(await ledgerStore.listByType(t)).map(ledgerFactToRecord));
+            }
+            return out;
+          },
         });
         runtime.recallEngine = recallEngine;
         const v2Assembler = new ContextAssemblerV2({
           reader: memory,
-          safety: safetyView,
+          safety: makeSelfHealingSafetyReader(safetyView, () => ledgerStore.listSafetyRelevant(), mutationCoordinator),
           maxChars: config.memory.bootstrapMaxChars,
           clock: systemClock,
           curatedMemory: {
@@ -549,10 +637,11 @@ export class ProfileRuntime {
           pipeline,
           ledger: ledgerStore,
           safety: safetyRenderer,
-          queue: writeQueue,
+          queue: mutationCoordinator,
           narrative: narrativeStore,
           sideEffectLookup: sideEffects,
-          afterLedgerMutation: (type): Promise<void> => rederive.rederive([`ledger/${TYPE_TO_FILE[type]}`]),
+          tier1Rederive: tier1RederiveType,
+          afterLedgerMutation: (type): Promise<void> => tier2Rederive.rederive([`ledger/${TYPE_TO_FILE[type]}`]),
         })) {
           registry.register(tool);
         }
@@ -561,7 +650,7 @@ export class ProfileRuntime {
       }
 
       try {
-        for (const tool of createEpisodeTools({ store: episodeStore, profileId })) {
+        for (const tool of createEpisodeTools({ store: episodeStore, profileId, queue: mutationCoordinator })) {
           registry.register(tool);
         }
       } catch (e) {
@@ -569,7 +658,7 @@ export class ProfileRuntime {
       }
 
       try {
-        for (const tool of createSafetyTools({ safetyView })) {
+        for (const tool of createSafetyTools({ safetyView, queue: mutationCoordinator })) {
           registry.register(tool);
         }
       } catch (e) {

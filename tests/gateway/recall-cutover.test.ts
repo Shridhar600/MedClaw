@@ -196,10 +196,52 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
     expect(lastSystem(seen)).toContain('lisinopril');
   });
 
-  it('fails closed on the next live turn after SAFETY publication fails', async () => {
+  // RR-STRUCT R-S3 Part C (mini-plan v3 §3.7): this single test used to assert an UNCONDITIONAL
+  // "next turn fails closed" after any SAFETY render failure. R-S3 adds self-heal — a Tier-1 read
+  // that detects drift attempts ONE on-demand re-projection from the authoritative ledger before
+  // failing. That changes the OLD assertion's premise: a TRANSIENT render failure (the ledger fact
+  // itself was already durably recorded; only the projection publish glitched) no longer
+  // permanently bricks the profile — it self-heals on the very next read. The invariant the old
+  // test actually protects (C-03: SAFETY fails CLOSED, never serves a prompt with no/stale SAFETY)
+  // still holds, but only for a PERSISTENT failure (the heal attempt itself fails too). Migrated
+  // into two precise tests below — each OLD assertion maps to a specific NEW one:
+  //   - `result.isError === true` after the write   -> UNCHANGED in both new tests (Tier-1 write
+  //     path still fails the write + marks dirty on a render failure; not touched by self-heal).
+  //   - "next turn replies 'trouble right now', 0 extra provider calls" (used to be unconditional)
+  //     -> now the PERSISTENT-failure test only (self-heal itself fails, so it still fails closed).
+  //   - (NEW) a TRANSIENT failure's next turn now SUCCEEDS via self-heal — proven by a fresh test.
+  // See the report (§Behavior changes) for the git-stash RED reproduction of the pre-R-S3 baseline.
+  it('SELF-HEALS on the next live turn after a TRANSIENT SAFETY publication failure', async () => {
     gateway = await startGateway(tmpDir);
     const seen = captureProvider(gateway);
+    // Fails exactly ONCE — the ledger_record write's own re-render. The ledger fact itself is
+    // still recorded successfully (recordFact runs before reRenderSafety); only the SAFETY
+    // projection publish glitched transiently.
     const renderSpy = jest.spyOn(SafetyView.prototype, 'render').mockRejectedValueOnce(new Error('render failure'));
+    try {
+      const result = await registryOf().execute('ledger_record', {
+        entity: 'penicillin', type: 'allergy', fields: { reaction: 'hives' }, note: 'penicillin allergy',
+      });
+      expect(result.isError).toBe(true);
+      expect(fs.existsSync(path.join(workspace, '.state', 'safety-view.dirty'))).toBe(true);
+
+      // The mocked failure has been consumed — the self-heal's re-projection attempt succeeds.
+      const reply = await gateway.handleTestMessage('chat-1', 'what should I know about antibiotics');
+      expect(reply).not.toContain('trouble right now');
+      // The self-healed SAFETY.md carries the penicillin allergy that was already durably recorded
+      // in the ledger — proving the heal re-derived from REAL data, not stale/empty content.
+      expect(fs.readFileSync(path.join(workspace, 'SAFETY.md'), 'utf8')).toContain('penicillin');
+      expect(lastSystem(seen)).toContain('penicillin');
+    } finally {
+      renderSpy.mockRestore();
+    }
+  });
+
+  it('STILL fails closed on the next live turn when SAFETY publication fails PERSISTENTLY', async () => {
+    gateway = await startGateway(tmpDir);
+    const seen = captureProvider(gateway);
+    // Fails on EVERY call — the initial write AND the self-heal's retry attempt.
+    const renderSpy = jest.spyOn(SafetyView.prototype, 'render').mockRejectedValue(new Error('render failure'));
     try {
       const result = await registryOf().execute('ledger_record', {
         entity: 'penicillin', type: 'allergy', fields: { reaction: 'hives' }, note: 'penicillin allergy',
@@ -209,7 +251,10 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
 
       const providerCallsBefore = seen.length;
       const reply = await gateway.handleTestMessage('chat-1', 'what should I know about antibiotics');
-      expect(reply).toContain("trouble right now");
+      // The self-heal attempt itself failed (render is STILL broken) — the C-03 invariant holds:
+      // fails closed, exactly once, never spins (the loop guard is unit-tested directly in
+      // tests/gateway/rs3-safety-self-heal.test.ts).
+      expect(reply).toContain('trouble right now');
       expect(seen.length).toBe(providerCallsBefore);
     } finally {
       renderSpy.mockRestore();

@@ -6,6 +6,7 @@
 
 import type { Tool, ToolExecutionContext, ToolResult } from './types';
 import type { CapturePipeline, QueuePort, SafetyRenderer } from '../capture';
+import { computeIdempotencyKey } from '../capture';
 import type { LedgerStore } from '../memcore';
 import type { FactType, LedgerFact, RecordFactResult, Authority, Provenance } from '../memcore';
 import { TokenRejectedError, sanitizeSingleLine } from '../memcore';
@@ -32,12 +33,20 @@ export interface LedgerToolsDeps {
    */
   narrative?: { appendLedgerAnchor(date: string, entity: string, factId: string): Promise<string> };
   /**
-   * E2/CONTRA-09: re-derive the recall substrate (fact mirror + chunk index) for a fact TYPE after a
-   * state-changing confirm/remove. `ledger_record` re-derives via the capture pipeline, but the
-   * confirm (`ledger_update`) and direct-apply (`ledger_remove`) paths bypass it — without this hook a
-   * confirmed retraction/discontinuation keeps injecting the stale fact into the next turn's context.
+   * E2/CONTRA-09: re-derive the recall substrate (chunk index bookkeeping + reindex — Tier-2, ASYNC,
+   * OFF the write lock) for a fact TYPE after a state-changing confirm/remove. `ledger_record`
+   * re-derives via the capture pipeline, but the confirm (`ledger_update`) and direct-apply
+   * (`ledger_remove`) paths bypass it — without this hook a confirmed retraction/discontinuation
+   * keeps injecting the stale fact into the next turn's context.
    */
   afterLedgerMutation?: (type: FactType) => Promise<void>;
+  /**
+   * RR-STRUCT R-S3 (mini-plan v3 §3.6): Tier-1 FactMirror derivation — SYNCHRONOUS, called INSIDE
+   * the SAME write-lock op as the confirm/discontinue itself (never `afterLedgerMutation`, which
+   * runs OUTSIDE the lock). Must never itself enqueue (no re-entrancy — MutationCoordinator's guard
+   * rejects that). A failure warns and continues (fail-soft; recall's fallback port covers reads).
+   */
+  tier1Rederive?: (type: FactType) => Promise<void>;
 }
 
 function ok(text: string): ToolResult {
@@ -110,6 +119,16 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       await deps.afterLedgerMutation(type);
     } catch (e) {
       console.warn('[ledger-tools] post-mutation recall re-derive failed (rebuilds at boot):', summarizeErrorForLog(e));
+    }
+  };
+  // Tier-1: called from WITHIN the write-lock `run()` closure (never after `queue.enqueue()`
+  // resolves) so the FactMirror update lands atomically with the confirm/discontinue itself.
+  const afterTier1 = async (type: FactType): Promise<void> => {
+    if (!deps.tier1Rederive) return;
+    try {
+      await deps.tier1Rederive(type);
+    } catch (e) {
+      console.warn('[ledger-tools] Tier-1 fact-mirror derivation failed (recall fallback covers reads):', summarizeErrorForLog(e));
     }
   };
   const clock = deps.clock ?? systemClock;
@@ -230,12 +249,37 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
 
       const source = (params.source as Authority) ?? 'user';
       const confidence = (params.confidence as number) ?? 0.9;
+      // RR-STRUCT R-S3 (Finding-5): a deterministic idempotency key so a replayed/duplicate
+      // delivery of the SAME tool call returns the cached ORIGINAL `RecordFactResult` instead of
+      // silently double-writing (or, pre-R-S3, always getting a fresh random key that never
+      // dedupes at all). Built from the caller-scoped identity (chatId/turnId/toolCallId) — NOT
+      // from `provenance.capturedAt`, which is stamped fresh on every call and would defeat
+      // replay-detection if included. Falls back to no key (today's per-call-random behavior)
+      // when the caller supplies no chatId/turnId (e.g. a bare unit-test construction).
+      const idempotencyKey = context?.chatId && context?.turnId
+        ? computeIdempotencyKey({
+          chatId: context.chatId,
+          turnMessageId: context.turnId,
+          toolCallId: context.toolCallId,
+          canonicalParams: {
+            entity, type, fields, source, confidence,
+            safetyRelevant: params.safety_relevant,
+            episodeId: params.episode_id,
+            language: params.language,
+            verbatim: params.verbatim,
+            note: params.note,
+            replaces: params.replaces,
+            corrects: params.corrects,
+          },
+        })
+        : undefined;
       let result: RecordFactResult | void;
       try {
         result = await deps.pipeline.ingest({
           profileId: 'default',
           source: 'tool:ledger_record',
           kind: 'ledger-fact',
+          idempotencyKey,
           payload: {
             entity,
             type,
@@ -330,11 +374,14 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
                 console.warn('[ledger_update] ledger-writes anchor failed (continuing):', summarizeErrorForLog(anchorError));
               }
             }
+            // Tier-1 (in-lock): the FactMirror update lands atomically with this confirm.
+            await afterTier1(applied.type);
             return applied;
           },
         });
-        // Re-derive the recall mirror/index so the confirmed change (supersession, retraction,
-        // discontinuation, dispute resolution) reaches the NEXT turn's context (CONTRA-09).
+        // Tier-2 (off-lock): re-derive chunk index bookkeeping so the confirmed change
+        // (supersession, retraction, discontinuation, dispute resolution) reaches the NEXT turn's
+        // context (CONTRA-09).
         await afterMutation(fact.type);
         return ok(`Confirmed: ${fact.entity} (${fact.type}) is now ${fact.status} as ${fact.id}.`);
       } catch (e) {
@@ -392,9 +439,24 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       // RM (H1/C1-arch): the agent-facing removal surface — routes through the
       // ledger's discontinuation flow so med-class removal is user-confirmed
       // and every version stays preserved (soft-delete law).
+      //
+      // RR-STRUCT R-S3 hunt finding: the SAFETY re-render used to run AFTER `queue.enqueue()`
+      // resolved — OUTSIDE the write lock — unlike `ledger_update`'s confirm path, which already
+      // rendered in-lock. A concurrent SAFETY-touching op could interleave with an unlocked
+      // render here (the exact split-brain window R-S3 exists to close). Moved in-lock alongside
+      // the new Tier-1 FactMirror derivation, matching `ledger_update`'s existing contract.
       const result = await deps.queue.enqueue('turn', {
         label: 'ledger_remove:discontinue',
-        run: () => deps.ledger.discontinue(entity, type, provenance('user', 0.9), { reason }),
+        run: async () => {
+          const outcome = await deps.ledger.discontinue(entity, type, provenance('user', 0.9), { reason });
+          if (outcome.kind === 'applied') {
+            if (outcome.fact.safetyRelevant) {
+              await deps.safety.render(await deps.safety.listSafetyRelevant());
+            }
+            await afterTier1(outcome.fact.type);
+          }
+          return outcome;
+        },
       });
 
       if (result.kind === 'noop') {
@@ -407,10 +469,8 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
           `current: ${summarizeFields(result.fact)}`,
         );
       }
-      if (result.fact.safetyRelevant) {
-        await deps.safety.render(await deps.safety.listSafetyRelevant());
-      }
-      // A direct-applied (non-med) removal also bypasses the pipeline — re-derive so recall drops it.
+      // Tier-2 (off-lock): a direct-applied (non-med) removal also bypasses the pipeline —
+      // re-derive chunk index bookkeeping so recall drops it.
       await afterMutation(result.fact.type);
       return ok(`Removed ${entity} (${type}) — now ${result.fact.status} as ${result.fact.id}.`);
     },

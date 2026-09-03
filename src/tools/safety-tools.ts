@@ -7,10 +7,19 @@
 
 import type { Tool, ToolResult } from './types';
 import type { SafetyView } from '../memcore';
+import type { QueuePort } from '../capture';
 import { contentContainsCredentials } from '../security';
 
 export interface SafetyToolsDeps {
   safetyView: SafetyView;
+  /**
+   * RR-STRUCT R-S3 (C-46 generalization): `add-critical-event` used to write DIRECTLY to
+   * `SafetyView` (load→push→write — a read-modify-write on SAFETY.md) with no serialization
+   * against a concurrent Critical Event append. Critical Events are add-only (VANI-05) — losing
+   * one to a lost-update race is a genuine safety-log hazard. Optional + falls back to the direct
+   * (pre-R-S3) call when absent, matching every other coordinator seam in this slice.
+   */
+  queue?: QueuePort;
 }
 
 function ok(text: string): ToolResult {
@@ -49,11 +58,14 @@ export function createSafetyTools(deps: SafetyToolsDeps): Tool[] {
         if (credScan.matched) {
           return err(`Write rejected: content matches credential pattern (${credScan.pattern}). Credentials must never be stored in SAFETY.md.`);
         }
-        await deps.safetyView.addCriticalEvent({
+        const addEvent = (): Promise<string> => deps.safetyView.addCriticalEvent({
           date: (params.date as string) ?? '',
           summary,
           action: actionTaken,
         });
+        await (deps.queue
+          ? deps.queue.enqueue('turn', { label: 'safety:add-critical-event', scope: 'safety', run: addEvent })
+          : addEvent());
         return ok(`Added critical event to SAFETY.md: ${summary}`);
       }
 

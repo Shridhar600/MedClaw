@@ -240,7 +240,13 @@ export class TurnCoordinator {
     let result: AgentRunResult;
     try {
       const history = await sessions.prepareHistory(chatId);
-      result = await this.requireAgentLoop().run(agentInput, history, { chatId, mode: 'chat' });
+      // RR-STRUCT R-S3: derive `turnId` from the real Telegram messageId when available (the same
+      // identity `captureUserTurn` already keys its idempotencyKey on above) rather than letting
+      // AgentLoop fall back to an in-memory, restart-resetting sequence number — tool-call
+      // idempotency keys built from `context.turnId` need a value that is STABLE across a replayed
+      // delivery of the SAME message, which an in-process counter is not.
+      const turnId = incoming.messageId ? `chat:${chatId}:${incoming.messageId}` : undefined;
+      result = await this.requireAgentLoop().run(agentInput, history, { chatId, mode: 'chat', turnId });
     } catch (error) {
       console.error('[gateway] Agent error:', summarizeErrorForLog(error));
       await this.persistFailureTrace(chatId, agentInput, AGENT_FAILURE_RESPONSE);
