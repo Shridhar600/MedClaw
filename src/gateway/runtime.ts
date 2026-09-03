@@ -308,7 +308,11 @@ export class ProfileRuntime {
     runtime.registry = registry;
 
     try {
-      for (const tool of createMemoryTools(memory, search, indexer, profileId, () => runtime.factMirror)) {
+      // R-S3b: `memory_write` routes through the single-writer. The coordinator does NOT
+      // exist yet at this point (built below in the memcore block), so pass a LAZY
+      // accessor read at execute time — passing the instance directly would capture
+      // `undefined` and silently never route. Same shape as the `factMirror` accessor.
+      for (const tool of createMemoryTools(memory, search, indexer, profileId, () => runtime.factMirror, () => runtime.mutationCoordinator)) {
         registry.register(tool);
       }
     } catch (e) {

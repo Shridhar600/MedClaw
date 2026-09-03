@@ -3,6 +3,7 @@ import type { MemoryEngine } from '../memory/memory-engine';
 import type { MemorySearch } from '../memory/search';
 import type { MemoryIndexer } from '../memory/indexer';
 import type { FactMirror, FactRecord } from '../ports';
+import type { QueuePort } from '../capture';
 import { chunkHasStaleEntity } from '../recall';
 import * as path from 'path';
 import { contentContainsCredentials, summarizeErrorForLog, PathContainmentError } from '../security';
@@ -204,9 +205,25 @@ export function createMemoryTools(
   // accessor because the gateway builds the mirror AFTER these tools register — the closure reads
   // it at execute time (boot-complete), and `undefined` degrades to no filtering.
   factMirror?: FactMirror | (() => FactMirror | undefined),
+  /**
+   * RR-STRUCT R-S3b (C-46, last bypass): `memory_write` used to write DIRECTLY to
+   * `MemoryEngine` — two concurrent writes to the SAME file (two turns, or a turn racing
+   * a heartbeat) could interleave, and the credential-scan-and-rollback read-modify-write
+   * was not atomic against a concurrent write. Routing the WHOLE write body through the
+   * single-writer coordinator closes that window. Optional + falls back to the direct
+   * (pre-R-S3b) call when absent, so existing single-caller test construction is
+   * unaffected — a missing coordinator degrades atomicity, never availability
+   * (resilience law). Accepts a lazy accessor because the gateway registers these tools
+   * BEFORE the memcore block builds the `WriteQueue`/`MutationCoordinator` — the closure
+   * reads it at execute time (boot-complete), exactly like `factMirror` above. A direct
+   * instance is also accepted (tests / late wiring).
+   */
+  queue?: QueuePort | (() => QueuePort | undefined),
 ): Tool[] {
   const getMirror: () => FactMirror | undefined =
     typeof factMirror === 'function' ? factMirror : () => factMirror;
+  const getQueue: () => QueuePort | undefined =
+    typeof queue === 'function' ? queue : () => queue;
   const memoryGet: Tool = {
     name: 'memory_get',
     group: 'group:memory',
@@ -264,83 +281,104 @@ export function createMemoryTools(
           return rejection(`Write rejected: content exceeds the ${MEMORY_TOOL_MAX_BYTES}-byte / ${MEMORY_TOOL_MAX_TOKENS}-token memory tool limit.`);
         }
 
-      // Managed-lane guard (G1): refuse invariant-bearing paths before any write.
-      const managed = await classifyManagedWrite(engine, filePath, mode, content);
-      if (managed) return managed;
+        // The WHOLE write body — managed-lane guard, credential pre-scan, engine write,
+        // post-append full-file re-scan + rollback — runs as ONE coordinator op so the
+        // read-modify-write is atomic against every other memory-domain write. The LOGIC
+        // below is unchanged pre-R-S3b behavior, only wrapped. No embed/LLM runs in the
+        // lock (the reindex trigger stays outside, below); nothing in here re-enqueues,
+        // so the coordinator's re-entrancy guard cannot fire on this path.
+        const doWrite = async (): Promise<ToolResult> => {
+          // Managed-lane guard (G1): refuse invariant-bearing paths before any write.
+          const managed = await classifyManagedWrite(engine, filePath, mode, content);
+          if (managed) return managed;
 
-      if (mode === 'append') {
-        // SEC-M2b: capture the FULL existing content pre-append — both for the
-        // tail-window pre-scan and as the rollback target if the post-append
-        // full-file re-scan catches a split-append credential that the
-        // tail-window pre-scan missed.
-        let preAppendContent: string | null = null;
-        try {
-          preAppendContent = await engine.readFile(filePath);
-        } catch {
-          // file doesn't exist yet, that's fine
-        }
-        const existingTail = preAppendContent !== null && preAppendContent.length > 0
-          ? preAppendContent.slice(-8192)
-          : '';
-        const combined = existingTail + content;
-        const rejection = contentContainsCredentials(combined);
-        if (rejection.matched) {
-          return {
-            content: [{ type: 'text', text: `Write rejected: content matches credential pattern (${rejection.pattern}). PHI/sensitive data should not be stored in plain text memory files.` }],
-            isError: true,
-          };
-        }
-        await engine.appendToFile(filePath, content);
-
-        // SEC-M2b: re-read the ENTIRE assembled file and re-scan. A split-append
-        // can hide a label behind >8192 chars of non-alphanumeric padding so the
-        // tail-window pre-scan passes, yet the assembled file reconstructs a
-        // complete credential. On match, roll the append back to the pre-append
-        // content and reject. Cost is acceptable for health-memory files. A
-        // rollback failure must warn-and-continue (resilience) — never crash.
-        try {
-          const assembled = await engine.readFile(filePath);
-          if (assembled !== null) {
-            const postRejection = contentContainsCredentials(assembled);
-            if (postRejection.matched) {
-              try {
-                await engine.writeFile(filePath, preAppendContent ?? '');
-              } catch (rollbackError) {
-                console.warn(
-                  '[memory-tools] Credential rejection rollback failed:',
-                  summarizeErrorForLog(rollbackError),
-                );
-              }
+          if (mode === 'append') {
+            // SEC-M2b: capture the FULL existing content pre-append — both for the
+            // tail-window pre-scan and as the rollback target if the post-append
+            // full-file re-scan catches a split-append credential that the
+            // tail-window pre-scan missed.
+            let preAppendContent: string | null = null;
+            try {
+              preAppendContent = await engine.readFile(filePath);
+            } catch {
+              // file doesn't exist yet, that's fine
+            }
+            const existingTail = preAppendContent !== null && preAppendContent.length > 0
+              ? preAppendContent.slice(-8192)
+              : '';
+            const combined = existingTail + content;
+            const rejection = contentContainsCredentials(combined);
+            if (rejection.matched) {
               return {
-                content: [{ type: 'text', text: `Write rejected: appended content completes a credential pattern (${postRejection.pattern}). PHI/sensitive data should not be stored in plain text memory files.` }],
+                content: [{ type: 'text', text: `Write rejected: content matches credential pattern (${rejection.pattern}). PHI/sensitive data should not be stored in plain text memory files.` }],
                 isError: true,
               };
             }
+            await engine.appendToFile(filePath, content);
+
+            // SEC-M2b: re-read the ENTIRE assembled file and re-scan. A split-append
+            // can hide a label behind >8192 chars of non-alphanumeric padding so the
+            // tail-window pre-scan passes, yet the assembled file reconstructs a
+            // complete credential. On match, roll the append back to the pre-append
+            // content and reject. Cost is acceptable for health-memory files. A
+            // rollback failure must warn-and-continue (resilience) — never crash.
+            try {
+              const assembled = await engine.readFile(filePath);
+              if (assembled !== null) {
+                const postRejection = contentContainsCredentials(assembled);
+                if (postRejection.matched) {
+                  try {
+                    await engine.writeFile(filePath, preAppendContent ?? '');
+                  } catch (rollbackError) {
+                    console.warn(
+                      '[memory-tools] Credential rejection rollback failed:',
+                      summarizeErrorForLog(rollbackError),
+                    );
+                  }
+                  return {
+                    content: [{ type: 'text', text: `Write rejected: appended content completes a credential pattern (${postRejection.pattern}). PHI/sensitive data should not be stored in plain text memory files.` }],
+                    isError: true,
+                  };
+                }
+              }
+            } catch (postScanError) {
+              // Post-append re-scan is defense-in-depth; a read failure here must
+              // not undo a legitimate append nor crash the daemon.
+              console.warn(
+                '[memory-tools] Post-append credential re-scan failed (continuing):',
+                summarizeErrorForLog(postScanError),
+              );
+            }
+          } else {
+            const rejection = contentContainsCredentials(content);
+            if (rejection.matched) {
+              return {
+                content: [{ type: 'text', text: `Write rejected: content matches credential pattern (${rejection.pattern}). PHI/sensitive data should not be stored in plain text memory files.` }],
+                isError: true,
+              };
+            }
+            await engine.writeFile(filePath, content);
           }
-        } catch (postScanError) {
-          // Post-append re-scan is defense-in-depth; a read failure here must
-          // not undo a legitimate append nor crash the daemon.
-          console.warn(
-            '[memory-tools] Post-append credential re-scan failed (continuing):',
-            summarizeErrorForLog(postScanError),
+          return { content: [{ type: 'text', text: `Written to ${filePath}` }] };
+        };
+
+        // Serialize this write against every other memory-domain writer. Absent
+        // coordinator ⇒ run inline (today's behavior): degraded atomicity, never
+        // availability (resilience law).
+        const coordinator = getQueue();
+        const result = coordinator
+          ? await coordinator.enqueue('turn', { label: 'memory:write', scope: 'memory', run: doWrite })
+          : await doWrite();
+        // Tier-2 stays OFF the write lock (RR-7 C-09: embeddings never run inside the
+        // single-writer lock) — fire-and-forget after the op resolves, and only on
+        // success: every rejection above returns `isError: true` from inside the op,
+        // exactly matching the pre-R-S3b "reached the indexer line" behavior.
+        if (indexer && !result.isError) {
+          void indexer.indexFile(filePath).catch(e =>
+            console.warn(`[memory-tools] Reindex failed for ${filePath}:`, summarizeErrorForLog(e)),
           );
         }
-      } else {
-        const rejection = contentContainsCredentials(content);
-        if (rejection.matched) {
-          return {
-            content: [{ type: 'text', text: `Write rejected: content matches credential pattern (${rejection.pattern}). PHI/sensitive data should not be stored in plain text memory files.` }],
-            isError: true,
-          };
-        }
-        await engine.writeFile(filePath, content);
-      }
-      if (indexer) {
-        void indexer.indexFile(filePath).catch(e =>
-          console.warn(`[memory-tools] Reindex failed for ${filePath}:`, summarizeErrorForLog(e)),
-        );
-      }
-        return { content: [{ type: 'text', text: `Written to ${filePath}` }] };
+        return result;
       } catch (e) {
         if (isPathError(e)) return invalidPathResult();
         throw e;

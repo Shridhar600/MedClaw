@@ -9,6 +9,7 @@ import {
   type SemaphorePriority,
 } from '../tools/semaphore';
 import { summarizeErrorForLog } from '../security';
+import type { HeartbeatJob } from '../scheduler/types';
 import type { ProfileRuntime } from './runtime';
 
 const SESSION_RESET_FAILURE_RESPONSE = "I couldn't start a fresh session right now. Please try again in a moment.";
@@ -53,6 +54,32 @@ export interface HeartbeatTurnRequest {
   input: string;
   egress: TurnEgress;
   afterDelivery: (result: AgentRunResult) => Promise<void>;
+  /**
+   * RR-STRUCT R-S3b (C-39 for heartbeats): stable per-OCCURRENCE identity
+   * (`heartbeatTurnId`), threaded into the `AgentLoop` run-context so a tool called
+   * inside a heartbeat (e.g. `ledger_record`) builds a deterministic idempotency key —
+   * a scheduler RETRY of the same occurrence returns the cached original instead of
+   * double-writing. Absent ⇒ `AgentLoop` falls back to its in-memory sequence number
+   * (today's behavior).
+   */
+  turnId?: string;
+}
+
+/**
+ * RR-STRUCT R-S3b: the heartbeat occurrence key — `${job.id}:${job.lastRunAt}`.
+ *
+ * `lastRunAt` is set by `HeartbeatStore.markRun` AFTER the trigger completes
+ * (`scheduler/runtime.ts` `executeJobBody`), and NO retry/failure/outcome path touches
+ * it (`retry-policy` patches, `markError`, `recordOutcome` all leave it alone) — so it
+ * is STABLE across a RETRY of one occurrence (the retry dedupes the write it already
+ * made) but DISTINCT across occurrences (tomorrow's recurring reminder is NOT dropped
+ * as a duplicate of tonight's — a static `job.id` alone WOULD drop it). A missing
+ * `lastRunAt` (e.g. a never-yet-run job) yields `undefined`: no key, today's
+ * per-call behavior — never a random/unstable one.
+ */
+export function heartbeatTurnId(job: Pick<HeartbeatJob, 'id' | 'lastRunAt'>): string | undefined {
+  if (!job.lastRunAt) return undefined;
+  return `${job.id}:${job.lastRunAt}`;
 }
 
 export type HeartbeatTurnResult =
@@ -300,10 +327,13 @@ export class TurnCoordinator {
   private async executeHeartbeat(request: HeartbeatTurnRequest): Promise<AgentRunResult> {
     const sessions = this.requireSessions();
     const history = await sessions.prepareHistory(request.chatId);
+    // RR-STRUCT R-S3b: mirror `executeUser`'s message-derived `turnId` — the heartbeat's
+    // per-occurrence `turnId` (when supplied) is what tool-call idempotency keys are
+    // built from; `undefined` keeps `AgentLoop`'s sequence fallback (today's behavior).
     const result = await this.requireAgentLoop().run(
       request.input,
       history,
-      { chatId: request.chatId, origin: 'heartbeat', mode: 'heartbeat' },
+      { chatId: request.chatId, origin: 'heartbeat', mode: 'heartbeat', turnId: request.turnId },
     );
 
     await sessions.recordTurn(request.chatId, [

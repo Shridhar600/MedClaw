@@ -27,7 +27,7 @@ import {
 } from '../security';
 import { ProfileRuntime } from './runtime';
 import { GatewayMessageRouter, sweepStagedMedia } from './router';
-import { TurnQueueFullError } from './turn-coordinator';
+import { TurnQueueFullError, heartbeatTurnId } from './turn-coordinator';
 
 const SHUTDOWN_RESPONSE = 'The health assistant is shutting down. Please try again in a moment.';
 const BOOT_HEALTHCHECK_BUDGET_MS = 3_000;
@@ -375,9 +375,14 @@ export class Gateway {
     ].join('\n');
 
     try {
+      // RR-STRUCT R-S3b (C-39 for heartbeats): thread the per-occurrence turnId so a
+      // `ledger_record` inside this turn gets a deterministic idempotency key — a
+      // scheduler RETRY of this occurrence dedupes instead of double-writing.
+      const turnId = heartbeatTurnId(job);
       const result = await coordinator.runHeartbeat({
         chatId: job.chatId,
         input,
+        turnId,
         egress: (text) => this.channel!.send(job.chatId, { text }),
         afterDelivery: async (agentResult) => {
           await scheduler?.recordOutcome(job.id, agentResult.text === HEARTBEAT_NOOP ? 'noop' : 'sent');
