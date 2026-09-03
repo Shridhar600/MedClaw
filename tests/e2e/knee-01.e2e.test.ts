@@ -97,7 +97,7 @@ describe('KNEE-01 E2E (real Gateway.handleTestMessage)', () => {
 
     // Skip the deterministic onboarding machine and feed canned tool-calls to the REAL agent loop.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).handleOnboarding = async (): Promise<null> => null;
+    (gateway.runtimeInstance!.turnCoordinator as any).handleOnboarding = async (): Promise<null> => null;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).agentLoop.provider = new ScriptedProvider(KNEE_01_SCRIPT);
 

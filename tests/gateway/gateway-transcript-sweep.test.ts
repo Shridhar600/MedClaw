@@ -10,7 +10,7 @@ jest.mock('node-cron', () => ({
 }));
 
 // F-6 + MEDIUM-6: the nightly sweep exercised through the REAL Gateway seam — Gateway.runTranscriptSweep()
-// composes buildSweepDeps() over the real SessionManager day files, the real LedgerStore (ALL versions),
+// composes the runtime's sweep dependencies over the real SessionManager day files, the real LedgerStore (ALL versions),
 // and the real CuriosityQueue. Proves the feature is wired (not inert) and that an entity logged yesterday
 // then superseded today is still recognized as logged yesterday (no spurious critical re-ask).
 
@@ -56,9 +56,10 @@ describe('Gateway.runTranscriptSweep (F-6 integration, MEDIUM-6)', () => {
     await gateway.start();
     warn.mockRestore(); log.mockRestore();
 
-    const sessions = (gateway as any).sessions;
-    const ledger = (gateway as any).ledgerStore;
-    const curiosity = (gateway as any).curiosity;
+    const runtime = gateway.runtimeInstance!;
+    const sessions = runtime.sessions!;
+    const ledger = runtime.ledgerStore!;
+    const curiosity = runtime.curiosity!;
 
     jest.useFakeTimers();
     try {
@@ -82,7 +83,7 @@ describe('Gateway.runTranscriptSweep (F-6 integration, MEDIUM-6)', () => {
       expect(entities).toContain('naproxen');       // mentioned, never logged → critical miss
       expect(entities).not.toContain('metformin');  // logged yesterday → no item
       expect(entities).not.toContain('ibuprofen');  // logged yesterday (v1), superseded today → no item (MEDIUM-6)
-      expect(items.find((i: any) => i.relatedEntity === 'naproxen').critical).toBe(true);
+      expect(items.find((i: any) => i.relatedEntity === 'naproxen')!.critical).toBe(true);
     } finally {
       jest.useRealTimers();
     }

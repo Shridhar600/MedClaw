@@ -42,9 +42,23 @@ export class SemaphoreShutdownError extends Error {
   }
 }
 
+export class HeartbeatPreemptedError extends Error {
+  constructor() {
+    super('heartbeat preempted by user turn');
+    this.name = 'HeartbeatPreemptedError';
+  }
+}
+
+export interface SemaphoreEntryMetadata {
+  readonly chatId?: string;
+  readonly origin?: SemaphorePriority;
+  readonly [key: string]: unknown;
+}
+
 interface QueueEntry {
   fn: () => Promise<void>;
   reject: (reason: unknown) => void;
+  meta: SemaphoreEntryMetadata;
 }
 
 export interface LLMSemaphoreOptions {
@@ -81,7 +95,11 @@ export class LLMSemaphore {
       ?? DEFAULT_MAX_CONSECUTIVE_USER_JOBS_WITH_BACKGROUND;
   }
 
-  async run<T>(priority: SemaphorePriority, fn: () => Promise<T>): Promise<T> {
+  async run<T>(
+    priority: SemaphorePriority,
+    fn: () => Promise<T>,
+    meta?: SemaphoreEntryMetadata,
+  ): Promise<T> {
     if (this.closed) {
       return Promise.reject(new SemaphoreShutdownError());
     }
@@ -106,10 +124,32 @@ export class LLMSemaphore {
           }
         },
         reject,
+        meta: meta ?? {},
       };
       queue.push(entry);
       void this.drain();
     });
+  }
+
+  /** Evict matching queued entries. The active job is already removed from its queue and is untouched. */
+  abortQueueEntry(predicate: (meta: SemaphoreEntryMetadata) => boolean): number {
+    let aborted = 0;
+    for (const queue of [this.userQueue, this.heartbeatQueue, this.backgroundQueue]) {
+      for (let index = queue.length - 1; index >= 0; index--) {
+        const entry = queue[index];
+        let matches = false;
+        try {
+          matches = predicate(entry.meta);
+        } catch {
+          // A caller predicate cannot be allowed to leave a partially mutated queue or break drain().
+        }
+        if (!matches) continue;
+        queue.splice(index, 1);
+        entry.reject(new HeartbeatPreemptedError());
+        aborted += 1;
+      }
+    }
+    return aborted;
   }
 
   /** Reject pending work and refuse future enqueues. The active call is not interrupted. */

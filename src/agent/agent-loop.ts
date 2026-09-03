@@ -63,7 +63,7 @@ export class AgentLoop {
     const exec = (): Promise<AgentRunResult> => this.runInternal(userMessage, conversationHistory, context);
     if (this.semaphore) {
       const priority: SemaphorePriority = runContext?.origin ?? 'user';
-      return this.semaphore.run(priority, exec);
+      return this.semaphore.run(priority, exec, { chatId: runContext?.chatId, origin: priority });
     }
     return exec();
   }

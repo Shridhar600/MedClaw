@@ -210,9 +210,9 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send, disconnect };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
+    (gateway.runtimeInstance as any).agentLoop = { run };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = sessions;
+    (gateway.runtimeInstance as any).sessions = sessions;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({ chatId: 'chat-1', text: 'hi there' });

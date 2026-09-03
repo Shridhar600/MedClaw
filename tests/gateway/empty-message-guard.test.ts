@@ -5,8 +5,11 @@
 // turn. Both gateway entry paths are covered: handleMessage (channel path) and
 // handleTestMessage (test/CLI path).
 
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
 import { Gateway } from '../../src/gateway/gateway';
 import type { AppConfig } from '../../src/config/types';
+import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 
 function makeConfig(): AppConfig {
   return {
@@ -62,14 +65,12 @@ describe('PROD-P1-6 empty/whitespace message guard', () => {
       const send = jest.fn().mockResolvedValue(undefined);
       const prepareHistory = jest.fn().mockResolvedValue([]);
       const recordTurn = jest.fn().mockResolvedValue(undefined);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      attachGatewayTestRuntime(gateway, makeConfig(), {
+        agentLoop: { run },
+        sessions: { prepareHistory, recordTurn, recordPromptUsage: jest.fn().mockResolvedValue(undefined), resetSession: jest.fn() },
+      });
+      (gateway as any).runtime.turnCoordinator.handleOnboarding = jest.fn().mockResolvedValue(undefined);
       (gateway as any).channel = { send };
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (gateway as any).agentLoop = { run };
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (gateway as any).sessions = { prepareHistory, recordTurn, recordPromptUsage: jest.fn().mockResolvedValue(undefined), resetSession: jest.fn() };
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
       return { run, send, prepareHistory, recordTurn };
     }
 
@@ -131,12 +132,11 @@ describe('PROD-P1-6 empty/whitespace message guard', () => {
       });
       const prepareHistory = jest.fn().mockResolvedValue([]);
       const recordTurn = jest.fn().mockResolvedValue(undefined);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (gateway as any).agentLoop = { run };
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (gateway as any).sessions = { prepareHistory, recordTurn, recordPromptUsage: jest.fn().mockResolvedValue(undefined), resetSession: jest.fn() };
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
+      attachGatewayTestRuntime(gateway, makeConfig(), {
+        agentLoop: { run },
+        sessions: { prepareHistory, recordTurn, recordPromptUsage: jest.fn().mockResolvedValue(undefined), resetSession: jest.fn() },
+      });
+      (gateway as any).runtime.turnCoordinator.handleOnboarding = jest.fn().mockResolvedValue(undefined);
       return { run, prepareHistory, recordTurn };
     }
 

@@ -7,6 +7,7 @@ import type { AppConfig } from '../../src/config/types';
 import type { HeartbeatJob } from '../../src/scheduler/types';
 import { HeartbeatStore } from '../../src/scheduler/store';
 import { HeartbeatScheduler } from '../../src/scheduler/runtime';
+import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 
 describe('Gateway heartbeat integration', () => {
   let tmpDir: string;
@@ -81,6 +82,7 @@ describe('Gateway heartbeat integration', () => {
       },
     });
     const gateway = new Gateway(config);
+    attachGatewayTestRuntime(gateway, config);
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn().mockResolvedValue({
       text: 'Heartbeat sent',
@@ -147,6 +149,7 @@ describe('Gateway heartbeat integration', () => {
       },
     });
     const gateway = new Gateway(config);
+    attachGatewayTestRuntime(gateway, config);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
 
@@ -172,6 +175,7 @@ describe('Gateway heartbeat integration', () => {
     });
 
     const gateway = new Gateway(config);
+    attachGatewayTestRuntime(gateway, config);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -193,6 +197,7 @@ describe('Gateway heartbeat integration', () => {
   it('does not send a scheduled message when delivery policy suppresses it', async () => {
     const config = makeConfig();
     const gateway = new Gateway(config);
+    attachGatewayTestRuntime(gateway, config);
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn().mockResolvedValue({
       text: 'Heartbeat sent',
@@ -265,6 +270,7 @@ describe('Gateway heartbeat integration', () => {
       },
     });
     const gateway = new Gateway(config);
+    attachGatewayTestRuntime(gateway, config);
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn().mockResolvedValue({
       text: 'HEARTBEAT_NOOP',
@@ -321,6 +327,7 @@ describe('Gateway heartbeat integration', () => {
     );
 
     const gateway = new Gateway(config);
+    attachGatewayTestRuntime(gateway, config);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -370,6 +377,7 @@ describe('Gateway heartbeat integration', () => {
       },
     });
     const gateway = new Gateway(config);
+    attachGatewayTestRuntime(gateway, config);
     const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -440,6 +448,7 @@ describe('Gateway heartbeat integration', () => {
       },
     });
     const gateway = new Gateway(config);
+    attachGatewayTestRuntime(gateway, config);
     const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
@@ -510,6 +519,7 @@ describe('Gateway heartbeat integration', () => {
       },
     });
     const gateway = new Gateway(config);
+    attachGatewayTestRuntime(gateway, config);
     const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
@@ -583,6 +593,7 @@ describe('Gateway heartbeat integration', () => {
       },
     });
     const gateway = new Gateway(config);
+    attachGatewayTestRuntime(gateway, config);
     const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
@@ -655,6 +666,7 @@ describe('Gateway heartbeat integration', () => {
       },
     });
     const gateway = new Gateway(config);
+    attachGatewayTestRuntime(gateway, config);
     const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
@@ -754,6 +766,7 @@ describe('Gateway heartbeat integration', () => {
     });
 
     const gateway = new Gateway(config);
+    attachGatewayTestRuntime(gateway, config);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -817,6 +830,7 @@ describe('Gateway heartbeat integration', () => {
       jest.setSystemTime(new Date('2026-04-19T08:30:00.000Z'));
 
       const gateway = new Gateway(config);
+      attachGatewayTestRuntime(gateway, config);
       const send = jest.fn().mockResolvedValue(undefined);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (gateway as any).channel = { send };
@@ -866,6 +880,7 @@ describe('Gateway heartbeat integration', () => {
       },
     });
     const gateway = new Gateway(config);
+    attachGatewayTestRuntime(gateway, config);
     const send = jest.fn().mockResolvedValue(undefined);
     const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(

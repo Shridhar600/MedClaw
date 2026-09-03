@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -6,6 +7,7 @@ import type { AppConfig } from '../../src/config/types';
 import type { HeartbeatJob } from '../../src/scheduler/types';
 import { Gateway } from '../../src/gateway/gateway';
 import { SqliteChunkStats, SqliteKeywordIndex, SqliteVecIndex } from '../../src/indexstore';
+import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 
 const mockMainProvider: LLMProvider = {
   modelName: 'rr7-main',
@@ -132,16 +134,16 @@ describe('Gateway RR-7 concurrency and lifecycle', () => {
         await releaseIndex.promise;
       }
     });
-    (gateway as unknown as { handleOnboarding: jest.Mock }).handleOnboarding = jest.fn().mockResolvedValue(undefined);
+    (gateway.runtimeInstance!.turnCoordinator as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
     const agentRun = jest.fn().mockResolvedValue({
         text: 'turn complete',
         trace: [{ role: 'assistant', content: 'turn complete' }],
         usedTools: [],
         healthResponse: false,
       });
-    (gateway as unknown as { agentLoop: unknown }).agentLoop = {
+    gateway.runtimeInstance!.agentLoop = {
       run: agentRun,
-    };
+    } as any;
 
     let turn: Promise<string> | undefined;
     try {
@@ -159,7 +161,7 @@ describe('Gateway RR-7 concurrency and lifecycle', () => {
       ]);
       expect(completion).toBe('completed');
       expect(agentRun).toHaveBeenCalledTimes(1);
-      const store = (gateway as unknown as { store: { getFileHash(filePath: string): string | undefined } }).store;
+      const store = gateway.runtimeInstance!.store!;
       expect(store.getFileHash(`memory/${day}.md`)).toMatch(/^embedding-partial:/);
     } finally {
       releaseIndex.resolve();
@@ -198,16 +200,18 @@ describe('Gateway RR-7 concurrency and lifecycle', () => {
     const captureStarted = deferred();
     const releaseCapture = deferred();
     const order: string[] = [];
-    (gateway as unknown as { capturePipeline: unknown }).capturePipeline = {
-      ingest: jest.fn(async () => {
-        order.push('capture');
-        captureStarted.resolve();
-        await releaseCapture.promise;
-      }),
-    };
-    (gateway as unknown as { sessions: unknown }).sessions = {
-      recordTurn: jest.fn(async () => { order.push('persist'); }),
-    };
+    attachGatewayTestRuntime(gateway, makeConfig(tmpDir), {
+      capturePipeline: {
+        ingest: jest.fn(async () => {
+          order.push('capture');
+          captureStarted.resolve();
+          await releaseCapture.promise;
+        }),
+      },
+      sessions: {
+        recordTurn: jest.fn(async () => { order.push('persist'); }),
+      },
+    });
     (gateway as unknown as { channel: unknown }).channel = {
       send: jest.fn(async () => { order.push('send'); }),
     };
@@ -236,22 +240,24 @@ describe('Gateway RR-7 concurrency and lifecycle', () => {
     const send = jest.fn().mockResolvedValue(undefined);
     const recordOutcome = jest.fn().mockResolvedValue(undefined);
     const reconcile = jest.fn().mockRejectedValue(new Error('private health reconciliation detail'));
+    attachGatewayTestRuntime(gateway, makeConfig(tmpDir), {
+      sessions: {
+        getLastActiveAt: jest.fn().mockReturnValue(undefined),
+        prepareHistory: jest.fn().mockResolvedValue([]),
+        recordTurn: jest.fn().mockResolvedValue(undefined),
+        recordPromptUsage: jest.fn().mockResolvedValue(undefined),
+      },
+      agentLoop: {
+        run: jest.fn().mockResolvedValue({
+          text: 'Heartbeat sent',
+          trace: [{ role: 'assistant', content: 'Heartbeat sent' }],
+          usedTools: [],
+          healthResponse: false,
+        }),
+      },
+      scheduler: { recordOutcome },
+    });
     (gateway as unknown as { channel: unknown }).channel = { send };
-    (gateway as unknown as { sessions: unknown }).sessions = {
-      getLastActiveAt: jest.fn().mockReturnValue(undefined),
-      prepareHistory: jest.fn().mockResolvedValue([]),
-      recordTurn: jest.fn().mockResolvedValue(undefined),
-      recordPromptUsage: jest.fn().mockResolvedValue(undefined),
-    };
-    (gateway as unknown as { agentLoop: unknown }).agentLoop = {
-      run: jest.fn().mockResolvedValue({
-        text: 'Heartbeat sent',
-        trace: [{ role: 'assistant', content: 'Heartbeat sent' }],
-        usedTools: [],
-        healthResponse: false,
-      }),
-    };
-    (gateway as unknown as { scheduler: unknown }).scheduler = { recordOutcome };
     (gateway as unknown as { reconcileHeartbeatPolicies: jest.Mock }).reconcileHeartbeatPolicies = reconcile;
 
     await expect(
@@ -290,28 +296,30 @@ describe('Gateway RR-7 concurrency and lifecycle', () => {
     const schedulerStopStarted = deferred();
     const releaseSchedulerStop = deferred();
     const prepareHistory = jest.fn().mockResolvedValue([]);
-    (gateway as unknown as { sessions: unknown }).sessions = {
-      drainCompactions: async () => {
-        compactionStarted.resolve();
-        await releaseCompaction.promise;
+    attachGatewayTestRuntime(gateway, makeConfig(tmpDir), {
+      sessions: {
+        drainCompactions: async () => {
+          compactionStarted.resolve();
+          await releaseCompaction.promise;
+        },
+        getLastActiveAt: jest.fn().mockReturnValue(undefined),
+        prepareHistory,
+        recordTurn: jest.fn().mockResolvedValue(undefined),
+        recordPromptUsage: jest.fn().mockResolvedValue(undefined),
       },
-      getLastActiveAt: jest.fn().mockReturnValue(undefined),
-      prepareHistory,
-      recordTurn: jest.fn().mockResolvedValue(undefined),
-      recordPromptUsage: jest.fn().mockResolvedValue(undefined),
-    };
-    (gateway as unknown as { scheduler: unknown }).scheduler = {
-      stop: async () => {
-        schedulerStopStarted.resolve();
-        await releaseSchedulerStop.promise;
+      scheduler: {
+        stop: async () => {
+          schedulerStopStarted.resolve();
+          await releaseSchedulerStop.promise;
+        },
+        recordOutcome: jest.fn().mockResolvedValue(undefined),
       },
-      recordOutcome: jest.fn().mockResolvedValue(undefined),
-    };
+    });
     (gateway as unknown as { channel: unknown }).channel = {
       disconnect: jest.fn().mockResolvedValue(undefined),
       send: jest.fn().mockResolvedValue(undefined),
     };
-    (gateway as unknown as { agentLoop: unknown }).agentLoop = {
+    (gateway.runtimeInstance as any).agentLoop = {
       run: jest.fn().mockResolvedValue({
         text: 'late heartbeat',
         trace: [{ role: 'assistant', content: 'late heartbeat' }],

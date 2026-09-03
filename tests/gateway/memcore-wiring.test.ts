@@ -105,7 +105,7 @@ describe('Gateway memory-core wiring (Task 13)', () => {
 
     // Skip onboarding + stub the agent so turns reach the capture + agent path deterministically.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).handleOnboarding = async (): Promise<null> => null;
+    (gateway.runtimeInstance!.turnCoordinator as any).handleOnboarding = async (): Promise<null> => null;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).agentLoop = { run: async (): Promise<unknown> => ({ text: 'ok', trace: [{ role: 'assistant', content: 'ok' }] }) };
 

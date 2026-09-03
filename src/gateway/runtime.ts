@@ -57,6 +57,7 @@ import { createProvider } from '../providers/factory';
 import type { LLMProvider } from '../providers/types';
 import type { LLMSemaphore } from '../tools/semaphore';
 import { SessionManager } from './session';
+import { TurnCoordinator } from './turn-coordinator';
 import { HeartbeatStore } from '../scheduler/store';
 import { HeartbeatScheduler } from '../scheduler/runtime';
 import { runNightlySweep } from '../scheduler/transcript-sweep-job';
@@ -142,6 +143,7 @@ export interface ProfileRuntimeDeps {
   canSchedule?: boolean;
   runScheduledJob?: (job: HeartbeatJob) => Promise<void>;
   sideEffectLookup?: (entity: string) => Promise<string[]>;
+  reconcile?: (chatId: string) => Promise<void>;
 }
 
 export class ProfileRuntime {
@@ -164,6 +166,7 @@ export class ProfileRuntime {
   indexer?: MemoryIndexerType;
   registry?: ToolRegistry;
   agentLoop?: AgentLoop;
+  turnCoordinator?: TurnCoordinator;
   sessions?: SessionManager;
   scheduler?: HeartbeatScheduler;
   vectorIndex?: SqliteVecIndex;
@@ -188,7 +191,7 @@ export class ProfileRuntime {
   readonly dirtyIndexPaths: Set<string> = new Set();
   dirtyIndexMarkerPath?: string;
 
-  constructor(profileId: ProfileId = 'default' as ProfileId, workspace = '', config?: AppConfig) {
+  private constructor(profileId: ProfileId = 'default' as ProfileId, workspace = '', config?: AppConfig) {
     this.profileId = profileId;
     this.workspace = workspace;
     this.config = config ?? ({} as AppConfig);
@@ -213,6 +216,7 @@ export class ProfileRuntime {
       mainProvider,
       semaphore,
       sideEffectLookup,
+      reconcile,
     } = deps;
 
     const runtime = new ProfileRuntime(profileId, memoryWorkspace, config);
@@ -599,6 +603,7 @@ export class ProfileRuntime {
       perChatArchive: true,
     });
     runtime.sessions = sessions;
+    runtime.turnCoordinator = new TurnCoordinator(runtime, semaphore, reconcile);
 
     sessions.setBackgroundRunner((fn) => semaphore.run('background', fn));
     if (runtime.sessionSummarySink) {

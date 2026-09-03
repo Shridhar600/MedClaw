@@ -6,6 +6,7 @@ import { ProfileRegistry } from '../../src/profiles/registry';
 import { SessionManager } from '../../src/gateway/session';
 import type { AppConfig } from '../../src/config/types';
 import type { ProfileId } from '../../src/profiles/types';
+import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 
 jest.mock('../../src/memory/indexer', () => ({
   MemoryIndexer: jest.fn().mockImplementation(() => ({
@@ -125,10 +126,10 @@ describe('Gateway chat→profile pairing', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).profileRegistry = registry;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = sessions;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = makeMockAgentLoop();
+    attachGatewayTestRuntime(gateway, config, {
+      sessions,
+      agentLoop: makeMockAgentLoop(),
+    });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
 
@@ -222,7 +223,7 @@ describe('Gateway chat→profile pairing', () => {
     registry.pairChatToProfile('work-chat-42', workProfile.profileId);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const agent = (gateway as any).agentLoop;
+    const agent = gateway.runtimeInstance!.agentLoop!;
     const reply = await gateway.handleTestMessage('work-chat-42', 'show my private health history');
 
     expect(reply).toContain("can't serve");
@@ -264,10 +265,10 @@ describe('Gateway chat→profile pairing', () => {
       'default',
     );
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = sessions;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = makeMockAgentLoop();
+    attachGatewayTestRuntime(gateway, config, {
+      sessions,
+      agentLoop: makeMockAgentLoop(),
+    });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -295,10 +296,10 @@ describe('Gateway chat→profile pairing', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).profileRegistry = registry;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = sessions;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = makeMockAgentLoop();
+    attachGatewayTestRuntime(gateway, config, {
+      sessions,
+      agentLoop: makeMockAgentLoop(),
+    });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
 
@@ -321,8 +322,7 @@ describe('Gateway chat→profile pairing', () => {
 
     expect(reply).toBe('Starting fresh session. Your health memory is preserved.');
     expect(resetSpy).toHaveBeenCalledWith('owner-chat');
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((gateway as any).agentLoop.run).not.toHaveBeenCalled();
+    expect(gateway.runtimeInstance?.agentLoop?.run).not.toHaveBeenCalled();
   });
 
   it('refuses an unknown chat once another chat is already paired (auto-pair closes)', async () => {
@@ -342,8 +342,7 @@ describe('Gateway chat→profile pairing', () => {
     }
 
     // And the agent never ran for the stranger — only the owner's turn.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const agentLoop = (gateway as any).agentLoop;
+    const agentLoop = gateway.runtimeInstance!.agentLoop!;
     expect(agentLoop.run).toHaveBeenCalledTimes(1);
   });
 
@@ -361,8 +360,7 @@ describe('Gateway chat→profile pairing', () => {
     for (const p of onDisk.profiles) {
       expect(p.chatIds).not.toContain('stranger-chat');
     }
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const agentLoop = (gateway as any).agentLoop;
+    const agentLoop = gateway.runtimeInstance!.agentLoop!;
     expect(agentLoop.run).toHaveBeenCalledTimes(1);
   });
 

@@ -74,7 +74,7 @@ async function startGateway(tmpDir: string): Promise<Gateway> {
   warn.mockRestore();
   log.mockRestore();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (gateway as any).handleOnboarding = async (): Promise<null> => null;
+  (gateway.runtimeInstance!.turnCoordinator as any).handleOnboarding = async (): Promise<null> => null;
   return gateway;
 }
 

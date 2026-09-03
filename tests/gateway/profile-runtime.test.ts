@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -278,7 +279,7 @@ describe('ProfileRuntime Seam Tests (R-S1)', () => {
       expect(onboardingReply).toContain('personal health companion');
 
       // Subsequent agent message after onboarding bypassed
-      (gateway as unknown as { handleOnboarding: unknown }).handleOnboarding = jest.fn().mockResolvedValue(undefined);
+      (gateway.runtimeInstance!.turnCoordinator as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
       const agentReply = await gateway.handleTestMessage('test-chat', 'hello agent');
       expect(agentReply).toContain('ok');
       expect(agentReply).toContain('I am an AI health companion');

@@ -1,4 +1,4 @@
-import { LLMSemaphore, HeartbeatQueueFullError } from '../../src/tools/semaphore';
+import { HeartbeatPreemptedError, LLMSemaphore, HeartbeatQueueFullError } from '../../src/tools/semaphore';
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -453,5 +453,81 @@ describe('LLMSemaphore', () => {
     await Promise.all(heartbeats);
 
     expect(order.indexOf('background')).toBeLessThan(order.indexOf('heartbeat-2'));
+  });
+
+  it('evicts matching queued entries with HeartbeatPreemptedError and leaves the running job untouched', async () => {
+    const running = deferred();
+    const release = deferred();
+    const order: string[] = [];
+    const active = sem.run('user', async () => {
+      order.push('active-start');
+      running.resolve();
+      await release.promise;
+      order.push('active-end');
+    });
+    await running.promise;
+
+    const matching = sem.run('heartbeat', async () => { order.push('matching'); }, {
+      chatId: 'chat-a',
+      origin: 'heartbeat',
+    });
+    const nonMatching = sem.run('heartbeat', async () => { order.push('non-matching'); }, {
+      chatId: 'chat-b',
+      origin: 'heartbeat',
+    });
+
+    expect(sem.abortQueueEntry((meta) => meta?.chatId === 'chat-a' && meta.origin === 'heartbeat')).toBe(1);
+    await expect(matching).rejects.toBeInstanceOf(HeartbeatPreemptedError);
+    release.resolve();
+    await active;
+    await nonMatching;
+
+    expect(order).toEqual(['active-start', 'active-end', 'non-matching']);
+  });
+
+  it('is race-safe when aborting during an active drain and preserves later queue progress', async () => {
+    const running = deferred();
+    const release = deferred();
+    const active = sem.run('heartbeat', async () => {
+      running.resolve();
+      await release.promise;
+    }, { chatId: 'chat-a', origin: 'heartbeat' });
+    await running.promise;
+    const queued = sem.run('heartbeat', async () => 'kept', { chatId: 'chat-b', origin: 'heartbeat' });
+
+    expect(sem.abortQueueEntry((meta) => meta?.chatId === 'chat-a')).toBe(0);
+    expect(sem.abortQueueEntry((meta) => meta?.chatId === 'chat-b')).toBe(1);
+    await expect(queued).rejects.toBeInstanceOf(HeartbeatPreemptedError);
+    release.resolve();
+    await active;
+
+    await expect(sem.run('user', async () => 'after-abort')).resolves.toBe('after-abort');
+  });
+
+  it('preserves the background reservation counter when queued heartbeats are aborted', async () => {
+    const bounded = new LLMSemaphore({ maxConsecutiveUserJobsWithBackground: 1 });
+    const running = deferred();
+    const release = deferred();
+    const order: string[] = [];
+    const active = bounded.run('user', async () => {
+      order.push('active');
+      running.resolve();
+      await release.promise;
+    });
+    await running.promise;
+
+    const heartbeat = bounded.run('heartbeat', async () => { order.push('heartbeat'); }, {
+      chatId: 'chat-a',
+      origin: 'heartbeat',
+    });
+    const background = bounded.run('background', async () => { order.push('background'); });
+    const user = bounded.run('user', async () => { order.push('user'); });
+
+    expect(bounded.abortQueueEntry((meta) => meta.chatId === 'chat-a')).toBe(1);
+    await expect(heartbeat).rejects.toBeInstanceOf(HeartbeatPreemptedError);
+    release.resolve();
+    await Promise.all([active, background, user]);
+
+    expect(order).toEqual(['active', 'background', 'user']);
   });
 });

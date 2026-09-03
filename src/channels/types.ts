@@ -4,7 +4,8 @@ export interface IncomingMessage {
   text: string;
   /** Source message identity, when the channel provides one, for capture deduplication. */
   messageId?: string;
-  mediaPath?: string;  // Local path if user sent a file/image
+  /** Absolute profile-agnostic staging path until the gateway Router adopts it into a profile workspace. */
+  mediaPath?: string;
   mediaError?: string;
   replyToMessageId?: string;
 }

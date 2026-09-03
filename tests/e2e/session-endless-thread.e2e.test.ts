@@ -86,7 +86,7 @@ async function startGateway(tmpDir: string): Promise<Gateway> {
   await gw.start();
   warn.mockRestore(); log.mockRestore(); err.mockRestore();
   const provider = journeyProvider();
-  (gw as any).handleOnboarding = async (): Promise<null> => null; // skip the deterministic onboarding machine
+  (gw.runtimeInstance!.turnCoordinator as any).handleOnboarding = async (): Promise<null> => null; // skip the deterministic onboarding machine
   (gw as any).agentLoop.provider = provider;   // agent turns
   (gw as any).sessions.llmProvider = provider;  // compaction summary
   return gw;

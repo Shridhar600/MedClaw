@@ -1,3 +1,6 @@
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { TelegramChannel } from '../../src/channels/telegram';
 
 const mockGetFile = jest.fn();
@@ -36,8 +39,8 @@ describe('TelegramChannel', () => {
   });
 
   describe('constructor', () => {
-    it('accepts workspacePath as second parameter', () => {
-      const channel = new TelegramChannel('test-token', '/workspace/path');
+    it('accepts stagingPath as second parameter', () => {
+      const channel = new TelegramChannel('test-token', '/workspace/path/.staging/media');
       expect(channel).toBeInstanceOf(TelegramChannel);
     });
   });
@@ -102,10 +105,10 @@ describe('TelegramChannel', () => {
 
       expect(receivedMessages).toHaveLength(1);
       expect(receivedMessages[0].mediaPath).toBeDefined();
-      expect(receivedMessages[0].mediaPath).toMatch(/^reports\//);
-      expect(receivedMessages[0].mediaPath).not.toMatch(/^\//);
+      expect(receivedMessages[0].mediaPath).toMatch(/^\/tmp\/test-workspace\/\d+-[0-9a-f-]+-report\.pdf$/);
       expect(receivedMessages[0].text).toBe('My report');
     });
+
 
     it('document handler surfaces explicit mediaError on download failure', async () => {
       let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
@@ -140,6 +143,75 @@ describe('TelegramChannel', () => {
       expect(receivedMessages).toHaveLength(1);
       expect(receivedMessages[0].mediaPath).toBeUndefined();
       expect(receivedMessages[0].mediaError).toContain('Failed to download');
+    });
+
+    it('rejects a symlinked staging root without writing through it', async () => {
+      let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-telegram-staging-link-'));
+      const realStaging = path.join(root, 'real-media');
+      const stagingPath = path.join(root, 'media');
+      fs.mkdirSync(realStaging, { recursive: true, mode: 0o700 });
+      fs.symlinkSync(realStaging, stagingPath, 'dir');
+      mockBotOn.mockImplementation((event: string, cb: (ctx: MockCtx) => Promise<void>) => {
+        if (event === 'message:document') handler = cb;
+      });
+      mockGetFile.mockResolvedValue({ file_path: 'documents/test.pdf' });
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        arrayBuffer: () => Promise.resolve(new ArrayBuffer(2)),
+      });
+      const channel = new TelegramChannel('test-token', stagingPath);
+      const receivedMessages: { mediaPath?: string; mediaError?: string }[] = [];
+      channel.onMessage(async (msg) => { receivedMessages.push(msg); });
+
+      try {
+        await handler?.({
+          message: { document: { file_id: 'doc123', file_name: 'report.pdf' } },
+          chat: { id: 123 },
+          from: { id: 456 },
+        });
+        expect(receivedMessages[0].mediaPath).toBeUndefined();
+        expect(receivedMessages[0].mediaError).toContain('Failed to download');
+        expect(fs.readdirSync(realStaging)).toEqual([]);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects a symlinked staging ancestor when a trusted base is provided', async () => {
+      let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-telegram-staging-ancestor-'));
+      const realParent = path.join(root, 'real-staging');
+      const stagingParent = path.join(root, 'staging');
+      const stagingPath = path.join(stagingParent, 'media');
+      fs.mkdirSync(path.join(realParent, 'media'), { recursive: true, mode: 0o700 });
+      fs.symlinkSync(realParent, stagingParent, 'dir');
+      mockBotOn.mockImplementation((event: string, cb: (ctx: MockCtx) => Promise<void>) => {
+        if (event === 'message:document') handler = cb;
+      });
+      mockGetFile.mockResolvedValue({ file_path: 'documents/test.pdf' });
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        arrayBuffer: () => Promise.resolve(new ArrayBuffer(2)),
+      });
+      const channel = new TelegramChannel('test-token', stagingPath, root);
+      const receivedMessages: { mediaPath?: string; mediaError?: string }[] = [];
+      channel.onMessage(async (msg) => { receivedMessages.push(msg); });
+
+      try {
+        await handler?.({
+          message: { document: { file_id: 'doc123', file_name: 'report.pdf' } },
+          chat: { id: 123 },
+          from: { id: 456 },
+        });
+        expect(receivedMessages[0].mediaPath).toBeUndefined();
+        expect(receivedMessages[0].mediaError).toContain('Failed to download');
+        expect(fs.readdirSync(path.join(realParent, 'media'))).toEqual([]);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
     });
 
     it('document download failure logs only the sanitized error identity', async () => {
@@ -295,8 +367,7 @@ describe('TelegramChannel', () => {
 
       expect(receivedMessages).toHaveLength(1);
       expect(receivedMessages[0].mediaPath).toBeDefined();
-      expect(receivedMessages[0].mediaPath).toMatch(/^reports\//);
-      expect(receivedMessages[0].mediaPath).not.toMatch(/^\//);
+      expect(receivedMessages[0].mediaPath).toMatch(/^\/tmp\/test-workspace\/\d+-[0-9a-f-]+-photo-large\.jpg$/);
       expect(mockGetFile).toHaveBeenCalledWith('large');
     });
 

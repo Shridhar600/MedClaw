@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -6,6 +7,7 @@ import { SessionManager } from '../../src/gateway/session';
 import { SqliteSessionIndex } from '../../src/indexstore/session-index';
 import type { AppConfig } from '../../src/config/types';
 import type { HeartbeatJob } from '../../src/scheduler/types';
+import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 
 const FALLBACK = "I'm having trouble right now. Please try again in a moment.";
 
@@ -26,11 +28,13 @@ describe('RR-6b gateway delivery durability', () => {
 
   function prepareFailureGateway(sessions: SessionManager): Gateway {
     const gateway = makeGateway();
+    attachGatewayTestRuntime(gateway, {} as AppConfig, {
+      capturePipeline: { ingest: jest.fn().mockResolvedValue(undefined) },
+      agentLoop: { run: jest.fn().mockRejectedValue(new Error('provider failed')) },
+      sessions,
+    });
     const state = gateway as unknown as Record<string, unknown>;
-    state.handleOnboarding = jest.fn().mockResolvedValue(undefined);
-    state.capturePipeline = { ingest: jest.fn().mockResolvedValue(undefined) };
-    state.agentLoop = { run: jest.fn().mockRejectedValue(new Error('provider failed')) };
-    state.sessions = sessions;
+    (state.runtime as any).turnCoordinator.handleOnboarding = jest.fn().mockResolvedValue(undefined);
     return gateway;
   }
 
@@ -76,6 +80,7 @@ describe('RR-6b gateway delivery durability', () => {
 
   it('does not deliver a heartbeat before a failed persistence attempt, so retry sends once', async () => {
     const gateway = makeGateway();
+    attachGatewayTestRuntime(gateway, {} as AppConfig);
     const state = gateway as unknown as Record<string, unknown>;
     const send = jest.fn().mockResolvedValue(undefined);
     let recordCalls = 0;
@@ -105,7 +110,6 @@ describe('RR-6b gateway delivery durability', () => {
         },
       },
     };
-    state.getProfileForChat = jest.fn().mockReturnValue('default');
 
     const job: HeartbeatJob = {
       id: 'job-1',
@@ -136,6 +140,7 @@ describe('RR-6b gateway delivery durability', () => {
 
   it('does not report /new success or reject the test handler when the replacement window write fails', async () => {
     const gateway = makeGateway();
+    attachGatewayTestRuntime(gateway, {} as AppConfig);
     const state = gateway as unknown as Record<string, unknown>;
     state.sessions = {
       resetSession: jest.fn().mockRejectedValue(new Error('window write failed')),
@@ -146,6 +151,7 @@ describe('RR-6b gateway delivery durability', () => {
 
   it('does not reject the channel handler when the replacement window write fails', async () => {
     const gateway = makeGateway();
+    attachGatewayTestRuntime(gateway, {} as AppConfig);
     const state = gateway as unknown as Record<string, unknown>;
     const send = jest.fn().mockResolvedValue(undefined);
     state.channel = { send };
