@@ -1,48 +1,33 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { createHash } from 'crypto';
 import type { AppConfig } from '../config/types';
 import { ProfileRegistry } from '../profiles';
 import type { ProfileId } from '../profiles';
 import type { Channel, IncomingMessage } from '../channels/types';
 import { TelegramChannel } from '../channels/telegram';
 import { AgentLoop } from '../agent/agent-loop';
-import type { PrepareSystem } from '../agent/agent-loop';
-import { ContextAssembler } from '../agent/context';
-import { ContextAssembler as ContextAssemblerV2 } from '../context2';
-import { RecallEngine, DEFAULT_RECALL_CONFIG } from '../recall';
-import { MemoryEngine } from '../memory/memory-engine';
-import { ToolRegistry } from '../tools/registry';
 import { LLMSemaphore, HeartbeatQueueFullError } from '../tools/semaphore';
-import { createMemoryTools } from '../tools/memory-tools';
-import { createMedicalTools } from '../tools/medical-tools';
-import type { MedicalContextProvider } from '../tools/medical-tools';
-import { createCronManageTool } from '../tools/cron-manage';
-import { createHeartbeatManageTool } from '../tools/heartbeat-manage';
-import { createLedgerTools } from '../tools/ledger-tools';
-import { createEpisodeTools } from '../tools/episode-tools';
-import { createSafetyTools } from '../tools/safety-tools';
-import { WriteQueue, replayJournal } from '../profiles';
-import { LedgerStore, NarrativeStore, SafetyView, EpisodeStore, CuriosityQueue, CuratedMemory, TYPE_TO_FILE, normalizeEntity } from '../memcore';
-import type { CuriosityItem, FactType, LedgerIndexDelta, NarrativeIndexDelta } from '../memcore';
-import { SqliteFactMirror, SqliteEventSink, SqliteVecIndex, SqliteKeywordIndex, SqliteChunkStats, SqliteSessionIndex, ledgerFactToRecord, isRemoteEmbeddingBaseUrl } from '../indexstore';
-import { createSessionTools } from '../tools/session-tools';
+import { WriteQueue } from '../profiles';
+import { LedgerStore, NarrativeStore, CuriosityQueue } from '../memcore';
+import type { LedgerIndexDelta, NarrativeIndexDelta } from '../memcore';
+import {
+  SqliteFactMirror,
+  SqliteEventSink,
+  SqliteVecIndex,
+  SqliteKeywordIndex,
+  SqliteChunkStats,
+  SqliteSessionIndex,
+} from '../indexstore';
 import { deprecatedSessionWarnings } from '../config/deprecations';
-import type { EmbeddingPort } from '../ports';
-import { systemClock } from '../ports';
-import { CapturePipeline, FileCaptureIdempotency } from '../capture';
-import { makeSafetyRenderer } from '../capture';
+import type { CapturePipeline } from '../capture';
 import { SqliteStore } from '../memory/sqlite-store';
-import { MemorySearch } from '../memory/search';
 import type { MemoryIndexer as MemoryIndexerType, MemoryIndexDelta } from '../memory/indexer';
 import { createProvider } from '../providers/factory';
 import { SessionManager } from './session';
-import * as cron from 'node-cron';
-import { HeartbeatStore } from '../scheduler/store';
+import type * as cron from 'node-cron';
 import { HeartbeatScheduler } from '../scheduler/runtime';
 import { syncHeartbeatMarkdown } from '../scheduler/heartbeat-markdown';
-import { runNightlySweep } from '../scheduler/transcript-sweep-job';
-import type { LedgerDayRead, NightlySweepDeps, NightlySweepResult } from '../scheduler/transcript-sweep-job';
+import type { NightlySweepDeps, NightlySweepResult } from '../scheduler/transcript-sweep-job';
 import type { HeartbeatJob } from '../scheduler/types';
 import { decideHeartbeatDelivery, HEARTBEAT_NOOP } from '../scheduler/delivery-policy';
 import { buildDesiredHeartbeatJobs } from '../scheduler/policy-engine';
@@ -57,10 +42,9 @@ import {
   checkProviderBindAddresses,
   verifyWorkspacePermissions,
   summarizeErrorForLog,
-  secureMkdir,
-  secureWriteViaTmp,
 } from '../security';
 import { EMERGENCY_RESPONSE, isEmergencyInput } from '../safety/emergency-detector';
+import { ProfileRuntime } from './runtime';
 
 const UNRECOGNIZED_CHAT_RESPONSE =
   'This chat is not recognized. This is a private health assistant; new chats cannot be added over this channel.';
@@ -72,9 +56,6 @@ const PROFILE_UNAVAILABLE_RESPONSE =
 const EMPTY_MESSAGE_RESPONSE = "I didn't catch any message. Send some text or an attachment and I'll take a look.";
 const SESSION_RESET_FAILURE_RESPONSE = "I couldn't start a fresh session right now. Please try again in a moment.";
 const SHUTDOWN_RESPONSE = 'The health assistant is shutting down. Please try again in a moment.';
-const INDEX_EMBED_TIMEOUT_MS = 500;
-const INDEX_EMBED_COOLDOWN_MS = 1_000;
-const HEARTBEAT_CURIOSITY_LIMIT = 5;
 const BOOT_HEALTHCHECK_BUDGET_MS = 3_000;
 
 function pendingReadiness(label: string): ReadinessResult {
@@ -102,113 +83,202 @@ function readinessLabel(result: ReadinessResult): 'OK' | 'FAIL' | 'PENDING' {
   return result.ready ? 'OK' : 'FAIL';
 }
 
-type SignalEmbeddingProvider = LLMProvider & {
-  embedWithSignal?: (text: string, signal: AbortSignal) => Promise<number[]>;
-};
-
-function makeBoundedEmbeddingProvider(provider: LLMProvider): LLMProvider {
-  let unavailableUntil = 0;
-  const signalProvider = provider as SignalEmbeddingProvider;
-  return {
-    modelName: provider.modelName,
-    chat: (messages, tools) => provider.chat(messages, tools),
-    embed: async (text: string): Promise<number[]> => {
-      if (Date.now() < unavailableUntil) {
-        throw new Error('embedding provider temporarily unavailable');
-      }
-      const controller = new AbortController();
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const work = typeof signalProvider.embedWithSignal === 'function'
-        ? signalProvider.embedWithSignal(text, controller.signal)
-        : provider.embed(text);
-      const timeout = new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          unavailableUntil = Date.now() + INDEX_EMBED_COOLDOWN_MS;
-          controller.abort();
-          reject(new Error('embedding timeout'));
-        }, INDEX_EMBED_TIMEOUT_MS);
-        timer.unref?.();
-      });
-      try {
-        return await Promise.race([work, timeout]);
-      } finally {
-        if (timer) clearTimeout(timer);
-      }
-    },
-  };
-}
-
-function dueCuriosityItems(items: CuriosityItem[], now: Date): CuriosityItem[] {
-  const clinicalKinds = new Set(['follow-up', 'medication-reminder', 'lab-correlation', 'missing-data']);
-  return items
-    .filter(item => {
-      if (!item.dueAt) return true;
-      const dueAt = Date.parse(item.dueAt);
-      return Number.isNaN(dueAt) || dueAt <= now.getTime();
-    })
-    .sort((a, b) => {
-      const priority = (item: CuriosityItem): number => item.critical || clinicalKinds.has(item.kind) ? 0 : 1;
-      const dueRank = (item: CuriosityItem): number => {
-        const value = item.dueAt ? Date.parse(item.dueAt) : Date.parse(item.createdAt);
-        return Number.isNaN(value) ? Number.MAX_SAFE_INTEGER : value;
-      };
-      return priority(a) - priority(b)
-        || dueRank(a) - dueRank(b)
-        || a.createdAt.localeCompare(b.createdAt)
-        || a.id.localeCompare(b.id);
-    })
-    .slice(0, HEARTBEAT_CURIOSITY_LIMIT);
-}
-
 export class Gateway {
   private config: AppConfig;
   private channel?: Channel;
-  private agentLoop?: AgentLoop;
-  private sessions?: SessionManager;
-  private scheduler?: HeartbeatScheduler;
-  private store?: SqliteStore;
-  private factMirror?: SqliteFactMirror;
-  private eventSink?: SqliteEventSink;
-  private sessionIndex?: SqliteSessionIndex;
-  // D4.4: the profile's curiosity queue (nightly transcript sweep sink) + the nightly cron task.
-  private curiosity?: CuriosityQueue;
-  private ledgerStore?: LedgerStore;
-  private sweepTask?: cron.ScheduledTask;
-  // MEDIUM-8/9: one sweep at a time; awaited on shutdown so it never writes after stop().
-  private sweepInFlight?: Promise<NightlySweepResult>;
-  private sweepStopping = false;
-  // D3.4/C-29: copies each compaction summary to a chat-scoped state lane. Built in the memcore block
-  // (needs the NarrativeStore + WriteQueue), wired into the SessionManager after construction.
-  private sessionSummarySink?: (chatId: string, anchoredSummary: string) => Promise<void>;
   private profileRegistry?: ProfileRegistry;
   private resolvedMemoryWorkspace?: string;
   private bootHealth?: { providers: ReadinessResult[]; telegram: ReadinessResult };
-  // D9 observability (L-2): 'per-turn' when the recall + v2-assembler path is live; 'boot-cached'
-  // when it failed to construct and chat fell back to the frozen boot prompt (recall effectively off).
-  private promptMode: 'per-turn' | 'boot-cached' = 'boot-cached';
   private mainProvider?: LLMProvider;
-  // v2 capture pipeline for the active profile (per-turn narrative capture hook, Task 13.3).
-  private capturePipeline?: CapturePipeline;
   private securityWarnings: string[] = [];
   private reconcileTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
-  private indexer?: MemoryIndexerType;
-  private writeQueue?: WriteQueue;
-  private vectorIndex?: SqliteVecIndex;
-  private keywordIndex?: SqliteKeywordIndex;
-  private chunkStats?: SqliteChunkStats;
   private semaphore?: LLMSemaphore;
-  private readonly reindexTails: Map<string, Promise<void>> = new Map();
-  private readonly pendingIndexDeltas: Map<string, MemoryIndexDelta[]> = new Map();
-  private readonly backgroundOperations: Set<Promise<void>> = new Set();
-  private readonly inFlightOperations: Set<Promise<unknown>> = new Set();
-  private readonly dirtyIndexPaths: Set<string> = new Set();
-  private dirtyIndexMarkerPath?: string;
   private stopping = false;
   private stopped = false;
   private stopPromise?: Promise<void>;
+  private runtime?: ProfileRuntime;
 
   constructor(config: AppConfig) {
     this.config = config;
+  }
+
+  get runtimeInstance(): ProfileRuntime | undefined {
+    return this.runtime;
+  }
+
+  get agentLoop(): AgentLoop | undefined {
+    return this.runtime?.agentLoop;
+  }
+  set agentLoop(val: AgentLoop | undefined) {
+    this.ensureRuntime().agentLoop = val;
+  }
+
+  get sessions(): SessionManager | undefined {
+    return this.runtime?.sessions;
+  }
+  set sessions(val: SessionManager | undefined) {
+    this.ensureRuntime().sessions = val;
+  }
+
+  get scheduler(): HeartbeatScheduler | undefined {
+    return this.runtime?.scheduler;
+  }
+  set scheduler(val: HeartbeatScheduler | undefined) {
+    this.ensureRuntime().scheduler = val;
+  }
+
+  get store(): SqliteStore | undefined {
+    return this.runtime?.store;
+  }
+  set store(val: SqliteStore | undefined) {
+    this.ensureRuntime().store = val;
+  }
+
+  get factMirror(): SqliteFactMirror | undefined {
+    return this.runtime?.factMirror;
+  }
+  set factMirror(val: SqliteFactMirror | undefined) {
+    this.ensureRuntime().factMirror = val;
+  }
+
+  get eventSink(): SqliteEventSink | undefined {
+    return this.runtime?.eventSink;
+  }
+  set eventSink(val: SqliteEventSink | undefined) {
+    this.ensureRuntime().eventSink = val;
+  }
+
+  get sessionIndex(): SqliteSessionIndex | undefined {
+    return this.runtime?.sessionIndex;
+  }
+  set sessionIndex(val: SqliteSessionIndex | undefined) {
+    this.ensureRuntime().sessionIndex = val;
+  }
+
+  get curiosity(): CuriosityQueue | undefined {
+    return this.runtime?.curiosity;
+  }
+  set curiosity(val: CuriosityQueue | undefined) {
+    this.ensureRuntime().curiosity = val;
+  }
+
+  get ledgerStore(): LedgerStore | undefined {
+    return this.runtime?.ledgerStore;
+  }
+  set ledgerStore(val: LedgerStore | undefined) {
+    this.ensureRuntime().ledgerStore = val;
+  }
+
+  get sweepTask(): cron.ScheduledTask | undefined {
+    return this.runtime?.sweepTask;
+  }
+  set sweepTask(val: cron.ScheduledTask | undefined) {
+    this.ensureRuntime().sweepTask = val;
+  }
+
+  get sweepInFlight(): Promise<NightlySweepResult> | undefined {
+    return this.runtime?.sweepInFlight;
+  }
+  set sweepInFlight(val: Promise<NightlySweepResult> | undefined) {
+    this.ensureRuntime().sweepInFlight = val;
+  }
+
+  get sweepStopping(): boolean {
+    return this.runtime?.sweepStopping ?? false;
+  }
+  set sweepStopping(val: boolean) {
+    this.ensureRuntime().sweepStopping = val;
+  }
+
+  get sessionSummarySink(): ((chatId: string, anchoredSummary: string) => Promise<void>) | undefined {
+    return this.runtime?.sessionSummarySink;
+  }
+  set sessionSummarySink(val: ((chatId: string, anchoredSummary: string) => Promise<void>) | undefined) {
+    this.ensureRuntime().sessionSummarySink = val;
+  }
+
+  get promptMode(): 'per-turn' | 'boot-cached' {
+    return this.runtime?.promptMode ?? 'boot-cached';
+  }
+  set promptMode(val: 'per-turn' | 'boot-cached') {
+    this.ensureRuntime().promptMode = val;
+  }
+
+  get capturePipeline(): CapturePipeline | undefined {
+    return this.runtime?.capturePipeline;
+  }
+  set capturePipeline(val: CapturePipeline | undefined) {
+    this.ensureRuntime().capturePipeline = val;
+  }
+
+  get indexer(): MemoryIndexerType | undefined {
+    return this.runtime?.indexer;
+  }
+  set indexer(val: MemoryIndexerType | undefined) {
+    this.ensureRuntime().indexer = val;
+  }
+
+  get writeQueue(): WriteQueue | undefined {
+    return this.runtime?.writeQueue;
+  }
+  set writeQueue(val: WriteQueue | undefined) {
+    this.ensureRuntime().writeQueue = val;
+  }
+
+  get vectorIndex(): SqliteVecIndex | undefined {
+    return this.runtime?.vectorIndex;
+  }
+  set vectorIndex(val: SqliteVecIndex | undefined) {
+    this.ensureRuntime().vectorIndex = val;
+  }
+
+  get keywordIndex(): SqliteKeywordIndex | undefined {
+    return this.runtime?.keywordIndex;
+  }
+  set keywordIndex(val: SqliteKeywordIndex | undefined) {
+    this.ensureRuntime().keywordIndex = val;
+  }
+
+  get chunkStats(): SqliteChunkStats | undefined {
+    return this.runtime?.chunkStats;
+  }
+  set chunkStats(val: SqliteChunkStats | undefined) {
+    this.ensureRuntime().chunkStats = val;
+  }
+
+  get inFlightOperations(): Set<Promise<unknown>> {
+    return this.ensureRuntime().inFlightOperations;
+  }
+
+  get backgroundOperations(): Set<Promise<void>> {
+    return this.ensureRuntime().backgroundOperations;
+  }
+
+  get reindexTails(): Map<string, Promise<void>> {
+    return this.ensureRuntime().reindexTails;
+  }
+
+  get pendingIndexDeltas(): Map<string, MemoryIndexDelta[]> {
+    return this.ensureRuntime().pendingIndexDeltas;
+  }
+
+  get dirtyIndexPaths(): Set<string> {
+    return this.ensureRuntime().dirtyIndexPaths;
+  }
+
+  get dirtyIndexMarkerPath(): string | undefined {
+    return this.runtime?.dirtyIndexMarkerPath;
+  }
+  set dirtyIndexMarkerPath(val: string | undefined) {
+    this.ensureRuntime().dirtyIndexMarkerPath = val;
+  }
+
+  private ensureRuntime(): ProfileRuntime {
+    if (!this.runtime) {
+      const profileId = (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
+      this.runtime = new ProfileRuntime(profileId, this.getEffectiveWorkspace(), this.config);
+    }
+    return this.runtime;
   }
 
   async start(): Promise<void> {
@@ -217,7 +287,6 @@ export class Gateway {
     const profileId = (profilesConfig?.defaultProfileId ?? 'default') as ProfileId;
     this.stopping = false;
     this.stopped = false;
-    this.pendingIndexDeltas.clear();
 
     console.log('[gateway] Starting Redacted...');
 
@@ -231,13 +300,7 @@ export class Gateway {
     this.bootstrapWorkspace(config.memory.workspace);
 
     // Profiles: construct the registry and (idempotently) migrate the legacy
-    // single-user workspace into the profile-scoped layout. Only attempted
-    // when the caller has actually configured a `profiles` section — configs
-    // that omit it (older configs, ad-hoc test configs) keep the pre-P0
-    // legacy paths untouched, which is the safest "sensible default" per the
-    // resilience rule (never assume a filesystem location the caller didn't
-    // opt into). This step must never crash boot: any failure here falls
-    // back to the legacy workspace path.
+    // single-user workspace into the profile-scoped layout.
     this.profileRegistry = profilesConfig ? this.tryCreateProfileRegistry(profilesConfig.baseDir) : undefined;
     const memoryWorkspace = this.profileRegistry
       ? this.migrateAndResolveWorkspace(this.profileRegistry, profileId, config.memory.workspace)
@@ -245,491 +308,21 @@ export class Gateway {
     this.resolvedMemoryWorkspace = memoryWorkspace;
     const usingProfileWorkspace = memoryWorkspace !== config.memory.workspace;
 
-    // Memory
-    const memory = new MemoryEngine(memoryWorkspace, profileId);
     const dbPath = usingProfileWorkspace && this.profileRegistry
       ? this.profileRegistry.profileSearchDb(profileId)
       : path.join(config.memory.workspace, '..', 'search.db');
-    // SqliteStore (better-sqlite3) does not create its parent directory;
-    // the legacy path relied on config.memory.workspace's parent already
-    // existing via bootstrapWorkspace. The profile-scoped `.state/` dir has
-    // no other creator this early in startup, so ensure it here.
-    secureMkdir(path.dirname(dbPath));
-    const store = new SqliteStore(dbPath, profileId);
-    this.store = store;
-    const embeddingProvider = createProvider(config.providers.embeddings);
-    const boundedEmbeddingProvider = makeBoundedEmbeddingProvider(embeddingProvider);
-    const { MemoryIndexer } = await import('../memory/indexer');
-    const indexer = new MemoryIndexer(
-      store,
-      boundedEmbeddingProvider,
-      memoryWorkspace,
-      profileId,
-      (relativePath) => this.takePendingIndexDelta(relativePath),
-    );
-    this.indexer = indexer;
-    this.dirtyIndexMarkerPath = path.join(memoryWorkspace, '.state', 'index-dirty.json');
-    try {
-      await indexer.indexAll();
-      this.clearAllDirtyIndexMarkers();
-      console.log('[gateway] Memory index ready');
-    } catch (error) {
-      console.warn('[gateway] Memory index unavailable; continuing with degraded search:', summarizeErrorForLog(error));
-    }
-    // A3.1b (v2-BL-2 = B1): the recall latency budget assumes LOCAL embeddings.
-    if (isRemoteEmbeddingBaseUrl(config.providers.embeddings.baseUrl)) {
-      console.warn('[gateway] Embeddings provider is remote — the recall latency budget (p50<=300ms / p95<=800ms) assumes local embeddings; expect higher per-turn recall latency.');
-    }
 
-    const search = new MemorySearch(store, boundedEmbeddingProvider, config.memory.search.hybridWeights, profileId);
-
-    // Providers
-    const mainProvider = createProvider(config.providers.main);
-    this.mainProvider = mainProvider; // #3: kept for the boot completion probe.
-    let medicalContextProvider: MedicalContextProvider | undefined;
-
-    // Tools
-    const registry = new ToolRegistry(config.tools);
-    // RES-P2-1: each tool group is registered independently so a failure in
-    // one factory/dependency disables only that group and boot continues with
-    // the remaining tools (resilience law: disable tool, log, continue).
-    try {
-      // E1.1: pass a lazy accessor for the fact mirror (built later in the memcore block). memory_search's
-      // status:active filter reads it at execute time; if the memcore block never ran, it stays undefined
-      // and the search degrades to no status filtering (backward-compat).
-      for (const tool of createMemoryTools(memory, search, indexer, profileId, () => this.factMirror)) {
-        registry.register(tool);
-      }
-    } catch (e) {
-      console.warn('[gateway] Memory tools unavailable; continuing without them:', summarizeErrorForLog(e));
-    }
-
-    // Medical tools with medical provider
-    try {
-      const medicalProvider = createProvider(config.providers.medical);
-      for (const tool of createMedicalTools(
-        memory,
-        (query) => medicalContextProvider ? medicalContextProvider(query) : Promise.resolve(''),
-        medicalProvider,
-        mainProvider,
-        memoryWorkspace,
-        {
-          medicalProviderType: config.providers.medical.type,
-          medicalProviderBaseUrl: config.providers.medical.baseUrl,
-          allowRawMedicalMedia: config.providers.medical.allowRawMedicalMedia,
-          mainProviderType: config.providers.main.type,
-          mainProviderBaseUrl: config.providers.main.baseUrl,
-        },
-      )) {
-        registry.register(tool);
-      }
-    } catch (e) {
-      console.warn('[gateway] Medical tools unavailable; continuing without them:', summarizeErrorForLog(e));
-    }
-
-    // P2 C3 — the per-turn system-prompt supplier (recall + v2 assembly, D9). Assigned inside the
-    // memcore block once the recall substrate is up; stays undefined (⇒ legacy boot-cached prompt)
-    // if any of it fails to construct (resilience — a degraded recall path must not break the chat).
-    let prepareSystem: PrepareSystem | undefined;
-
-    // v2 memory core (P1): per-profile stores + capture pipeline + the ledger/episode/safety
-    // tool groups + the per-turn narrative capture hook (Task 13). The stores share the
-    // resolved profile workspace as their root (ledger/ , memory/ , SAFETY.md), so the legacy
-    // assembler reads back what capture writes. Each block is individually try/caught (the P0
-    // pattern): a broken store disables its group and boot continues. CuratedMemory/ScratchStore
-    // land with their tools in a later phase — no P1 tool consumes them yet.
-    try {
-      const stateDir = path.join(memoryWorkspace, '.state');
-      secureMkdir(stateDir);
-      const journalPath = path.join(stateDir, 'write-queue.journal');
-      const writeQueue = new WriteQueue({
-        journalPath,
-        onReconcile: (record) => {
-          console.warn('[gateway] unresolved write-queue intent detected:', record.label);
-        },
-      });
-      this.writeQueue = writeQueue;
-      // A4 / 13.4: reconcile any begin-without-commit intent before serving. The later boot rebuilds
-      // repair derived state; the append-only source journal remains available for another reconcile.
-      try {
-        await replayJournal(journalPath, (label) => {
-          // A4: the SQLite mirror + search index are rebuilt from Markdown below (boot rebuild +
-          // indexAll), so a stuck op's derived state self-heals — Markdown is the source of truth.
-          console.warn('[gateway] unresolved write-queue intent at boot:', label);
-        });
-      } catch (e) {
-        console.warn('[gateway] write-queue journal reconciliation failed:', summarizeErrorForLog(e));
-      }
-
-      const ledgerStore = new LedgerStore(memoryWorkspace);
-      this.ledgerStore = ledgerStore;
-      const narrativeStore = new NarrativeStore(memoryWorkspace);
-      const safetyView = new SafetyView(
-        memoryWorkspace,
-        systemClock,
-        () => ledgerStore.listSafetyRelevant(),
-      );
-      const episodeStore = new EpisodeStore(memoryWorkspace);
-      const curiosityQueue = new CuriosityQueue(memoryWorkspace, undefined, undefined, profileId);
-      this.curiosity = curiosityQueue;
-      const curatedMemory = new CuratedMemory(memoryWorkspace, {
-        budgetChars: config.memory.bootstrapMaxChars,
-        budgetRatios: config.memory.budgetRatios,
-      });
-      const safetyRenderer = makeSafetyRenderer({
-        render: (facts) => safetyView.render(facts),
-        listSafetyRelevant: () => ledgerStore.listSafetyRelevant(),
-        markDirty: () => safetyView.markDirty(),
-      });
-
-      // D3.4/C-29: the compaction-summary → chat-scoped sink. The write goes through
-      // the single-writer WriteQueue (background priority); the LLM that produced the summary already ran
-      // outside the queue (B2). Best-effort — the SessionManager wraps the call so a failure never fails
-      // compaction. Searchable/dreamable: the bullets (with their sessions/<file>#L<n> anchors) land in the
-      // per-chat state lane, which is not part of profile-wide memory recall.
-      this.sessionSummarySink = async (chatId: string, anchoredSummary: string): Promise<void> => {
-        const day = new Date().toISOString().slice(0, 10);
-        await writeQueue.enqueue('background', {
-          label: 'session-summary',
-          run: () => narrativeStore.appendSessionSummary(chatId, day, anchoredSummary),
-        });
-      };
-
-      // P2 A1/A2: the FactMirror (recall Stage 1 source) + the per-file re-derivation seam.
-      // The mirror opens its OWN connection to the SAME search.db (M-3). It is fully rebuildable
-      // from the ledger Markdown, so we rebuild it at boot (A4 self-heal — closes any crash window)
-      // and re-derive per changed file after each capture write (M-2). Re-derivation runs OUTSIDE
-      // the write-queue op (embeds off the single-writer lock — B2).
-      const factMirror = new SqliteFactMirror({ dbPath });
-      this.factMirror = factMirror;
-      // A3: the event store, populated on metric/fact writes (Stage-3 correlation source, P5).
-      const eventSink = new SqliteEventSink({ dbPath });
-      this.eventSink = eventSink;
-      const fileToType = new Map<string, FactType>(
-        (Object.entries(TYPE_TO_FILE) as [FactType, string][]).map(([t, f]) => [f, t]),
-      );
-      const mirrorTails: Map<FactType, Promise<void>> = new Map();
-      const rederive = {
-        rederive: async (relPaths: string[]): Promise<void> => {
-          if (this.stopping) return;
-          for (const rel of new Set(relPaths)) {
-            if (this.stopping) return;
-            const type = rel.startsWith('ledger/')
-              ? fileToType.get(rel.slice('ledger/'.length))
-              : undefined;
-            const sourceDelta = type
-              ? ledgerStore.takeIndexDelta(type)
-              : this.narrativeDeltaFor(rel, narrativeStore);
-            if (sourceDelta) {
-              this.enqueuePendingIndexDelta(rel, sourceDelta);
-            }
-            // The source write has completed. Publish a durable partial checkpoint before
-            // scheduling any provider work, so a crash cannot make the new source look indexed.
-            await this.markIndexDirty(memoryWorkspace, rel, store, sourceDelta?.hash);
-            if (type) {
-              // FactMirror is the fast Stage-1 safety projection. Keep it synchronous from the
-              // caller's perspective, but serialize concurrent refreshes for the same type.
-              const previous = mirrorTails.get(type) ?? Promise.resolve();
-              const refresh = previous
-                .catch(() => undefined)
-                .then(async () => {
-                  if (this.stopping) return;
-                  try {
-                    const entities = sourceDelta && type && 'entities' in sourceDelta
-                      ? [...new Set((sourceDelta as LedgerIndexDelta).entities)]
-                      : [];
-                    if (entities.length > 0) {
-                      for (const entity of entities) {
-                        const facts = await ledgerStore.listAllOfEntity(type, entity);
-                        await factMirror.replaceScope(type, entity, facts.map(ledgerFactToRecord));
-                      }
-                    } else {
-                      const facts = await ledgerStore.listAllOfType(type);
-                      await factMirror.replaceType(type, facts.map(ledgerFactToRecord));
-                    }
-                  } catch (e) {
-                    console.warn('[gateway] fact-mirror re-derive failed (rebuildable at boot):', summarizeErrorForLog(e));
-                  }
-                });
-              mirrorTails.set(type, refresh);
-              await refresh;
-              if (mirrorTails.get(type) === refresh) mirrorTails.delete(type);
-              if (this.stopping) return;
-            }
-            this.queueBackgroundReindex(rel, async () => {
-              // Reindexing is deliberately detached from the source operation. The bounded provider
-              // ensures a stuck embed becomes a partial checkpoint instead of a late DB write.
-              try {
-                await indexer.indexFile(rel);
-                this.clearIndexDirty(rel);
-              } catch (e) {
-                console.warn('[gateway] incremental reindex failed for a changed file:', summarizeErrorForLog(e));
-              }
-            });
-          }
-        },
-      };
-
-      // A4 (specs/13): rebuild the mirror from Markdown once at boot (parallels indexer.indexAll)
-      // so any crash between a ledger write and its mirror upsert self-heals.
-      try {
-        let records = [] as ReturnType<typeof ledgerFactToRecord>[];
-        for (const t of Object.keys(TYPE_TO_FILE) as FactType[]) {
-          records = records.concat((await ledgerStore.listAllOfType(t)).map(ledgerFactToRecord));
-        }
-        await factMirror.rebuild(records);
-        console.log(`[gateway] Fact mirror rebuilt from ledger (${records.length} facts)`);
-      } catch (e) {
-        console.warn('[gateway] Fact-mirror boot rebuild failed (recall Stage 1 may degrade):', summarizeErrorForLog(e));
-      }
-
-      const pipeline = new CapturePipeline({
-        queue: writeQueue,
-        ledger: ledgerStore,
-        narrative: narrativeStore,
-        safety: safetyRenderer,
-        curiosity: curiosityQueue,
-        events: eventSink,
-        rederive,
-        idempotency: new FileCaptureIdempotency(path.join(stateDir, 'capture-idempotency.log')),
-      });
-      this.capturePipeline = pipeline;
-
-      // REC (SB-8): boot-time SAFETY reconciliation. One full re-render from the
-      // ledger closes the crash window between a ledger write and its render, and
-      // turns a corrupt-type-file degradation into a self-healing event.
-      try {
-        await safetyRenderer.render(await ledgerStore.listSafetyRelevant());
-      } catch (e) {
-        console.warn('[gateway] boot SAFETY reconciliation failed (continuing):', summarizeErrorForLog(e));
-      }
-
-      // P2 C3 — recall + v2 assembler → the per-turn system-prompt supplier (D9). The recall READ
-      // adapters open their own connections to the same search.db (M-3: store is the sole chunk
-      // writer; these are read-mostly, chunk_stats excepted). A failure here degrades the CHAT path
-      // to the legacy boot-cached prompt but keeps ledger/episode/safety tools + capture working.
-      try {
-        let cachedDim: number | null = null;
-        const embeddingPort: EmbeddingPort = {
-          embed: (texts) => Promise.all(texts.map((t) => boundedEmbeddingProvider.embed(t))),
-          dim: async () => {
-            if (cachedDim === null) cachedDim = (await boundedEmbeddingProvider.embed('')).length;
-            return cachedDim;
-          },
-          modelId: async () => config.providers.embeddings.model,
-        };
-        const vectorIndex = new SqliteVecIndex({ dbPath });
-        this.vectorIndex = vectorIndex;
-        const keywordIndex = new SqliteKeywordIndex({ dbPath });
-        this.keywordIndex = keywordIndex;
-        const chunkStats = new SqliteChunkStats({ dbPath });
-        this.chunkStats = chunkStats;
-        const recallEngine = new RecallEngine({
-          embedding: embeddingPort,
-          vectorIndex,
-          keywordIndex,
-          factMirror,
-          chunkStats,
-          clock: systemClock,
-          config: DEFAULT_RECALL_CONFIG,
-        });
-        const v2Assembler = new ContextAssemblerV2({
-          reader: memory,
-          safety: safetyView,
-          maxChars: config.memory.bootstrapMaxChars,
-          clock: systemClock,
-          curatedMemory: {
-            readForContext: (maxChars, budgetRatios) => curatedMemory.readForContext(maxChars, budgetRatios),
-          },
-          budgetRatios: config.memory.budgetRatios,
-        });
-        medicalContextProvider = async (userMessage) => {
-          let recall = null as Awaited<ReturnType<typeof recallEngine.run>> | null;
-          let status: 'available' | 'unreadable' | 'provider-unavailable' = 'available';
-          try {
-            recall = await recallEngine.run({ profileId, userMessage }, { narrative: true });
-          } catch (e) {
-            status = 'provider-unavailable';
-            console.warn('[gateway] medical recall failed (using SAFETY/profile only):', summarizeErrorForLog(e));
-          }
-          const report = await v2Assembler.assemble(profileId, 'chat', recall);
-          const medicalKeys = new Set(['SAFETY.md', 'active-ledger', 'recall', 'check']);
-          const content = report.sections
-            .filter((section) => medicalKeys.has(section.key))
-            .map((section) => `## ${section.title}\n${section.content}`)
-            .join('\n\n');
-          if (status === 'available' && report.degraded.length > 0) status = 'unreadable';
-          if (status === 'available' && recall?.indexStatus === 'failed') status = 'provider-unavailable';
-          return { content, status };
-        };
-        prepareSystem = async (mode, userMessage) => {
-          // Recall is best-effort: any failure degrades to no recall, never blocks the turn
-          // (resilience). Assembly is NOT guarded here — a SAFETY-invariant violation must abort the
-          // turn (medical-safety > resilience); the caller turns it into a safe fallback reply.
-          let recall = null as Awaited<ReturnType<typeof recallEngine.run>> | null;
-          try {
-            // Only chat renders narrative hits; heartbeat/dream/subagent get Stage-1 ledger only —
-            // running Stage-2 there would bump injected_count for chunks never shown (M-1).
-            recall = await recallEngine.run({ profileId, userMessage }, { narrative: mode === 'chat' });
-          } catch (e) {
-            console.warn('[gateway] recall failed (assembling without recall):', summarizeErrorForLog(e));
-            recall = null;
-          }
-          if (mode === 'heartbeat') {
-            try {
-              const items = dueCuriosityItems(await curiosityQueue.list(), systemClock.now());
-              recall = recall
-                ? { ...recall, curiosity: items }
-                : {
-                  ledger: '', ledgerTokens: 0, ledgerTruncated: false,
-                  narrative: '', narrativeTokens: 0, hits: [], injectedChunkIds: [],
-                  indexStatus: 'failed' as const, checkNotes: '', curiosity: items,
-                };
-            } catch (e) {
-              console.warn('[gateway] heartbeat curiosity read unavailable:', summarizeErrorForLog(e));
-              recall = recall
-                ? { ...recall, curiosityStatus: 'unreadable' }
-                : {
-                  ledger: '', ledgerTokens: 0, ledgerTruncated: false,
-                  narrative: '', narrativeTokens: 0, hits: [], injectedChunkIds: [],
-                  indexStatus: 'failed' as const, checkNotes: '', curiosityStatus: 'unreadable' as const,
-                };
-            }
-          }
-          const report = await v2Assembler.assemble(profileId, mode, recall);
-          return {
-            messages: [{ role: 'system', content: report.content }],
-            recordUsed: recall
-              ? (ids) => recallEngine.recordUsage(ids, systemClock.now().toISOString(), recall!.injectedChunkIds)
-              : undefined,
-            healthContextTouched: report.sections.some((section) =>
-              ['SAFETY.md', 'HEALTH_PROFILE.md', 'active-ledger', 'recall', 'check', 'curiosity'].includes(section.key)),
-          };
-        };
-        console.log('[gateway] Per-turn recall + v2 context assembler ready (D9)');
-      } catch (e) {
-        console.warn('[gateway] Recall/v2-assembler unavailable; chat uses the boot-cached prompt:', summarizeErrorForLog(e));
-      }
-
-      // DIAB-06 side-effect lookup: prefer on-device medgemma, fall back to main (resilience).
-      let sideEffectProvider: LLMProvider = mainProvider;
-      try {
-        sideEffectProvider = createProvider(config.providers.medical);
-      } catch (e) {
-        console.warn('[gateway] Medical provider for side-effect lookup unavailable; using main:', summarizeErrorForLog(e));
-      }
-
-      try {
-        for (const tool of createLedgerTools({
-          pipeline,
-          ledger: ledgerStore,
-          safety: safetyRenderer,
-          queue: writeQueue,
-          narrative: narrativeStore,
-          sideEffectLookup: (entity) => this.lookupSideEffects(sideEffectProvider, entity),
-          // CONTRA-09: confirm/remove bypass the capture pipeline — re-derive the recall mirror +
-          // index for the changed ledger file so a confirmed retraction leaves the next turn's context.
-          afterLedgerMutation: (type) => rederive.rederive([`ledger/${TYPE_TO_FILE[type]}`]),
-        })) {
-          registry.register(tool);
-        }
-      } catch (e) {
-        console.warn('[gateway] Ledger tools unavailable; continuing without them:', summarizeErrorForLog(e));
-      }
-      try {
-        for (const tool of createEpisodeTools({ store: episodeStore, profileId })) {
-          registry.register(tool);
-        }
-      } catch (e) {
-        console.warn('[gateway] Episode tools unavailable; continuing without them:', summarizeErrorForLog(e));
-      }
-      try {
-        for (const tool of createSafetyTools({ safetyView })) {
-          registry.register(tool);
-        }
-      } catch (e) {
-        console.warn('[gateway] Safety tools unavailable; continuing without them:', summarizeErrorForLog(e));
-      }
-    } catch (e) {
-      console.warn('[gateway] Memory-core (v2) unavailable; continuing without ledger/episode/safety tools + per-turn capture:', summarizeErrorForLog(e));
-    }
-
-    // Context. The legacy assembler still runs once at boot: it fires the SAFETY non-omission
-    // invariant (a broken non-empty SAFETY.md aborts boot — medical-safety > resilience) and yields
-    // the fallback system prompt used when the v2 recall path is unavailable. The live chat path
-    // uses `prepareSystem` (per-turn recall + v2 assembly, D9) when it was constructed above.
-    const assembler = new ContextAssembler(memory, config.memory.bootstrapMaxChars, profileId);
-    const systemMessages = await assembler.buildSystemMessages();
-
-    // Agent
-    const semaphore = new LLMSemaphore();
-    this.semaphore = semaphore;
-    const agentSystem: PrepareSystem = prepareSystem ?? (async () => ({
-      messages: systemMessages,
-      healthContextTouched: systemMessages.length > 0,
-    }));
-    this.agentLoop = new AgentLoop(mainProvider, registry, agentSystem, config.agent, semaphore);
-    this.promptMode = prepareSystem ? 'per-turn' : 'boot-cached';
-
-    // Sessions
-    // Path resolution stays here (Gateway) rather than inside SessionManager
-    // itself: SessionManager has no other dependency on the profiles module,
-    // and keeping it that way avoids adding module coupling for a value the
-    // caller already has to compute (ProfileRegistry.profileSessions). Only
-    // derived when a profiles config was actually supplied; otherwise
-    // SessionManager keeps its own legacy default.
     const sessionsPath = this.profileRegistry
       ? (usingProfileWorkspace
         ? this.profileRegistry.profileSessions(profileId)
         : path.join(path.dirname(config.memory.workspace), 'sessions'))
       : undefined;
-    this.sessions = new SessionManager({
-      sessionsPath,
-      softResetMinutes: config.sessions.softResetAfterMinutes,
-      hardResetMinutes: config.sessions.hardResetAfterMinutes,
-      provider: mainProvider,
-      toolRegistry: registry,
-      compaction: config.sessions.compaction,
-      // P2b spec 14 §3: real-token window triggers + the model's context window (DD4).
-      window: config.sessions.window,
-      contextWindow: config.providers.main.contextWindow,
-      profileId,
-      // Wave-D panel X-1/X-2 (founder decision 2026-08-30): the perpetual THREAD is per-chat (health
-      // MEMORY stays per-profile). Every chat gets its own namespaced archive + window + index scope so a
-      // second chat on a profile can never resume another chat's summary or search its turns. spec 14 §2
-      // "per-profile thread" holds in the common one-chat-per-profile case (P0 auto-pair).
-      perChatArchive: true,
-    });
-    // F8: run compaction LLM calls at 'background' priority (below user + heartbeat). prepareHistory
-    // (where compaction happens) runs before AgentLoop acquires the semaphore, so this never deadlocks.
-    this.sessions.setBackgroundRunner((fn) => semaphore.run('background', fn));
-    // D3.4 (spec 14 §4 step 4): copy each compaction summary to the daily log (if the memcore block wired
-    // the sink; absent ⇒ compaction still runs, just without the daily-log copy).
-    if (this.sessionSummarySink) {
-      this.sessions.setSummarySink(this.sessionSummarySink);
-      try {
-        await this.sessions.retryPendingSummaries();
-      } catch (e) {
-        console.warn('[gateway] Pending session-summary retry failed; continuing:', summarizeErrorForLog(e));
-      }
-    }
 
-    // Wave D-2 (PLAT-20): session_search FTS over the append-only day-file archive — the losslessness
-    // substrate for prune (D3). The index opens its OWN connection to the profile search.db (M-3) and
-    // rebuilds from the day files when empty (post-migration / dropped table, A-MF4). It is injected into
-    // the SessionManager for incremental per-turn indexing and exposed as the session_search tool. The
-    // AgentLoop reads the registry live each turn, so registering here (after its construction) is fine.
-    // Individually wrapped (RES-P2-1): any failure disables search and boot continues with the rest.
-    try {
-      const sessionIndex = new SqliteSessionIndex({ dbPath, sessionsDir: this.sessions.sessionsDir });
-      this.sessionIndex = sessionIndex;
-      this.sessions.setTurnIndex(sessionIndex);
-      for (const tool of createSessionTools({ index: sessionIndex })) {
-        registry.register(tool);
-      }
-    } catch (e) {
-      console.warn('[gateway] session_search unavailable; continuing without it:', summarizeErrorForLog(e));
-    }
+    const mainProvider = createProvider(config.providers.main);
+    this.mainProvider = mainProvider;
+
+    const semaphore = new LLMSemaphore();
+    this.semaphore = semaphore;
 
     // Channel
     if (config.channels.telegram.enabled) {
@@ -742,29 +335,39 @@ export class Gateway {
       await this.channel.connect();
     }
 
-    await this.initializeScheduler();
-    if (this.scheduler) {
-      try {
-        registry.register(createCronManageTool(this.scheduler, this.getEffectiveWorkspace()));
-        registry.register(createHeartbeatManageTool(this.scheduler, this.getEffectiveWorkspace()));
-      } catch (e) {
-        console.warn('[gateway] Cron/heartbeat tools unavailable; continuing without them:', summarizeErrorForLog(e));
-      }
-    }
+    const schedulerPaths = this.resolveSchedulerPaths(profileId);
 
-    // D4.4: the nightly transcript sweep (spec 14 §5 / PD-17 dreaming step 1.5) — deterministic, no
-    // LLM. Fire-and-forget at 03:15 local; `runTranscriptSweep` is fully guarded so a failure never
-    // escapes, and the task is stopped in `stop()`. A scheduling failure degrades the feature, not boot.
-    this.sweepStopping = false;
-    try {
-      this.sweepTask?.stop(); // MEDIUM-10: a re-`start()` must not orphan the previous cron task
-      this.sweepTask = cron.schedule(
-        '15 3 * * *',
-        () => { this.launchBackgroundSweep(); },
-        { scheduled: true, timezone: this.config.heartbeat.timezone },
-      );
-    } catch (e) {
-      console.warn('[gateway] nightly transcript sweep could not be scheduled; continuing:', summarizeErrorForLog(e));
+    // ProfileRuntime constructs and owns the per-profile stack
+    this.runtime = await ProfileRuntime.create({
+      profileId,
+      workspace: memoryWorkspace,
+      dbPath,
+      sessionsPath,
+      schedulerPaths,
+      config,
+      mainProvider,
+      semaphore,
+      // Match the original initializeScheduler guard: the scheduler starts only when a delivery
+      // channel exists (heartbeats deliver through it). Telegram-disabled ⇒ no channel ⇒ no scheduler.
+      canSchedule: Boolean(config.heartbeat.enabled && this.channel),
+      runScheduledJob: (job) => this.handleScheduledJob(job, true),
+      sideEffectLookup: (entity) => {
+        let sideEffectProvider: LLMProvider = mainProvider;
+        try {
+          sideEffectProvider = createProvider(config.providers.medical);
+        } catch (e) {
+          console.warn('[gateway] Medical provider for side-effect lookup unavailable; using main:', summarizeErrorForLog(e));
+        }
+        return this.lookupSideEffects(sideEffectProvider, entity);
+      },
+    });
+
+    if (this.runtime.scheduler) {
+      const startupChatId = await this.resolveStartupPolicyChatId();
+      if (startupChatId) {
+        await this.reconcileHeartbeatPolicies(startupChatId);
+      }
+      await syncHeartbeatMarkdown(this.getEffectiveWorkspace(), await this.runtime.scheduler.listJobs());
     }
 
     await this.runBootHealthchecks();
@@ -773,78 +376,23 @@ export class Gateway {
     console.log('[gateway] Redacted is running.');
   }
 
-  /**
-   * D4.4: run the nightly transcript sweep now (spec 14 §5) — deterministic, no LLM. Guarded: a
-   * not-yet-wired profile returns not-scanned, and `runNightlySweep` swallows any I/O failure. Public
-   * so the cron tick, the acceptance suite, and the E2E journey all drive the same path.
-   */
   async runTranscriptSweep(): Promise<NightlySweepResult> {
-    // MEDIUM-8: a run scheduled after shutdown began does no work (never write after stop()).
-    if (this.stopping || this.sweepStopping) return { scanned: false, added: 0 };
-    // MEDIUM-9: one sweep at a time — a second cron tick or manual call joins the in-flight run
-    // instead of racing the list-then-add dedup boundary.
-    if (this.sweepInFlight) return this.sweepInFlight;
-    if (!this.sessions || !this.ledgerStore || !this.curiosity) {
-      return { scanned: false, added: 0 };
-    }
-    const run = runNightlySweep(this.buildSweepDeps()).finally(() => { this.sweepInFlight = undefined; });
-    this.sweepInFlight = run;
-    return run;
+    if (this.stopping) return { scanned: false, added: 0 };
+    if (!this.runtime) return { scanned: false, added: 0 };
+    return this.runtime.runTranscriptSweep();
   }
 
   private launchBackgroundSweep(): void {
     if (this.stopping) return;
-    void this.runTranscriptSweep().catch((error) => {
-      console.warn('[gateway] Transcript sweep failed:', summarizeErrorForLog(error));
-    });
+    this.runtime?.launchBackgroundSweep();
   }
 
-  // D4.4: compose the sweep's read/write seams from the live profile collaborators. `ledgerEntitiesForDay`
-  // enumerates EVERY ledger version (all types) and keeps those whose `createdAt` falls on `date` (UTC,
-  // parsed so an offset timestamp is placed on its real UTC day — MEDIUM-7). Using all versions, not just
-  // FactMirror heads, means an entity logged yesterday then updated today is still recognized as logged
-  // yesterday (no spurious critical re-ask — MEDIUM-6). Names are normalized to match the sweep's mentions.
   private buildSweepDeps(): NightlySweepDeps {
-    const sessions = this.sessions!;
-    const ledgerStore = this.ledgerStore!;
-    const curiosity = this.curiosity!;
-    return {
-      readDayLines: (date) => sessions.readDayFileLines(date),
-      ledgerEntitiesForDay: async (date) => {
-        const key = date.toISOString().slice(0, 10);
-        const set = new Set<string>();
-        let incomplete = false;
-        for (const type of Object.keys(TYPE_TO_FILE) as FactType[]) {
-          let facts;
-          try {
-            facts = await ledgerStore.listAllOfType(type);
-          } catch (e) {
-            incomplete = true;
-            console.warn('[gateway] transcript sweep ledger lane unreadable:', summarizeErrorForLog(e));
-            continue;
-          }
-          for (const f of facts) {
-            const created = new Date(f.createdAt);
-            if (!Number.isNaN(created.getTime()) && created.toISOString().slice(0, 10) === key) {
-              set.add(normalizeEntity(f.entity));
-            }
-          }
-        }
-        return { entities: set, incomplete } satisfies LedgerDayRead;
-      },
-      listCuriosity: () => curiosity.list(),
-      addCuriosity: (item) => curiosity.add(item),
-    };
+    return this.ensureRuntime().buildSweepDeps();
   }
 
-  /**
-   * Per-turn narrative capture (Task 13.3 / F4 / CHAT-06). Raw user text is ALWAYS captured
-   * losslessly through the profile's CapturePipeline — deterministic, agent-independent.
-   * Structured ledger entries stay agent-initiated via tools. Capture never blocks the reply:
-   * a failure warns-and-continues (resilience). Empty text and media-only turns are skipped.
-   */
   private async captureUserTurn(chatId: string, text: string, sourceMessageId?: string): Promise<void> {
-    const pipeline = this.capturePipeline;
+    const pipeline = this.runtime?.capturePipeline;
     if (!pipeline || text.trim().length === 0) return;
     try {
       await pipeline.ingest({
@@ -859,10 +407,9 @@ export class Gateway {
     }
   }
 
-  /** Persist a generated fallback before delivery so provider failures remain searchable in the chat archive. */
   private async persistFailureTrace(chatId: string, userContent: string, fallback: string): Promise<void> {
     try {
-      await this.sessions?.recordTurn(chatId, [
+      await this.runtime?.sessions?.recordTurn(chatId, [
         { role: 'user', content: userContent },
         { role: 'assistant', content: fallback },
       ]);
@@ -871,11 +418,6 @@ export class Gateway {
     }
   }
 
-  /**
-   * DIAB-06 (D1): resolve a medication's known side effects via the medical provider before
-   * a ledger write. Fully guarded — any failure returns [] so the field is never absent, and
-   * the medication name (health content) is never logged.
-   */
   private async lookupSideEffects(provider: LLMProvider, entity: string): Promise<string[]> {
     try {
       const prompt =
@@ -905,22 +447,16 @@ export class Gateway {
   }
 
   private async handleTestMessageInternal(chatId: string, text: string, sourceMessageId?: string): Promise<string> {
-    // PROD-P1-6: empty/whitespace-only text → short canned reply, no agent run,
-    // no session write (mirrors the channel path in handleMessage).
     if (text.trim().length === 0) {
       return EMPTY_MESSAGE_RESPONSE;
     }
 
     const profileId = this.getProfileForChat(chatId);
     if (profileId === null) {
-      // Refused chats still get emergency guidance (medical-safety rule; the
-      // emergency text carries no PHI) — but no agent run, no session write.
       const emergency = this.handleEmergencyInput(text);
       return emergency ?? UNRECOGNIZED_CHAT_RESPONSE;
     }
     if (!this.isDefaultRuntimeProfile(profileId)) {
-      // C-01 interim: this Gateway instance owns stores for the configured default profile only.
-      // Refuse a paired non-default chat rather than serving it with the wrong profile's stores.
       const emergency = this.handleEmergencyInput(text);
       return emergency ?? PROFILE_UNAVAILABLE_RESPONSE;
     }
@@ -929,11 +465,9 @@ export class Gateway {
       return this.buildBootStatusText();
     }
 
-    // forka #4: /new must reset the session here too (parity with the channel
-    // path in handleMessage). Previously it fell through to the agent loop.
     if (text.trim() === '/new') {
       try {
-        await this.sessions!.resetSession(chatId);
+        await this.runtime!.sessions!.resetSession(chatId);
       } catch (e) {
         console.error('[gateway] Failed to reset session (keeping existing context):', summarizeErrorForLog(e));
         return SESSION_RESET_FAILURE_RESPONSE;
@@ -941,61 +475,49 @@ export class Gateway {
       return 'Starting fresh session. Your health memory is preserved.';
     }
 
-    // P2b DD9: /compact forces the spec-14 §4 compaction pipeline on demand.
     if (text.trim() === '/compact') {
-      await this.sessions!.runCompaction(chatId);
+      await this.runtime!.sessions!.runCompaction(chatId);
       return 'Compacted the conversation. Older turns are summarized; recent context is kept. Nothing is lost — ask me to look anything up.';
     }
 
     const emergency = this.handleEmergencyInput(text);
     if (emergency) {
-      // C-2/H9: persistence is best-effort — a failed archive must NEVER suppress emergency guidance
-      // (medical-safety: reaching the user wins; divergence is logged sanitized). Mirrors handleMessage.
       try {
-        await this.sessions?.recordTurn(chatId, [
+        await this.runtime?.sessions?.recordTurn(chatId, [
           { role: 'user', content: text },
           { role: 'assistant', content: emergency },
         ]);
       } catch (e) {
         console.error('[gateway] Failed to persist emergency turn (test path; sending guidance anyway):', summarizeErrorForLog(e));
       }
-      // Emergency guidance must not wait for capture or indexing. The source capture is still
-      // retained and drained by Gateway.stop() when the process remains alive.
       this.scheduleBackgroundCapture(chatId, text, sourceMessageId);
       return emergency;
     }
 
     const onboarding = await this.handleOnboarding(chatId, text);
     if (onboarding) {
-      // CAP (M6-sec): onboarding answers carry structured health facts (meds,
-      // conditions) — captured losslessly like every other turn.
       await this.captureUserTurn(chatId, text, sourceMessageId);
       return onboarding;
     }
 
-    // Lossless per-turn capture (F4) — always, before the agent run.
     await this.captureUserTurn(chatId, text, sourceMessageId);
 
-    // M-3: guard the agent run exactly like handleMessage — the CLI/e2e path must DEGRADE to the
-    // canned fallback, never throw out of the handler (mirror-sync law).
     let result: Awaited<ReturnType<AgentLoop['run']>>;
     try {
-      const history = await this.sessions!.prepareHistory(chatId);
-      result = await this.agentLoop!.run(text, history, { chatId, mode: 'chat' });
+      const history = await this.runtime!.sessions!.prepareHistory(chatId);
+      result = await this.runtime!.agentLoop!.run(text, history, { chatId, mode: 'chat' });
     } catch (e) {
       console.error('[gateway] Agent error (test path):', summarizeErrorForLog(e));
       await this.persistFailureTrace(chatId, text, "I'm having trouble right now. Please try again in a moment.");
       return "I'm having trouble right now. Please try again in a moment.";
     }
-    // C-2/H9: post-agent persistence is best-effort — mirror handleMessage's guarded pre-send persistence
-    // so the CLI/e2e path DEGRADES (still returns the answer) instead of throwing out of the handler.
+
     try {
-      await this.sessions!.recordTurn(chatId, [
+      await this.runtime!.sessions!.recordTurn(chatId, [
         { role: 'user', content: text },
         ...result.trace,
       ]);
-      // Spec 14 §3: feed the real window-fill signal back so the NEXT turn's prepareHistory can trigger.
-      await this.sessions!.recordPromptUsage(chatId, result.lastPromptTokens);
+      await this.runtime!.sessions!.recordPromptUsage(chatId, result.lastPromptTokens);
     } catch (e) {
       console.error('[gateway] Post-agent persistence error (test path; returning answer anyway):', summarizeErrorForLog(e));
     }
@@ -1008,8 +530,6 @@ export class Gateway {
     try {
       await this.trackOperation(() => this.handleMessageInternal(incoming));
     } catch (error) {
-      // Channel callbacks are detached by the Telegram adapter. Keep the final
-      // boundary non-rejecting so a handler defect cannot become an unhandled rejection.
       console.error('[gateway] Handler error:', summarizeErrorForLog(error));
     }
   }
@@ -1066,7 +586,7 @@ export class Gateway {
     // Handle /new command
     if (text.trim() === '/new') {
       try {
-        await this.sessions!.resetSession(chatId);
+        await this.runtime!.sessions!.resetSession(chatId);
       } catch (e) {
         console.error('[gateway] Failed to reset session (keeping existing context):', summarizeErrorForLog(e));
         try {
@@ -1082,7 +602,7 @@ export class Gateway {
 
     // P2b DD9: /compact forces the spec-14 §4 compaction pipeline on demand.
     if (text.trim() === '/compact') {
-      await this.sessions!.runCompaction(chatId);
+      await this.runtime!.sessions!.runCompaction(chatId);
       await this.channel!.send(chatId, { text: 'Compacted the conversation. Older turns are summarized; recent context is kept. Nothing is lost — ask me to look anything up.' });
       return;
     }
@@ -1101,7 +621,7 @@ export class Gateway {
         { role: 'assistant' as const, content: emergency },
       ];
       try {
-        await this.sessions!.recordTurn(chatId, emergencyTurn);
+        await this.runtime?.sessions?.recordTurn(chatId, emergencyTurn);
       } catch (e) {
         console.error(
           '[gateway] Failed to persist emergency turn (sending guidance anyway):',
@@ -1129,7 +649,7 @@ export class Gateway {
       ];
 
       try {
-        await this.sessions!.recordTurn(chatId, failureTrace);
+        await this.runtime!.sessions!.recordTurn(chatId, failureTrace);
       } catch (e) {
         console.error('[gateway] Failed to persist media upload error turn:', summarizeErrorForLog(e));
       }
@@ -1155,7 +675,7 @@ export class Gateway {
     if (postOnboardingEmergency) {
       // Persist-first (RES-P0-4), mirroring the early emergency branch above.
       try {
-        await this.sessions!.recordTurn(chatId, [
+        await this.runtime?.sessions?.recordTurn(chatId, [
           { role: 'user', content: agentInput },
           { role: 'assistant', content: postOnboardingEmergency },
         ]);
@@ -1179,8 +699,8 @@ export class Gateway {
 
     let result: Awaited<ReturnType<AgentLoop['run']>>;
     try {
-      const history = await this.sessions!.prepareHistory(chatId);
-      result = await this.agentLoop!.run(agentInput, history, { chatId, mode: 'chat' });
+      const history = await this.runtime!.sessions!.prepareHistory(chatId);
+      result = await this.runtime!.agentLoop!.run(agentInput, history, { chatId, mode: 'chat' });
     } catch (e) {
       console.error('[gateway] Agent error:', summarizeErrorForLog(e));
       await this.persistFailureTrace(chatId, agentInput, "I'm having trouble right now. Please try again in a moment.");
@@ -1199,12 +719,12 @@ export class Gateway {
     // losing an expensive LLM response is worse than a logged disk divergence.
     let persistFailed = false;
     try {
-      await this.sessions!.recordTurn(chatId, [
+      await this.runtime!.sessions!.recordTurn(chatId, [
         { role: 'user', content: agentInput },
         ...result.trace,
       ]);
       // Spec 14 §3: feed the real window-fill signal back so the NEXT turn's prepareHistory can trigger.
-      await this.sessions!.recordPromptUsage(chatId, result.lastPromptTokens);
+      await this.runtime!.sessions!.recordPromptUsage(chatId, result.lastPromptTokens);
     } catch (e) {
       persistFailed = true;
       console.error(
@@ -1238,7 +758,7 @@ export class Gateway {
     if (this.stopped) return;
     if (this.stopPromise) return this.stopPromise;
     this.stopping = true;
-    this.sweepStopping = true;
+    this.runtime?.beginStopping();
     const shared = this.stopResources().finally(() => {
       this.stopped = true;
       if (this.stopPromise === shared) this.stopPromise = undefined;
@@ -1254,25 +774,9 @@ export class Gateway {
     this.reconcileTimers.clear();
     let firstError: unknown;
     try {
-      // Cancel queued model work before waiting for producers. An active provider call is
-      // allowed to finish; pending calls reject with the typed semaphore shutdown error.
       this.semaphore?.shutdown();
     } catch (error) {
       console.warn('[gateway] Failed to stop LLM semaphore:', summarizeErrorForLog(error));
-    }
-    try {
-      // Stop every producer before draining consumers. The stopping gate was set by stop()
-      // before this method was entered, so callbacks racing this section refuse new work.
-      this.sweepTask?.stop();
-      this.sweepTask = undefined;
-    } catch (error) {
-      console.warn('[gateway] Failed to stop transcript sweep:', summarizeErrorForLog(error));
-    }
-    try {
-      await this.scheduler?.stop();
-    } catch (error) {
-      firstError = firstError ?? error;
-      console.warn('[gateway] Failed to stop scheduler:', summarizeErrorForLog(error));
     }
     try {
       await this.channel?.disconnect();
@@ -1281,38 +785,12 @@ export class Gateway {
       console.warn('[gateway] Failed to disconnect channel:', summarizeErrorForLog(error));
     }
 
-    // Quiescent drain: all accepted Gateway turns, sweeps, reindexes, reconciles,
-    // compactions, and source writes must settle before any native handle closes.
     try {
-      await this.drainInFlightOperations();
+      await this.runtime?.drainAndClose();
     } catch (error) {
-      console.warn('[gateway] Failed to drain Gateway operations:', summarizeErrorForLog(error));
+      firstError = firstError ?? error;
     }
-    try {
-      await this.sweepInFlight?.catch(() => undefined);
-    } catch (error) {
-      console.warn('[gateway] Failed to drain transcript sweep:', summarizeErrorForLog(error));
-    }
-    try {
-      await this.sessions?.drainCompactions();
-    } catch (error) {
-      console.warn('[gateway] Failed to drain compactions:', summarizeErrorForLog(error));
-    }
-    try {
-      await this.drainBackgroundOperations();
-    } catch (error) {
-      console.warn('[gateway] Failed to drain background operations:', summarizeErrorForLog(error));
-    }
-    try {
-      await this.writeQueue?.drain();
-    } catch (error) {
-      console.warn('[gateway] Failed to drain write queue:', summarizeErrorForLog(error));
-    }
-    try {
-      this.closeStore();
-    } catch (error) {
-      console.warn('[gateway] Failed to close store:', summarizeErrorForLog(error));
-    }
+
     console.log('[gateway] Stopped.');
     if (firstError) {
       throw firstError;
@@ -1326,33 +804,23 @@ export class Gateway {
     if (!this.channel || !this.agentLoop || !this.sessions) {
       return;
     }
-
-    const profileId = (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
-    const { storePath, auditLogPath } = this.resolveSchedulerPaths(profileId);
-    const store = new HeartbeatStore(storePath, profileId);
-    this.scheduler = new HeartbeatScheduler(
-      store,
-      async (job) => this.handleScheduledJob(job, true),
-      this.config.heartbeat.timezone,
-      {
-        auditLogPath,
-        defaultMaxRetries: this.config.heartbeat.retry.maxRetries,
-        maxGlobalTriggersPerMinute: this.config.heartbeat.rateLimit.maxGlobalTriggersPerMinute,
-        maxPerChatTriggersPerMinute: this.config.heartbeat.rateLimit.maxPerChatTriggersPerMinute,
-        recoveryEnabled: this.config.heartbeat.recovery.enabled,
-        recoveryWindowMinutes: this.config.heartbeat.recovery.windowMinutes,
-        retryBackoffMinutes: this.config.heartbeat.retry.backoffMinutes,
-      },
-    );
-    await this.scheduler.start();
-    const startupChatId = await this.resolveStartupPolicyChatId();
-    if (startupChatId) {
-      await this.reconcileHeartbeatPolicies(startupChatId);
+    this.ensureRuntime();
+    if (!this.runtime!.scheduler) {
+      await this.runtime!.initializeScheduler({
+        schedulerPaths: this.resolveSchedulerPaths(this.runtime!.profileId),
+        runScheduledJob: (job) => this.handleScheduledJob(job, true),
+      });
     }
-    await syncHeartbeatMarkdown(this.getEffectiveWorkspace(), await this.scheduler.listJobs());
+    if (this.runtime!.scheduler) {
+      const startupChatId = await this.resolveStartupPolicyChatId();
+      if (startupChatId) {
+        await this.reconcileHeartbeatPolicies(startupChatId);
+      }
+      await syncHeartbeatMarkdown(this.getEffectiveWorkspace(), await this.runtime!.scheduler.listJobs());
+    }
   }
 
-  private async handleScheduledJob(job: HeartbeatJob, invokedByScheduler: boolean = false): Promise<void> {
+  private async handleScheduledJob(job: HeartbeatJob, invokedByScheduler = false): Promise<void> {
     if (this.stopping) return;
     const profileId = this.getProfileForChat(job.chatId);
     if (profileId === null || !this.isDefaultRuntimeProfile(profileId)) {
@@ -1362,15 +830,15 @@ export class Gateway {
     const decision = decideHeartbeatDelivery(job, {
       now: new Date(Date.now()),
       quietHours: this.config.heartbeat.policy.quietHours,
-      lastChatActivityAt: this.sessions!.getLastActiveAt(job.chatId),
+      lastChatActivityAt: this.runtime!.sessions!.getLastActiveAt(job.chatId),
       skipIfChatActiveWithinMinutes: this.config.heartbeat.policy.skipIfChatActiveWithinMinutes,
     });
     if (decision.action === 'skip') {
-      await this.scheduler?.recordOutcome(job.id, decision.reason);
+      await this.runtime?.scheduler?.recordOutcome(job.id, decision.reason);
       return;
     }
 
-    const history = await this.sessions!.prepareHistory(job.chatId);
+    const history = await this.runtime!.sessions!.prepareHistory(job.chatId);
     if (this.stopping) return;
     const input = [
       '[Heartbeat Trigger]',
@@ -1380,44 +848,39 @@ export class Gateway {
     ].join('\n');
 
     try {
-      const result = await this.agentLoop!.run(input, history, { chatId: job.chatId, origin: 'heartbeat', mode: 'heartbeat' });
+      const result = await this.runtime!.agentLoop!.run(input, history, { chatId: job.chatId, origin: 'heartbeat', mode: 'heartbeat' });
       if (result.text === HEARTBEAT_NOOP) {
-        // A-H1: stamp the daemon-authored heartbeat turn so the nightly sweep never mines it.
-        await this.sessions!.recordTurn(job.chatId, [
+        await this.runtime!.sessions!.recordTurn(job.chatId, [
           { role: 'user', content: input },
           ...result.trace,
         ], 'heartbeat');
         try {
-          await this.sessions!.recordPromptUsage(job.chatId, result.lastPromptTokens);
+          await this.runtime!.sessions!.recordPromptUsage(job.chatId, result.lastPromptTokens);
         } catch (e) {
           console.warn('[gateway] Failed to persist heartbeat prompt usage; continuing to delivery:', summarizeErrorForLog(e));
         }
-        await this.scheduler?.recordOutcome(job.id, 'noop');
+        await this.runtime?.scheduler?.recordOutcome(job.id, 'noop');
         await this.reconcileAfterScheduledDelivery(job.chatId);
         return;
       }
 
-      // Persist-before-send: a persistence failure leaves the job undelivered so the scheduler can retry
-      // without duplicating a nudge that already reached the channel.
-      await this.sessions!.recordTurn(job.chatId, [
+      await this.runtime!.sessions!.recordTurn(job.chatId, [
         { role: 'user', content: input },
         ...result.trace,
       ], 'heartbeat');
       try {
-        await this.sessions!.recordPromptUsage(job.chatId, result.lastPromptTokens);
+        await this.runtime!.sessions!.recordPromptUsage(job.chatId, result.lastPromptTokens);
       } catch (e) {
         console.warn('[gateway] Failed to persist heartbeat prompt usage; continuing to delivery:', summarizeErrorForLog(e));
       }
       await this.channel!.send(job.chatId, { text: result.text });
-      await this.scheduler?.recordOutcome(job.id, 'sent');
+      await this.runtime?.scheduler?.recordOutcome(job.id, 'sent');
       await this.reconcileAfterScheduledDelivery(job.chatId);
     } catch (error) {
       if (error instanceof HeartbeatQueueFullError) {
         console.warn(`[gateway] Heartbeat queue full for job ${job.id}; scheduler will retry.`);
-        // recordFailure itself touches disk; a storage failure here must not
-        // escape (it would double-count the failure via executeJob's catch).
         try {
-          await this.scheduler?.recordFailure(job.id, 'heartbeat queue full');
+          await this.runtime?.scheduler?.recordFailure(job.id, 'heartbeat queue full');
         } catch (recordError) {
           console.warn(
             `[gateway] Failed to record queue-full for job ${job.id}:`,
@@ -1428,9 +891,8 @@ export class Gateway {
       }
 
       if (!invokedByScheduler) {
-        // lastError is persisted to disk — sanitize; provider/agent errors can echo PHI.
         try {
-          await this.scheduler?.recordFailure(job.id, summarizeErrorForLog(error));
+          await this.runtime?.scheduler?.recordFailure(job.id, summarizeErrorForLog(error));
         } catch (recordError) {
           console.warn(
             `[gateway] Failed to record heartbeat failure for job ${job.id}:`,
@@ -1446,19 +908,16 @@ export class Gateway {
     try {
       await this.reconcileHeartbeatPolicies(chatId);
     } catch (error) {
-      // Delivery already completed. Reconciliation is maintenance and must not
-      // send the same nudge through the scheduler retry path.
       console.warn('[gateway] Post-delivery heartbeat reconciliation failed:', summarizeErrorForLog(error));
     }
   }
 
   private async reconcileHeartbeatPolicies(chatId: string): Promise<void> {
-    if (this.stopping || !this.scheduler) {
+    if (this.stopping || !this.runtime?.scheduler) {
       return;
     }
     const resolved = this.profileRegistry?.getProfileForChat(chatId);
     if (resolved && !this.isDefaultRuntimeProfile(resolved.profileId)) {
-      // C-01 interim: policy reconciliation also reads/writes the default-bound workspace.
       return;
     }
 
@@ -1468,12 +927,12 @@ export class Gateway {
       timezone: this.config.heartbeat.timezone,
       policy: this.config.heartbeat.policy,
     });
-    await reconcilePolicyJobs(this.scheduler, desired);
-    await syncHeartbeatMarkdown(this.getEffectiveWorkspace(), await this.scheduler.listJobs());
+    await reconcilePolicyJobs(this.runtime.scheduler, desired);
+    await syncHeartbeatMarkdown(this.getEffectiveWorkspace(), await this.runtime.scheduler.listJobs());
   }
 
   private async debouncedReconcile(chatId: string): Promise<void> {
-    if (this.stopping || !this.scheduler) {
+    if (this.stopping || !this.runtime?.scheduler) {
       return;
     }
 
@@ -1490,19 +949,12 @@ export class Gateway {
   }
 
   private async resolveStartupPolicyChatId(): Promise<string | undefined> {
-    // F11: only READ which chat to reconcile heartbeat policies for — never
-    // auto-pair here. Auto-pair is a first-CONTACT bridge (getProfileForChat on
-    // a real inbound message). Consuming it at boot for a stale session/job
-    // chatId (e.g. pairing data lost, session JSONL survived) would permanently
-    // close pairing before the owner's first message — and could hand a
-    // leaked-token stranger the default profile. reconcileHeartbeatPolicies and
-    // handleScheduledJob use the chatId directly / re-check pairing themselves.
-    const sessionChatId = this.sessions?.getMostRecentChatId();
+    const sessionChatId = this.runtime?.sessions?.getMostRecentChatId();
     if (sessionChatId && this.isDefaultRuntimeChat(sessionChatId)) {
       return sessionChatId;
     }
 
-    const jobs = await this.scheduler!.listJobs();
+    const jobs = await this.runtime!.scheduler!.listJobs();
     return jobs.find((job) => job.chatId !== '__startup__' && this.isDefaultRuntimeChat(job.chatId))?.chatId;
   }
 
@@ -1530,9 +982,8 @@ export class Gateway {
         this.config.emergency?.keywords,
       );
       const result = await flow.handle('restart onboarding');
-      // C-2/H9: best-effort persistence — a failed archive must not reject the onboarding response.
       try {
-        await this.sessions?.recordTurn(chatId, [
+        await this.runtime?.sessions?.recordTurn(chatId, [
           { role: 'user', content: input },
           { role: 'assistant', content: result.response },
         ]);
@@ -1552,9 +1003,8 @@ export class Gateway {
     if (!result.response) {
       return undefined;
     }
-    // C-2/H9: best-effort persistence — a failed archive must not reject the onboarding response.
     try {
-      await this.sessions?.recordTurn(chatId, [
+      await this.runtime?.sessions?.recordTurn(chatId, [
         { role: 'user', content: input },
         { role: 'assistant', content: result.response },
       ]);
@@ -1585,103 +1035,42 @@ export class Gateway {
   }
 
   private trackOperation<T>(operation: () => Promise<T>): Promise<T> {
-    const promise = Promise.resolve().then(operation);
-    this.inFlightOperations.add(promise);
-    void promise.then(
-      () => { this.inFlightOperations.delete(promise); },
-      () => { this.inFlightOperations.delete(promise); },
-    );
-    return promise;
+    if (this.runtime) {
+      return this.runtime.trackOperation(operation);
+    }
+    return Promise.resolve().then(operation);
   }
 
   private trackBackgroundOperation(label: string, operation: () => Promise<void>): void {
     if (this.stopping) return;
-    let promise: Promise<void>;
-    try {
-      promise = operation().catch((error) => {
-        console.warn(`[gateway] ${label} failed:`, summarizeErrorForLog(error));
-      });
-    } catch (error) {
-      promise = Promise.resolve();
-      console.warn(`[gateway] ${label} failed:`, summarizeErrorForLog(error));
-    }
-    this.backgroundOperations.add(promise);
-    void promise.then(
-      () => { this.backgroundOperations.delete(promise); },
-      () => { this.backgroundOperations.delete(promise); },
-    );
+    this.ensureRuntime().trackBackgroundOperation(label, operation);
   }
 
   private queueBackgroundReindex(relativePath: string, operation: () => Promise<void>): void {
-    const previous = this.reindexTails.get(relativePath) ?? Promise.resolve();
-    const task = previous
-      .catch(() => undefined)
-      .then(async () => {
-        if (this.stopping) return;
-        await operation();
-      })
-      .catch((error) => {
-        console.warn('[gateway] background reindex failed:', summarizeErrorForLog(error));
-      })
-      .finally(() => {
-        if (this.reindexTails.get(relativePath) === task) {
-          this.reindexTails.delete(relativePath);
-        }
-      });
-    this.reindexTails.set(relativePath, task);
-    this.backgroundOperations.add(task);
-    void task.then(
-      () => { this.backgroundOperations.delete(task); },
-      () => { this.backgroundOperations.delete(task); },
-    );
+    this.ensureRuntime().queueBackgroundReindex(relativePath, operation);
   }
 
   private narrativeDeltaFor(relativePath: string, narrativeStore: NarrativeStore): NarrativeIndexDelta | undefined {
-    const match = relativePath.match(/^memory\/(\d{4}-\d{2}-\d{2})\.md$/);
-    return match ? narrativeStore.takeIndexDelta(match[1]) : undefined;
+    return this.ensureRuntime().narrativeDeltaFor(relativePath, narrativeStore);
   }
 
   private enqueuePendingIndexDelta(
     relativePath: string,
     sourceDelta: LedgerIndexDelta | NarrativeIndexDelta,
   ): void {
-    const delta: MemoryIndexDelta = {
-      hash: sourceDelta.hash,
-      fingerprint: sourceDelta.fingerprint,
-      chunks: sourceDelta.chunks.map((chunk) => ({
-        id: chunk.id,
-        content: chunk.content,
-        startLine: chunk.startLine,
-        endLine: chunk.endLine,
-      })),
-    };
-    const pending = this.pendingIndexDeltas.get(relativePath) ?? [];
-    pending.push(delta);
-    this.pendingIndexDeltas.set(relativePath, pending);
+    this.ensureRuntime().enqueuePendingIndexDelta(relativePath, sourceDelta);
   }
 
   private takePendingIndexDelta(relativePath: string): MemoryIndexDelta | undefined {
-    const pending = this.pendingIndexDeltas.get(relativePath);
-    if (!pending || pending.length === 0) return undefined;
-    this.pendingIndexDeltas.delete(relativePath);
-    const last = pending[pending.length - 1];
-    return {
-      hash: last.hash,
-      fingerprint: last.fingerprint,
-      chunks: pending.flatMap(delta => delta.chunks),
-    };
+    return this.runtime?.takePendingIndexDelta(relativePath);
   }
 
   private async drainInFlightOperations(): Promise<void> {
-    while (this.inFlightOperations.size > 0) {
-      await Promise.allSettled([...this.inFlightOperations]);
-    }
+    await this.runtime?.drainInFlightOperations();
   }
 
   private async drainBackgroundOperations(): Promise<void> {
-    while (this.backgroundOperations.size > 0) {
-      await Promise.allSettled([...this.backgroundOperations]);
-    }
+    await this.runtime?.drainBackgroundOperations();
   }
 
   private async markIndexDirty(
@@ -1690,129 +1079,29 @@ export class Gateway {
     store: SqliteStore,
     sourceHash?: string,
   ): Promise<void> {
-    try {
-      const hash = sourceHash ?? await this.hashFile(path.join(workspace, relativePath));
-      store.upsertFileHash(relativePath, `embedding-partial:${hash}`);
-    } catch (error) {
-      console.warn('[gateway] Could not publish index dirty checkpoint:', summarizeErrorForLog(error));
-    }
-    this.dirtyIndexPaths.add(relativePath);
-    this.persistDirtyIndexMarker();
+    await this.ensureRuntime().markIndexDirty(workspace, relativePath, store, sourceHash);
   }
 
   private async hashFile(filePath: string): Promise<string> {
-    const digest = createHash('sha256');
-    const input = fs.createReadStream(filePath);
-    try {
-      for await (const chunk of input) digest.update(chunk);
-      return digest.digest('hex');
-    } finally {
-      input.destroy();
-    }
+    return this.ensureRuntime().hashFile(filePath);
   }
 
   private clearIndexDirty(relativePath: string): void {
-    this.dirtyIndexPaths.delete(relativePath);
-    if (this.dirtyIndexPaths.size === 0) {
-      const marker = this.dirtyIndexMarkerPath;
-      if (!marker) return;
-      try {
-        fs.unlinkSync(marker);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-          console.warn('[gateway] Could not clear index dirty marker:', summarizeErrorForLog(error));
-        }
-      }
-      return;
-    }
-    this.persistDirtyIndexMarker();
+    this.runtime?.clearIndexDirty(relativePath);
   }
 
   private clearAllDirtyIndexMarkers(): void {
-    this.dirtyIndexPaths.clear();
-    const marker = this.dirtyIndexMarkerPath;
-    if (!marker) return;
-    try {
-      fs.unlinkSync(marker);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        console.warn('[gateway] Could not clear index dirty marker:', summarizeErrorForLog(error));
-      }
-    }
+    this.runtime?.clearAllDirtyIndexMarkers();
   }
 
   private persistDirtyIndexMarker(): void {
-    const marker = this.dirtyIndexMarkerPath;
-    if (!marker) return;
-    try {
-      secureWriteViaTmp(marker, JSON.stringify({ version: 1, paths: [...this.dirtyIndexPaths] }));
-    } catch (error) {
-      console.warn('[gateway] Could not persist index dirty marker:', summarizeErrorForLog(error));
-    }
+    this.runtime?.persistDirtyIndexMarker();
   }
 
   private closeStore(): void {
-    const vectorIndex = this.vectorIndex;
-    this.vectorIndex = undefined;
-    try {
-      vectorIndex?.close();
-    } catch (error) {
-      console.warn('[gateway] Failed to close vector index:', summarizeErrorForLog(error));
-    }
-
-    const keywordIndex = this.keywordIndex;
-    this.keywordIndex = undefined;
-    try {
-      keywordIndex?.close();
-    } catch (error) {
-      console.warn('[gateway] Failed to close keyword index:', summarizeErrorForLog(error));
-    }
-
-    const chunkStats = this.chunkStats;
-    this.chunkStats = undefined;
-    try {
-      chunkStats?.close();
-    } catch (error) {
-      console.warn('[gateway] Failed to close chunk stats:', summarizeErrorForLog(error));
-    }
-
-    const sessionIndex = this.sessionIndex;
-    this.sessionIndex = undefined;
-    try {
-      sessionIndex?.close();
-    } catch (error) {
-      console.warn('[gateway] Failed to close session index:', summarizeErrorForLog(error));
-    }
-
-    const factMirror = this.factMirror;
-    this.factMirror = undefined;
-    try {
-      factMirror?.close();
-    } catch (error) {
-      console.warn('[gateway] Failed to close fact mirror:', summarizeErrorForLog(error));
-    }
-
-    const eventSink = this.eventSink;
-    this.eventSink = undefined;
-    try {
-      eventSink?.close();
-    } catch (error) {
-      console.warn('[gateway] Failed to close event sink:', summarizeErrorForLog(error));
-    }
-
-    const store = this.store;
-    this.store = undefined;
-    try {
-      store?.close();
-    } catch (error) {
-      console.warn('[gateway] Failed to close memory store:', summarizeErrorForLog(error));
-    }
-    this.indexer = undefined;
-    this.writeQueue = undefined;
+    this.runtime?.closeStore();
   }
 
-  // Copies workspace template files from the project's workspace/ dir to the workspace/
-  // Only copies if the file does not already exist (preserves user edits).
   private bootstrapWorkspace(workspacePath: string): void {
     try {
       ensureWorkspaceBootstrap(workspacePath, {
@@ -1825,9 +1114,6 @@ export class Gateway {
     }
   }
 
-  // Constructs the ProfileRegistry. Never throws — a construction failure
-  // (e.g. an unwritable baseDir) degrades to "no profile registry", which
-  // callers treat as "use the legacy single-user paths" everywhere below.
   private tryCreateProfileRegistry(baseDir: string): ProfileRegistry | undefined {
     try {
       return new ProfileRegistry(baseDir);
@@ -1840,11 +1126,6 @@ export class Gateway {
     }
   }
 
-  /**
-   * Migrate the old global session archive before the profile workspace sentinel seals the cutover.
-   * SessionManager owns the append-only conversion and exposes its completion result so a partial
-   * conversion cannot be mistaken for a completed profile migration.
-   */
   private migrateLegacySessionsBeforeProfileSeal(
     registry: ProfileRegistry,
     profileId: ProfileId,
@@ -1874,16 +1155,6 @@ export class Gateway {
     }
   }
 
-  // Idempotently migrates the legacy single-user workspace into the
-  // profile-scoped layout (via ProfileRegistry.migrateLegacyWorkspace, which
-  // already handles the sentinel + idempotent per-file copy) and decides
-  // which workspace path the rest of startup should use.
-  //
-  // Decision rule: only switch to the profile-scoped workspace once the
-  // migration sentinel is actually present (i.e. migration is confirmed
-  // complete with zero errors). A failed or partial migration must never
-  // brick the daemon, so on any error — or on an unexpected exception — this
-  // falls back to the legacy workspace path untouched.
   private migrateAndResolveWorkspace(
     registry: ProfileRegistry,
     profileId: ProfileId,
@@ -1899,8 +1170,6 @@ export class Gateway {
         return profileWorkspace;
       }
 
-      // The workspace sentinel is the commit point for the whole cutover. Convert the separate global
-      // session archive first so a successful sentinel can never strand the pre-cutover conversation.
       if (!this.migrateLegacySessionsBeforeProfileSeal(registry, profileId, legacyWorkspace)) {
         return legacyWorkspace;
       }
@@ -1910,8 +1179,6 @@ export class Gateway {
         `[gateway] Legacy workspace migration: migrated=${result.migrated} skipped=${result.skipped} errors=${result.errors.length}`,
       );
       if (result.errors.length > 0) {
-        // Error strings carry workspace-relative health-file paths (PHI
-        // context) — log the count only, never the list.
         console.warn(`[gateway] Migration encountered ${result.errors.length} error(s); details withheld from logs.`);
       }
 
@@ -1964,8 +1231,6 @@ export class Gateway {
       if (result === null) {
         this.bootHealth = pendingBootHealth();
         console.warn('[gateway] Boot healthcheck exceeded startup budget; continuing in degraded health-check-pending state');
-        // A transport that ignores AbortSignal may still settle later. Keep the late result useful for
-        // /status, but never let it hold boot or surface an unhandled rejection.
         void allChecks
           .then(([healthResults, completionResult]) => {
             if (this.stopping) return;
@@ -2007,8 +1272,6 @@ export class Gateway {
     }
   }
 
-  // #3: merge the live completion result for the MAIN provider only. A completion result is ignored
-  // when its config/reachability probe already failed, preserving the original skip semantics.
   private mergeMainCompletionResult(
     healthResults: { providers: ReadinessResult[]; telegram: ReadinessResult },
     completion?: ReadinessResult,
@@ -2074,9 +1337,6 @@ export class Gateway {
       `  telegram: ${readinessLabel(h.telegram)}`,
       `  prompt: ${this.promptMode}${this.promptMode === 'boot-cached' ? ' (recall off — degraded)' : ''}`,
     ];
-    // Security warnings carry config internals (provider baseUrls, workspace
-    // filesystem paths) and must never reach a network channel — surface the
-    // count only; full text stays on the local console/CLI.
     if (this.securityWarnings.length > 0) {
       lines.push('', `Security warnings: ${this.securityWarnings.length} (details in local logs)`);
     }
@@ -2085,15 +1345,9 @@ export class Gateway {
   }
 
   private getEffectiveWorkspace(): string {
-    return this.resolvedMemoryWorkspace ?? this.config.memory.workspace;
+    return this.runtime?.workspace || this.resolvedMemoryWorkspace || this.config.memory?.workspace || '';
   }
 
-  // P0 persists pairings only; runtime dispatch is single-profile at boot.
-  // Auto-pair is a first-contact bridge (PD-16 pairing codes land in P6): it
-  // fires ONLY while no chat is paired to any profile. Once the owner's first
-  // chat is paired, every other unknown chatId is refused (returns null) —
-  // otherwise a leaked bot token would let a stranger pair themselves to the
-  // default profile and read the owner's health memory through the chat tools.
   private getProfileForChat(chatId: string): ProfileId | null {
     if (!this.profileRegistry) {
       return (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
@@ -2122,9 +1376,6 @@ export class Gateway {
     return !resolved || this.isDefaultRuntimeProfile(resolved.profileId);
   }
 
-  // Same sentinel-gated fallback as migrateAndResolveWorkspace: heartbeat
-  // store + scheduler audit log only move to profile-scoped paths once the
-  // workspace migration sentinel confirms migration completed cleanly.
   private resolveSchedulerPaths(profileId: ProfileId): { storePath: string; auditLogPath: string } {
     const legacy = { storePath: this.config.heartbeat.storePath, auditLogPath: this.config.heartbeat.audit.path };
     if (!this.profileRegistry) {
