@@ -75,6 +75,17 @@ import {
 const INDEX_EMBED_TIMEOUT_MS = 500;
 const INDEX_EMBED_COOLDOWN_MS = 1_000;
 const HEARTBEAT_CURIOSITY_LIMIT = 5;
+/**
+ * RR-STRUCT R-S4 (mini-plan v3 §3.9, Part C; closes C-27 availability / BACKLOG "Bounded shutdown
+ * hard-stop"): the overall budget `drainAndClose()` gives its full drain sequence (stop producers
+ * -> in-flight/sweep/compactions/background/write-queue) before abandoning whatever is still
+ * running and proceeding to `closeStore()` anyway, so a single hung op (e.g. an ACTIVE provider
+ * call with no timeout) can never stall shutdown forever. Not yet config-exposed — a named
+ * constant (per the brief's "config or a named constant" choice) to keep this slice's diff
+ * surgical; promoting it to `AppConfig` (schema + onboarding + validation) is a reasonable, small
+ * follow-up but out of R-S4's touched-files lane.
+ */
+const SHUTDOWN_DRAIN_BUDGET_MS = 10_000;
 
 type SignalEmbeddingProvider = LLMProvider & {
   embedWithSignal?: (text: string, signal: AbortSignal) => Promise<number[]>;
@@ -223,8 +234,27 @@ export class ProfileRuntime {
   sweepTask?: cron.ScheduledTask;
   sweepInFlight?: Promise<NightlySweepResult>;
   sweepStopping = false;
-  stopping = false;
-  closed = false;
+
+  /**
+   * RR-STRUCT R-S4 (mini-plan v3 §3.9, Part A): the single source-of-truth lifecycle state —
+   * a one-way progression `running -> stopping -> closed`. Replaces the old ad-hoc pair of
+   * independent `stopping`/`closed` booleans (which could in principle diverge) with one field;
+   * `stopping`/`closed` below are now DERIVED getters so every existing internal read site
+   * (`this.stopping`, `runtime.closed`, etc.) keeps working unchanged. `isStopping()`/
+   * `isClosed()` (the public seam the R-1 tests + callers use) are unchanged in behavior.
+   */
+  private lifecycleState: 'running' | 'stopping' | 'closed' = 'running';
+
+  /** `true` from the moment `beginStopping()` runs through `closed` (inclusive) — matches the
+   *  pre-R-S4 field's semantics exactly (never resets to false once past `running`). */
+  get stopping(): boolean {
+    return this.lifecycleState !== 'running';
+  }
+
+  /** `true` only once `drainAndClose()` has finished `closeStore()`. */
+  get closed(): boolean {
+    return this.lifecycleState === 'closed';
+  }
 
   promptMode: 'per-turn' | 'boot-cached' = 'boot-cached';
   sessionSummarySink?: (chatId: string, anchoredSummary: string) => Promise<void>;
@@ -250,6 +280,12 @@ export class ProfileRuntime {
     return this.closed;
   }
 
+  /** RR-STRUCT R-S4 (mini-plan v3 §3.9, Part A): the explicit lifecycle state, for diagnostics
+   *  and tests. `isStopping()`/`isClosed()` remain the public seam production callers consult. */
+  getLifecycleState(): 'running' | 'stopping' | 'closed' {
+    return this.lifecycleState;
+  }
+
   static async create(deps: ProfileRuntimeDeps): Promise<ProfileRuntime> {
     const {
       profileId,
@@ -265,8 +301,9 @@ export class ProfileRuntime {
     } = deps;
 
     const runtime = new ProfileRuntime(profileId, memoryWorkspace, config);
-    runtime.stopping = false;
-    runtime.closed = false;
+    // `lifecycleState` already defaults to 'running' on a fresh instance (RR-STRUCT R-S4 Part A);
+    // no explicit reset needed (the old `stopping`/`closed` field assignments here were redundant
+    // even before R-S4 — a fresh instance's field initializers already produced the same values).
     runtime.pendingIndexDeltas.clear();
 
     secureMkdir(path.dirname(dbPath));
@@ -354,7 +391,11 @@ export class ProfileRuntime {
         },
       });
       runtime.writeQueue = writeQueue;
-      const mutationCoordinator = new MutationCoordinator(writeQueue);
+      // RR-STRUCT R-S4 (mini-plan v3 §3.9, Part B): the isShutdown port keys on `isClosed()`
+      // (post-closeStore), NOT `isStopping()` — an in-flight mutation that started before stop()
+      // began must still be allowed to drain (see runtime.ts drainAndClose / the coordinator's
+      // own doc comment). A port (not a direct gateway import) keeps `src/capture` v2-core-clean.
+      const mutationCoordinator = new MutationCoordinator(writeQueue, () => runtime.isClosed());
       runtime.mutationCoordinator = mutationCoordinator;
 
       try {
@@ -698,6 +739,10 @@ export class ProfileRuntime {
     runtime.sessions = sessions;
     runtime.turnCoordinator = new TurnCoordinator(runtime, semaphore, reconcile);
 
+    // RR-STRUCT R-S4 (mini-plan v3 §3.9, Part B): same gate predicate + same "closed, not
+    // stopping" reasoning as the MutationCoordinator wiring above — recordTurn/recordPromptUsage/
+    // runCompaction must still be allowed to drain a turn that started before stop().
+    sessions.setShutdownGate(() => runtime.isClosed());
     sessions.setBackgroundRunner((fn) => semaphore.run('background', fn));
     if (runtime.sessionSummarySink) {
       sessions.setSummarySink(runtime.sessionSummarySink);
@@ -780,57 +825,126 @@ export class ProfileRuntime {
   }
 
   beginStopping(): void {
-    this.stopping = true;
+    // One-way progression (RR-STRUCT R-S4 Part A): never regress 'closed' back to 'stopping'.
+    if (this.lifecycleState === 'running') {
+      this.lifecycleState = 'stopping';
+    }
     this.sweepStopping = true;
   }
 
+  /**
+   * RR-STRUCT R-S4 (mini-plan v3 §3.9, Part C): drains the SAME sequence R-S1/R-S2 established
+   * (stop producers -> drain in-flight/sweep/compactions/background/write-queue -> close every
+   * SQLite handle once) — this does NOT reorder that sequence. What's new is a BOUNDED overall
+   * budget wrapped around it: `withBudget` computes one shared deadline
+   * (`SHUTDOWN_DRAIN_BUDGET_MS` from `beginStopping()`'s moment) and races each phase against the
+   * time remaining under it. A phase that is still running when the shared deadline passes is
+   * ABANDONED (never awaited further — but still started, so it keeps making best-effort progress
+   * in the background) and recorded in `stillPending` for one sanitized warning; every later phase
+   * then sees ~0ms remaining and is abandoned immediately too, fast-forwarding straight to
+   * `closeStore()`. This is corruption-safe: `better-sqlite3` is fully synchronous, so no SQL
+   * statement is ever mid-execution across an `await` — closing a handle can only ever run BEFORE
+   * or AFTER one of its synchronous statements, never DURING one (JS's single-threaded, non-
+   * preemptive execution model guarantees this) — so an abandoned op's next DB call either
+   * completes cleanly (if it wins the race) or throws a plain, already-caught "database is
+   * closed"-style error / hits the Part B write-gate (if it loses it). Never re-introduces the
+   * crude unconditional 10s cap RR-7 removed: a fast drain (the overwhelming common case) is
+   * unaffected — every phase gets the FULL remaining budget, not a per-phase slice.
+   */
   async drainAndClose(): Promise<void> {
     if (this.closed) return;
     this.beginStopping();
     let firstError: unknown;
+    const deadline = Date.now() + SHUTDOWN_DRAIN_BUDGET_MS;
+    const stillPending: string[] = [];
 
-    try {
-      this.sweepTask?.stop();
-      this.sweepTask = undefined;
-    } catch (error) {
-      console.warn('[gateway] Failed to stop transcript sweep:', summarizeErrorForLog(error));
-    }
+    const withBudget = async (label: string, work: () => Promise<void>): Promise<void> => {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        // Budget already exhausted by an earlier phase: fire this phase for best-effort
+        // background progress, but do not make shutdown wait on it any further.
+        stillPending.push(label);
+        void work();
+        return;
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timedOut = new Promise<'timeout'>((resolve) => {
+        timer = setTimeout(() => resolve('timeout'), remaining);
+        timer.unref?.();
+      });
+      try {
+        const outcome = await Promise.race([work().then(() => 'done' as const), timedOut]);
+        if (outcome === 'timeout') stillPending.push(label);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
 
-    try {
-      await this.scheduler?.stop();
-    } catch (error) {
-      firstError = firstError ?? error;
-      console.warn('[gateway] Failed to stop scheduler:', summarizeErrorForLog(error));
-    }
+    await withBudget('sweep-task-stop', async () => {
+      try {
+        this.sweepTask?.stop();
+        this.sweepTask = undefined;
+      } catch (error) {
+        console.warn('[gateway] Failed to stop transcript sweep:', summarizeErrorForLog(error));
+      }
+    });
 
-    try {
-      await this.drainInFlightOperations();
-    } catch (error) {
-      console.warn('[gateway] Failed to drain Gateway operations:', summarizeErrorForLog(error));
-    }
+    await withBudget('scheduler-stop', async () => {
+      try {
+        await this.scheduler?.stop();
+      } catch (error) {
+        firstError = firstError ?? error;
+        console.warn('[gateway] Failed to stop scheduler:', summarizeErrorForLog(error));
+      }
+    });
 
-    try {
-      await this.sweepInFlight?.catch(() => undefined);
-    } catch (error) {
-      console.warn('[gateway] Failed to drain transcript sweep:', summarizeErrorForLog(error));
-    }
+    await withBudget('in-flight-operations', async () => {
+      try {
+        await this.drainInFlightOperations();
+      } catch (error) {
+        console.warn('[gateway] Failed to drain Gateway operations:', summarizeErrorForLog(error));
+      }
+    });
 
-    try {
-      await this.sessions?.drainCompactions();
-    } catch (error) {
-      console.warn('[gateway] Failed to drain compactions:', summarizeErrorForLog(error));
-    }
+    await withBudget('transcript-sweep', async () => {
+      try {
+        await this.sweepInFlight?.catch(() => undefined);
+      } catch (error) {
+        console.warn('[gateway] Failed to drain transcript sweep:', summarizeErrorForLog(error));
+      }
+    });
 
-    try {
-      await this.drainBackgroundOperations();
-    } catch (error) {
-      console.warn('[gateway] Failed to drain background operations:', summarizeErrorForLog(error));
-    }
+    await withBudget('session-compactions', async () => {
+      try {
+        await this.sessions?.drainCompactions();
+      } catch (error) {
+        console.warn('[gateway] Failed to drain compactions:', summarizeErrorForLog(error));
+      }
+    });
 
-    try {
-      await this.writeQueue?.drain();
-    } catch (error) {
-      console.warn('[gateway] Failed to drain write queue:', summarizeErrorForLog(error));
+    await withBudget('background-operations', async () => {
+      try {
+        await this.drainBackgroundOperations();
+      } catch (error) {
+        console.warn('[gateway] Failed to drain background operations:', summarizeErrorForLog(error));
+      }
+    });
+
+    await withBudget('write-queue', async () => {
+      try {
+        await this.writeQueue?.drain();
+      } catch (error) {
+        console.warn('[gateway] Failed to drain write queue:', summarizeErrorForLog(error));
+      }
+    });
+
+    if (stillPending.length > 0) {
+      // Sanitized: phase LABELS only (constant strings, defined above — never operation content),
+      // matching the PHI-never-in-logs invariant.
+      console.warn(
+        `[gateway] Shutdown drain budget (${SHUTDOWN_DRAIN_BUDGET_MS}ms) exceeded; proceeding to close ` +
+        `stores with operations still in flight: ${stillPending.join(', ')}`,
+      );
     }
 
     try {
@@ -839,7 +953,7 @@ export class ProfileRuntime {
       console.warn('[gateway] Failed to close store:', summarizeErrorForLog(error));
     }
 
-    this.closed = true;
+    this.lifecycleState = 'closed';
     if (firstError) {
       throw firstError;
     }

@@ -31,7 +31,7 @@
 
 import { AsyncLocalStorage } from 'async_hooks';
 import { createHash } from 'crypto';
-import { AppError } from '../shared/errors';
+import { AppError, DaemonShutdownError } from '../shared/errors';
 import type { WriteQueue, WritePriority, WriteOp } from '../profiles';
 
 function canonicalize(value: unknown): unknown {
@@ -87,11 +87,27 @@ export interface MutateOp<T> {
 export class MutationCoordinator {
   private readonly reentrancyGuard = new AsyncLocalStorage<string>();
 
-  constructor(private readonly queue: WriteQueue) {}
+  /**
+   * RR-STRUCT R-S4 (mini-plan v3 §3.9, closes C-27 core): `isShutdown` is a PORT injected by the
+   * composition root (`ProfileRuntime`, wired to `runtime.isClosed()`) — never a direct import of
+   * `src/gateway`, which would violate the v2-core module boundary. It keys on CLOSED (post-
+   * `closeStore()`), not merely "stopping": an in-flight mutation that started before `stop()`
+   * began must still be allowed to enqueue and drain (that is the entire point of
+   * `drainInFlightOperations`/`writeQueue.drain()` in `runtime.ts`'s `drainAndClose`) — gating on
+   * "stopping" here would strand such an in-flight op mid-drain (e.g. a `ledger_record` tool call
+   * invoked partway through an already-approved turn) instead of letting it finish. Defaults to
+   * "never shut down" so every existing call site (`new MutationCoordinator(queue)`, tests
+   * included) is unaffected.
+   */
+  constructor(
+    private readonly queue: WriteQueue,
+    private readonly isShutdown: () => boolean = () => false,
+  ) {}
 
   /** Plain append-only entry point (NarrativeStore/CuriosityQueue-shaped lanes). Structurally
    *  compatible with the existing `QueuePort` (capture/pipeline.ts) — a drop-in for `WriteQueue`. */
   enqueue<T>(priority: WritePriority, op: WriteOp<T>): Promise<T> {
+    this.assertNotShutdown(op.label);
     this.assertNotReentrant(op.label);
     return this.queue.enqueue(priority, {
       label: op.label,
@@ -104,6 +120,7 @@ export class MutationCoordinator {
   /** Keyed read-modify-write entry point. See module doc point 2 for why this currently shares
    *  `enqueue()`'s serialization rather than sharding by `id`. */
   mutate<T>(priority: WritePriority, op: MutateOp<T>): Promise<T> {
+    this.assertNotShutdown(op.label);
     this.assertNotReentrant(op.label);
     return this.queue.enqueue(priority, {
       label: op.label,
@@ -119,6 +136,7 @@ export class MutationCoordinator {
    *  `enqueue`/`mutate`. Always `turn`-priority: a foreground read is waiting on it. */
   selfHeal<T>(label: string, run: () => Promise<T>): Promise<T> {
     const fullLabel = `self-heal:${label}`;
+    this.assertNotShutdown(fullLabel);
     this.assertNotReentrant(fullLabel);
     return this.queue.enqueue('turn', {
       label: fullLabel,
@@ -127,9 +145,19 @@ export class MutationCoordinator {
     });
   }
 
-  /** Resolves once the queue is idle (delegates to the underlying `WriteQueue.drain()`). */
+  /** Resolves once the queue is idle (delegates to the underlying `WriteQueue.drain()`). NEVER
+   *  gated by `isShutdown` — draining must stay possible for as long as shutdown itself needs it. */
   drain(): Promise<void> {
     return this.queue.drain();
+  }
+
+  /** RR-STRUCT R-S4: reject a late write BEFORE it ever touches the WriteQueue/stores. Checked
+   *  before the reentrancy guard (the common, expected-during-shutdown case takes priority over
+   *  the rarer programming-error case). */
+  private assertNotShutdown(label: string): void {
+    if (this.isShutdown()) {
+      throw new DaemonShutdownError(label);
+    }
   }
 
   private assertNotReentrant(label: string): void {

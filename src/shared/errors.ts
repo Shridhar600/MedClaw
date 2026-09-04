@@ -101,3 +101,23 @@ export class InvariantViolationError extends AppError {
     super(message);
   }
 }
+
+/**
+ * RR-STRUCT R-S4 (mini-plan v3 §3.9): a write was refused because the owning `ProfileRuntime`
+ * has progressed past the safe point of its `running -> stopping -> closed` shutdown sequence
+ * (its SQLite handles are closed). This is the EXPECTED, HANDLED outcome of a straggler/abandoned
+ * write racing shutdown — never an unhandled crash against a closed native handle. Thrown by
+ * `MutationCoordinator.enqueue/mutate/selfHeal` (src/capture) and `SessionManager.recordTurn/
+ * recordPromptUsage/runCompaction` (src/gateway), both gated on `ProfileRuntime.isClosed()`.
+ * Lives here (not in mutation-coordinator.ts, where `ReentrantMutationError` lives) because BOTH
+ * `src/capture` (v2-core) and `src/gateway` (legacy) must be able to import it without a
+ * module-law violation (`v2-core-boundary` in .dependency-cruiser.cjs permits v2-core modules to
+ * import only from `src/ports/`, `src/shared/`, their own directory, and external packages).
+ * `label` is a PHI-free operation/lane name (a tool/method label, never health content) — safe to
+ * log and safe to surface in a tool-result error string.
+ */
+export class DaemonShutdownError extends AppError {
+  constructor(public readonly label: string) {
+    super(`"${label}" was refused: the runtime is shutting down and its stores are closed.`);
+  }
+}

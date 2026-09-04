@@ -10,6 +10,7 @@ import { ToolRegistry } from '../../src/tools/registry';
 import { HeartbeatPreemptedError, LLMSemaphore } from '../../src/tools/semaphore';
 import { TurnCoordinator, TurnQueueFullError } from '../../src/gateway/turn-coordinator';
 import type { LLMProvider, LLMResponse, Message } from '../../src/providers/types';
+import { DaemonShutdownError } from '../../src/shared/errors';
 
 function deferred<T = void>() {
   let resolve!: (value?: T | PromiseLike<T>) => void;
@@ -366,5 +367,72 @@ describe('TurnCoordinator deterministic front-of-turn onboarding', () => {
     expect(onboarding).toHaveBeenCalledTimes(2);
     expect(runtime.sessions.prepareHistory).not.toHaveBeenCalled();
     expect(runtime.agentLoop.run).not.toHaveBeenCalled();
+  });
+});
+
+// RR-STRUCT R-S4 (mini-plan v3 §3.9, Part B): every caller of a gated write must turn a
+// DaemonShutdownError into a benign, sanitized-logged no-op — never crash, never rethrow to
+// process level. executeUser already had a catch around recordTurn/recordPromptUsage (the
+// existing `persistFailed` pattern) that handles ANY error the same way, DaemonShutdownError
+// included — this describe block proves that holds for the NEW error type without needing a code
+// change there. executeHeartbeat had NO local catch around recordTurn before R-S4 (a genuine gap:
+// it would have propagated to Gateway.handleScheduledJob's catch, which calls
+// scheduler.recordFailure — treating a benign shutdown-time abandonment as a real job failure) —
+// runHeartbeat now catches DaemonShutdownError the same way it already catches
+// HeartbeatPreemptedError, returning a new `{status: 'abandoned'}` outcome instead.
+describe('TurnCoordinator RR-STRUCT R-S4 — DaemonShutdownError graceful handling', () => {
+  let runtime: RuntimeDouble;
+
+  beforeEach(() => {
+    runtime = makeRuntime();
+    runtime.agentLoop.run.mockResolvedValue(response('agent reply'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(runtime.workspace, { recursive: true, force: true });
+    jest.restoreAllMocks();
+  });
+
+  it('executeUser: a DaemonShutdownError from recordTurn is caught, sanitized-logged, and never rethrown — the response still sends', async () => {
+    runtime.sessions.recordTurn.mockRejectedValue(new DaemonShutdownError('recordTurn'));
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const coordinator = new TurnCoordinator(runtime as unknown as ProfileRuntime, new LLMSemaphore());
+    const egress = jest.fn().mockResolvedValue(undefined);
+
+    const text = await coordinator.runUser(message('hello'), egress, noEmergency);
+
+    expect(text).toBe('agent reply');
+    expect(egress).toHaveBeenCalledWith('agent reply');
+    expect(errorSpy).toHaveBeenCalled();
+  });
+
+  it('executeHeartbeat/runHeartbeat: a DaemonShutdownError from recordTurn resolves as {status: "abandoned"} — never rethrown, delivery/afterDelivery skipped', async () => {
+    runtime.sessions.recordTurn.mockRejectedValue(new DaemonShutdownError('recordTurn'));
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const coordinator = new TurnCoordinator(runtime as unknown as ProfileRuntime, new LLMSemaphore());
+    const egress = jest.fn().mockResolvedValue(undefined);
+    const afterDelivery = jest.fn().mockResolvedValue(undefined);
+
+    const result = await coordinator.runHeartbeat({ chatId: 'chat-x', input: 'hb trigger', egress, afterDelivery });
+
+    expect(result.status).toBe('abandoned');
+    if (result.status === 'abandoned') {
+      expect(result.error).toBeInstanceOf(DaemonShutdownError);
+    }
+    expect(egress).not.toHaveBeenCalled();
+    expect(afterDelivery).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalled();
+  });
+
+  it('runHeartbeat still propagates a NON-shutdown error unchanged (no over-broad catch)', async () => {
+    runtime.sessions.recordTurn.mockRejectedValue(new Error('unrelated disk failure'));
+    const coordinator = new TurnCoordinator(runtime as unknown as ProfileRuntime, new LLMSemaphore());
+
+    await expect(coordinator.runHeartbeat({
+      chatId: 'chat-y',
+      input: 'hb trigger',
+      egress: jest.fn().mockResolvedValue(undefined),
+      afterDelivery: jest.fn().mockResolvedValue(undefined),
+    })).rejects.toThrow('unrelated disk failure');
   });
 });

@@ -11,6 +11,7 @@ import {
 import { summarizeErrorForLog } from '../security';
 import type { HeartbeatJob } from '../scheduler/types';
 import type { ProfileRuntime } from './runtime';
+import { DaemonShutdownError } from '../shared/errors';
 
 const SESSION_RESET_FAILURE_RESPONSE = "I couldn't start a fresh session right now. Please try again in a moment.";
 const AGENT_FAILURE_RESPONSE = "I'm having trouble right now. Please try again in a moment.";
@@ -85,7 +86,16 @@ export function heartbeatTurnId(job: Pick<HeartbeatJob, 'id' | 'lastRunAt'>): st
 export type HeartbeatTurnResult =
   | { status: 'sent'; result: AgentRunResult }
   | { status: 'noop'; result: AgentRunResult }
-  | { status: 'preempted'; error: HeartbeatPreemptedError };
+  | { status: 'preempted'; error: HeartbeatPreemptedError }
+  /**
+   * RR-STRUCT R-S4 (mini-plan v3 §3.9, Part B): the runtime closed its stores mid-drain — this
+   * heartbeat turn was abandoned by the bounded hard-stop (Part C) or lost the shutdown race.
+   * Distinct from 'preempted' (a live user turn evicted it) and from an actual failure — a
+   * shutdown-time abandonment is expected/benign and must NOT be recorded via
+   * `scheduler.recordFailure` (Gateway.handleScheduledJob only branches on 'preempted'; an
+   * 'abandoned' result falls through harmlessly, exactly like 'sent'/'noop').
+   */
+  | { status: 'abandoned'; error: DaemonShutdownError };
 
 interface QueueEntry {
   execute: () => Promise<void>;
@@ -127,6 +137,13 @@ export class TurnCoordinator {
     } catch (error) {
       if (error instanceof HeartbeatPreemptedError) {
         return { status: 'preempted', error };
+      }
+      if (error instanceof DaemonShutdownError) {
+        // Log-and-drop (never crash, never error-scare, never rethrown to process level): the
+        // heartbeat's write was refused because the runtime already closed its stores. Do not
+        // attempt egress/afterDelivery against a runtime/channel that is mid-teardown.
+        console.warn('[gateway] Heartbeat turn abandoned by shutdown (log-and-drop):', summarizeErrorForLog(error));
+        return { status: 'abandoned', error };
       }
       throw error;
     }

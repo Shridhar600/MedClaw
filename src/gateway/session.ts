@@ -5,6 +5,7 @@ import type { Message, ToolSchema } from '../providers/types';
 import type { LLMProvider, LLMResponse } from '../providers/types';
 import type { ToolRegistry } from '../tools/registry';
 import { type RotationConfig } from '../scheduler/rotation';
+import { DaemonShutdownError } from '../shared/errors';
 import {
   summarizeErrorForLog,
   secureMkdir,
@@ -416,10 +417,32 @@ export class SessionManager {
   private migrationAppendedRows = false;
   // C-40: a summary copy is durable pending work until the sink and the cleared window state both commit.
   private readonly pendingSummariesByChat: Map<string, string> = new Map();
+  // RR-STRUCT R-S4 (mini-plan v3 §3.9): the ProfileRuntime lifecycle hard gate — `true` once the
+  // owning runtime has closed its SQLite handles (`isClosed()`), never merely "stopping". recordTurn
+  // feeds the SqliteSessionIndex (one of the 7 retained-and-closed handles) via appendMessagesToJsonl,
+  // so a late write after close must refuse instead of touching a closed native handle. Keyed on
+  // "closed" (not "stopping") for the SAME reason MutationCoordinator is: a turn that started before
+  // stop() must still be allowed to drain its recordTurn (see runtime.ts drainAndClose). Wired by the
+  // composition root (setter — same pattern as setBackgroundRunner). Unset (tests / no runtime) ⇒
+  // never shut down (today's behavior).
+  private isShutdown: () => boolean = () => false;
 
   /** Wire compaction LLM calls through the semaphore at background priority (F8). */
   setBackgroundRunner(run: <T>(fn: () => Promise<T>) => Promise<T>): void {
     this.runBackground = run;
+  }
+
+  /** Wire the shutdown hard-gate (RR-STRUCT R-S4): recordTurn/recordPromptUsage/runCompaction
+   *  refuse with a DaemonShutdownError once the owning ProfileRuntime has closed its stores. */
+  setShutdownGate(isShutdown: () => boolean): void {
+    this.isShutdown = isShutdown;
+  }
+
+  /** RR-STRUCT R-S4: reject a late write BEFORE it touches disk/the op queue. */
+  private assertNotShutdown(label: string): void {
+    if (this.isShutdown()) {
+      throw new DaemonShutdownError(label);
+    }
   }
 
   /** Wire the session_search FTS index for incremental per-turn indexing (D2.5). */
@@ -797,6 +820,7 @@ export class SessionManager {
   }
 
   async recordTurn(chatId: string, turnTrace: Message[], origin: JsonlOrigin = 'chat'): Promise<Anchor[]> {
+    this.assertNotShutdown('recordTurn');
     return this.enqueue(chatId, async () => {
       if (turnTrace.length === 0) {
         return [];
@@ -841,6 +865,7 @@ export class SessionManager {
    * persists window state) so it serializes with recordTurn / prepareHistory / compaction.
    */
   async recordPromptUsage(chatId: string, tokens?: number): Promise<void> {
+    this.assertNotShutdown('recordPromptUsage');
     await this.enqueue(chatId, async () => {
       const reading = tokens !== undefined
         ? { tokens, estimated: false }
@@ -881,6 +906,7 @@ export class SessionManager {
   // Public compaction (the /compact command + tests). With an LLM: the full §4 pipeline (off-queue LLM,
   // queued live-tail apply), reusing an in-flight one. Without an LLM: a synchronous turn-aware truncate.
   async runCompaction(chatId: string): Promise<void> {
+    this.assertNotShutdown('runCompaction');
     await this.retryPendingSummaries();
     if (this.llmProvider) {
       await this.guardedCompaction(chatId);
