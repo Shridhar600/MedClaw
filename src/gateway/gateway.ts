@@ -26,6 +26,7 @@ import {
   summarizeErrorForLog,
 } from '../security';
 import { ProfileRuntime } from './runtime';
+import { ProfileRuntimeManager } from './manager';
 import { GatewayMessageRouter, sweepStagedMedia } from './router';
 import { TurnQueueFullError, heartbeatTurnId } from './turn-coordinator';
 
@@ -64,6 +65,10 @@ export class Gateway {
   private resolvedMemoryWorkspace?: string;
   private bootHealth?: { providers: ReadinessResult[]; telegram: ReadinessResult };
   private mainProvider?: LLMProvider;
+  /** RR-STRUCT R-S5a: the medical-provider fallback used for medication side-effect lookups,
+   *  shared across every profile's runtime (daemon-singleton per mini-plan v3 §3.1) — hoisted to
+   *  a field (was a `start()`-local var) so `buildRuntimeFor` can close over it for any profile. */
+  private sideEffectProvider?: LLMProvider;
   private securityWarnings: string[] = [];
   private reconcileTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private semaphore?: LLMSemaphore;
@@ -71,6 +76,11 @@ export class Gateway {
   private stopped = false;
   private stopPromise?: Promise<void>;
   private runtime?: ProfileRuntime;
+  /** RR-STRUCT R-S5a (mini-plan v3 §3.3): owns one ProfileRuntime per paired profile. `this.runtime`
+   *  above stays the DEFAULT profile's runtime (`manager.get(defaultProfileId)`) — every existing
+   *  accessor/handler/Router keeps reading `this.runtime` unchanged; dispatch stays default-only
+   *  (the RR-4 refusal is untouched — R-S5b routes by profile and retires it). */
+  private manager?: ProfileRuntimeManager;
   private router?: GatewayMessageRouter;
 
   constructor(config: AppConfig) {
@@ -79,6 +89,13 @@ export class Gateway {
 
   get runtimeInstance(): ProfileRuntime | undefined {
     return this.runtime;
+  }
+
+  /** Test/diagnostic seam (mirrors `runtimeInstance`): the manager owning every built profile's
+   *  runtime. `undefined` until `start()` has run (or in the `attachGatewayTestRuntime` test-double
+   *  seam, which never constructs one). */
+  get runtimeManager(): ProfileRuntimeManager | undefined {
+    return this.manager;
   }
 
   // Narrow test-backed seams. Setters require a runtime attached by ProfileRuntime.create
@@ -162,24 +179,10 @@ export class Gateway {
     const stagingDir = this.mediaStagingDir();
     sweepStagedMedia(stagingDir, os.homedir());
 
-    // Profiles: construct the registry and (idempotently) migrate the legacy
-    // single-user workspace into the profile-scoped layout.
+    // Profiles: construct the registry. Legacy migration (idempotent) happens per-profile inside
+    // buildRuntimeFor below, restricted to the DEFAULT profile only (RR-STRUCT R-S5a Part B,
+    // mini-plan v3 §3.8 A-F04 — SAFETY-CRITICAL: a secondary profile must never see it).
     this.profileRegistry = profilesConfig ? this.tryCreateProfileRegistry(profilesConfig.baseDir) : undefined;
-    const memoryWorkspace = this.profileRegistry
-      ? this.migrateAndResolveWorkspace(this.profileRegistry, profileId, config.memory.workspace)
-      : config.memory.workspace;
-    this.resolvedMemoryWorkspace = memoryWorkspace;
-    const usingProfileWorkspace = memoryWorkspace !== config.memory.workspace;
-
-    const dbPath = usingProfileWorkspace && this.profileRegistry
-      ? this.profileRegistry.profileSearchDb(profileId)
-      : path.join(config.memory.workspace, '..', 'search.db');
-
-    const sessionsPath = this.profileRegistry
-      ? (usingProfileWorkspace
-        ? this.profileRegistry.profileSessions(profileId)
-        : path.join(path.dirname(config.memory.workspace), 'sessions'))
-      : undefined;
 
     const mainProvider = createProvider(config.providers.main);
     this.mainProvider = mainProvider;
@@ -193,6 +196,7 @@ export class Gateway {
     } catch (error) {
       console.warn('[gateway] Medical provider for side-effect lookup unavailable; using main:', summarizeErrorForLog(error));
     }
+    this.sideEffectProvider = sideEffectProvider;
 
     // Channel
     if (config.channels.telegram.enabled) {
@@ -204,25 +208,16 @@ export class Gateway {
       this.channel.onMessage((msg) => this.handleMessage(msg));
     }
 
-    const schedulerPaths = this.resolveSchedulerPaths(profileId);
-
-    // ProfileRuntime constructs and owns the per-profile stack
-    this.runtime = await ProfileRuntime.create({
-      profileId,
-      workspace: memoryWorkspace,
-      dbPath,
-      sessionsPath,
-      schedulerPaths,
-      config,
-      mainProvider,
-      semaphore,
-      // Scheduler recovery can invoke the callback before ProfileRuntime.create returns. Delay
-      // scheduler construction until the runtime is installed on this Gateway.
-      canSchedule: false,
-      runScheduledJob: (job) => this.handleScheduledJob(job, true),
-      reconcile: (chatId) => this.debouncedReconcile(chatId),
-      sideEffectLookup: (entity) => this.lookupSideEffects(sideEffectProvider, entity),
-    });
+    // RR-STRUCT R-S5a (mini-plan v3 §3.3): ProfileRuntimeManager owns one ProfileRuntime per
+    // paired profile. The DEFAULT profile is built first and DIRECTLY (not via buildAll) so its
+    // failure semantics stay byte-identical to pre-R-S5a: exactly one build attempt, and a
+    // genuine failure propagates straight out of start() (see tests/gateway/memcore-wiring.test.ts
+    // "aborts boot when the SAFETY.md injection invariant is violated"). Every OTHER paired
+    // profile is then eager-built via buildAll — individually guarded, so a secondary profile's
+    // broken storage degrades only that profile and never touches the default or aborts boot.
+    this.manager = new ProfileRuntimeManager((id) => this.buildRuntimeFor(id));
+    this.runtime = await this.manager.get(profileId);
+    await this.manager.buildAll(this.pairedProfileIds(profileId));
 
     this.router = this.createRouter();
     if (this.channel && typeof this.channel.connect === 'function') {
@@ -236,10 +231,43 @@ export class Gateway {
     console.log('[gateway] Redacted is running.');
   }
 
+  /**
+   * RR-STRUCT R-S5a Part C (mini-plan v3 §3.8 A-F07): a nightly-sweep COORDINATOR across every
+   * built profile — each profile's own cron (`ProfileRuntime`'s internal `sweepTask`, R-S1)
+   * already sweeps itself independently in production; this is the manual/test-triggered surface
+   * (`gateway.runTranscriptSweep()`). Preserves the EXISTING external contract exactly: it still
+   * returns the DEFAULT profile's `NightlySweepResult` (the shape every existing sweep test
+   * asserts on), while additionally sweeping every OTHER built profile against its OWN sessions/
+   * ledger/curiosity, individually guarded — one profile's sweep failure never aborts another's
+   * (including the default's).
+   */
   async runTranscriptSweep(): Promise<NightlySweepResult> {
     if (this.stopping) return { scanned: false, added: 0 };
-    if (!this.runtime) return { scanned: false, added: 0 };
-    return this.runtime.runTranscriptSweep();
+    if (!this.manager) {
+      // Test-double seam (attachGatewayTestRuntime): no manager was ever built.
+      if (!this.runtime) return { scanned: false, added: 0 };
+      return this.runtime.runTranscriptSweep();
+    }
+    const defaultProfileId = (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
+    const results = await this.sweepAllBuiltProfiles();
+    return results.get(defaultProfileId) ?? { scanned: false, added: 0 };
+  }
+
+  private async sweepAllBuiltProfiles(): Promise<Map<ProfileId, NightlySweepResult>> {
+    const out = new Map<ProfileId, NightlySweepResult>();
+    const runtimes = this.manager?.all() ?? [];
+    await Promise.allSettled(runtimes.map(async (runtime) => {
+      try {
+        out.set(runtime.profileId, await runtime.runTranscriptSweep());
+      } catch (error) {
+        console.warn(
+          '[gateway] Nightly transcript sweep failed for a profile; other profiles are unaffected:',
+          summarizeErrorForLog(error),
+        );
+        out.set(runtime.profileId, { scanned: false, added: 0 });
+      }
+    }));
+    return out;
   }
 
   private async lookupSideEffects(provider: LLMProvider, entity: string): Promise<string[]> {
@@ -318,7 +346,14 @@ export class Gateway {
     }
 
     try {
-      await this.runtime?.drainAndClose();
+      if (this.manager) {
+        // RR-STRUCT R-S5a: drains + closes EVERY built profile's runtime (not just the default).
+        await this.manager.drainAndCloseAll();
+      } else {
+        // Test-double seam (attachGatewayTestRuntime): start() never ran, so no manager exists —
+        // fall back to closing the directly-attached runtime, exactly as pre-R-S5a.
+        await this.runtime?.drainAndClose();
+      }
     } catch (error) {
       firstError = firstError ?? error;
     }
@@ -598,6 +633,102 @@ export class Gateway {
       );
       return legacyWorkspace;
     }
+  }
+
+  /**
+   * RR-STRUCT R-S5a (mini-plan v3 §3.8 A-F04 — SAFETY-CRITICAL): the `buildRuntimeFor` injected
+   * into `ProfileRuntimeManager`. Branches by profileId:
+   *  - the DEFAULT profile (or ANY profile when there is no ProfileRegistry — legacy no-registry
+   *    mode, A-F11) resolves paths via the EXACT SAME migration path as pre-R-S5a
+   *    (`migrateAndResolveWorkspace` / `resolveSchedulerPaths`) — unchanged.
+   *  - any NON-DEFAULT profile NEVER calls `migrateAndResolveWorkspace` or
+   *    `migrateLegacySessionsBeforeProfileSeal` — it has no legacy data, and running either
+   *    against it would leak the default user's legacy workspace/sessions into it (the design
+   *    review reproduced exactly this — `505/exec/reviews/rr-struct-design-review-isolation.md`
+   *    F-04). Instead every path is resolved DIRECTLY from the registry
+   *    (`profileSearchDb`/`profileSessions`/`profileSchedulerStore`/`profileAuditLog`, no
+   *    `hasBeenMigrated` gate, no `legacySessionsPath`) and the workspace is bootstrapped CLEAN —
+   *    generic template files only (`ensureWorkspaceBootstrap`, the same primitive
+   *    `bootstrapWorkspace()` uses for the legacy workspace — ships no PHI, just static repo
+   *    assets), never a copy of the legacy/default content.
+   */
+  private async buildRuntimeFor(profileId: ProfileId): Promise<ProfileRuntime> {
+    const { config } = this;
+    const defaultProfileId = (config.profiles?.defaultProfileId ?? 'default') as ProfileId;
+    const registry = this.profileRegistry;
+    const isDefault = profileId === defaultProfileId;
+
+    let workspace: string;
+    let dbPath: string;
+    let sessionsPath: string | undefined;
+    let schedulerPaths: { storePath: string; auditLogPath: string };
+
+    if (isDefault || !registry) {
+      const legacyWorkspace = config.memory.workspace;
+      workspace = registry
+        ? this.migrateAndResolveWorkspace(registry, profileId, legacyWorkspace)
+        : legacyWorkspace;
+      this.resolvedMemoryWorkspace = workspace;
+      const usingProfileWorkspace = workspace !== legacyWorkspace;
+
+      dbPath = usingProfileWorkspace && registry
+        ? registry.profileSearchDb(profileId)
+        : path.join(legacyWorkspace, '..', 'search.db');
+
+      sessionsPath = registry
+        ? (usingProfileWorkspace
+          ? registry.profileSessions(profileId)
+          : path.join(path.dirname(legacyWorkspace), 'sessions'))
+        : undefined;
+
+      schedulerPaths = this.resolveSchedulerPaths(profileId);
+    } else {
+      workspace = registry.profileWorkspace(profileId);
+      try {
+        ensureWorkspaceBootstrap(workspace, {
+          preserveExisting: true,
+          log: (message) => console.log(`[gateway] [profile:${profileId}] ${message}`),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`Workspace bootstrap failed for profile "${profileId}": ${message}`);
+      }
+      dbPath = registry.profileSearchDb(profileId);
+      sessionsPath = registry.profileSessions(profileId);
+      schedulerPaths = {
+        storePath: registry.profileSchedulerStore(profileId),
+        auditLogPath: registry.profileAuditLog(profileId),
+      };
+    }
+
+    return ProfileRuntime.create({
+      profileId,
+      workspace,
+      dbPath,
+      sessionsPath,
+      schedulerPaths,
+      config,
+      mainProvider: this.mainProvider!,
+      semaphore: this.semaphore!,
+      // Scheduler recovery can invoke the callback before ProfileRuntime.create returns. Delay
+      // scheduler construction until Gateway explicitly initializes it (initializeScheduler,
+      // default-profile-only this slice — see its own doc comment).
+      canSchedule: false,
+      runScheduledJob: (job) => this.handleScheduledJob(job, true),
+      reconcile: (chatId) => this.debouncedReconcile(chatId),
+      sideEffectLookup: (entity) => this.lookupSideEffects(this.sideEffectProvider ?? this.mainProvider!, entity),
+    });
+  }
+
+  /** Every profile the manager should eager-build at boot: the default (always) plus every
+   *  profile with >=1 paired chat (mini-plan v3 §3.8/§5 R-S5a). A profile that exists in the
+   *  registry but has never been paired to a chat has nothing to serve yet and is skipped. */
+  private pairedProfileIds(defaultProfileId: ProfileId): ProfileId[] {
+    if (!this.profileRegistry) return [defaultProfileId];
+    const paired = this.profileRegistry.getAllProfiles()
+      .filter((profile) => profile.chatIds.length > 0)
+      .map((profile) => profile.profileId);
+    return [...new Set([defaultProfileId, ...paired])];
   }
 
   private async runBootHealthchecks(): Promise<void> {
