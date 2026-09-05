@@ -364,32 +364,71 @@ export class Gateway {
     }
   }
 
+  /**
+   * RR-STRUCT R-S5b (mini-plan v3 §3.1 Finding-6, §3.8 A-F03; the R-S5a deferral): starts EACH
+   * built profile's OWN heartbeat scheduler (R-S5a built every runtime with `canSchedule:false`
+   * and started only the default's). Boot order is unchanged — the Router is created before
+   * this runs, so the R-S5a scheduler-recovery race guard (recovery invoking
+   * `runScheduledJob → handleScheduledJob → requireRouter()` before the router exists) still
+   * holds for every profile. No-manager (test-double) mode starts just the attached runtime.
+   */
   private async initializeScheduler(): Promise<void> {
-    if (!this.config.heartbeat.enabled || !this.channel || !this.runtime?.agentLoop || !this.runtime.sessions) return;
-    if (!this.runtime.scheduler) {
-      await this.runtime.initializeScheduler({
-        schedulerPaths: this.resolveSchedulerPaths(this.runtime.profileId),
-        runScheduledJob: (job) => this.handleScheduledJob(job, true),
-      });
+    if (!this.config.heartbeat.enabled || !this.channel) return;
+    const runtimes = this.manager ? this.manager.all() : (this.runtime ? [this.runtime] : []);
+    for (const runtime of runtimes) {
+      if (!runtime.agentLoop || !runtime.sessions) continue;
+      if (!runtime.scheduler) {
+        await runtime.initializeScheduler({
+          schedulerPaths: this.schedulerPathsFor(runtime.profileId),
+          runScheduledJob: (job) => this.handleScheduledJob(job, true),
+        });
+      }
+      if (runtime.scheduler) {
+        const startupChatId = await this.resolveStartupPolicyChatIdFor(runtime);
+        if (startupChatId) await this.reconcileHeartbeatPolicies(startupChatId);
+        await syncHeartbeatMarkdown(runtime.workspace, await runtime.scheduler.listJobs());
+      }
     }
-    if (this.runtime.scheduler) {
-      const startupChatId = await this.resolveStartupPolicyChatId();
-      if (startupChatId) await this.reconcileHeartbeatPolicies(startupChatId);
-      await syncHeartbeatMarkdown(this.getEffectiveWorkspace(), await this.runtime.scheduler.listJobs());
+  }
+
+  /**
+   * RR-STRUCT R-S5b: scheduler paths per OWNING profile. The default (or legacy no-registry
+   * mode) goes through the `hasBeenMigrated`-gated `resolveSchedulerPaths` exactly as before;
+   * a NON-DEFAULT profile resolves DIRECTLY from the registry — never through that gate
+   * (preserves the R-S5a invariant its spy test enforces: `resolveSchedulerPaths` is only
+   * ever called with the default profileId).
+   */
+  private schedulerPathsFor(profileId: ProfileId): { storePath: string; auditLogPath: string } {
+    const defaultProfileId = (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
+    if (profileId === defaultProfileId || !this.profileRegistry) {
+      return this.resolveSchedulerPaths(profileId);
     }
+    return {
+      storePath: this.profileRegistry.profileSchedulerStore(profileId),
+      auditLogPath: this.profileRegistry.profileAuditLog(profileId),
+    };
   }
 
   private async handleScheduledJob(job: HeartbeatJob, invokedByScheduler = false): Promise<void> {
     if (this.stopping) return;
     const router = this.requireRouter();
     const profileId = router.resolveProfileForChat(job.chatId);
-    if (profileId === null || !router.isDefaultProfile(profileId)) {
+    if (profileId === null) {
       console.warn(`[gateway] Skipping heartbeat job ${job.id}: chat is not available in this runtime.`);
       return;
     }
-    const sessions = this.runtime?.sessions;
-    const scheduler = this.runtime?.scheduler;
-    const coordinator = this.runtime?.turnCoordinator;
+    // RR-STRUCT R-S5b: the RR-4 `!isDefaultProfile` skip is RETIRED — the job dispatches to
+    // the OWNING profile's runtime (its sessions/scheduler/coordinator), so outcomes,
+    // delivery-policy reads, and failure records all land in that profile's stores.
+    // Egress stays the daemon-singleton channel addressed by `job.chatId` (unchanged).
+    const runtime = await this.resolveRuntimeForProfile(profileId);
+    if (!runtime) {
+      console.warn(`[gateway] Skipping heartbeat job ${job.id}: owning profile runtime is degraded.`);
+      return;
+    }
+    const sessions = runtime.sessions;
+    const scheduler = runtime.scheduler;
+    const coordinator = runtime.turnCoordinator;
     if (!sessions || !coordinator) return;
     const decision = decideHeartbeatDelivery(job, {
       now: new Date(Date.now()),
@@ -469,27 +508,43 @@ export class Gateway {
     }
   }
 
+  /**
+   * RR-STRUCT R-S5b: reconcile runs against the runtime OWNING `chatId` — its scheduler +
+   * workspace — never the ambient default. A non-default chat's reconcile writes ONLY that
+   * profile's `HEARTBEATS.md` + scheduler store (the pre-R-S5b early-return for non-default
+   * chats is retired along with the refusal).
+   */
   private async reconcileHeartbeatPolicies(chatId: string): Promise<void> {
-    if (this.stopping || !this.runtime?.scheduler) {
+    if (this.stopping) {
       return;
     }
-    const resolved = this.profileRegistry?.getProfileForChat(chatId);
-    if (resolved && !this.isDefaultRuntimeProfile(resolved.profileId)) {
+    // Sync-first: every already-built profile (boot eager-build, the overwhelming common case)
+    // resolves with ZERO async hops, preserving the exact pre-R-S5b microtask timing the
+    // debounce path is pinned to. The async fallback on-demand builds a profile paired after
+    // boot that was never built (lazy serving).
+    const runtime = this.runtimeForChatSync(chatId) ?? await this.runtimeForChat(chatId);
+    if (!runtime?.scheduler) {
       return;
     }
 
     const desired = await buildDesiredHeartbeatJobs({
-      workspacePath: this.getEffectiveWorkspace(),
+      workspacePath: runtime.workspace,
       chatId,
       timezone: this.config.heartbeat.timezone,
       policy: this.config.heartbeat.policy,
     });
-    await reconcilePolicyJobs(this.runtime.scheduler, desired);
-    await syncHeartbeatMarkdown(this.getEffectiveWorkspace(), await this.runtime.scheduler.listJobs());
+    await reconcilePolicyJobs(runtime.scheduler, desired);
+    await syncHeartbeatMarkdown(runtime.workspace, await runtime.scheduler.listJobs());
   }
 
   private async debouncedReconcile(chatId: string): Promise<void> {
-    if (this.stopping || !this.runtime?.scheduler) {
+    if (this.stopping) {
+      return;
+    }
+    // Synchronous resolve (no async hop): the debounce timer must be scheduled synchronously
+    // so the window's timer semantics hold exactly as pre-R-S5b (fake-timer-pinned).
+    const runtime = this.runtimeForChatSync(chatId);
+    if (!runtime?.scheduler) {
       return;
     }
 
@@ -505,19 +560,41 @@ export class Gateway {
     this.reconcileTimers.set(chatId, timer);
   }
 
+  /**
+   * Kept for the single-runtime/test-double surface (F11 test calls this directly): resolves
+   * the startup-policy chat for the DEFAULT (attached) runtime, exactly as before.
+   */
   private async resolveStartupPolicyChatId(): Promise<string | undefined> {
-    const sessionChatId = this.runtime?.sessions?.getMostRecentChatId();
-    if (sessionChatId && this.isDefaultRuntimeChat(sessionChatId)) {
+    return this.resolveStartupPolicyChatIdFor(this.runtime);
+  }
+
+  /**
+   * RR-STRUCT R-S5b: startup-policy resolution SCOPED to one profile's runtime — its most
+   * recent session chat or scheduler job belonging to THAT profile (an unpaired/stale chat
+   * belongs to the default only, preserving the F11 no-auto-pair-at-boot invariant for every
+   * profile: this method only READS the registry, never pairs).
+   */
+  private async resolveStartupPolicyChatIdFor(runtime: ProfileRuntime | undefined): Promise<string | undefined> {
+    if (!runtime) return undefined;
+    const sessionChatId = runtime.sessions?.getMostRecentChatId();
+    if (sessionChatId && this.chatBelongsToProfile(sessionChatId, runtime.profileId)) {
       return sessionChatId;
     }
 
-    const jobs = await this.runtime!.scheduler!.listJobs();
-    return jobs.find((job) => job.chatId !== '__startup__' && this.isDefaultRuntimeChat(job.chatId))?.chatId;
+    if (!runtime.scheduler) return undefined;
+    const jobs = await runtime.scheduler.listJobs();
+    return jobs.find((job) => job.chatId !== '__startup__' && this.chatBelongsToProfile(job.chatId, runtime.profileId))?.chatId;
   }
 
   private launchBackgroundReconcile(chatId: string): void {
     if (this.stopping) return;
-    this.trackBackgroundOperation('heartbeat reconciliation', () => this.reconcileHeartbeatPolicies(chatId));
+    // Track the background op on the OWNING runtime so each profile's shutdown drain accounts
+    // for its own reconciles (falls back to the default-tracked op if unresolvable). The
+    // reconcile itself (`reconcileHeartbeatPolicies`) re-resolves async — this stays sync so
+    // the timer callback's fire-and-track semantics hold under fake timers.
+    const runtime = this.runtimeForChatSync(chatId) ?? this.runtime;
+    if (!runtime) return;
+    runtime.trackBackgroundOperation('heartbeat reconciliation', () => this.reconcileHeartbeatPolicies(chatId));
   }
 
   private trackOperation<T>(operation: () => Promise<T>): Promise<T> {
@@ -891,7 +968,60 @@ export class Gateway {
       stagingDir: this.mediaStagingDir(),
       stagingBaseDir: os.homedir(),
       buildBootStatusText: () => this.buildBootStatusText(),
+      // RR-STRUCT R-S5b (mini-plan v3 §3.2): the Router dispatches every turn to the runtime
+      // OWNING the resolved profile. Manager-backed in production; when no manager exists
+      // (the `attachGatewayTestRuntime` test-double seam, which never builds one) every
+      // profileId resolves to the single attached runtime — one resolver-based code path,
+      // both worlds working. Never rejects: a degraded profile yields `undefined` and the
+      // Router emits the canned degraded reply instead of crashing.
+      resolveRuntime: (profileId) => this.resolveRuntimeForProfile(profileId),
     });
+  }
+
+  /**
+   * RR-STRUCT R-S5b: the single per-profile runtime accessor every dispatch path funnels
+   * through (message routing via the Router's resolver, scheduled jobs, reconciles).
+   * `manager.get` is a memoized map read (single-flight); a persistently-broken profile
+   * rejects per call (rejection-evict + retry, Finding-7a) and degrades to `undefined`
+   * with a sanitized log — never a throw to the daemon.
+   */
+  private async resolveRuntimeForProfile(profileId: ProfileId): Promise<ProfileRuntime | undefined> {
+    try {
+      if (this.manager) return await this.manager.get(profileId);
+      return this.runtime;
+    } catch (error) {
+      console.warn(
+        `[gateway] Profile "${profileId}" runtime unavailable; degrading work for that profile:`,
+        summarizeErrorForLog(error),
+      );
+      return undefined;
+    }
+  }
+
+  /** The runtime OWNING `chatId` (registry lookup only — never auto-pairs; an unpaired chat
+   *  falls back to the default exactly as the pre-R-S5b reconcile did). May on-demand BUILD a
+   *  not-yet-built profile via the manager (single-flight, memoized) — for foreground paths
+   *  (turns, jobs, startup) where the caller already awaits. */
+  private async runtimeForChat(chatId: string): Promise<ProfileRuntime | undefined> {
+    const resolved = this.profileRegistry?.getProfileForChat(chatId);
+    const profileId = resolved?.profileId ?? (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
+    return this.resolveRuntimeForProfile(profileId);
+  }
+
+  /** Synchronous twin of `runtimeForChat` for the timer-driven reconcile path (see
+   *  `ProfileRuntimeManager.getIfBuilt`): never builds, never awaits — `undefined` means
+   *  "nothing to reconcile right now". */
+  private runtimeForChatSync(chatId: string): ProfileRuntime | undefined {
+    const resolved = this.profileRegistry?.getProfileForChat(chatId);
+    const profileId = resolved?.profileId ?? (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
+    if (this.manager) return this.manager.getIfBuilt(profileId);
+    return this.runtime;
+  }
+
+  private chatBelongsToProfile(chatId: string, profileId: ProfileId): boolean {
+    const resolved = this.profileRegistry?.getProfileForChat(chatId);
+    if (!resolved) return profileId === (this.config.profiles?.defaultProfileId ?? 'default');
+    return resolved.profileId === profileId;
   }
 
   private requireRuntimeForAccess(): ProfileRuntime {
@@ -902,15 +1032,6 @@ export class Gateway {
   private requireRouter(): GatewayMessageRouter {
     if (!this.router) this.router = this.createRouter();
     return this.router;
-  }
-
-  private isDefaultRuntimeProfile(profileId: ProfileId): boolean {
-    return profileId === (this.config.profiles?.defaultProfileId ?? 'default');
-  }
-
-  private isDefaultRuntimeChat(chatId: string): boolean {
-    const resolved = this.profileRegistry?.getProfileForChat(chatId);
-    return !resolved || this.isDefaultRuntimeProfile(resolved.profileId);
   }
 
   private resolveSchedulerPaths(profileId: ProfileId): { storePath: string; auditLogPath: string } {

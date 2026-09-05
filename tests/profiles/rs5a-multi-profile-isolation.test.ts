@@ -223,42 +223,17 @@ describe('RR-STRUCT R-S5a: ProfileRuntimeManager entry-path isolation', () => {
     expect(manager.all()[0].profileId).toBe('default');
   });
 
-  // ── Part D: dispatch stays default-only; the RR-4 refusal is untouched by the new machinery ──
-
-  it('a paired non-default chat is STILL refused even though its runtime now really exists and is built', async () => {
-    seedLegacyContent();
-    const secondaryId = preCreateSecondaryProfile('father-chat');
-    gateway = new Gateway(makeConfig());
-    await gateway.start();
-
-    // The secondary runtime genuinely exists now (R-S5a's whole point) ...
-    const secondaryRuntime = await gateway.runtimeManager!.get(secondaryId);
-    expect(secondaryRuntime).toBeDefined();
-
-    // ... yet a message to its paired chat is still refused, unrouted to it.
-    const reply = await gateway.handleTestMessage('father-chat', 'show my private health history');
-    expect(reply).toContain("can't serve");
-    expect(secondaryRuntime.sessions!.getHistory('father-chat')).toEqual([]);
-  });
-
-  it('handleScheduledJob still skips a job for a non-default profile chat (no routing added)', async () => {
-    seedLegacyContent();
-    const secondaryId = preCreateSecondaryProfile('father-chat');
-    gateway = new Gateway(makeConfig());
-    await gateway.start();
-    await gateway.runtimeManager!.get(secondaryId);
-
-    const job = {
-      id: 'job-1', title: 'Test job', chatId: 'father-chat', cron: '0 8 * * *', timezone: 'Asia/Kolkata',
-      prompt: 'p', enabled: true, source: 'system' as const, kind: 'routine' as const,
-      deliveryState: 'ready' as const, retryCount: 0, maxRetries: 3, policyKey: 'x',
-      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-    };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await expect((gateway as any).handleScheduledJob(job, true)).resolves.toBeUndefined();
-    // No crash, no delivery — the warning path fired (asserted structurally elsewhere); the point
-    // here is simply that a real non-default runtime existing does not cause it to be dispatched.
-  });
+  // ── Part D (RR-STRUCT R-S5b): the RR-4 refusal is RETIRED — dispatch is live. ──────
+  // The two tests that pinned the interim refusal ("still refused" message dispatch +
+  // "still skips" scheduled-job dispatch) are REPLACED by "now served / now dispatched"
+  // tests in tests/profiles/rs5b-multi-profile-dispatch.test.ts, assertion-for-assertion:
+  //   "can't serve" reply + empty secondary history
+  //     → served-by-secondary reply + history/memory ONLY in the secondary
+  //       ("a message to the secondary paired chat is now SERVED ...");
+  //   handleScheduledJob resolves without dispatching
+  //     → job dispatches to + records in the secondary only
+  //       ("each built profile gets its own scheduler ...").
+  // Everything else in this file (entry-path isolation machinery) is unchanged.
 
   // ── Part C: nightly sweep coordinator ──────────────────────────────────────────────────────
 

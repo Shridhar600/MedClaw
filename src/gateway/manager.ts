@@ -95,6 +95,18 @@ export class ProfileRuntimeManager {
   }
 
   /**
+   * RR-STRUCT R-S5b: synchronous snapshot read of ONE built runtime. The timer-driven
+   * reconcile path (`debouncedReconcile`/`launchBackgroundReconcile`) must resolve without an
+   * async hop — an awaited `get()` would defer the `setTimeout` scheduling past the debounce
+   * window's synchronous timer semantics (and could on-demand BUILD a runtime from a
+   * best-effort background tick). Returns `undefined` for in-flight/failed/unknown profiles;
+   * callers treat that as "nothing to reconcile right now" (the next served turn retries).
+   */
+  getIfBuilt(profileId: ProfileId): ProfileRuntime | undefined {
+    return this.resolvedRuntimes.get(profileId);
+  }
+
+  /**
    * Stops new builds (`stopping = true`, so no NEW `get()` for an unseen profile starts a build
    * mid-shutdown — Finding-7b), awaits EVERY in-flight/resolved build promise (`allSettled`, so a
    * build racing shutdown is drained rather than orphaned — its handles get closed the instant it

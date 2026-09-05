@@ -21,8 +21,12 @@ import {
 
 const UNRECOGNIZED_CHAT_RESPONSE =
   'This chat is not recognized. This is a private health assistant; new chats cannot be added over this channel.';
-const PROFILE_UNAVAILABLE_RESPONSE =
-  "This chat belongs to a profile this assistant instance can't serve yet.";
+/** RR-STRUCT R-S5b: the RR-4 interim refusal is RETIRED (paired non-default chats are now
+ *  dispatched to their own runtime — see `route()`). What remains is the GENUINE-failure path:
+ *  the chat IS paired but its profile's runtime cannot be resolved this turn (a degraded
+ *  profile whose build keeps failing). That is temporary, never policy — hence new wording. */
+const PROFILE_DEGRADED_RESPONSE =
+  "This chat's profile is temporarily unavailable. Please try again in a moment.";
 const EMPTY_MESSAGE_RESPONSE = "I didn't catch any message. Send some text or an attachment and I'll take a look.";
 const TURN_QUEUE_FULL_RESPONSE = "I'm still processing your previous message. Please try again in a moment.";
 const STAGED_MEDIA_FAILURE_RESPONSE = 'Failed to store uploaded file. Please try uploading it again.';
@@ -34,6 +38,15 @@ export interface GatewayMessageRouterDeps {
   stagingDir: string;
   stagingBaseDir?: string;
   buildBootStatusText: () => string;
+  /**
+   * RR-STRUCT R-S5b (mini-plan v3 §3.2): per-profile runtime resolution, injected by the
+   * Gateway and backed by `ProfileRuntimeManager.get`. Absent (unit tests that construct a
+   * Router directly with a single runtime), every dispatch falls back to `deps.runtime`.
+   * Must never reject to the Router — but the Router treats a rejection the same as
+   * `undefined` (degraded profile → canned reply, never a throw) so a misbehaving resolver
+   * cannot crash the daemon either.
+   */
+  resolveRuntime?: (profileId: ProfileId) => Promise<ProfileRuntime | undefined>;
 }
 
 interface StagedMedia {
@@ -113,17 +126,21 @@ export class GatewayMessageRouter {
         'Failed to respond to unrecognized chat',
       );
     }
-    if (!this.isDefaultRuntimeProfile(profileId)) {
+    // RR-STRUCT R-S5b: the RR-4 interim refusal (`!isDefaultRuntimeProfile`) is RETIRED — a
+    // paired non-default chat is dispatched to its OWN runtime below. The `profileId === null`
+    // refusal above is untouched: an unpaired chat can never reach the resolved-runtime path.
+    const runtime = await this.resolveRuntimeFor(profileId);
+    if (!runtime) {
       this.deleteStagedMedia(incoming.mediaPath);
       return this.emitSafely(
         egress,
-        PROFILE_UNAVAILABLE_RESPONSE,
-        'Failed to respond to unavailable profile chat',
+        PROFILE_DEGRADED_RESPONSE,
+        'Failed to respond to degraded profile chat',
       );
     }
 
     const routedIncoming = { ...incoming };
-    this.adoptStagedMedia(routedIncoming);
+    this.adoptStagedMedia(routedIncoming, runtime);
 
     if (text.trim() === '/status') {
       const statusText = this.deps.buildBootStatusText();
@@ -132,7 +149,7 @@ export class GatewayMessageRouter {
     }
 
     try {
-      return await this.requireCoordinator().runUser(
+      return await this.requireCoordinator(runtime).runUser(
         routedIncoming,
         egress,
         (input: string) => this.emergencyResponse(input),
@@ -203,9 +220,29 @@ export class GatewayMessageRouter {
     return parts.join('\n');
   }
 
-  private async persistEmergencyTurn(incoming: IncomingMessage, emergency: string): Promise<void> {
-    const runtime = this.deps.runtime;
-    if (!runtime) return;
+  /**
+   * RR-STRUCT R-S5b: resolve the runtime OWNING `profileId` for this turn — exactly once per
+   * turn; every dispatch method below receives the result instead of re-resolving. Falls back
+   * to the single injected `deps.runtime` when no resolver is present (direct Router unit
+   * tests). A rejection (persistently-broken profile build, manager stopping) degrades to
+   * `undefined` with a sanitized log — the caller emits the canned degraded reply, never throws.
+   */
+  private async resolveRuntimeFor(profileId: ProfileId): Promise<ProfileRuntime | undefined> {
+    const resolver = this.deps.resolveRuntime;
+    if (!resolver) return this.deps.runtime;
+    try {
+      return await resolver(profileId);
+    } catch (error) {
+      console.warn('[gateway] Failed to resolve profile runtime; degrading this turn:', summarizeErrorForLog(error));
+      return undefined;
+    }
+  }
+
+  private async persistEmergencyTurn(
+    incoming: IncomingMessage,
+    emergency: string,
+    runtime: ProfileRuntime,
+  ): Promise<void> {
     try {
       await runtime.sessions?.recordTurn(incoming.chatId, [
         { role: 'user', content: this.buildAgentInput(incoming) },
@@ -217,37 +254,33 @@ export class GatewayMessageRouter {
   }
 
   private async routeEmergency(incoming: IncomingMessage, egress: TurnEgress, emergency: string): Promise<string> {
+    // NOTE: deliberately `getExistingProfileForChat` (no auto-pair) — an emergency from an
+    // unknown chat must NEVER consume the one-time first-contact pairing, and stays
+    // unpersisted guidance. Only a chat already paired to a profile resolves a runtime.
     const profileId = this.getExistingProfileForChat(incoming.chatId);
-    const resolved = profileId !== null && this.isDefaultRuntimeProfile(profileId);
+    const runtime = profileId !== null ? await this.resolveRuntimeFor(profileId) : undefined;
     const emergencyIncoming = { ...incoming };
     if (path.isAbsolute(emergencyIncoming.mediaPath ?? '')) {
       this.deleteStagedMedia(emergencyIncoming.mediaPath);
       emergencyIncoming.mediaPath = undefined;
-    } else if (!resolved) {
+    } else if (!runtime) {
       this.deleteStagedMedia(emergencyIncoming.mediaPath);
     }
-    if (resolved) {
-      await this.persistEmergencyTurn(emergencyIncoming, emergency);
+    if (runtime) {
+      this.adoptStagedMedia(emergencyIncoming, runtime);
+      await this.persistEmergencyTurn(emergencyIncoming, emergency, runtime);
     }
     await this.emitSafely(egress, emergency, 'Failed to send emergency response');
-    if (resolved) this.scheduleBackgroundCapture(emergencyIncoming);
+    if (runtime) this.scheduleBackgroundCapture(emergencyIncoming, runtime);
     return emergency;
   }
 
-  private scheduleBackgroundCapture(incoming: IncomingMessage): void {
-    const runtime = this.deps.runtime;
-    if (!runtime) return;
+  private scheduleBackgroundCapture(incoming: IncomingMessage, runtime: ProfileRuntime): void {
     scheduleBackgroundCapture(runtime, incoming);
   }
 
-  private adoptStagedMedia(incoming: IncomingMessage): void {
+  private adoptStagedMedia(incoming: IncomingMessage, runtime: ProfileRuntime): void {
     if (!incoming.mediaPath || !path.isAbsolute(incoming.mediaPath)) return;
-    const runtime = this.deps.runtime;
-    if (!runtime) {
-      incoming.mediaPath = undefined;
-      incoming.mediaError = incoming.mediaError ?? STAGED_MEDIA_FAILURE_RESPONSE;
-      return;
-    }
     const staged = this.inspectStagedMedia(incoming.mediaPath);
     if (!staged) {
       this.deleteStagedMedia(incoming.mediaPath);
@@ -383,9 +416,9 @@ export class GatewayMessageRouter {
     return text;
   }
 
-  private requireCoordinator(): NonNullable<ProfileRuntime['turnCoordinator']> {
-    if (!this.deps.runtime?.turnCoordinator) throw new Error('Turn coordinator unavailable');
-    return this.deps.runtime.turnCoordinator;
+  private requireCoordinator(runtime: ProfileRuntime): NonNullable<ProfileRuntime['turnCoordinator']> {
+    if (!runtime?.turnCoordinator) throw new Error('Turn coordinator unavailable');
+    return runtime.turnCoordinator;
   }
 }
 

@@ -216,7 +216,11 @@ describe('Gateway chat→profile pairing', () => {
     }
   });
 
-  it('refuses a paired non-default chat before the default-profile agent or session can run', async () => {
+  // RR-STRUCT R-S5b: the RR-4 refusal is RETIRED. In the test-double seam (no manager)
+  // every profileId resolves to the single attached runtime, so a paired non-default chat is
+  // now SERVED by it. (Per-profile isolation under live dispatch is proven in
+  // tests/profiles/rs5b-multi-profile-dispatch.test.ts against real runtimes.)
+  it('serves a paired non-default chat via the attached runtime (test-double seam, no manager)', async () => {
     const config = makeConfig(tmpDir);
     const { gateway, registry, sessions } = buildGatewayWithRegistry(config);
     const workProfile = registry.createProfile('work');
@@ -226,13 +230,13 @@ describe('Gateway chat→profile pairing', () => {
     const agent = gateway.runtimeInstance!.agentLoop!;
     const reply = await gateway.handleTestMessage('work-chat-42', 'show my private health history');
 
-    expect(reply).toContain("can't serve");
+    expect(reply).toBe('OK');
     expect(reply).not.toContain('not recognized');
-    expect(agent.run).not.toHaveBeenCalled();
-    expect(sessions.getHistory('work-chat-42')).toEqual([]);
+    expect(agent.run).toHaveBeenCalledTimes(1);
+    expect(sessions.getHistory('work-chat-42')).toHaveLength(2);
   });
 
-  it('handleMessage also refuses a paired non-default chat while preserving emergency guidance', async () => {
+  it('handleMessage also serves a paired non-default chat while preserving emergency guidance', async () => {
     const config = makeConfig(tmpDir);
     const { gateway, registry } = buildGatewayWithRegistry(config);
     const workProfile = registry.createProfile('work');
@@ -242,7 +246,7 @@ describe('Gateway chat→profile pairing', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({ chatId: 'work-chat-42', text: 'show my private health history' });
-    expect(send.mock.calls.at(-1)?.[1].text).toContain("can't serve");
+    expect(send.mock.calls.at(-1)?.[1].text).toBe('OK');
     expect(send.mock.calls.at(-1)?.[1].text).not.toContain('not recognized');
 
     send.mockClear();
