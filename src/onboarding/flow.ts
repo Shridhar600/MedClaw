@@ -2,6 +2,7 @@ import { writeOnboardingProfile } from './profile-writer';
 import { OnboardingStore } from './store';
 import type { OnboardingAnswers, OnboardingResult, OnboardingState, OnboardingStep } from './types';
 import { EMERGENCY_RESPONSE, isEmergencyInput } from '../safety/emergency-detector';
+import { MEDICAL_DISCLAIMER } from '../safety/medical-disclaimer';
 
 const SKIP_PATTERN = /^(skip|later)$/i;
 const CONFIRM_PATTERN = /^(confirm|yes|y)\b/i;
@@ -61,8 +62,7 @@ export class OnboardingFlow {
       disclaimerShownAt: now,
     });
     return {
-      response:
-        'Before we start: I am a personal health companion, not a doctor, and I cannot diagnose or replace emergency care. What is your preferred name?',
+      response: 'Before we start: I am a personal health companion. What is your preferred name?' + MEDICAL_DISCLAIMER,
     };
   }
 

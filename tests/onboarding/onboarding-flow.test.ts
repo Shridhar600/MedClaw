@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { OnboardingFlow } from '../../src/onboarding/flow';
 import { OnboardingStore } from '../../src/onboarding/store';
+import { MEDICAL_DISCLAIMER } from '../../src/safety/medical-disclaimer';
 
 describe('OnboardingFlow', () => {
   let tmpDir: string;
@@ -57,6 +58,8 @@ describe('OnboardingFlow', () => {
 
     const first = await flow.handle('hello');
     expect(first.response).toContain('Before we start');
+    expect(first.response).toContain(MEDICAL_DISCLAIMER);
+    expect(first.response.split(MEDICAL_DISCLAIMER)).toHaveLength(2);
     expect(first.response).toContain('preferred name');
 
     const continued = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');

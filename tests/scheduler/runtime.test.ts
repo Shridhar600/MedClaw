@@ -171,6 +171,45 @@ describe('HeartbeatScheduler', () => {
     await scheduler.stop();
   });
 
+  it('sanitizes a persisted cron validation failure in startup logs and lastError', async () => {
+    const marker = 'RR2_A1_PRIVATE_CRON_MARKER';
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    let scheduler: HeartbeatScheduler | undefined;
+    try {
+      const store = new HeartbeatStore(storePath);
+      const job = await store.create({
+        title: 'Invalid persisted job with private marker',
+        chatId: 'chat-1',
+        cron: '0 8 * * *',
+        prompt: 'Should be disabled on startup.',
+        source: 'system',
+        kind: 'routine',
+        policyKey: 'defaults:rr2-a1-invalid',
+      });
+      await store.update(job.id, { cron: marker });
+
+      const trigger = jest.fn().mockResolvedValue(undefined);
+      scheduler = new HeartbeatScheduler(store, trigger);
+      await expect(scheduler.start()).resolves.toBeUndefined();
+
+      const refreshed = await store.get(job.id);
+      const capturedConsole = errorSpy.mock.calls.flat().map(String).join('\n');
+      expect(refreshed?.enabled).toBe(false);
+      expect(refreshed?.lastOutcome).toBe('error');
+      expect(refreshed?.lastError).toBeTruthy();
+      expect(refreshed?.lastError).not.toContain(marker);
+      expect(refreshed?.lastError).toContain('Error');
+      expect(capturedConsole).not.toContain(marker);
+      expect(trigger).not.toHaveBeenCalled();
+    } finally {
+      try {
+        if (scheduler) await scheduler.stop();
+      } finally {
+        errorSpy.mockRestore();
+      }
+    }
+  });
+
   it('recovers one missed run on startup when recovery is enabled', async () => {
     const store = new HeartbeatStore(storePath);
     const job = await store.create({

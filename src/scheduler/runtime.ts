@@ -376,7 +376,7 @@ export class HeartbeatScheduler {
         this.register(job);
         this.scheduleStateWakeup(job);
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = summarizeErrorForLog(error);
         await this.disableInvalidJob(job, message);
         console.error(`[scheduler] Failed to register heartbeat job (${job.id}):`, message);
       }
