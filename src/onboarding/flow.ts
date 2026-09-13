@@ -20,13 +20,16 @@ export class OnboardingFlow {
   }
 
   async handle(input: string): Promise<OnboardingResult> {
-    const cleanInput = sanitizeOnboardingInput(input);
-    if (isEmergencyInput(cleanInput, this.emergencyKeywords)) {
+    // RR2-A2 raw-input boundary: check the raw input BEFORE the onboarding
+    // sanitizer discards metadata-like lines — those lines can be user-authored
+    // crisis text. The sanitizer still applies to ordinary onboarding answers.
+    if (isEmergencyInput(input, this.emergencyKeywords)) {
       return {
         bypass: true,
         response: EMERGENCY_RESPONSE,
       };
     }
+    const cleanInput = sanitizeOnboardingInput(input);
 
     const state = await this.store.load();
     if (/^restart onboarding$/i.test(cleanInput)) {

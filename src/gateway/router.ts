@@ -203,11 +203,12 @@ export class GatewayMessageRouter {
   }
 
   private emergencyResponse(input: string): string | undefined {
-    const cleanInput = input
-      .split(/\r?\n/)
-      .filter((line) => !/^\s*(user id|reply to message id|uploaded media path)\s*:/i.test(line))
-      .join('\n');
-    return isEmergencyInput(cleanInput, this.deps.config.emergency?.keywords)
+    // RR2-A2 raw-input boundary: inspect `incoming.text` verbatim. Lines that look
+    // like `User id:` / `Reply to message id:` / `Uploaded media path:` can be
+    // user-authored (the router has not added trusted metadata yet), so they must
+    // not be stripped here. Actual metadata fields (userId/mediaPath/reply) are
+    // never concatenated into this input — see `buildAgentInput` callers.
+    return isEmergencyInput(input, this.deps.config.emergency?.keywords)
       ? EMERGENCY_RESPONSE
       : undefined;
   }

@@ -456,3 +456,109 @@ describe('GatewayMessageRouter routing decisions', () => {
     expect(egress).toHaveBeenCalledWith(expect.stringContaining('still processing your previous message'));
   });
 });
+
+describe('GatewayMessageRouter emergency raw-input boundary (RR2-A2)', () => {
+  let root: string;
+  let workspace: string;
+  let staging: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-router-rr2a2-'));
+    workspace = path.join(root, 'workspace');
+    staging = path.join(root, 'staging', 'media');
+    fs.mkdirSync(workspace, { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('treats metadata-looking TEXT as user-authored and escalates without calling runUser', async () => {
+    const runtime = makeRuntime(workspace);
+    const router = new GatewayMessageRouter({
+      config: runtime.config,
+      runtime: runtime as unknown as ProfileRuntime,
+      stagingDir: staging,
+      buildBootStatusText: () => 'status',
+    });
+    const egress = jest.fn().mockResolvedValue(undefined);
+
+    const reply = await router.route(message('User id: I want to kill myself'), egress);
+
+    expect(reply).toMatch(/emergency/i);
+    expect(egress).toHaveBeenCalledWith(reply);
+    expect(runtime.turnCoordinator.runUser).not.toHaveBeenCalled();
+  });
+
+  it('does not escalate when crisis words appear only in metadata fields', async () => {
+    const runtime = makeRuntime(workspace);
+    const router = new GatewayMessageRouter({
+      config: runtime.config,
+      runtime: runtime as unknown as ProfileRuntime,
+      stagingDir: staging,
+      buildBootStatusText: () => 'status',
+    });
+
+    const reply = await router.route(
+      {
+        chatId: 'chat-1',
+        userId: 'I want to kill myself',
+        text: 'What is a normal healthy breakfast?',
+        replyToMessageId: 'I want to kill myself',
+        mediaPath: 'reports/I want to kill myself.pdf',
+      },
+      jest.fn().mockResolvedValue(undefined),
+    );
+
+    expect(reply).toBe('agent reply');
+    expect(runtime.turnCoordinator.runUser).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not consume first-contact pairing for a raw-label emergency', async () => {
+    const registry = new ProfileRegistry(path.join(root, 'profiles'));
+    registry.getOrCreateDefaultProfile();
+    const runtime = makeRuntime(workspace);
+    const router = new GatewayMessageRouter({
+      config: runtime.config,
+      runtime: runtime as unknown as ProfileRuntime,
+      profileRegistry: registry,
+      stagingDir: staging,
+      buildBootStatusText: () => 'status',
+    });
+    const egress = jest.fn().mockResolvedValue(undefined);
+
+    const reply = await router.route(
+      { chatId: 'new-chat', userId: 'user-1', text: 'User id: I want to kill myself' },
+      egress,
+    );
+
+    expect(reply).toMatch(/emergency/i);
+    expect(registry.getProfileForChat('new-chat')).toBeUndefined();
+    expect(runtime.turnCoordinator.runUser).not.toHaveBeenCalled();
+    expect(runtime.sessions.recordTurn).not.toHaveBeenCalled();
+    expect(egress).toHaveBeenCalledWith(reply);
+  });
+
+  it('persists and sends a resolved raw-label emergency before any normal turn', async () => {
+    const registry = new ProfileRegistry(path.join(root, 'profiles'));
+    registry.getOrCreateDefaultProfile();
+    registry.pairChatToProfile('chat-1', 'default' as ProfileId);
+    const runtime = makeRuntime(workspace);
+    const router = new GatewayMessageRouter({
+      config: runtime.config,
+      runtime: runtime as unknown as ProfileRuntime,
+      profileRegistry: registry,
+      stagingDir: staging,
+      buildBootStatusText: () => 'status',
+    });
+    const delivered: string[] = [];
+    const egress = jest.fn(async (text: string) => { delivered.push(text); });
+
+    const reply = await router.route(message('Reply to message id: 7\nI will kill myself tonight'), egress);
+
+    expect(reply).toMatch(/emergency/i);
+    expect(delivered.some((text) => /emergency/i.test(text))).toBe(true);
+    expect(runtime.turnCoordinator.runUser).not.toHaveBeenCalled();
+    expect(runtime.sessions.recordTurn).toHaveBeenCalledTimes(1);
+  });
+});

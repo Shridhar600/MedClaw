@@ -182,6 +182,47 @@ describe('OnboardingFlow', () => {
     expect(result.response).toContain('I am an AI health companion, not a doctor');
   });
 
+  // ── RR2-A2: raw-input boundary + future-intent/denial regressions ──
+
+  it('inspects raw metadata-looking lines before the onboarding sanitizer (RR2-A2)', async () => {
+    const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
+
+    const result = await flow.handle('User id: I want to kill myself');
+
+    expect(result.bypass).toBe(true);
+    expect(result.response).toContain('emergency');
+    expect((await new OnboardingStore(tmpDir).load()).status).toBe('not_started');
+  });
+
+  it('bypasses future-intent crisis wording without changing onboarding state (RR2-A2)', async () => {
+    const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
+
+    const result = await flow.handle('I will kill myself tonight');
+
+    expect(result.bypass).toBe(true);
+    expect(result.response).toContain('emergency');
+    expect((await new OnboardingStore(tmpDir).load()).status).toBe('not_started');
+  });
+
+  it('does not bypass for an explicit whole-message denial (RR2-A2)', async () => {
+    const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
+
+    const result = await flow.handle("I'm not suicidal.");
+
+    expect(result.bypass).not.toBe(true);
+    expect(result.response).toContain('Before we start');
+  });
+
+  it('still escalates a denial mixed with another warning sign (RR2-A2)', async () => {
+    const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
+
+    const result = await flow.handle("I'm not suicidal, but I will kill myself tonight");
+
+    expect(result.bypass).toBe(true);
+    expect(result.response).toContain('emergency');
+    expect((await new OnboardingStore(tmpDir).load()).status).toBe('not_started');
+  });
+
   it('extends built-in emergency phrases with configured literal keywords', async () => {
     const flow = new (OnboardingFlow as never as new (...args: unknown[]) => OnboardingFlow)(
       new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata', ['code violet'],
