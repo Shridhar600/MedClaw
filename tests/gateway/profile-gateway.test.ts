@@ -399,9 +399,9 @@ describe('Gateway chat→profile pairing', () => {
     expect(sentText).not.toContain('System Health');
   });
 
-  it('handleScheduledJob resolves profileId for job.chatId without crashing', async () => {
+  it('handleScheduledJob refuses an unpaired destination WITHOUT consuming first-contact pairing', async () => {
     const config = makeConfig(tmpDir);
-    const { gateway } = buildGatewayWithRegistry(config);
+    const { gateway, registry } = buildGatewayWithRegistry(config);
 
     const job = {
       id: 'job-1',
@@ -421,12 +421,21 @@ describe('Gateway chat→profile pairing', () => {
       updatedAt: new Date().toISOString(),
     };
 
+    // RR2-B1 (R2-10): the scheduled handler takes the OWNING runtime explicitly; the job's
+    // chatId is a destination only. An unpaired chat must be refused — never auto-paired
+    // from the scheduler path. (Pre-B1 this test asserted the DEFECT: that the default
+    // profile's chatIds came to contain 'heartbeat-chat-1' after the dispatch.)
+    const runtime = gateway.runtimeInstance!;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (gateway as any).handleScheduledJob(job, false);
+    await (gateway as any).handleScheduledJob(job, runtime, false);
 
     const onDisk = readProfilesJson(config.profiles!.baseDir);
     const defaultProfile = onDisk.profiles.find((p) => p.profileId === 'default');
     expect(defaultProfile).toBeDefined();
-    expect(defaultProfile!.chatIds).toContain('heartbeat-chat-1');
+    expect(defaultProfile!.chatIds).not.toContain('heartbeat-chat-1');
+    expect(registry.getProfileForChat('heartbeat-chat-1')).toBeUndefined();
+    // A genuine first-contact message can still claim the pairing afterwards.
+    await gateway.handleTestMessage('genuine-new-chat', 'hello');
+    expect(registry.getProfileForChat('genuine-new-chat')?.profileId).toBe('default');
   });
 });

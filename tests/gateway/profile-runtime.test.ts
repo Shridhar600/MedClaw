@@ -115,6 +115,7 @@ describe('ProfileRuntime Seam Tests (R-S1)', () => {
       semaphore,
       canSchedule: true,
       runScheduledJob: jest.fn().mockResolvedValue(undefined),
+      canAddressChat: () => true,
       sideEffectLookup: jest.fn().mockResolvedValue([]),
     });
 
@@ -162,6 +163,7 @@ describe('ProfileRuntime Seam Tests (R-S1)', () => {
       semaphore,
       canSchedule: true,
       runScheduledJob: jest.fn().mockResolvedValue(undefined),
+      canAddressChat: () => true,
       sideEffectLookup: jest.fn().mockResolvedValue([]),
     });
 

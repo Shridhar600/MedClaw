@@ -562,3 +562,118 @@ describe('HeartbeatScheduler', () => {
     }
   });
 });
+
+describe('HeartbeatScheduler destination-ownership guard (RR2-B1)', () => {
+  let tmpDir: string;
+  let storePath: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-heartbeat-guard-'));
+    storePath = path.join(tmpDir, 'heartbeats', 'jobs.json');
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function guardedScheduler(store: HeartbeatStore, trigger: (job: unknown) => Promise<void>, owns: (chatId: string) => boolean): HeartbeatScheduler {
+    return new HeartbeatScheduler(store, trigger, 'UTC', { canAddressChat: owns } as never);
+  }
+
+  it('createJob refuses a foreign destination and persists nothing', async () => {
+    const store = new HeartbeatStore(storePath);
+    const scheduler = guardedScheduler(store, async () => undefined, (chatId) => chatId === 'chat-1');
+    await scheduler.start();
+
+    await expect(scheduler.createJob({
+      title: 'Foreign reminder', chatId: 'other-profile-chat', cron: '0 8 * * *',
+      prompt: 'x', source: 'system', kind: 'routine',
+    })).rejects.toThrow('does not own');
+    expect(await store.list()).toEqual([]);
+
+    const own = await scheduler.createJob({
+      title: 'Own reminder', chatId: 'chat-1', cron: '0 8 * * *',
+      prompt: 'x', source: 'system', kind: 'routine',
+    });
+    expect(own.chatId).toBe('chat-1');
+    await scheduler.stop();
+  });
+
+  it('updateJob refuses re-pointing a job at a foreign chat', async () => {
+    const store = new HeartbeatStore(storePath);
+    const scheduler = guardedScheduler(store, async () => undefined, (chatId) => chatId === 'chat-1');
+    await scheduler.start();
+    const job = await scheduler.createJob({
+      title: 'Own reminder', chatId: 'chat-1', cron: '0 8 * * *',
+      prompt: 'x', source: 'system', kind: 'routine',
+    });
+
+    await expect(scheduler.updateJob(job.id, { chatId: 'other-profile-chat' })).rejects.toThrow('does not own');
+    const refreshed = await store.get(job.id);
+    expect(refreshed?.chatId).toBe('chat-1');
+    await scheduler.stop();
+  });
+
+  it('updateJob refuses re-enabling a foreign-addressed record; disabling it stays allowed', async () => {
+    const store = new HeartbeatStore(storePath);
+    // Plant a foreign record directly through the store (bypassing the create guard).
+    const planted = await store.create({
+      title: 'Planted foreign job', chatId: 'other-profile-chat', cron: '0 8 * * *',
+      prompt: 'x', source: 'agent', kind: 'routine',
+    });
+    const scheduler = guardedScheduler(store, async () => undefined, (chatId) => chatId === 'chat-1');
+    await scheduler.start();
+
+    await expect(scheduler.updateJob(planted.id, { enabled: true })).rejects.toThrow('does not own');
+    await expect(scheduler.updateJob(planted.id, { enabled: false })).resolves.toMatchObject({ enabled: false });
+    await expect(scheduler.resume(planted.id)).rejects.toThrow('does not own');
+    await scheduler.stop();
+  });
+
+  it('start() disables a planted foreign-addressed record instead of registering it, and never triggers it', async () => {
+    const store = new HeartbeatStore(storePath);
+    const planted = await store.create({
+      title: 'Planted foreign job', chatId: 'other-profile-chat', cron: '0 8 * * *',
+      prompt: 'x', source: 'agent', kind: 'routine',
+    });
+    const trigger = jest.fn().mockResolvedValue(undefined);
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const scheduler = guardedScheduler(store, trigger, (chatId) => chatId === 'chat-1');
+      await scheduler.start();
+      const refreshed = await store.get(planted.id);
+      expect(refreshed?.enabled).toBe(false);
+      expect(refreshed?.lastError).toContain('not owned by this profile');
+      expect(trigger).not.toHaveBeenCalled();
+      await scheduler.stop();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('a scheduler without the guard keeps the standalone (non-profile) unguarded interface', async () => {
+    const store = new HeartbeatStore(storePath);
+    const scheduler = new HeartbeatScheduler(store, async () => undefined, 'UTC');
+    await scheduler.start();
+    const created = await scheduler.createJob({
+      title: 'Standalone reminder', chatId: 'any-chat', cron: '0 8 * * *',
+      prompt: 'x', source: 'system', kind: 'routine',
+    });
+    expect(created.chatId).toBe('any-chat');
+    await scheduler.stop();
+  });
+
+  it('a throwing destination lookup is a refusal, never an authorization or a crash', async () => {
+    const store = new HeartbeatStore(storePath);
+    const scheduler = new HeartbeatScheduler(store, async () => undefined, 'UTC', {
+      canAddressChat: () => { throw new Error('lookup exploded'); },
+    } as never);
+    await scheduler.start();
+    await expect(scheduler.createJob({
+      title: 'x', chatId: 'chat-1', cron: '0 8 * * *',
+      prompt: 'x', source: 'system', kind: 'routine',
+    })).rejects.toThrow('does not own');
+    expect(await store.list()).toEqual([]);
+    await scheduler.stop();
+  });
+});

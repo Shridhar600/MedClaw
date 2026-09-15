@@ -11,6 +11,8 @@ import type { LLMProvider, LLMResponse } from '../../src/providers/types';
 import type { AppConfig } from '../../src/config/types';
 import { HeartbeatStore } from '../../src/scheduler/store';
 import { HeartbeatScheduler } from '../../src/scheduler/runtime';
+import { ProfileRegistry } from '../../src/profiles/registry';
+import type { ProfileId } from '../../src/profiles/types';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 
 function deferred<T = void>() {
@@ -163,12 +165,20 @@ describe('LLM semaphore wiring', () => {
     const send = jest.fn().mockResolvedValue(undefined);
     const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
 
-    attachGatewayTestRuntime(gateway, config, {
+    const runtime = attachGatewayTestRuntime(gateway, config, {
       semaphore,
       agentLoop: loop,
       sessions,
     });
     (gateway as any).channel = { send };
+    // RR2-B1 setup migration: pair the job's chat to the attached runtime's profile so the
+    // queue-overflow assertions keep their original meaning under the destination guard.
+    const baseDir = path.join(tmpDir, 'profiles-base');
+    fs.mkdirSync(baseDir, { recursive: true });
+    const pairingRegistry = new ProfileRegistry(baseDir);
+    pairingRegistry.getOrCreateDefaultProfile();
+    pairingRegistry.pairChatToProfile('chat-1', 'default' as ProfileId);
+    (gateway as any).profileRegistry = pairingRegistry;
 
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
@@ -197,7 +207,7 @@ describe('LLM semaphore wiring', () => {
     try {
       await expect(
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (gateway as any).handleScheduledJob(job, true),
+        (gateway as any).handleScheduledJob(job, runtime, true),
       ).resolves.toBeUndefined();
 
       expect(warnSpy).toHaveBeenCalledWith(
@@ -239,7 +249,7 @@ describe('LLM semaphore wiring', () => {
     const gateway = new Gateway(config);
     const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
 
-    attachGatewayTestRuntime(gateway, config, {
+    const runtime = attachGatewayTestRuntime(gateway, config, {
       sessions,
       agentLoop: { run: jest.fn().mockRejectedValue(new HeartbeatQueueFullError()) },
       scheduler: {
@@ -247,6 +257,15 @@ describe('LLM semaphore wiring', () => {
       },
     });
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
+    // RR2-B1 setup migration: pair the job's chat to the attached runtime's profile.
+    {
+      const baseDir = path.join(tmpDir, 'profiles-base');
+      fs.mkdirSync(baseDir, { recursive: true });
+      const pairingRegistry = new ProfileRegistry(baseDir);
+      pairingRegistry.getOrCreateDefaultProfile();
+      pairingRegistry.pairChatToProfile('chat-1', 'default' as ProfileId);
+      (gateway as any).profileRegistry = pairingRegistry;
+    }
 
     const job = {
       id: 'job-rf',
@@ -270,7 +289,7 @@ describe('LLM semaphore wiring', () => {
     try {
       await expect(
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (gateway as any).handleScheduledJob(job, true),
+        (gateway as any).handleScheduledJob(job, runtime, true),
       ).resolves.toBeUndefined();
       const warned = warnSpy.mock.calls.map((c) => c.join(' ')).join('\n');
       expect(warned).toContain('Failed to record queue-full');

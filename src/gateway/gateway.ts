@@ -33,6 +33,21 @@ import { TurnQueueFullError, heartbeatTurnId } from './turn-coordinator';
 const SHUTDOWN_RESPONSE = 'The health assistant is shutting down. Please try again in a moment.';
 const BOOT_HEALTHCHECK_BUDGET_MS = 3_000;
 
+/**
+ * RR2-B1 (R2-10/11): a narrow, gateway-local boundary representing an AUTHORIZATION
+ * suppression of a scheduled delivery — the destination chat stopped belonging to the owning
+ * profile between dispatch and egress. Deliberately NOT an operational/provider error: it must
+ * never enter `recordFailure`'s retry/dead-letter state machine, and it must never let
+ * `afterDelivery` record an honest-looking sent/noop. Module-local by design — no other
+ * consumer may throw or catch it.
+ */
+class HeartbeatDestinationSuppressedError extends Error {
+  constructor() {
+    super('heartbeat destination is no longer owned by the dispatching profile');
+    this.name = 'HeartbeatDestinationSuppressedError';
+  }
+}
+
 function pendingReadiness(label: string): ReadinessResult {
   return {
     ready: false,
@@ -380,7 +395,11 @@ export class Gateway {
       if (!runtime.scheduler) {
         await runtime.initializeScheduler({
           schedulerPaths: this.schedulerPathsFor(runtime.profileId),
-          runScheduledJob: (job) => this.handleScheduledJob(job, true),
+          // RR2-B1: the trigger closure captures THIS profile's concrete runtime — the job's
+          // `chatId` never re-selects a runtime — and the destination guard is threaded into
+          // the scheduler so create/update/resume/registration refuse foreign addresses.
+          runScheduledJob: (job) => this.handleScheduledJob(job, runtime, true),
+          canAddressChat: (chatId) => this.canChatIdAddressProfile(chatId, runtime.profileId),
         });
       }
       if (runtime.scheduler) {
@@ -409,23 +428,57 @@ export class Gateway {
     };
   }
 
-  private async handleScheduledJob(job: HeartbeatJob, invokedByScheduler = false): Promise<void> {
+  /**
+   * RR2-B1 (R2-10/11) destination-ownership predicate: `chatId` may be addressed by work
+   * running as `profileId` ONLY when the (optional) profile registry currently pairs that
+   * chat to that profile. Side-effect-free: it READS `registry.getProfileForChat` only —
+   * never Router.resolveProfileForChat / getOrCreateDefaultProfile / pairChatToProfile, and
+   * it never builds or initializes another runtime. A missing/unreadable registry is FALSE
+   * (no implicit default authorization), and lookup failures are logged sanitized and
+   * refused. `job.chatId` is a destination, never authority.
+   */
+  private canChatIdAddressProfile(chatId: string, profileId: ProfileId): boolean {
+    try {
+      const resolved = this.profileRegistry?.getProfileForChat(chatId);
+      if (!resolved) return false;
+      return resolved.profileId === profileId;
+    } catch (error) {
+      console.warn('[gateway] Scheduled-work destination lookup failed; refusing:', summarizeErrorForLog(error));
+      return false;
+    }
+  }
+
+  private async recordSuppressedOutcomeOnOwner(owner: ProfileRuntime, jobId: string): Promise<void> {
+    const scheduler = owner.scheduler;
+    if (!scheduler) return;
+    try {
+      await scheduler.recordOutcome(jobId, 'skipped-unowned-chat');
+    } catch (recordError) {
+      console.warn('[gateway] Failed to record unowned-chat suppression:', summarizeErrorForLog(recordError));
+    }
+  }
+
+  /**
+   * RR2-B1: scheduled dispatch requires an explicit trusted runtime. `owner` is the
+   * ProfileRuntime whose scheduler created/fired this job — every trigger closure captures
+   * its concrete runtime at construction, so `job.chatId` never re-selects a runtime. All
+   * session/turn/scheduler/outcome state stays on the owner; a foreign or unpaired
+   * destination is refused BEFORE any session, tool, model, delivery-policy or channel work.
+   */
+  private async handleScheduledJob(
+    job: HeartbeatJob,
+    owner: ProfileRuntime,
+    invokedByScheduler = false,
+  ): Promise<void> {
     if (this.stopping) return;
-    const router = this.requireRouter();
-    const profileId = router.resolveProfileForChat(job.chatId);
-    if (profileId === null) {
-      console.warn(`[gateway] Skipping heartbeat job ${job.id}: chat is not available in this runtime.`);
+    if (!this.canChatIdAddressProfile(job.chatId, owner.profileId)) {
+      console.warn(
+        `[gateway] Suppressing heartbeat job ${job.id}: destination chat is not owned by profile "${owner.profileId}".`,
+      );
+      await this.recordSuppressedOutcomeOnOwner(owner, job.id);
       return;
     }
-    // RR-STRUCT R-S5b: the RR-4 `!isDefaultProfile` skip is RETIRED — the job dispatches to
-    // the OWNING profile's runtime (its sessions/scheduler/coordinator), so outcomes,
-    // delivery-policy reads, and failure records all land in that profile's stores.
-    // Egress stays the daemon-singleton channel addressed by `job.chatId` (unchanged).
-    const runtime = await this.resolveRuntimeForProfile(profileId);
-    if (!runtime) {
-      console.warn(`[gateway] Skipping heartbeat job ${job.id}: owning profile runtime is degraded.`);
-      return;
-    }
+    const runtime = owner;
     const sessions = runtime.sessions;
     const scheduler = runtime.scheduler;
     const coordinator = runtime.turnCoordinator;
@@ -448,6 +501,11 @@ export class Gateway {
       `Prompt: ${job.prompt}`,
     ].join('\n');
 
+    // RR2-B1: the destination can be REASSIGNED while the model runs. Re-check ownership
+    // immediately before channel.send (the delivery gate) and again before recording a
+    // sent/noop outcome, so a mid-turn reassignment is refused and suppressed — never
+    // delivered, never recorded as an honest success, never pushed into retry logic.
+    let delivered = false;
     try {
       // RR-STRUCT R-S3b (C-39 for heartbeats): thread the per-occurrence turnId so a
       // `ledger_record` inside this turn gets a deterministic idempotency key — a
@@ -457,10 +515,19 @@ export class Gateway {
         chatId: job.chatId,
         input,
         turnId,
-        egress: (text) => this.channel!.send(job.chatId, { text }),
+        egress: async (text) => {
+          if (!this.canChatIdAddressProfile(job.chatId, owner.profileId)) {
+            throw new HeartbeatDestinationSuppressedError();
+          }
+          await this.channel!.send(job.chatId, { text });
+          delivered = true;
+        },
         afterDelivery: async (agentResult) => {
+          if (!delivered && !this.canChatIdAddressProfile(job.chatId, owner.profileId)) {
+            throw new HeartbeatDestinationSuppressedError();
+          }
           await scheduler?.recordOutcome(job.id, agentResult.text === HEARTBEAT_NOOP ? 'noop' : 'sent');
-          await this.reconcileAfterScheduledDelivery(job.chatId);
+          await this.reconcileAfterScheduledDelivery(job.chatId, owner);
         },
       });
       if (result.status === 'preempted') {
@@ -471,6 +538,13 @@ export class Gateway {
         }
       }
     } catch (error) {
+      if (error instanceof HeartbeatDestinationSuppressedError) {
+        console.warn(
+          `[gateway] Suppressing heartbeat delivery for job ${job.id}: destination left this profile's ownership mid-turn.`,
+        );
+        await this.recordSuppressedOutcomeOnOwner(owner, job.id);
+        return;
+      }
       if (error instanceof HeartbeatQueueFullError || error instanceof TurnQueueFullError) {
         console.warn(`[gateway] Heartbeat queue full for job ${job.id}; scheduler will retry.`);
         if (scheduler) {
@@ -500,9 +574,17 @@ export class Gateway {
     }
   }
 
-  private async reconcileAfterScheduledDelivery(chatId: string): Promise<void> {
+  private async reconcileAfterScheduledDelivery(chatId: string, owner: ProfileRuntime): Promise<void> {
     try {
-      await this.reconcileHeartbeatPolicies(chatId);
+      // RR2-B1: reconciliation after a scheduled job stays owner-bound. If ownership no
+      // longer holds, skip — never re-resolve a now-foreign chat into another runtime.
+      if (!this.canChatIdAddressProfile(chatId, owner.profileId)) {
+        console.warn(
+          '[gateway] Skipping post-delivery heartbeat reconciliation: destination is no longer owned by this profile.',
+        );
+        return;
+      }
+      await this.reconcileHeartbeatPoliciesOnRuntime(owner, chatId);
     } catch (error) {
       console.warn('[gateway] Post-delivery heartbeat reconciliation failed:', summarizeErrorForLog(error));
     }
@@ -521,20 +603,42 @@ export class Gateway {
     // Sync-first: every already-built profile (boot eager-build, the overwhelming common case)
     // resolves with ZERO async hops, preserving the exact pre-R-S5b microtask timing the
     // debounce path is pinned to. The async fallback on-demand builds a profile paired after
-    // boot that was never built (lazy serving).
+    // boot that was never built (lazy serving). NON-JOB callers only (user-turn reconcile +
+    // debounce + startup): scheduled delivery uses the owner-bound path below.
     const runtime = this.runtimeForChatSync(chatId) ?? await this.runtimeForChat(chatId);
     if (!runtime?.scheduler) {
       return;
     }
+    // RR2-B1: fail-closed, matching the scheduler's createJob guard. An unpaired chat
+    // (or a lookup failure) must not arm policy jobs on the resolved runtime — and the
+    // refusal must degrade here (sanitized warn, no reconcile) instead of propagating a
+    // createJob ownership error through reconcilePolicyJobs' rethrow path.
+    if (!this.canChatIdAddressProfile(chatId, runtime.profileId)) {
+      console.warn('[gateway] Skipping heartbeat policy reconciliation: chat is not owned by the resolving profile.');
+      return;
+    }
+    await this.reconcileHeartbeatPoliciesOnRuntime(runtime, chatId);
+  }
 
+  /**
+   * RR2-B1: the reconcile body, bound to an explicit runtime. Called by
+   * `reconcileAfterScheduledDelivery` with the OWNING runtime (never a chat-derived
+   * re-resolution), and by `reconcileHeartbeatPolicies` for non-job callers (existing
+   * chat-resolution behavior retained there).
+   */
+  private async reconcileHeartbeatPoliciesOnRuntime(runtime: ProfileRuntime, chatId: string): Promise<void> {
+    const scheduler = runtime.scheduler;
+    if (!scheduler) {
+      return;
+    }
     const desired = await buildDesiredHeartbeatJobs({
       workspacePath: runtime.workspace,
       chatId,
       timezone: this.config.heartbeat.timezone,
       policy: this.config.heartbeat.policy,
     });
-    await reconcilePolicyJobs(runtime.scheduler, desired);
-    await syncHeartbeatMarkdown(runtime.workspace, await runtime.scheduler.listJobs());
+    await reconcilePolicyJobs(scheduler, desired);
+    await syncHeartbeatMarkdown(runtime.workspace, await scheduler.listJobs());
   }
 
   private async debouncedReconcile(chatId: string): Promise<void> {
@@ -787,11 +891,14 @@ export class Gateway {
       config,
       mainProvider: this.mainProvider!,
       semaphore: this.semaphore!,
-      // Scheduler recovery can invoke the callback before ProfileRuntime.create returns. Delay
-      // scheduler construction until Gateway explicitly initializes it (initializeScheduler,
-      // default-profile-only this slice — see its own doc comment).
+      // RR-STRUCT R-S5a: scheduler recovery must not invoke a callback before
+      // ProfileRuntime.create returns. Gateway explicitly initializes every runtime's
+      // scheduler AFTER boot (initializeScheduler), where the concrete runtime exists to
+      // capture in the trigger closure and the destination guard is threaded (RR2-B1).
+      // RR2-B1: no owner-less `runScheduledJob` is passed here — a closure captured at
+      // build time could not bind this runtime, and canSchedule stays false so the
+      // direct-factory activation path (which requires canAddressChat) is not used.
       canSchedule: false,
-      runScheduledJob: (job) => this.handleScheduledJob(job, true),
       reconcile: (chatId) => this.debouncedReconcile(chatId),
       sideEffectLookup: (entity) => this.lookupSideEffects(this.sideEffectProvider ?? this.mainProvider!, entity),
     });

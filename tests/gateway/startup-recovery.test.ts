@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { AppConfig } from '../../src/config/types';
+import type { ProfileId } from '../../src/profiles/types';
 import type { HeartbeatJob } from '../../src/scheduler/types';
 
 const mockSendMessage = jest.fn();
@@ -108,6 +109,9 @@ describe('Gateway scheduler recovery wiring', () => {
         },
       },
       agent: { maxIterations: 5, disclaimerEnabled: false },
+      // RR2-B1 setup migration: the destination-ownership guard reads the profile registry,
+      // so the fixture persists a default profile with the recovered job's chat pre-paired.
+      profiles: { baseDir: path.join(tmpDir, 'profiles-base'), defaultProfileId: 'default' },
     };
   }
 
@@ -178,7 +182,13 @@ describe('Gateway scheduler recovery wiring', () => {
 
   it('does not drop a recovered heartbeat while ProfileRuntime.create is in progress', async () => {
     const { Gateway } = await import('../../src/gateway/gateway');
+    const { ProfileRegistry } = await import('../../src/profiles/registry');
     const config = makeConfig();
+    // Persist the pairing fixture BEFORE boot: the destination guard refuses unpaired chats.
+    fs.mkdirSync(path.join(tmpDir, 'profiles-base'), { recursive: true });
+    const fixtureRegistry = new ProfileRegistry(path.join(tmpDir, 'profiles-base'));
+    fixtureRegistry.getOrCreateDefaultProfile();
+    fixtureRegistry.pairChatToProfile('chat-1', 'default' as ProfileId);
     installRuntime(config);
     const gateway = new Gateway(config);
 

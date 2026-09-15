@@ -195,6 +195,13 @@ export interface ProfileRuntimeDeps {
   semaphore: LLMSemaphore;
   canSchedule?: boolean;
   runScheduledJob?: (job: HeartbeatJob) => Promise<void>;
+  /**
+   * RR2-B1 (R2-10/11): destination-ownership capability for this runtime's scheduler.
+   * Required whenever `canSchedule` is true — a factory path that cannot prove which chats
+   * belong to this profile refuses scheduler activation rather than constructing an
+   * unguarded production scheduler.
+   */
+  canAddressChat?: (chatId: string) => boolean;
   sideEffectLookup?: (entity: string) => Promise<string[]>;
   reconcile?: (chatId: string) => Promise<void>;
 }
@@ -765,10 +772,20 @@ export class ProfileRuntime {
     }
 
     if (deps.canSchedule && deps.runScheduledJob && config.heartbeat.enabled) {
-      await runtime.initializeScheduler({
-        schedulerPaths,
-        runScheduledJob: deps.runScheduledJob,
-      });
+      // RR2-B1: refuse scheduler activation without a destination-ownership guard — never
+      // construct an unguarded production scheduler (fail-closed, sanitized, no throw).
+      if (!deps.canAddressChat) {
+        console.warn(
+          '[gateway] Heartbeat scheduler not activated: no destination ownership guard ' +
+          '(canAddressChat) was supplied for this runtime.',
+        );
+      } else {
+        await runtime.initializeScheduler({
+          schedulerPaths,
+          runScheduledJob: deps.runScheduledJob,
+          canAddressChat: deps.canAddressChat,
+        });
+      }
     }
 
     runtime.sweepStopping = false;
@@ -789,6 +806,13 @@ export class ProfileRuntime {
   async initializeScheduler(options: {
     schedulerPaths: { storePath: string; auditLogPath: string };
     runScheduledJob: (job: HeartbeatJob) => Promise<void>;
+    /**
+     * RR2-B1 (R2-10/11): REQUIRED for production — the destination-ownership capability
+     * closed over THIS runtime's profileId. Threaded into the scheduler so
+     * createJob/updateJob/resume/start registration can refuse foreign destinations, and
+     * the dispatch trigger stays owner-bound (the Gateway closure captures this runtime).
+     */
+    canAddressChat: (chatId: string) => boolean;
   }): Promise<void> {
     if (!this.config.heartbeat?.enabled) {
       return;
@@ -796,7 +820,7 @@ export class ProfileRuntime {
     if (this.stopping || this.closed) {
       return;
     }
-    const { schedulerPaths, runScheduledJob } = options;
+    const { schedulerPaths, runScheduledJob, canAddressChat } = options;
     const store = new HeartbeatStore(schedulerPaths.storePath, this.profileId);
     this.scheduler = new HeartbeatScheduler(
       store,
@@ -810,6 +834,7 @@ export class ProfileRuntime {
         recoveryEnabled: this.config.heartbeat.recovery.enabled,
         recoveryWindowMinutes: this.config.heartbeat.recovery.windowMinutes,
         retryBackoffMinutes: this.config.heartbeat.retry.backoffMinutes,
+        canAddressChat,
       },
     );
     await this.scheduler.start();

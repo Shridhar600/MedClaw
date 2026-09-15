@@ -289,8 +289,10 @@ describe('RR-STRUCT R-S5b: live multi-profile dispatch (C-01 close)', () => {
       title: 'Father reminder', chatId: SECONDARY_CHAT, cron: '0 8 * * *',
       prompt: 'take your morning pill', source: 'user', kind: 'routine',
     });
+    // RR2-B1: dispatch requires the explicit OWNING runtime — this job belongs to the
+    // secondary profile, so its own runtime is passed (chatId never re-selects one).
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (gateway as any).handleScheduledJob(job, true);
+    await (gateway as any).handleScheduledJob(job, secondaryRuntime, true);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const send = (gateway as any).channel.send as jest.Mock;

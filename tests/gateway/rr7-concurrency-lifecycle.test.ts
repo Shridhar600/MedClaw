@@ -8,6 +8,8 @@ import type { HeartbeatJob } from '../../src/scheduler/types';
 import { Gateway } from '../../src/gateway/gateway';
 import { SqliteChunkStats, SqliteKeywordIndex, SqliteVecIndex } from '../../src/indexstore';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
+import { ProfileRegistry } from '../../src/profiles/registry';
+import type { ProfileId } from '../../src/profiles/types';
 
 const mockMainProvider: LLMProvider = {
   modelName: 'rr7-main',
@@ -240,7 +242,7 @@ describe('Gateway RR-7 concurrency and lifecycle', () => {
     const send = jest.fn().mockResolvedValue(undefined);
     const recordOutcome = jest.fn().mockResolvedValue(undefined);
     const reconcile = jest.fn().mockRejectedValue(new Error('private health reconciliation detail'));
-    attachGatewayTestRuntime(gateway, makeConfig(tmpDir), {
+    const runtime = attachGatewayTestRuntime(gateway, makeConfig(tmpDir), {
       sessions: {
         getLastActiveAt: jest.fn().mockReturnValue(undefined),
         prepareHistory: jest.fn().mockResolvedValue([]),
@@ -258,15 +260,26 @@ describe('Gateway RR-7 concurrency and lifecycle', () => {
       scheduler: { recordOutcome },
     });
     (gateway as unknown as { channel: unknown }).channel = { send };
-    (gateway as unknown as { reconcileHeartbeatPolicies: jest.Mock }).reconcileHeartbeatPolicies = reconcile;
+    // RR2-B1 migration: the owner-bound reconcile body is the seam this test spies on (same
+    // assertion meaning — a post-delivery reconcile failure must not fail the delivery).
+    (gateway as unknown as { reconcileHeartbeatPoliciesOnRuntime: jest.Mock }).reconcileHeartbeatPoliciesOnRuntime = reconcile;
+    // Destination guard fixture: pair the job's chat to the owning profile.
+    {
+      const baseDir = path.join(tmpDir, 'profiles-base');
+      fs.mkdirSync(baseDir, { recursive: true });
+      const pairingRegistry = new ProfileRegistry(baseDir);
+      pairingRegistry.getOrCreateDefaultProfile();
+      pairingRegistry.pairChatToProfile('chat-1', 'default' as ProfileId);
+      (gateway as unknown as { profileRegistry: unknown }).profileRegistry = pairingRegistry;
+    }
 
     await expect(
-      (gateway as unknown as { handleScheduledJob(job: HeartbeatJob, invokedByScheduler: boolean): Promise<void> })
-        .handleScheduledJob(scheduledJob, true),
+      (gateway as unknown as { handleScheduledJob(job: HeartbeatJob, owner: unknown, invokedByScheduler: boolean): Promise<void> })
+        .handleScheduledJob(scheduledJob, runtime, true),
     ).resolves.toBeUndefined();
     expect(send).toHaveBeenCalledTimes(1);
     expect(recordOutcome).toHaveBeenCalledWith('rr7-job', 'sent');
-    expect(reconcile).toHaveBeenCalledWith('chat-1');
+    expect(reconcile).toHaveBeenCalledWith(expect.anything(), 'chat-1');
   });
 
   it('retains and closes all recall SQLite adapters exactly once across repeated stop calls', async () => {
@@ -332,8 +345,8 @@ describe('Gateway RR-7 concurrency and lifecycle', () => {
     const stopPromise = gateway.stop();
     try {
       await Promise.race([schedulerStopStarted.promise, compactionStarted.promise]);
-      await (gateway as unknown as { handleScheduledJob(job: HeartbeatJob, invokedByScheduler: boolean): Promise<void> })
-        .handleScheduledJob(scheduledJob, true);
+      await (gateway as unknown as { handleScheduledJob(job: HeartbeatJob, owner: unknown, invokedByScheduler: boolean): Promise<void> })
+        .handleScheduledJob(scheduledJob, gateway.runtimeInstance, true);
       expect(prepareHistory).not.toHaveBeenCalled();
     } finally {
       releaseSchedulerStop.resolve();

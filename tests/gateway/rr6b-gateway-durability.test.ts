@@ -8,6 +8,8 @@ import { SqliteSessionIndex } from '../../src/indexstore/session-index';
 import type { AppConfig } from '../../src/config/types';
 import type { HeartbeatJob } from '../../src/scheduler/types';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
+import { ProfileRegistry } from '../../src/profiles/registry';
+import type { ProfileId } from '../../src/profiles/types';
 
 const FALLBACK = "I'm having trouble right now. Please try again in a moment.";
 
@@ -80,7 +82,7 @@ describe('RR-6b gateway delivery durability', () => {
 
   it('does not deliver a heartbeat before a failed persistence attempt, so retry sends once', async () => {
     const gateway = makeGateway();
-    attachGatewayTestRuntime(gateway, {} as AppConfig);
+    const runtime = attachGatewayTestRuntime(gateway, {} as AppConfig);
     const state = gateway as unknown as Record<string, unknown>;
     const send = jest.fn().mockResolvedValue(undefined);
     let recordCalls = 0;
@@ -129,12 +131,21 @@ describe('RR-6b gateway delivery durability', () => {
       updatedAt: new Date().toISOString(),
     };
 
-    await expect((gateway as unknown as { handleScheduledJob(job: HeartbeatJob, schedulerOwned: boolean): Promise<void> })
-      .handleScheduledJob(job, true)).rejects.toThrow('session persistence unavailable');
+    // RR2-B1 setup migration: dispatch requires an explicit owner runtime; pair the job's
+    // chat to the attached runtime's profile so the delivery assertions keep their meaning.
+    const baseDir = path.join(tmpDir, 'profiles-base');
+    fs.mkdirSync(baseDir, { recursive: true });
+    const pairingRegistry = new ProfileRegistry(baseDir);
+    pairingRegistry.getOrCreateDefaultProfile();
+    pairingRegistry.pairChatToProfile('chat-1', 'default' as ProfileId);
+    state.profileRegistry = pairingRegistry;
+
+    await expect((gateway as unknown as { handleScheduledJob(job: HeartbeatJob, owner: unknown, schedulerOwned: boolean): Promise<void> })
+      .handleScheduledJob(job, runtime, true)).rejects.toThrow('session persistence unavailable');
     expect(send).not.toHaveBeenCalled();
 
-    await (gateway as unknown as { handleScheduledJob(job: HeartbeatJob, schedulerOwned: boolean): Promise<void> })
-      .handleScheduledJob(job, true);
+    await (gateway as unknown as { handleScheduledJob(job: HeartbeatJob, owner: unknown, schedulerOwned: boolean): Promise<void> })
+      .handleScheduledJob(job, runtime, true);
     expect(send).toHaveBeenCalledTimes(1);
   });
 
