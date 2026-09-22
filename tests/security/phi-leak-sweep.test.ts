@@ -77,6 +77,9 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
         registry,
         { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 2 },
       );
+      // I3 added bounded retries to compaction LLM calls; this test asserts log
+      // sanitization, so use a single fast attempt to stay inside the timeout.
+      manager.setCompactionRetryPolicy({ attempts: 1 });
       const chatId = 'chat-phi';
       for (let i = 0; i < 6; i++) {
         await manager.addTurn(chatId, { role: 'user', content: `u${i}` }, { role: 'assistant', content: `a${i}` });

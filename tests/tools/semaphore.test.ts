@@ -1,4 +1,4 @@
-import { LLMSemaphore, HeartbeatQueueFullError } from '../../src/tools/semaphore';
+import { HeartbeatPreemptedError, LLMSemaphore, HeartbeatQueueFullError } from '../../src/tools/semaphore';
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -73,6 +73,31 @@ describe('LLMSemaphore', () => {
     await pHb;
 
     expect(order).toEqual(['user-start', 'user-end', 'heartbeat-start']);
+  });
+
+  it('drains background priority only after user AND heartbeat (F8)', async () => {
+    const order: string[] = [];
+    const blockerRunning = deferred();
+    const blockerDone = deferred();
+
+    const pBlock = sem.run('user', async () => {
+      order.push('block-start');
+      blockerRunning.resolve();
+      await blockerDone.promise;
+      order.push('block-end');
+    });
+    await blockerRunning.promise;
+
+    // Enqueue in reverse-priority order while the blocker holds the semaphore.
+    const pBg = sem.run('background', async () => { order.push('bg'); });
+    const pHb = sem.run('heartbeat', async () => { order.push('hb'); });
+    const pUser = sem.run('user', async () => { order.push('user2'); });
+
+    blockerDone.resolve();
+    await Promise.all([pBlock, pBg, pHb, pUser]);
+
+    // Priority order wins over enqueue order: user > heartbeat > background.
+    expect(order).toEqual(['block-start', 'block-end', 'user2', 'hb', 'bg']);
   });
 
   it('serializes multiple heartbeat jobs', async () => {
@@ -250,8 +275,8 @@ describe('LLMSemaphore', () => {
     await expect(overflow).rejects.toThrow('heartbeat queue full');
     await expect(overflow).rejects.toBeInstanceOf(HeartbeatQueueFullError);
 
-    // A user job must still be accepted (enqueued, not rejected) while the
-    // heartbeat queue is full — user jobs are never bounded.
+    // The independent user cap still leaves room for a user job while the
+    // heartbeat queue is full.
     const userResult = sem.run('user', async () => 'user-ok');
 
     blockerDone.resolve();
@@ -294,5 +319,215 @@ describe('LLMSemaphore', () => {
     await Promise.all(hbPromises);
 
     expect(order).toEqual(['blocker-start', 'blocker-end', 'user', 'hb0', 'hb1', 'hb2', 'hb3', 'hb4']);
+  });
+
+  it('rejects a user enqueue once the bounded user queue is full', async () => {
+    const SemaphoreWithOptions = LLMSemaphore as unknown as new (options: {
+      maxQueuedUsers: number;
+      maxQueuedHeartbeats: number;
+      maxQueuedBackground: number;
+    }) => LLMSemaphore;
+    const bounded = new SemaphoreWithOptions({ maxQueuedUsers: 1, maxQueuedHeartbeats: 10, maxQueuedBackground: 20 });
+    const blockerRunning = deferred();
+    const blockerDone = deferred();
+    const blocker = bounded.run('user', async () => {
+      blockerRunning.resolve();
+      await blockerDone.promise;
+    });
+    await blockerRunning.promise;
+
+    const queued = bounded.run('user', async () => {});
+    const overflow = bounded.run('user', async () => {});
+
+    blockerDone.resolve();
+    await blocker;
+    await expect(overflow).rejects.toMatchObject({ name: 'UserQueueFullError' });
+    await queued;
+  });
+
+  it('rejects a background enqueue once the bounded background queue is full', async () => {
+    const SemaphoreWithOptions = LLMSemaphore as unknown as new (options: {
+      maxQueuedUsers: number;
+      maxQueuedHeartbeats: number;
+      maxQueuedBackground: number;
+    }) => LLMSemaphore;
+    const bounded = new SemaphoreWithOptions({ maxQueuedUsers: 100, maxQueuedHeartbeats: 10, maxQueuedBackground: 1 });
+    const blockerRunning = deferred();
+    const blockerDone = deferred();
+    const blocker = bounded.run('user', async () => {
+      blockerRunning.resolve();
+      await blockerDone.promise;
+    });
+    await blockerRunning.promise;
+
+    const queued = bounded.run('background', async () => {});
+    const overflow = bounded.run('background', async () => {});
+
+    blockerDone.resolve();
+    await blocker;
+    await expect(overflow).rejects.toMatchObject({ name: 'BackgroundQueueFullError' });
+    await queued;
+  });
+
+  it('shutdown rejects queued work with a typed error and does not run it', async () => {
+    const blockerRunning = deferred();
+    const blockerDone = deferred();
+    const order: string[] = [];
+    const blocker = sem.run('user', async () => {
+      order.push('blocker');
+      blockerRunning.resolve();
+      await blockerDone.promise;
+    });
+    await blockerRunning.promise;
+
+    const queuedUser = sem.run('user', async () => { order.push('queued-user'); });
+    const queuedHeartbeat = sem.run('heartbeat', async () => { order.push('queued-heartbeat'); });
+    const queuedBackground = sem.run('background', async () => { order.push('queued-background'); });
+
+    try {
+      (sem as unknown as { shutdown(): void }).shutdown();
+
+      await expect(queuedUser).rejects.toMatchObject({ name: 'SemaphoreShutdownError' });
+      await expect(queuedHeartbeat).rejects.toMatchObject({ name: 'SemaphoreShutdownError' });
+      await expect(queuedBackground).rejects.toMatchObject({ name: 'SemaphoreShutdownError' });
+    } finally {
+      blockerDone.resolve();
+      await blocker;
+    }
+    expect(order).toEqual(['blocker']);
+  });
+
+  it('allows a waiting background job to run after a bounded burst of users', async () => {
+    const blockerRunning = deferred();
+    const blockerDone = deferred();
+    const order: string[] = [];
+    const blocker = sem.run('user', async () => {
+      order.push('blocker');
+      blockerRunning.resolve();
+      await blockerDone.promise;
+    });
+    await blockerRunning.promise;
+
+    const background = sem.run('background', async () => { order.push('background'); });
+    const users = Array.from({ length: 9 }, (_, i) => sem.run('user', async () => { order.push(`user-${i}`); }));
+
+    blockerDone.resolve();
+    await blocker;
+    await background;
+    await Promise.all(users);
+
+    expect(order.indexOf('background')).toBeGreaterThan(0);
+    expect(order.indexOf('background')).toBeLessThan(order.indexOf('user-8'));
+  });
+
+  it('allows a waiting background job to run after a bounded burst of heartbeats', async () => {
+    const SemaphoreWithOptions = LLMSemaphore as unknown as new (options: {
+      maxQueuedUsers: number;
+      maxQueuedHeartbeats: number;
+      maxQueuedBackground: number;
+      maxConsecutiveUserJobsWithBackground: number;
+    }) => LLMSemaphore;
+    const bounded = new SemaphoreWithOptions({
+      maxQueuedUsers: 100,
+      maxQueuedHeartbeats: 10,
+      maxQueuedBackground: 1,
+      maxConsecutiveUserJobsWithBackground: 2,
+    });
+    const blockerRunning = deferred();
+    const blockerDone = deferred();
+    const order: string[] = [];
+    const blocker = bounded.run('user', async () => {
+      order.push('blocker');
+      blockerRunning.resolve();
+      await blockerDone.promise;
+    });
+    await blockerRunning.promise;
+
+    const background = bounded.run('background', async () => { order.push('background'); });
+    const heartbeats = Array.from({ length: 3 }, (_, i) =>
+      bounded.run('heartbeat', async () => { order.push(`heartbeat-${i}`); }));
+
+    blockerDone.resolve();
+    await blocker;
+    await background;
+    await Promise.all(heartbeats);
+
+    expect(order.indexOf('background')).toBeLessThan(order.indexOf('heartbeat-2'));
+  });
+
+  it('evicts matching queued entries with HeartbeatPreemptedError and leaves the running job untouched', async () => {
+    const running = deferred();
+    const release = deferred();
+    const order: string[] = [];
+    const active = sem.run('user', async () => {
+      order.push('active-start');
+      running.resolve();
+      await release.promise;
+      order.push('active-end');
+    });
+    await running.promise;
+
+    const matching = sem.run('heartbeat', async () => { order.push('matching'); }, {
+      chatId: 'chat-a',
+      origin: 'heartbeat',
+    });
+    const nonMatching = sem.run('heartbeat', async () => { order.push('non-matching'); }, {
+      chatId: 'chat-b',
+      origin: 'heartbeat',
+    });
+
+    expect(sem.abortQueueEntry((meta) => meta?.chatId === 'chat-a' && meta.origin === 'heartbeat')).toBe(1);
+    await expect(matching).rejects.toBeInstanceOf(HeartbeatPreemptedError);
+    release.resolve();
+    await active;
+    await nonMatching;
+
+    expect(order).toEqual(['active-start', 'active-end', 'non-matching']);
+  });
+
+  it('is race-safe when aborting during an active drain and preserves later queue progress', async () => {
+    const running = deferred();
+    const release = deferred();
+    const active = sem.run('heartbeat', async () => {
+      running.resolve();
+      await release.promise;
+    }, { chatId: 'chat-a', origin: 'heartbeat' });
+    await running.promise;
+    const queued = sem.run('heartbeat', async () => 'kept', { chatId: 'chat-b', origin: 'heartbeat' });
+
+    expect(sem.abortQueueEntry((meta) => meta?.chatId === 'chat-a')).toBe(0);
+    expect(sem.abortQueueEntry((meta) => meta?.chatId === 'chat-b')).toBe(1);
+    await expect(queued).rejects.toBeInstanceOf(HeartbeatPreemptedError);
+    release.resolve();
+    await active;
+
+    await expect(sem.run('user', async () => 'after-abort')).resolves.toBe('after-abort');
+  });
+
+  it('preserves the background reservation counter when queued heartbeats are aborted', async () => {
+    const bounded = new LLMSemaphore({ maxConsecutiveUserJobsWithBackground: 1 });
+    const running = deferred();
+    const release = deferred();
+    const order: string[] = [];
+    const active = bounded.run('user', async () => {
+      order.push('active');
+      running.resolve();
+      await release.promise;
+    });
+    await running.promise;
+
+    const heartbeat = bounded.run('heartbeat', async () => { order.push('heartbeat'); }, {
+      chatId: 'chat-a',
+      origin: 'heartbeat',
+    });
+    const background = bounded.run('background', async () => { order.push('background'); });
+    const user = bounded.run('user', async () => { order.push('user'); });
+
+    expect(bounded.abortQueueEntry((meta) => meta.chatId === 'chat-a')).toBe(1);
+    await expect(heartbeat).rejects.toBeInstanceOf(HeartbeatPreemptedError);
+    release.resolve();
+    await Promise.all([active, background, user]);
+
+    expect(order).toEqual(['active', 'background', 'user']);
   });
 });

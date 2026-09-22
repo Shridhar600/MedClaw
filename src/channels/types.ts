@@ -2,7 +2,10 @@ export interface IncomingMessage {
   chatId: string;
   userId: string;
   text: string;
-  mediaPath?: string;  // Local path if user sent a file/image
+  /** Source message identity, when the channel provides one, for capture deduplication. */
+  messageId?: string;
+  /** Absolute profile-agnostic staging path until the gateway Router adopts it into a profile workspace. */
+  mediaPath?: string;
   mediaError?: string;
   replyToMessageId?: string;
 }

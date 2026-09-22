@@ -138,10 +138,15 @@ describe('Compaction never splits a tool-call group (#16)', () => {
     jest.restoreAllMocks();
   });
 
-  // Seed a history whose naive `-keepRecent` boundary lands *inside* a tool
-  // group: last-but-one message is a `tool` result.
-  //   [u1, a1, u2, asst(tc), tool, a2]  (keepRecent=2 -> recent = [tool, a2])
+  // Turn-aware compaction (H4) keeps the last keepRecentTurns TURNS, so we seed one older turn (to be
+  // summarized away) plus the split-inducing tool-group turn in the RECENT tail. This still proves #16
+  // (a compaction boundary never splits a tool group) and gives the flush a real older range.
+  //   [older, olderA, u1, a1, u2, asst(tc), tool, a2]  (keepRecentTurns=2 -> recent = [u1..a2])
   async function seedSplitInducingHistory(manager: SessionManager, chatId: string): Promise<void> {
+    await manager.recordTurn(chatId, [
+      { role: 'user', content: 'older turn to summarize' },
+      { role: 'assistant', content: 'older answer' },
+    ]);
     await manager.recordTurn(chatId, [
       { role: 'user', content: 'u1' },
       { role: 'assistant', content: 'a1' },
@@ -310,14 +315,14 @@ describe('Token-budget compaction trigger (#15)', () => {
     expect(contextWindowFor(undefined)).toBe(8192);
   });
 
-  it('prepareHistory compacts an over-budget session with no idle', async () => {
+  it('prepareHistory emergency-compacts an over-budget (≥80%) session synchronously (spec 14 §3)', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
-    // model undefined -> 8192 window; pct=1 -> budget ~= 81.92 tokens ~= 327 chars.
+    // model undefined -> 8192 context window. A real reading of 7000 tokens ~= 85% ⇒ emergency (sync).
     const provider = makeStrictProvider('compacted summary', undefined);
     const manager = new SessionManager(240, 1440, tmpDir, provider, undefined, {
       enabled: true,
-      triggerAtTokenPercent: 1,
+      triggerAtTokenPercent: 80,
       memoryFlush: false,
       keepRecentTurns: 2,
     });
@@ -330,6 +335,7 @@ describe('Token-budget compaction trigger (#15)', () => {
     }
     const before = manager.getHistory(chatId).length;
     expect(before).toBe(16);
+    await manager.recordPromptUsage(chatId, 7000); // ≥80% of the 8192 window → emergency
 
     const prepared = await manager.prepareHistory(chatId);
 
@@ -344,7 +350,7 @@ describe('Token-budget compaction trigger (#15)', () => {
     const provider = makeStrictProvider('should not be called', undefined);
     const manager = new SessionManager(240, 1440, tmpDir, provider, undefined, {
       enabled: true,
-      triggerAtTokenPercent: 1,
+      triggerAtTokenPercent: 80, // legacy key, inert under spec-14 window triggers
       memoryFlush: false,
       keepRecentTurns: 2,
     });
@@ -353,6 +359,9 @@ describe('Token-budget compaction trigger (#15)', () => {
       { role: 'user', content: 'hi' },
       { role: 'assistant', content: 'hello' },
     ]);
+    // A REAL under-threshold reading (~0.1% of the 8192 default window) — proves the trigger is off
+    // because the fill is low, NOT merely because no reading was ever recorded (test-integrity fix).
+    await manager.recordPromptUsage(chatId, 10);
 
     const prepared = await manager.prepareHistory(chatId);
 
@@ -440,10 +449,13 @@ describe('Reload sanitizes an OpenAI-invalid persisted history (F1)', () => {
   });
 });
 
-// F6: the no-LLM and olderTurns===0 compaction branches must degrade like the
-// summary path — a persist failure must warn-and-continue, not reject the whole
-// prepareHistory/turn.
-describe('Compaction persist failure degrades gracefully (F6)', () => {
+// F6 (P2b/D1.6, revised by the Wave-D panel M5): compaction persists via a best-effort WINDOW save (the
+// day-file archive is never rewritten — DD1). A failing window save must warn-and-continue (never reject
+// the turn). M5 / spec 14 §4: a plain compaction is candidate-then-swap — a FAILED save keeps the OLD
+// window (in memory too), so disk and memory never diverge. (The ≥80% emergency truncate is the sole
+// exception — it must reduce in memory regardless, as the overflow valve; covered in
+// session-compaction-panel-fixes.test.ts.)
+describe('Compaction window-save failure degrades gracefully (F6 / M5)', () => {
   let tmpDir: string;
 
   beforeEach(() => {
@@ -455,7 +467,7 @@ describe('Compaction persist failure degrades gracefully (F6)', () => {
     jest.restoreAllMocks();
   });
 
-  it('no-LLM branch: persist failure does not reject; history unchanged', async () => {
+  it('no-LLM branch: a failing window save does not reject and keeps the OLD window (M5)', async () => {
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const manager = new SessionManager(240, 1440, tmpDir, undefined, undefined, {
       enabled: true,
@@ -467,15 +479,16 @@ describe('Compaction persist failure degrades gracefully (F6)', () => {
     for (let i = 0; i < 4; i++) {
       await manager.addTurn(chatId, { role: 'user', content: `u${i}` }, { role: 'assistant', content: `a${i}` });
     }
-    const before = manager.getHistory(chatId).map((m) => m.content);
 
     const writeSpy = jest.spyOn(fsRealForFixes, 'writeFileSync').mockImplementation(() => {
       throw new Error('disk full');
     });
-    await expect(manager.runCompaction(chatId)).resolves.toBeUndefined();
+    await expect(manager.runCompaction(chatId)).resolves.toBeUndefined(); // best-effort: never rejects
     writeSpy.mockRestore();
 
-    expect(manager.getHistory(chatId).map((m) => m.content)).toEqual(before);
+    // M5 candidate-then-swap: the window save failed, so the compaction is NOT applied — the old window
+    // (all 4 turns) is retained in memory, matching disk. No memory/disk divergence.
+    expect(manager.getHistory(chatId).map((m) => m.content)).toEqual(['u0', 'a0', 'u1', 'a1', 'u2', 'a2', 'u3', 'a3']);
   });
 
   it('olderTurns===0 branch: persist failure does not reject; history unchanged', async () => {
@@ -501,46 +514,8 @@ describe('Compaction persist failure degrades gracefully (F6)', () => {
   });
 });
 
-// F9: generateSummary persists its fallback into a .md file; a provider error
-// there must go through summarizeErrorForLog (name+frame), never raw
-// error.message which can echo transcript PHI.
-describe('Session summary never persists a raw provider error (F9, PHI)', () => {
-  let tmpDir: string;
-
-  beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-summary-phi-'));
-  });
-
-  afterEach(() => {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-    jest.restoreAllMocks();
-  });
-
-  it('sanitizes a provider error in the fallback summary', async () => {
-    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const marker = 'glucose-300-SECRETMARKER';
-    const throwingProvider = {
-      modelName: 'gpt-5.6-luna',
-      chat: jest.fn(async () => {
-        throw new Error(`upstream failure ${marker}`);
-      }),
-      embed: jest.fn(async () => [0.1]),
-    } as unknown as LLMProvider;
-    const manager = new SessionManager(240, 1440, tmpDir, throwingProvider, undefined, {
-      enabled: true,
-      triggerAtTokenPercent: 80,
-      memoryFlush: false,
-      keepRecentTurns: 10,
-    });
-    const chatId = 'chat-f9';
-    await manager.addTurn(chatId, { role: 'user', content: 'u0' }, { role: 'assistant', content: 'a0' });
-
-    await manager.resetSession(chatId);
-
-    const summariesDir = path.join(tmpDir, 'summaries');
-    const files = fs.readdirSync(summariesDir);
-    expect(files.length).toBeGreaterThan(0);
-    const content = fs.readFileSync(path.join(summariesDir, files[0]), 'utf-8');
-    expect(content).not.toContain('SECRETMARKER');
-  });
-});
+// P2b/D3.6 (DD9): the F9 archive-summary PHI test is RETIRED with its feature — generateSummary +
+// the summaries/ side-file no longer exist. The surviving compaction pipeline never PERSISTS error
+// text: a summary failure keeps the old window (nothing written), and the daily-log summary copy runs
+// only on success (a real summary, no error). PHI-in-logs stays enforced by summarizeErrorForLog at
+// every compaction catch. (Was: "Session summary never persists a raw provider error".)

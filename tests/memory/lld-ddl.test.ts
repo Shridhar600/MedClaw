@@ -75,7 +75,7 @@ describe('LLD §4 DDL addendum tables', () => {
   it('existing chunks table still present', () => {
     const cols = getTableInfo('chunks');
     const colNames = cols.map(c => c.name).sort();
-    expect(colNames).toEqual(['content', 'embedding', 'end_line', 'id', 'path', 'start_line']);
+    expect(colNames).toEqual(['content', 'created_at', 'embedding', 'end_line', 'id', 'lane', 'path', 'start_line']);
   });
 
   it('chunks_fts indexes chunk content and is queryable via MATCH', () => {

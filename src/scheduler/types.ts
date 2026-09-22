@@ -19,7 +19,14 @@ export type HeartbeatLastOutcome =
   | 'noop'
   | 'skipped-quiet-hours'
   | 'skipped-recent-activity'
-  | 'error';
+  | 'error'
+  /**
+   * RR2-B1 (R2-10/11): the job's destination chat is not owned by the scheduler's profile
+   * (or ownership could not be proven). An authorization refusal, not an operational failure:
+   * it must never schedule provider retries, increment delivery counts, or claim a send.
+   * Maps to the existing `suppressed` audit event semantics.
+   */
+  | 'skipped-unowned-chat';
 
 export interface HeartbeatJob {
   id: string;

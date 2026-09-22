@@ -4,9 +4,12 @@ import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { SessionManager } from '../../src/gateway/session';
 import type { AppConfig } from '../../src/config/types';
+import type { ProfileId } from '../../src/profiles/types';
 import type { HeartbeatJob } from '../../src/scheduler/types';
 import { HeartbeatStore } from '../../src/scheduler/store';
 import { HeartbeatScheduler } from '../../src/scheduler/runtime';
+import { ProfileRegistry } from '../../src/profiles/registry';
+import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 
 describe('Gateway heartbeat integration', () => {
   let tmpDir: string;
@@ -18,6 +21,21 @@ describe('Gateway heartbeat integration', () => {
   afterEach(() => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
+
+  /**
+   * RR2-B1 setup migration: the dispatch handler requires an explicit owner runtime, and the
+   * destination guard reads the gateway's profile registry. Fixture: pair the job's chat to
+   * the attached runtime's profile so the valid-job assertions keep their original meaning.
+   */
+  function pairChatToDefaultRuntime(gateway: Gateway, chatId: string): void {
+    const baseDir = path.join(tmpDir, 'profiles-base');
+    fs.mkdirSync(baseDir, { recursive: true });
+    const registry = new ProfileRegistry(baseDir);
+    registry.getOrCreateDefaultProfile();
+    registry.pairChatToProfile(chatId, 'default' as ProfileId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).profileRegistry = registry;
+  }
 
   function makeConfig(overrides?: Partial<AppConfig>): AppConfig {
     return {
@@ -81,6 +99,7 @@ describe('Gateway heartbeat integration', () => {
       },
     });
     const gateway = new Gateway(config);
+    const runtime = attachGatewayTestRuntime(gateway, config);
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn().mockResolvedValue({
       text: 'Heartbeat sent',
@@ -114,12 +133,13 @@ describe('Gateway heartbeat integration', () => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
+    pairChatToDefaultRuntime(gateway, job.chatId);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (gateway as any).handleScheduledJob(job);
+    await (gateway as any).handleScheduledJob(job, runtime);
 
     expect(send).toHaveBeenCalledWith('chat-1', { text: 'Heartbeat sent' });
-    const sessionJsonl = path.join(tmpDir, 'sessions', 'active-chat-1.jsonl');
+    const sessionJsonl = path.join(tmpDir, 'sessions', new Date().toISOString().slice(0, 10) + '.jsonl');
     const content = fs.readFileSync(sessionJsonl, 'utf8');
     expect(content).toContain('[Heartbeat Trigger]');
     expect(content).toContain('Job id: job-1');
@@ -147,6 +167,7 @@ describe('Gateway heartbeat integration', () => {
       },
     });
     const gateway = new Gateway(config);
+    attachGatewayTestRuntime(gateway, config);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
 
@@ -172,12 +193,16 @@ describe('Gateway heartbeat integration', () => {
     });
 
     const gateway = new Gateway(config);
+    attachGatewayTestRuntime(gateway, config);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).agentLoop = { run: jest.fn() };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    // RR2-B1 setup migration: the guarded policy reconcile refuses unpaired chats; pair
+    // the persisted job's chat so the HEARTBEAT.md sync assertions keep their meaning.
+    pairChatToDefaultRuntime(gateway, 'chat-1');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).initializeScheduler();
@@ -193,6 +218,7 @@ describe('Gateway heartbeat integration', () => {
   it('does not send a scheduled message when delivery policy suppresses it', async () => {
     const config = makeConfig();
     const gateway = new Gateway(config);
+    const runtime = attachGatewayTestRuntime(gateway, config);
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn().mockResolvedValue({
       text: 'Heartbeat sent',
@@ -215,6 +241,7 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
+    pairChatToDefaultRuntime(gateway, 'chat-1');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send };
@@ -232,7 +259,7 @@ describe('Gateway heartbeat integration', () => {
     const clock = jest.spyOn(Date, 'now').mockReturnValue(new Date('2026-04-18T22:30:00+05:30').getTime());
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await (gateway as any).handleScheduledJob(job);
+      await (gateway as any).handleScheduledJob(job, runtime);
     } finally {
       clock.mockRestore();
     }
@@ -265,6 +292,7 @@ describe('Gateway heartbeat integration', () => {
       },
     });
     const gateway = new Gateway(config);
+    const runtime = attachGatewayTestRuntime(gateway, config);
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn().mockResolvedValue({
       text: 'HEARTBEAT_NOOP',
@@ -288,6 +316,7 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
+    pairChatToDefaultRuntime(gateway, 'chat-1');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send };
@@ -299,12 +328,12 @@ describe('Gateway heartbeat integration', () => {
     (gateway as any).scheduler = scheduler;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (gateway as any).handleScheduledJob(job);
+    await (gateway as any).handleScheduledJob(job, runtime);
 
     expect(send).not.toHaveBeenCalled();
     const refreshed = await scheduler.getStore().get(job.id);
     expect(refreshed?.lastOutcome).toBe('noop');
-    const sessionJsonl = path.join(tmpDir, 'sessions', 'active-chat-1.jsonl');
+    const sessionJsonl = path.join(tmpDir, 'sessions', new Date().toISOString().slice(0, 10) + '.jsonl');
     const content = fs.readFileSync(sessionJsonl, 'utf8');
     expect(content).toContain('[Heartbeat Trigger]');
     expect(content).toContain('HEARTBEAT_NOOP');
@@ -321,6 +350,7 @@ describe('Gateway heartbeat integration', () => {
     );
 
     const gateway = new Gateway(config);
+    attachGatewayTestRuntime(gateway, config);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -329,6 +359,9 @@ describe('Gateway heartbeat integration', () => {
     await sessions.recordTurn('chat-1', [{ role: 'user', content: 'Seed startup chat.' }]);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).sessions = sessions;
+    // RR2-B1 setup migration: the guarded policy reconcile refuses unpaired chats; pair
+    // the startup chat so the policy-job creation assertions keep their meaning.
+    pairChatToDefaultRuntime(gateway, 'chat-1');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).initializeScheduler();
@@ -370,6 +403,7 @@ describe('Gateway heartbeat integration', () => {
       },
     });
     const gateway = new Gateway(config);
+    const runtime = attachGatewayTestRuntime(gateway, config);
     const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -391,6 +425,7 @@ describe('Gateway heartbeat integration', () => {
     await sessions.recordTurn('chat-1', [{ role: 'user', content: 'Seed policy chat.' }]);
     const sessionState = sessions.getOrCreateSessionState('chat-1');
     sessionState.lastActiveAt = new Date(Date.now() - (2 * 60 * 60 * 1000));
+    pairChatToDefaultRuntime(gateway, 'chat-1');
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).initializeScheduler();
 
@@ -406,7 +441,7 @@ describe('Gateway heartbeat integration', () => {
     });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (gateway as any).handleScheduledJob(scheduledJob);
+    await (gateway as any).handleScheduledJob(scheduledJob, runtime);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const jobs = await (gateway as any).scheduler.listJobs();
@@ -419,7 +454,7 @@ describe('Gateway heartbeat integration', () => {
     await (gateway as any).scheduler?.stop();
   });
 
-  it('does not persist a false assistant turn when scheduled delivery fails', async () => {
+  it('persists the attempted heartbeat before scheduled delivery fails', async () => {
     const config = makeConfig({
       heartbeat: {
         enabled: true,
@@ -440,6 +475,7 @@ describe('Gateway heartbeat integration', () => {
       },
     });
     const gateway = new Gateway(config);
+    const runtime = attachGatewayTestRuntime(gateway, config);
     const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
@@ -461,6 +497,7 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
+    pairChatToDefaultRuntime(gateway, 'chat-1');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockRejectedValue(new Error('send failed')) };
@@ -479,10 +516,11 @@ describe('Gateway heartbeat integration', () => {
     (gateway as any).scheduler = scheduler;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await expect((gateway as any).handleScheduledJob(job)).rejects.toThrow('send failed');
+    await expect((gateway as any).handleScheduledJob(job, runtime)).rejects.toThrow('send failed');
 
-    const sessionJsonl = path.join(tmpDir, 'sessions', 'active-chat-1.jsonl');
-    expect(fs.existsSync(sessionJsonl)).toBe(false);
+    const sessionJsonl = path.join(tmpDir, 'sessions', new Date().toISOString().slice(0, 10) + '.jsonl');
+    expect(fs.existsSync(sessionJsonl)).toBe(true);
+    expect(fs.readFileSync(sessionJsonl, 'utf8')).toContain('Heartbeat sent');
     const refreshed = await scheduler.getStore().get(job.id);
     expect(refreshed?.lastOutcome).toBe('error');
     await scheduler.stop();
@@ -509,6 +547,7 @@ describe('Gateway heartbeat integration', () => {
       },
     });
     const gateway = new Gateway(config);
+    const runtime = attachGatewayTestRuntime(gateway, config);
     const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
@@ -530,6 +569,7 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
+    pairChatToDefaultRuntime(gateway, 'chat-1');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockRejectedValue(new Error('send failed')) };
@@ -548,7 +588,7 @@ describe('Gateway heartbeat integration', () => {
     (gateway as any).scheduler = scheduler;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await expect((gateway as any).handleScheduledJob(job)).rejects.toThrow('send failed');
+    await expect((gateway as any).handleScheduledJob(job, runtime)).rejects.toThrow('send failed');
 
     const refreshed = await scheduler.getStore().get(job.id);
     expect(refreshed?.deliveryState).toBe('retry-wait');
@@ -582,12 +622,13 @@ describe('Gateway heartbeat integration', () => {
       },
     });
     const gateway = new Gateway(config);
+    const runtime = attachGatewayTestRuntime(gateway, config);
     const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
       async (job) => {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        await (gateway as any).handleScheduledJob(job, true);
+        await (gateway as any).handleScheduledJob(job, runtime, true);
       },
       'Asia/Kolkata',
       {
@@ -605,6 +646,7 @@ describe('Gateway heartbeat integration', () => {
       source: 'system',
       kind: 'routine',
     });
+    pairChatToDefaultRuntime(gateway, 'chat-1');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockRejectedValue(new Error('send failed')) };
@@ -654,6 +696,7 @@ describe('Gateway heartbeat integration', () => {
       },
     });
     const gateway = new Gateway(config);
+    const runtime = attachGatewayTestRuntime(gateway, config);
     const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
@@ -675,6 +718,7 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
+    pairChatToDefaultRuntime(gateway, 'chat-1');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockRejectedValue(new Error('send failed')) };
@@ -693,12 +737,12 @@ describe('Gateway heartbeat integration', () => {
     (gateway as any).scheduler = scheduler;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await expect((gateway as any).handleScheduledJob(job)).rejects.toThrow('send failed');
+    await expect((gateway as any).handleScheduledJob(job, runtime)).rejects.toThrow('send failed');
     const retryJob = await scheduler.getStore().get(job.id);
     expect(retryJob?.deliveryState).toBe('retry-wait');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await expect((gateway as any).handleScheduledJob(retryJob!)).rejects.toThrow('send failed');
+    await expect((gateway as any).handleScheduledJob(retryJob!, runtime)).rejects.toThrow('send failed');
 
     const refreshed = await scheduler.getStore().get(job.id);
     expect(refreshed?.deliveryState).toBe('dead-letter');
@@ -753,6 +797,7 @@ describe('Gateway heartbeat integration', () => {
     });
 
     const gateway = new Gateway(config);
+    attachGatewayTestRuntime(gateway, config);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -816,6 +861,7 @@ describe('Gateway heartbeat integration', () => {
       jest.setSystemTime(new Date('2026-04-19T08:30:00.000Z'));
 
       const gateway = new Gateway(config);
+      attachGatewayTestRuntime(gateway, config);
       const send = jest.fn().mockResolvedValue(undefined);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (gateway as any).channel = { send };
@@ -830,6 +876,7 @@ describe('Gateway heartbeat integration', () => {
       };
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (gateway as any).sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+      pairChatToDefaultRuntime(gateway, 'chat-1');
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await (gateway as any).initializeScheduler();
@@ -865,13 +912,14 @@ describe('Gateway heartbeat integration', () => {
       },
     });
     const gateway = new Gateway(config);
+    const runtime = attachGatewayTestRuntime(gateway, config);
     const send = jest.fn().mockResolvedValue(undefined);
     const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
       async (job) => {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        await (gateway as any).handleScheduledJob(job, true);
+        await (gateway as any).handleScheduledJob(job, runtime, true);
       },
       'UTC',
       {
@@ -919,6 +967,7 @@ describe('Gateway heartbeat integration', () => {
     (gateway as any).sessions = sessions;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).scheduler = scheduler;
+    pairChatToDefaultRuntime(gateway, 'chat-1');
 
     await scheduler.runNow(firstJob.id);
     await scheduler.runNow(secondJob.id);

@@ -3,6 +3,7 @@ import * as path from 'path';
 import { Worker } from 'worker_threads';
 import { PDFParse } from 'pdf-parse';
 import type { ImageAttachment } from '../providers/types';
+import { MediaValidationError } from '../shared/errors';
 
 const workerGlobal = globalThis as unknown as { Worker?: typeof Worker };
 workerGlobal.Worker ??= Worker;
@@ -70,7 +71,7 @@ export async function processReportFile(
     };
   }
 
-  throw new Error('Unsupported report file type. Supported files: .txt, .md, .csv, .json, .log, .pdf, .png, .jpg, .jpeg.');
+  throw new MediaValidationError('Unsupported report file type. Supported files: .txt, .md, .csv, .json, .log, .pdf, .png, .jpg, .jpeg.');
 }
 
 function processTextReport(
@@ -80,7 +81,7 @@ function processTextReport(
 ): ProcessedReport {
   const raw = fs.readFileSync(fullPath, 'utf8');
   if (raw.includes('\u0000')) {
-    throw new Error('This file appears to be binary. Supported binary report files: .pdf, .png, .jpg, .jpeg.');
+    throw new MediaValidationError('This file appears to be binary. Supported binary report files: .pdf, .png, .jpg, .jpeg.');
   }
 
   const textContent = truncateText(raw, options.maxTextChars ?? DEFAULT_MAX_TEXT_CHARS);
@@ -100,7 +101,7 @@ async function processPdfReport(
   const maxPdfPages = options.maxPdfPages ?? DEFAULT_MAX_PDF_PAGES;
   const pdfData = fs.readFileSync(fullPath);
   if (!pdfData.subarray(0, 5).equals(Buffer.from('%PDF-'))) {
-    throw new Error('File has a .pdf extension but does not look like a PDF document.');
+    throw new MediaValidationError('File has a .pdf extension but does not look like a PDF document.');
   }
 
   const parser = new PDFParse({ data: pdfData });
@@ -132,7 +133,7 @@ async function processPdfReport(
       }));
 
     if (images.length === 0) {
-      throw new Error('PDF text extraction found no readable text and no pages could be rendered for vision analysis.');
+      throw new MediaValidationError('PDF text extraction found no readable text and no pages could be rendered for vision analysis.');
     }
 
     return {
@@ -176,7 +177,7 @@ function validateImageSignature(data: Buffer, mimeType: ImageAttachment['mimeTyp
     && data[2] === 0xff;
 
   if ((mimeType === 'image/png' && !isPng) || (mimeType === 'image/jpeg' && !isJpeg)) {
-    throw new Error(`File extension does not match a valid ${mimeType} image.`);
+    throw new MediaValidationError(`File extension does not match a valid ${mimeType} image.`);
   }
 }
 
@@ -209,6 +210,6 @@ function formatBytes(bytes: number): string {
 
 function enforceSize(size: number, maxSize: number, label: string): void {
   if (size > maxSize) {
-    throw new Error(`${label} is too large: ${formatBytes(size)}. Limit is ${formatBytes(maxSize)}.`);
+    throw new MediaValidationError(`${label} is too large: ${formatBytes(size)}. Limit is ${formatBytes(maxSize)}.`);
   }
 }

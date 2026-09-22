@@ -1,4 +1,12 @@
 import { Authority, AUTHORITY_RANK, FactStatus, FactType, LedgerFact } from './types';
+import { normalizeEntitySlug, sanitizeSingleLine } from './sanitize';
+
+const FACT_STATUSES: ReadonlySet<FactStatus> = new Set([
+  'active', 'superseded', 'retracted', 'discontinued', 'resolved', 'paused', 'disputed',
+]);
+const VISIBILITIES: ReadonlySet<LedgerFact['visibility']> = new Set([
+  'private', 'shareable-summary', 'shareable-full',
+]);
 
 function detectValue(raw: string): string | number | string[] {
   const trimmed = raw.trim();
@@ -16,16 +24,43 @@ function detectValue(raw: string): string | number | string[] {
   return trimmed;
 }
 
-function parseProvenance(rawValue: string): { source: Authority; confidence: number; anchor: string; note?: string } | null {
-  const parts = rawValue.split(' · ');
-  if (parts.length < 2) return null;
+/**
+ * The form a value takes after one Markdown round-trip (INJ-b): the parser's
+ * `detectValue` coercion is the single source of truth, so conflict detection
+ * and change hashes compare CANONICAL forms — a stored number vs its re-typed
+ * string twin must never read as a contradiction.
+ */
+export function canonicalFieldValue(value: string | number | string[]): string | number | string[] {
+  if (Array.isArray(value)) return value.map(v => String(v).trim());
+  const canonical = detectValue(String(value));
+  return typeof canonical === 'number' ? canonical : String(canonical).trim();
+}
 
-  const sourceMatch = parts[0].match(/^([a-zA-Z]+)\s*\(([\d.]+)\)/);
+/** Canonicalize every field value of a record (for stable hashes + comparisons). */
+export function canonicalFields(
+  fields: Record<string, string | number | string[]>,
+): Record<string, string | number | string[]> {
+  const out: Record<string, string | number | string[]> = {};
+  for (const [k, v] of Object.entries(fields)) out[k] = canonicalFieldValue(v);
+  return out;
+}
+
+function parseProvenance(rawValue: string): { source: Authority; confidence: number; anchor: string; note?: string } | null {
+  // Split on the bare middot and trim each segment. An empty anchor is a legitimate
+  // state (a fact recorded before its narrative anchor is known), and the reader trims
+  // the renderer's trailing `· ` down to `·` — so tolerate a missing/empty anchor rather
+  // than rejecting the line (which silently quarantined the whole block and fabricated a
+  // v0 "active" fact on the next read).
+  const parts = rawValue.split('·').map(s => s.trim());
+
+  const sourceMatch = parts[0].match(/^([a-zA-Z]+)\s*\((\d+(?:\.\d+)?)\)$/);
   if (!sourceMatch) return null;
 
   const source = sourceMatch[1] as Authority;
-  const confidence = parseFloat(sourceMatch[2]);
-  const anchor = parts[1].trim();
+  if (!Object.prototype.hasOwnProperty.call(AUTHORITY_RANK, source)) return null;
+  const confidence = Number(sourceMatch[2]);
+  if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) return null;
+  const anchor = parts[1] ?? '';
   let note: string | undefined;
   if (parts.length > 2) {
     note = parts.slice(2).join(' · ').replace(/^"(.*)"$/, '$1');
@@ -68,7 +103,7 @@ export function renderLedgerFile(facts: LedgerFact[]): string {
   for (const entity of sortedEntities) {
     const versions = groups.get(entity)!;
     versions.sort((a, b) => b.version - a.version);
-    blocks.push(`## ${entity}`);
+    blocks.push(`## ${sanitizeSingleLine(entity)}`);
     for (const v of versions) {
       const headerDate = v.createdAt ? v.createdAt.slice(0, 10) : '';
       if (v.status === 'active') {
@@ -87,7 +122,7 @@ export function renderLedgerFile(facts: LedgerFact[]): string {
 function flattenFactForRender(fact: LedgerFact): string[] {
   const lines: string[] = [];
 
-  lines.push(`- provenance: ${fact.provenance.source} (${fact.provenance.confidence.toFixed(2)}) · ${fact.provenance.anchor}${fact.provenance.note ? ` · "${fact.provenance.note}"` : ''}`);
+  lines.push(`- provenance: ${fact.provenance.source} (${fact.provenance.confidence.toFixed(2)}) · ${sanitizeSingleLine(fact.provenance.anchor)}${fact.provenance.note ? ` · "${sanitizeSingleLine(fact.provenance.note)}"` : ''}`);
 
   if (fact.provenance.capturedAt) {
     lines.push(`- captured_at: ${fact.provenance.capturedAt}`);
@@ -102,7 +137,7 @@ function flattenFactForRender(fact: LedgerFact): string[] {
   }
 
   if (fact.verbatim !== undefined && fact.verbatim !== '') {
-    lines.push(`- verbatim: "${fact.verbatim}"`);
+    lines.push(`- verbatim: "${sanitizeSingleLine(fact.verbatim)}"`);
   }
   if (fact.visibility) {
     lines.push(`- visibility: ${fact.visibility}`);
@@ -113,6 +148,23 @@ function flattenFactForRender(fact: LedgerFact): string[] {
   if (fact.supersededBy) {
     lines.push(`- supersededBy: ${fact.supersededBy}`);
   }
+  // Cross-entity links + discontinue reason are top-level fields, so they need
+  // explicit render/parse (the generic `fields` fallback only covers `fields` keys).
+  if (fact.replaces) {
+    lines.push(`- replaces: ${fact.replaces}`);
+  }
+  if (fact.replacedBy) {
+    lines.push(`- replacedBy: ${fact.replacedBy}`);
+  }
+  if (fact.corrects) {
+    lines.push(`- corrects: ${fact.corrects}`);
+  }
+  if (fact.correctedBy) {
+    lines.push(`- correctedBy: ${fact.correctedBy}`);
+  }
+  if (fact.discontinuedReason) {
+    lines.push(`- discontinuedReason: ${sanitizeSingleLine(fact.discontinuedReason)}`);
+  }
 
   if (fact.createdAt) {
     lines.push(`- created_at: ${fact.createdAt}`);
@@ -121,22 +173,38 @@ function flattenFactForRender(fact: LedgerFact): string[] {
   for (const [key, value] of Object.entries(fact.fields)) {
     if (key === 'pre_pause_summary' || key === 'restartOf' || key === 'created_at') {
       if (key === 'pre_pause_summary') {
-        lines.push(`- pre_pause_summary: ${value}`);
+        lines.push(`- pre_pause_summary: ${sanitizeSingleLine(String(value))}`);
       }
       if (key === 'restartOf') {
         lines.push(`- restartOf: ${value}`);
       }
       continue;
     }
+    // Reserved names are rendered from their top-level `fact.*` field above; a
+    // `fields` entry with the same name must NOT also render (it would re-parse
+    // into the top-level slot and corrupt the round-trip). These names are
+    // therefore reserved and cannot be used as generic field keys.
+    if (RESERVED_TOP_LEVEL_FIELD_KEYS.has(key)) {
+      continue;
+    }
+    // SBX-1: sanitize the KEY too, not just the value — a key with embedded newlines/# would
+    // otherwise forge `## entity`/`### vN` structure at line start on the next parse.
     if (Array.isArray(value)) {
-      lines.push(`- ${key}: [${value.join(', ')}]`);
+      lines.push(`- ${sanitizeSingleLine(key)}: ${sanitizeSingleLine(`[${value.join(', ')}]`)}`);
     } else {
-      lines.push(`- ${key}: ${value}`);
+      lines.push(`- ${sanitizeSingleLine(key)}: ${sanitizeSingleLine(String(value))}`);
     }
   }
 
   return lines;
 }
+
+/** Field-key names that render as top-level `- key:` lines and re-parse into `fact.*`, never `fields`. */
+const RESERVED_TOP_LEVEL_FIELD_KEYS = new Set<string>([
+  'provenance', 'captured_at', 'safety_relevant', 'episode', 'lang',
+  'verbatim', 'visibility', 'supersedes', 'supersededBy',
+  'replaces', 'replacedBy', 'corrects', 'correctedBy', 'discontinuedReason', 'created_at',
+]);
 
 export function parseLedgerFile(md: string, options: { type: FactType; profileId: string }): LedgerFact[] {
   const facts: LedgerFact[] = [];
@@ -145,12 +213,20 @@ export function parseLedgerFile(md: string, options: { type: FactType; profileId
   if (entityMatches.length === 0) return facts;
 
   for (let i = 0; i < entityMatches.length; i++) {
-    const entityName = entityMatches[i][1];
+    const rawEntityName = entityMatches[i][1];
+    const entityName = normalizeEntitySlug(rawEntityName);
     const sectionStart = entityMatches[i].index!;
     const sectionEnd = i + 1 < entityMatches.length ? entityMatches[i + 1].index! : md.length;
     const sectionContent = md.slice(sectionStart, sectionEnd);
 
     const versionMatches = Array.from(sectionContent.matchAll(/^### v(\d+) \((\w+)(?: ([^)]+))?\)$/gm));
+    const versionHeaders = Array.from(sectionContent.matchAll(/^###.*$/gm));
+    const validHeaderLines = new Set(versionMatches.map((match) => match[0]));
+    const hasMalformedHeader = versionHeaders.some((match) => !validHeaderLines.has(match[0]));
+    if (entityName === null || hasMalformedHeader) {
+      facts.push(createParseErrorFact(rawEntityName, options, `PARSE-ERROR block for ${rawEntityName}: invalid entity or version header`));
+      continue;
+    }
     if (versionMatches.length === 0) continue;
 
     for (let j = 0; j < versionMatches.length; j++) {
@@ -163,6 +239,11 @@ export function parseLedgerFile(md: string, options: { type: FactType; profileId
       const blockBody = sectionContent.slice(headerEnd, blockEnd);
 
       try {
+        if (!Number.isSafeInteger(version) || version < 1 || !FACT_STATUSES.has(status)) {
+          throw new Error('invalid-version-header');
+        }
+        // Active headers have no lifecycle annotation in the canonical format.
+        if (status === 'active' && vm[3] !== undefined) throw new Error('invalid-active-header');
         const fact = parseSingleVersionBlock(entityName, version, status, blockBody, options);
         if (fact) facts.push(fact);
       } catch {
@@ -199,7 +280,15 @@ function parseSingleVersionBlock(
   body: string,
   options: { type: FactType; profileId: string },
 ): LedgerFact | null {
-  const lines = body.split('\n').filter(l => l.startsWith('- '));
+  const bodyLines = body.split('\n');
+  // Preserve the existing lenient treatment of free-form non-bullet text, but never
+  // silently discard a line that claims to be a structured field and is malformed.
+  for (const line of bodyLines) {
+    if (line.startsWith('- ') && !/^- [^:]+: .*$/.test(line)) {
+      throw new Error('malformed-field-line');
+    }
+  }
+  const lines = bodyLines.filter(l => l.startsWith('- '));
   const fields: Record<string, string | number | string[]> = {};
 
   let provSource: Authority = 'user';
@@ -214,7 +303,13 @@ function parseSingleVersionBlock(
   let visibility: 'private' | 'shareable-summary' | 'shareable-full' = 'private';
   let supersedes: string | undefined;
   let supersededByVal: string | undefined;
+  let replaces: string | undefined;
+  let replacedBy: string | undefined;
+  let corrects: string | undefined;
+  let correctedBy: string | undefined;
+  let discontinuedReason: string | undefined;
   let createdAt = new Date().toISOString();
+  let sawProvenance = false;
 
   for (const line of lines) {
     const colonIdx = line.indexOf(': ');
@@ -224,15 +319,19 @@ function parseSingleVersionBlock(
 
     if (key === 'provenance') {
       const parsed = parseProvenance(rawVal);
-      if (parsed) {
-        provSource = parsed.source;
-        provConfidence = parsed.confidence;
-        provAnchor = parsed.anchor;
-        provNote = parsed.note;
-      }
+      if (!parsed) throw new Error('invalid-provenance');
+      provSource = parsed.source;
+      provConfidence = parsed.confidence;
+      provAnchor = parsed.anchor;
+      provNote = parsed.note;
+      sawProvenance = true;
     } else if (key === 'captured_at') {
       capturedAt = rawVal;
+      if (Number.isNaN(new Date(capturedAt).getTime())) throw new Error('invalid-captured-at');
     } else if (key === 'safety_relevant' || key === 'episode' || key === 'lang') {
+      if (key === 'safety_relevant' && !['true', 'false'].includes(rawVal.split(' · ')[0].trim())) {
+        throw new Error('invalid-safety-relevant');
+      }
       const meta = parseCombinedMetaValues(key, rawVal);
       if (meta.safetyRelevant !== undefined) safetyRelevant = meta.safetyRelevant;
       if (meta.episodeId !== undefined) episodeId = meta.episodeId;
@@ -240,20 +339,39 @@ function parseSingleVersionBlock(
     } else if (key === 'verbatim') {
       verbatim = rawVal.replace(/^"(.*)"$/, '$1');
     } else if (key === 'visibility') {
+      if (!VISIBILITIES.has(rawVal as LedgerFact['visibility'])) throw new Error('invalid-visibility');
       visibility = rawVal as 'private' | 'shareable-summary' | 'shareable-full';
     } else if (key === 'supersedes') {
       supersedes = rawVal;
     } else if (key === 'supersededBy') {
       supersededByVal = rawVal;
+    } else if (key === 'replaces') {
+      replaces = rawVal;
+    } else if (key === 'replacedBy') {
+      replacedBy = rawVal;
+    } else if (key === 'corrects') {
+      corrects = rawVal;
+    } else if (key === 'correctedBy') {
+      correctedBy = rawVal;
+    } else if (key === 'discontinuedReason') {
+      discontinuedReason = rawVal;
     } else if (key === 'restartOf') {
       fields.restartOf = rawVal;
     } else if (key === 'created_at') {
       createdAt = rawVal;
+      if (Number.isNaN(new Date(createdAt).getTime())) throw new Error('invalid-created-at');
     } else if (key === 'pre_pause_summary') {
       fields.pre_pause_summary = rawVal;
     } else {
       fields[key] = detectValue(rawVal);
     }
+  }
+
+  // A real version block always carries a valid `- provenance:` line (the renderer
+  // always emits one). Its absence means the block is corrupt → throw so the caller
+  // quarantines it instead of FABRICATING an active fact from defaulted values.
+  if (!sawProvenance) {
+    throw new Error(`missing provenance in ${entity}@v${version}`);
   }
 
   const finalCreatedAt = createdAt;
@@ -272,6 +390,11 @@ function parseSingleVersionBlock(
     version,
     supersedes,
     supersededBy: supersededByVal,
+    replaces,
+    replacedBy,
+    corrects,
+    correctedBy,
+    discontinuedReason,
     status,
     fields: cleanFields,
     provenance: {

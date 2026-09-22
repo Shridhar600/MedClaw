@@ -11,6 +11,7 @@ export function createProvider(config: ProviderConfig): LLMProvider {
     case 'openai':
     case 'anthropic': // Anthropic has OpenAI-compatible endpoint
     case 'google':
+    case 'openrouter': // OpenRouter is OpenAI-compatible; base URL defaults in OpenAIProvider
       return new OpenAIProvider(config);
     default: {
       // TypeScript exhaustiveness check

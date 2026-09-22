@@ -4,6 +4,12 @@ import * as path from 'path';
 import { HeartbeatStore } from '../../src/scheduler/store';
 import { HeartbeatScheduler } from '../../src/scheduler/runtime';
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
+}
+
 describe('HeartbeatScheduler', () => {
   let tmpDir: string;
   let storePath: string;
@@ -163,6 +169,45 @@ describe('HeartbeatScheduler', () => {
     expect(refreshed?.enabled).toBe(false);
     expect(refreshed?.lastOutcome).toBe('error');
     await scheduler.stop();
+  });
+
+  it('sanitizes a persisted cron validation failure in startup logs and lastError', async () => {
+    const marker = 'RR2_A1_PRIVATE_CRON_MARKER';
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    let scheduler: HeartbeatScheduler | undefined;
+    try {
+      const store = new HeartbeatStore(storePath);
+      const job = await store.create({
+        title: 'Invalid persisted job with private marker',
+        chatId: 'chat-1',
+        cron: '0 8 * * *',
+        prompt: 'Should be disabled on startup.',
+        source: 'system',
+        kind: 'routine',
+        policyKey: 'defaults:rr2-a1-invalid',
+      });
+      await store.update(job.id, { cron: marker });
+
+      const trigger = jest.fn().mockResolvedValue(undefined);
+      scheduler = new HeartbeatScheduler(store, trigger);
+      await expect(scheduler.start()).resolves.toBeUndefined();
+
+      const refreshed = await store.get(job.id);
+      const capturedConsole = errorSpy.mock.calls.flat().map(String).join('\n');
+      expect(refreshed?.enabled).toBe(false);
+      expect(refreshed?.lastOutcome).toBe('error');
+      expect(refreshed?.lastError).toBeTruthy();
+      expect(refreshed?.lastError).not.toContain(marker);
+      expect(refreshed?.lastError).toContain('Error');
+      expect(capturedConsole).not.toContain(marker);
+      expect(trigger).not.toHaveBeenCalled();
+    } finally {
+      try {
+        if (scheduler) await scheduler.stop();
+      } finally {
+        errorSpy.mockRestore();
+      }
+    }
   });
 
   it('recovers one missed run on startup when recovery is enabled', async () => {
@@ -428,5 +473,207 @@ describe('HeartbeatScheduler', () => {
     } finally {
       logSpy.mockRestore();
     }
+  });
+
+  it('serializes concurrent recordFailure transitions so retry attempts are not lost', async () => {
+    const store = new HeartbeatStore(storePath);
+    const job = await store.create({
+      title: 'Concurrent failure job',
+      chatId: 'chat-1',
+      cron: '* * * * *',
+      prompt: 'Retry this safely.',
+      source: 'system',
+      kind: 'routine',
+      maxRetries: 3,
+    });
+    const firstUpdateStarted = deferred();
+    const releaseFirstUpdate = deferred();
+    const originalUpdate = store.update.bind(store);
+    let first = true;
+    jest.spyOn(store, 'update').mockImplementation(async (id, patch) => {
+      if (first) {
+        first = false;
+        firstUpdateStarted.resolve();
+        await releaseFirstUpdate.promise;
+      }
+      return originalUpdate(id, patch);
+    });
+
+    const scheduler = new HeartbeatScheduler(store, async () => undefined, 'UTC', {
+      retryBackoffMinutes: 5,
+    });
+    const firstFailure = scheduler.recordFailure(job.id, 'first failure');
+    await firstUpdateStarted.promise;
+    const secondFailure = scheduler.recordFailure(job.id, 'second failure');
+
+    // Give an unsynchronized implementation a chance to read the same retryCount.
+    await Promise.resolve();
+    await Promise.resolve();
+    releaseFirstUpdate.resolve();
+    await Promise.all([firstFailure, secondFailure]);
+
+    expect((await store.get(job.id))?.retryCount).toBe(2);
+    await scheduler.stop();
+  });
+
+  it('routes an unexpected detached wakeup failure into the retry state machine', async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-04-19T08:00:00.000Z'));
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const store = new HeartbeatStore(storePath);
+      const created = await store.create({
+        title: 'Detached failure job',
+        chatId: 'chat-1',
+        cron: '0 8 * * *',
+        prompt: 'Retry detached failure.',
+        source: 'system',
+        kind: 'routine',
+        maxRetries: 1,
+      });
+      const retryAt = '2026-04-19T08:00:00.000Z';
+      const job = await store.update(created.id, {
+        deliveryState: 'retry-wait',
+        nextRetryAt: retryAt,
+      });
+      let firstGet = true;
+      const originalGet = store.get.bind(store);
+      jest.spyOn(store, 'get').mockImplementation(async (id) => {
+        if (firstGet) {
+          firstGet = false;
+          throw new Error('detached provider failure');
+        }
+        return originalGet(id);
+      });
+      const scheduler = new HeartbeatScheduler(store, async () => undefined, 'UTC', {
+        retryBackoffMinutes: 5,
+      });
+
+      await scheduler.start();
+      await jest.advanceTimersByTimeAsync(0);
+
+      const refreshed = await originalGet(job.id);
+      expect(refreshed?.retryCount).toBe(1);
+      expect(refreshed?.deliveryState).toBe('retry-wait');
+      await scheduler.stop();
+    } finally {
+      errorSpy.mockRestore();
+      jest.useRealTimers();
+    }
+  });
+});
+
+describe('HeartbeatScheduler destination-ownership guard (RR2-B1)', () => {
+  let tmpDir: string;
+  let storePath: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-heartbeat-guard-'));
+    storePath = path.join(tmpDir, 'heartbeats', 'jobs.json');
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function guardedScheduler(store: HeartbeatStore, trigger: (job: unknown) => Promise<void>, owns: (chatId: string) => boolean): HeartbeatScheduler {
+    return new HeartbeatScheduler(store, trigger, 'UTC', { canAddressChat: owns } as never);
+  }
+
+  it('createJob refuses a foreign destination and persists nothing', async () => {
+    const store = new HeartbeatStore(storePath);
+    const scheduler = guardedScheduler(store, async () => undefined, (chatId) => chatId === 'chat-1');
+    await scheduler.start();
+
+    await expect(scheduler.createJob({
+      title: 'Foreign reminder', chatId: 'other-profile-chat', cron: '0 8 * * *',
+      prompt: 'x', source: 'system', kind: 'routine',
+    })).rejects.toThrow('does not own');
+    expect(await store.list()).toEqual([]);
+
+    const own = await scheduler.createJob({
+      title: 'Own reminder', chatId: 'chat-1', cron: '0 8 * * *',
+      prompt: 'x', source: 'system', kind: 'routine',
+    });
+    expect(own.chatId).toBe('chat-1');
+    await scheduler.stop();
+  });
+
+  it('updateJob refuses re-pointing a job at a foreign chat', async () => {
+    const store = new HeartbeatStore(storePath);
+    const scheduler = guardedScheduler(store, async () => undefined, (chatId) => chatId === 'chat-1');
+    await scheduler.start();
+    const job = await scheduler.createJob({
+      title: 'Own reminder', chatId: 'chat-1', cron: '0 8 * * *',
+      prompt: 'x', source: 'system', kind: 'routine',
+    });
+
+    await expect(scheduler.updateJob(job.id, { chatId: 'other-profile-chat' })).rejects.toThrow('does not own');
+    const refreshed = await store.get(job.id);
+    expect(refreshed?.chatId).toBe('chat-1');
+    await scheduler.stop();
+  });
+
+  it('updateJob refuses re-enabling a foreign-addressed record; disabling it stays allowed', async () => {
+    const store = new HeartbeatStore(storePath);
+    // Plant a foreign record directly through the store (bypassing the create guard).
+    const planted = await store.create({
+      title: 'Planted foreign job', chatId: 'other-profile-chat', cron: '0 8 * * *',
+      prompt: 'x', source: 'agent', kind: 'routine',
+    });
+    const scheduler = guardedScheduler(store, async () => undefined, (chatId) => chatId === 'chat-1');
+    await scheduler.start();
+
+    await expect(scheduler.updateJob(planted.id, { enabled: true })).rejects.toThrow('does not own');
+    await expect(scheduler.updateJob(planted.id, { enabled: false })).resolves.toMatchObject({ enabled: false });
+    await expect(scheduler.resume(planted.id)).rejects.toThrow('does not own');
+    await scheduler.stop();
+  });
+
+  it('start() disables a planted foreign-addressed record instead of registering it, and never triggers it', async () => {
+    const store = new HeartbeatStore(storePath);
+    const planted = await store.create({
+      title: 'Planted foreign job', chatId: 'other-profile-chat', cron: '0 8 * * *',
+      prompt: 'x', source: 'agent', kind: 'routine',
+    });
+    const trigger = jest.fn().mockResolvedValue(undefined);
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const scheduler = guardedScheduler(store, trigger, (chatId) => chatId === 'chat-1');
+      await scheduler.start();
+      const refreshed = await store.get(planted.id);
+      expect(refreshed?.enabled).toBe(false);
+      expect(refreshed?.lastError).toContain('not owned by this profile');
+      expect(trigger).not.toHaveBeenCalled();
+      await scheduler.stop();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('a scheduler without the guard keeps the standalone (non-profile) unguarded interface', async () => {
+    const store = new HeartbeatStore(storePath);
+    const scheduler = new HeartbeatScheduler(store, async () => undefined, 'UTC');
+    await scheduler.start();
+    const created = await scheduler.createJob({
+      title: 'Standalone reminder', chatId: 'any-chat', cron: '0 8 * * *',
+      prompt: 'x', source: 'system', kind: 'routine',
+    });
+    expect(created.chatId).toBe('any-chat');
+    await scheduler.stop();
+  });
+
+  it('a throwing destination lookup is a refusal, never an authorization or a crash', async () => {
+    const store = new HeartbeatStore(storePath);
+    const scheduler = new HeartbeatScheduler(store, async () => undefined, 'UTC', {
+      canAddressChat: () => { throw new Error('lookup exploded'); },
+    } as never);
+    await scheduler.start();
+    await expect(scheduler.createJob({
+      title: 'x', chatId: 'chat-1', cron: '0 8 * * *',
+      prompt: 'x', source: 'system', kind: 'routine',
+    })).rejects.toThrow('does not own');
+    expect(await store.list()).toEqual([]);
+    await scheduler.stop();
   });
 });

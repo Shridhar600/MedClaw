@@ -1,173 +1,217 @@
+import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import type { AppConfig } from '../config/types';
 import { ProfileRegistry } from '../profiles';
 import type { ProfileId } from '../profiles';
 import type { Channel, IncomingMessage } from '../channels/types';
 import { TelegramChannel } from '../channels/telegram';
-import { AgentLoop } from '../agent/agent-loop';
-import { ContextAssembler } from '../agent/context';
-import { MemoryEngine } from '../memory/memory-engine';
-import { ToolRegistry } from '../tools/registry';
 import { LLMSemaphore, HeartbeatQueueFullError } from '../tools/semaphore';
-import { createMemoryTools } from '../tools/memory-tools';
-import { createMedicalTools } from '../tools/medical-tools';
-import { createCronManageTool } from '../tools/cron-manage';
-import { createHeartbeatManageTool } from '../tools/heartbeat-manage';
-import { SqliteStore } from '../memory/sqlite-store';
-import { MemorySearch } from '../memory/search';
+import { deprecatedSessionWarnings } from '../config/deprecations';
 import { createProvider } from '../providers/factory';
 import { SessionManager } from './session';
-import { HeartbeatStore } from '../scheduler/store';
-import { HeartbeatScheduler } from '../scheduler/runtime';
 import { syncHeartbeatMarkdown } from '../scheduler/heartbeat-markdown';
+import type { NightlySweepResult } from '../scheduler/transcript-sweep-job';
 import type { HeartbeatJob } from '../scheduler/types';
 import { decideHeartbeatDelivery, HEARTBEAT_NOOP } from '../scheduler/delivery-policy';
 import { buildDesiredHeartbeatJobs } from '../scheduler/policy-engine';
 import { reconcilePolicyJobs } from '../scheduler/reconciler';
-import { OnboardingFlow } from '../onboarding/flow';
-import { OnboardingStore } from '../onboarding/store';
 import { ensureWorkspaceBootstrap } from '../workspace/bootstrap';
 import { checkSystemReadiness, probeChatCompletion } from '../providers/healthcheck';
 import type { ReadinessResult } from '../providers/healthcheck';
 import type { LLMProvider } from '../providers/types';
-import { checkProviderBindAddresses, verifyWorkspacePermissions, summarizeErrorForLog, secureMkdir } from '../security';
+import {
+  checkProviderBindAddresses,
+  verifyWorkspacePermissions,
+  summarizeErrorForLog,
+} from '../security';
+import { ProfileRuntime } from './runtime';
+import { ProfileRuntimeManager } from './manager';
+import { GatewayMessageRouter, sweepStagedMedia } from './router';
+import { TurnQueueFullError, heartbeatTurnId } from './turn-coordinator';
 
-const EMERGENCY_PATTERN =
-  /\b(chest pain|can't breathe|cannot breathe|difficulty breathing|stroke|heart attack|severe bleeding|suicidal|emergency)\b/i;
-const EMERGENCY_RESPONSE =
-  'This may be an emergency. Please contact local emergency services now or go to the nearest emergency department. If you can, ask someone nearby to stay with you while you get help.';
-const UNRECOGNIZED_CHAT_RESPONSE =
-  'This chat is not recognized. This is a private health assistant; new chats cannot be added over this channel.';
-// PROD-P1-6: an empty or whitespace-only text message with no media gets a
-// short canned reply — no agent run, no session write. Matches the test-cli's
-// existing empty-input guard so the dev web UI exercises the same boundary.
-const EMPTY_MESSAGE_RESPONSE = "I didn't catch any message. Send some text or an attachment and I'll take a look.";
+const SHUTDOWN_RESPONSE = 'The health assistant is shutting down. Please try again in a moment.';
+const BOOT_HEALTHCHECK_BUDGET_MS = 3_000;
+
+/**
+ * RR2-B1 (R2-10/11): a narrow, gateway-local boundary representing an AUTHORIZATION
+ * suppression of a scheduled delivery — the destination chat stopped belonging to the owning
+ * profile between dispatch and egress. Deliberately NOT an operational/provider error: it must
+ * never enter `recordFailure`'s retry/dead-letter state machine, and it must never let
+ * `afterDelivery` record an honest-looking sent/noop. Module-local by design — no other
+ * consumer may throw or catch it.
+ */
+class HeartbeatDestinationSuppressedError extends Error {
+  constructor() {
+    super('heartbeat destination is no longer owned by the dispatching profile');
+    this.name = 'HeartbeatDestinationSuppressedError';
+  }
+}
+
+function pendingReadiness(label: string): ReadinessResult {
+  return {
+    ready: false,
+    checked: true,
+    label,
+    status: 'warn',
+    details: ['health check pending'],
+    warnings: ['not completed within the startup budget'],
+    reasonCode: 'healthcheck-timeout',
+    actionHint: 'Health checks continue in the background; retry status shortly.',
+  };
+}
+
+function pendingBootHealth(): { providers: ReadinessResult[]; telegram: ReadinessResult } {
+  return {
+    providers: ['main provider', 'medical provider', 'embeddings provider'].map(pendingReadiness),
+    telegram: pendingReadiness('telegram'),
+  };
+}
+
+function readinessLabel(result: ReadinessResult): 'OK' | 'FAIL' | 'PENDING' {
+  if (result.reasonCode === 'healthcheck-timeout') return 'PENDING';
+  return result.ready ? 'OK' : 'FAIL';
+}
 
 export class Gateway {
   private config: AppConfig;
   private channel?: Channel;
-  private agentLoop?: AgentLoop;
-  private sessions?: SessionManager;
-  private scheduler?: HeartbeatScheduler;
-  private store?: SqliteStore;
   private profileRegistry?: ProfileRegistry;
   private resolvedMemoryWorkspace?: string;
   private bootHealth?: { providers: ReadinessResult[]; telegram: ReadinessResult };
   private mainProvider?: LLMProvider;
+  /** RR-STRUCT R-S5a: the medical-provider fallback used for medication side-effect lookups,
+   *  shared across every profile's runtime (daemon-singleton per mini-plan v3 §3.1) — hoisted to
+   *  a field (was a `start()`-local var) so `buildRuntimeFor` can close over it for any profile. */
+  private sideEffectProvider?: LLMProvider;
   private securityWarnings: string[] = [];
   private reconcileTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+  private semaphore?: LLMSemaphore;
+  private stopping = false;
+  private stopped = false;
+  private stopPromise?: Promise<void>;
+  private runtime?: ProfileRuntime;
+  /** RR-STRUCT R-S5a (mini-plan v3 §3.3): owns one ProfileRuntime per paired profile. `this.runtime`
+   *  above stays the DEFAULT profile's runtime (`manager.get(defaultProfileId)`) — every existing
+   *  accessor/handler/Router keeps reading `this.runtime` unchanged; dispatch stays default-only
+   *  (the RR-4 refusal is untouched — R-S5b routes by profile and retires it). */
+  private manager?: ProfileRuntimeManager;
+  private router?: GatewayMessageRouter;
 
   constructor(config: AppConfig) {
     this.config = config;
+  }
+
+  get runtimeInstance(): ProfileRuntime | undefined {
+    return this.runtime;
+  }
+
+  /** Test/diagnostic seam (mirrors `runtimeInstance`): the manager owning every built profile's
+   *  runtime. `undefined` until `start()` has run (or in the `attachGatewayTestRuntime` test-double
+   *  seam, which never constructs one). */
+  get runtimeManager(): ProfileRuntimeManager | undefined {
+    return this.manager;
+  }
+
+  // Narrow test-backed seams. Setters require a runtime attached by ProfileRuntime.create
+  // (or a structural runtime test double); they never construct one.
+  get agentLoop(): ProfileRuntime['agentLoop'] {
+    return this.runtime?.agentLoop;
+  }
+  set agentLoop(value: ProfileRuntime['agentLoop']) {
+    this.requireRuntimeForAccess().agentLoop = value;
+  }
+
+  get sessions(): ProfileRuntime['sessions'] {
+    return this.runtime?.sessions;
+  }
+  set sessions(value: ProfileRuntime['sessions']) {
+    this.requireRuntimeForAccess().sessions = value;
+  }
+
+  get scheduler(): ProfileRuntime['scheduler'] {
+    return this.runtime?.scheduler;
+  }
+  set scheduler(value: ProfileRuntime['scheduler']) {
+    this.requireRuntimeForAccess().scheduler = value;
+  }
+
+  get store(): ProfileRuntime['store'] {
+    return this.runtime?.store;
+  }
+  set store(value: ProfileRuntime['store']) {
+    this.requireRuntimeForAccess().store = value;
+  }
+
+  get capturePipeline(): ProfileRuntime['capturePipeline'] {
+    return this.runtime?.capturePipeline;
+  }
+  set capturePipeline(value: ProfileRuntime['capturePipeline']) {
+    this.requireRuntimeForAccess().capturePipeline = value;
+  }
+
+  get factMirror(): ProfileRuntime['factMirror'] {
+    return this.runtime?.factMirror;
+  }
+
+  get ledgerStore(): ProfileRuntime['ledgerStore'] {
+    return this.runtime?.ledgerStore;
+  }
+
+  get curiosity(): ProfileRuntime['curiosity'] {
+    return this.runtime?.curiosity;
+  }
+
+  get vectorIndex(): ProfileRuntime['vectorIndex'] {
+    return this.runtime?.vectorIndex;
+  }
+
+  get keywordIndex(): ProfileRuntime['keywordIndex'] {
+    return this.runtime?.keywordIndex;
+  }
+
+  get chunkStats(): ProfileRuntime['chunkStats'] {
+    return this.runtime?.chunkStats;
   }
 
   async start(): Promise<void> {
     const { config } = this;
     const profilesConfig = config.profiles;
     const profileId = (profilesConfig?.defaultProfileId ?? 'default') as ProfileId;
+    this.stopping = false;
+    this.stopped = false;
 
     console.log('[gateway] Starting Redacted...');
 
+    // P2b DD10 / D3.7: warn once at boot for any retired idle-reset config key still set to a
+    // non-default value (they no longer trigger anything).
+    for (const warning of deprecatedSessionWarnings(config.sessions)) {
+      console.warn(`[gateway] Deprecated config: ${warning}`);
+    }
+
     // Bootstrap workspace with template files on first run
     this.bootstrapWorkspace(config.memory.workspace);
+    const stagingDir = this.mediaStagingDir();
+    sweepStagedMedia(stagingDir, os.homedir());
 
-    // Profiles: construct the registry and (idempotently) migrate the legacy
-    // single-user workspace into the profile-scoped layout. Only attempted
-    // when the caller has actually configured a `profiles` section — configs
-    // that omit it (older configs, ad-hoc test configs) keep the pre-P0
-    // legacy paths untouched, which is the safest "sensible default" per the
-    // resilience rule (never assume a filesystem location the caller didn't
-    // opt into). This step must never crash boot: any failure here falls
-    // back to the legacy workspace path.
+    // Profiles: construct the registry. Legacy migration (idempotent) happens per-profile inside
+    // buildRuntimeFor below, restricted to the DEFAULT profile only (RR-STRUCT R-S5a Part B,
+    // mini-plan v3 §3.8 A-F04 — SAFETY-CRITICAL: a secondary profile must never see it).
     this.profileRegistry = profilesConfig ? this.tryCreateProfileRegistry(profilesConfig.baseDir) : undefined;
-    const memoryWorkspace = this.profileRegistry
-      ? this.migrateAndResolveWorkspace(this.profileRegistry, profileId, config.memory.workspace)
-      : config.memory.workspace;
-    this.resolvedMemoryWorkspace = memoryWorkspace;
-    const usingProfileWorkspace = memoryWorkspace !== config.memory.workspace;
 
-    // Memory
-    const memory = new MemoryEngine(memoryWorkspace, profileId);
-    const dbPath = usingProfileWorkspace && this.profileRegistry
-      ? this.profileRegistry.profileSearchDb(profileId)
-      : path.join(config.memory.workspace, '..', 'search.db');
-    // SqliteStore (better-sqlite3) does not create its parent directory;
-    // the legacy path relied on config.memory.workspace's parent already
-    // existing via bootstrapWorkspace. The profile-scoped `.state/` dir has
-    // no other creator this early in startup, so ensure it here.
-    secureMkdir(path.dirname(dbPath));
-    const store = new SqliteStore(dbPath, profileId);
-    this.store = store;
-    const embeddingProvider = createProvider(config.providers.embeddings);
-    const { MemoryIndexer } = await import('../memory/indexer');
-    const indexer = new MemoryIndexer(store, embeddingProvider, memoryWorkspace, profileId);
-    try {
-      await indexer.indexAll();
-      console.log('[gateway] Memory index ready');
-    } catch (error) {
-      console.warn('[gateway] Memory index unavailable; continuing with degraded search:', summarizeErrorForLog(error));
-    }
-
-    const search = new MemorySearch(store, embeddingProvider, config.memory.search.hybridWeights, profileId);
-
-    // Providers
     const mainProvider = createProvider(config.providers.main);
-    this.mainProvider = mainProvider; // #3: kept for the boot completion probe.
+    this.mainProvider = mainProvider;
 
-    // Tools
-    const registry = new ToolRegistry(config.tools);
-    // RES-P2-1: each tool group is registered independently so a failure in
-    // one factory/dependency disables only that group and boot continues with
-    // the remaining tools (resilience law: disable tool, log, continue).
-    try {
-      for (const tool of createMemoryTools(memory, search, indexer, profileId)) {
-        registry.register(tool);
-      }
-    } catch (e) {
-      console.warn('[gateway] Memory tools unavailable; continuing without them:', summarizeErrorForLog(e));
-    }
-
-    // Medical tools with medical provider
-    try {
-      const medicalProvider = createProvider(config.providers.medical);
-      for (const tool of createMedicalTools(memory, search, medicalProvider, mainProvider, memoryWorkspace, {
-        medicalProviderType: config.providers.medical.type,
-        medicalProviderBaseUrl: config.providers.medical.baseUrl,
-        allowRawMedicalMedia: config.providers.medical.allowRawMedicalMedia,
-        mainProviderType: config.providers.main.type,
-        mainProviderBaseUrl: config.providers.main.baseUrl,
-      })) {
-        registry.register(tool);
-      }
-    } catch (e) {
-      console.warn('[gateway] Medical tools unavailable; continuing without them:', summarizeErrorForLog(e));
-    }
-
-    // Context
-    const assembler = new ContextAssembler(memory, config.memory.bootstrapMaxChars, profileId);
-    const systemMessages = await assembler.buildSystemMessages();
-
-    // Agent
     const semaphore = new LLMSemaphore();
-    this.agentLoop = new AgentLoop(mainProvider, registry, systemMessages, config.agent, semaphore);
+    this.semaphore = semaphore;
 
-    // Sessions
-    // Path resolution stays here (Gateway) rather than inside SessionManager
-    // itself: SessionManager has no other dependency on the profiles module,
-    // and keeping it that way avoids adding module coupling for a value the
-    // caller already has to compute (ProfileRegistry.profileSessions). Only
-    // derived when a profiles config was actually supplied; otherwise
-    // SessionManager keeps its own legacy default.
-    const sessionsPath = this.profileRegistry ? this.profileRegistry.profileSessions(profileId) : undefined;
-    this.sessions = new SessionManager(
-      config.sessions.softResetAfterMinutes,
-      config.sessions.hardResetAfterMinutes,
-      sessionsPath,
-      mainProvider,
-      registry,
-      config.sessions.compaction,
-      profileId,
-    );
+    let sideEffectProvider: LLMProvider = mainProvider;
+    try {
+      sideEffectProvider = createProvider(config.providers.medical);
+    } catch (error) {
+      console.warn('[gateway] Medical provider for side-effect lookup unavailable; using main:', summarizeErrorForLog(error));
+    }
+    this.sideEffectProvider = sideEffectProvider;
 
     // Channel
     if (config.channels.telegram.enabled) {
@@ -175,20 +219,26 @@ export class Gateway {
       if (!token) {
         throw new Error('TELEGRAM_BOT_TOKEN not set. Set it in config or environment.');
       }
-      this.channel = new TelegramChannel(token, memoryWorkspace);
+      this.channel = new TelegramChannel(token, stagingDir, os.homedir());
       this.channel.onMessage((msg) => this.handleMessage(msg));
-      await this.channel.connect();
     }
 
-    await this.initializeScheduler();
-    if (this.scheduler) {
-      try {
-        registry.register(createCronManageTool(this.scheduler, this.getEffectiveWorkspace()));
-        registry.register(createHeartbeatManageTool(this.scheduler, this.getEffectiveWorkspace()));
-      } catch (e) {
-        console.warn('[gateway] Cron/heartbeat tools unavailable; continuing without them:', summarizeErrorForLog(e));
-      }
+    // RR-STRUCT R-S5a (mini-plan v3 §3.3): ProfileRuntimeManager owns one ProfileRuntime per
+    // paired profile. The DEFAULT profile is built first and DIRECTLY (not via buildAll) so its
+    // failure semantics stay byte-identical to pre-R-S5a: exactly one build attempt, and a
+    // genuine failure propagates straight out of start() (see tests/gateway/memcore-wiring.test.ts
+    // "aborts boot when the SAFETY.md injection invariant is violated"). Every OTHER paired
+    // profile is then eager-built via buildAll — individually guarded, so a secondary profile's
+    // broken storage degrades only that profile and never touches the default or aborts boot.
+    this.manager = new ProfileRuntimeManager((id) => this.buildRuntimeFor(id));
+    this.runtime = await this.manager.get(profileId);
+    await this.manager.buildAll(this.pairedProfileIds(profileId));
+
+    this.router = this.createRouter();
+    if (this.channel && typeof this.channel.connect === 'function') {
+      await this.channel.connect();
     }
+    await this.initializeScheduler();
 
     await this.runBootHealthchecks();
     this.runSecurityChecks();
@@ -196,246 +246,112 @@ export class Gateway {
     console.log('[gateway] Redacted is running.');
   }
 
-  async handleTestMessage(chatId: string, text: string): Promise<string> {
-    // PROD-P1-6: empty/whitespace-only text → short canned reply, no agent run,
-    // no session write (mirrors the channel path in handleMessage).
-    if (text.trim().length === 0) {
-      return EMPTY_MESSAGE_RESPONSE;
+  /**
+   * RR-STRUCT R-S5a Part C (mini-plan v3 §3.8 A-F07): a nightly-sweep COORDINATOR across every
+   * built profile — each profile's own cron (`ProfileRuntime`'s internal `sweepTask`, R-S1)
+   * already sweeps itself independently in production; this is the manual/test-triggered surface
+   * (`gateway.runTranscriptSweep()`). Preserves the EXISTING external contract exactly: it still
+   * returns the DEFAULT profile's `NightlySweepResult` (the shape every existing sweep test
+   * asserts on), while additionally sweeping every OTHER built profile against its OWN sessions/
+   * ledger/curiosity, individually guarded — one profile's sweep failure never aborts another's
+   * (including the default's).
+   */
+  async runTranscriptSweep(): Promise<NightlySweepResult> {
+    if (this.stopping) return { scanned: false, added: 0 };
+    if (!this.manager) {
+      // Test-double seam (attachGatewayTestRuntime): no manager was ever built.
+      if (!this.runtime) return { scanned: false, added: 0 };
+      return this.runtime.runTranscriptSweep();
     }
+    const defaultProfileId = (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
+    const results = await this.sweepAllBuiltProfiles();
+    return results.get(defaultProfileId) ?? { scanned: false, added: 0 };
+  }
 
-    const profileId = this.getProfileForChat(chatId);
-    if (profileId === null) {
-      // Refused chats still get emergency guidance (medical-safety rule; the
-      // emergency text carries no PHI) — but no agent run, no session write.
-      const emergency = this.handleEmergencyInput(text);
-      return emergency ?? UNRECOGNIZED_CHAT_RESPONSE;
+  private async sweepAllBuiltProfiles(): Promise<Map<ProfileId, NightlySweepResult>> {
+    const out = new Map<ProfileId, NightlySweepResult>();
+    const runtimes = this.manager?.all() ?? [];
+    await Promise.allSettled(runtimes.map(async (runtime) => {
+      try {
+        out.set(runtime.profileId, await runtime.runTranscriptSweep());
+      } catch (error) {
+        console.warn(
+          '[gateway] Nightly transcript sweep failed for a profile; other profiles are unaffected:',
+          summarizeErrorForLog(error),
+        );
+        out.set(runtime.profileId, { scanned: false, added: 0 });
+      }
+    }));
+    return out;
+  }
+
+  private async lookupSideEffects(provider: LLMProvider, entity: string): Promise<string[]> {
+    try {
+      const prompt =
+        `List the well-known common side effects of the medication "${entity}" as a compact JSON ` +
+        `array of short lowercase strings (e.g. ["nausea","dizziness"]). If unsure, return []. ` +
+        `Output ONLY the JSON array.`;
+      const res = await provider.chat([{ role: 'user', content: prompt }]);
+      if (res.type !== 'text') return [];
+      const match = res.text.match(/\[[\s\S]*\]/);
+      if (!match) return [];
+      const parsed: unknown = JSON.parse(match[0]);
+      if (!Array.isArray(parsed)) return [];
+      return parsed
+        .filter((x): x is string => typeof x === 'string')
+        .map(s => s.trim())
+        .filter(Boolean)
+        .slice(0, 20);
+    } catch (e) {
+      console.warn('[gateway] side-effect lookup failed (falling back to []):', summarizeErrorForLog(e));
+      return [];
     }
+  }
 
-    if (text.trim() === '/status') {
-      return this.buildBootStatusText();
-    }
-
-    // forka #4: /new must reset the session here too (parity with the channel
-    // path in handleMessage). Previously it fell through to the agent loop.
-    if (text.trim() === '/new') {
-      await this.sessions!.resetSession(chatId);
-      return 'Starting fresh session. Your health memory is preserved.';
-    }
-
-    const emergency = this.handleEmergencyInput(text);
-    if (emergency) {
-      await this.sessions?.recordTurn(chatId, [
-        { role: 'user', content: text },
-        { role: 'assistant', content: emergency },
-      ]);
-      return emergency;
-    }
-
-    const onboarding = await this.handleOnboarding(chatId, text);
-    if (onboarding) {
-      return onboarding;
-    }
-
-    const history = await this.sessions!.prepareHistory(chatId);
-    const result = await this.agentLoop!.run(text, history, { chatId });
-    await this.sessions!.recordTurn(chatId, [
-      { role: 'user', content: text },
-      ...result.trace,
-    ]);
-    await this.debouncedReconcile(chatId);
-    return result.text;
+  async handleTestMessage(chatId: string, text: string, sourceMessageId?: string): Promise<string> {
+    if (this.stopping) return SHUTDOWN_RESPONSE;
+    return this.trackOperation(() => this.requireRouter().route(
+      { chatId, userId: '', text, ...(sourceMessageId ? { messageId: sourceMessageId } : {}) },
+      async () => undefined,
+      false,
+    ).then((response) => response ?? ''));
   }
 
   private async handleMessage(incoming: IncomingMessage): Promise<void> {
-    const { chatId, text } = incoming;
-    console.log(
-      `[gateway] Message from ${chatId}: ${text.length} chars${incoming.mediaPath ? ', media attached' : ''}`,
-    );
-
-    // PROD-P1-6: empty/whitespace-only text with no media → short canned reply,
-    // no agent run, no session write. A media upload with empty caption still
-    // flows through the normal agent path below.
-    if (text.trim().length === 0 && !incoming.mediaPath && !incoming.mediaError) {
-      try {
-        await this.channel!.send(chatId, { text: EMPTY_MESSAGE_RESPONSE });
-      } catch (e) {
-        console.error('[gateway] Failed to send empty-message response:', summarizeErrorForLog(e));
-      }
-      return;
-    }
-
-    const profileId = this.getProfileForChat(chatId);
-    if (profileId === null) {
-      // Refused chats still get emergency guidance (medical-safety rule; the
-      // emergency text carries no PHI) — but no agent run, no session write.
-      const emergency = this.handleEmergencyInput(text);
-      try {
-        await this.channel!.send(chatId, { text: emergency ?? UNRECOGNIZED_CHAT_RESPONSE });
-      } catch (e) {
-        console.error('[gateway] Failed to respond to unrecognized chat:', summarizeErrorForLog(e));
-      }
-      return;
-    }
-
-    if (text.trim() === '/status') {
-      const statusText = this.buildBootStatusText();
-      await this.channel!.send(chatId, { text: statusText });
-      return;
-    }
-
-    const agentInput = this.buildAgentInput(incoming);
-
-    // Handle /new command
-    if (text.trim() === '/new') {
-      await this.sessions!.resetSession(chatId);
-      await this.channel!.send(chatId, { text: 'Starting fresh session. Your health memory is preserved.' });
-      return;
-    }
-
-    const emergency = this.handleEmergencyInput(text);
-    if (emergency) {
-      // Persist-first (RES-P0-4): record the turn BEFORE sending so a crash
-      // between the two never loses the turn. The emergency text is canned
-      // and carries no PHI, but ordering still matters for transcript
-      // integrity. On persistence failure we still send the guidance —
-      // medical-safety prioritizes reaching the user over disk hygiene
-      // (divergence is logged, sanitized). On send failure we just log;
-      // the (possibly persisted) turn is not double-sent.
-      const emergencyTurn = [
-        { role: 'user' as const, content: agentInput },
-        { role: 'assistant' as const, content: emergency },
-      ];
-      try {
-        await this.sessions!.recordTurn(chatId, emergencyTurn);
-      } catch (e) {
-        console.error(
-          '[gateway] Failed to persist emergency turn (sending guidance anyway):',
-          summarizeErrorForLog(e),
-        );
-      }
-      try {
-        await this.channel!.send(chatId, { text: emergency });
-      } catch (e) {
-        console.error('[gateway] Failed to send emergency response:', summarizeErrorForLog(e));
-      }
-      return;
-    }
-
-    if (incoming.mediaError) {
-      const failureTrace = [
-        { role: 'user' as const, content: agentInput },
-        { role: 'assistant' as const, content: `[Media upload failure]\n${incoming.mediaError}` },
-      ];
-
-      try {
-        await this.channel!.send(chatId, { text: incoming.mediaError });
-      } catch (e) {
-        console.error('[gateway] Failed to send media upload error:', summarizeErrorForLog(e));
-        return;
-      }
-
-      try {
-        await this.sessions!.recordTurn(chatId, failureTrace);
-      } catch (e) {
-        console.error('[gateway] Failed to persist media upload error turn:', summarizeErrorForLog(e));
-      }
-      return;
-    }
-
-    const onboarding = await this.handleOnboarding(chatId, text);
-    if (onboarding) {
-      await this.channel!.send(chatId, { text: onboarding });
-      return;
-    }
-
-    // Emergency check after onboarding completes
-    const postOnboardingEmergency = this.handleEmergencyInput(text);
-    if (postOnboardingEmergency) {
-      // Persist-first (RES-P0-4), mirroring the early emergency branch above.
-      try {
-        await this.sessions!.recordTurn(chatId, [
-          { role: 'user', content: agentInput },
-          { role: 'assistant', content: postOnboardingEmergency },
-        ]);
-      } catch (e) {
-        console.error(
-          '[gateway] Failed to persist emergency turn (sending guidance anyway):',
-          summarizeErrorForLog(e),
-        );
-      }
-      try {
-        await this.channel!.send(chatId, { text: postOnboardingEmergency });
-      } catch (e) {
-        console.error('[gateway] Failed to send emergency response:', summarizeErrorForLog(e));
-      }
-      return;
-    }
-
-    let result: Awaited<ReturnType<AgentLoop['run']>>;
+    if (this.stopping) return;
     try {
-      const history = await this.sessions!.prepareHistory(chatId);
-      result = await this.agentLoop!.run(agentInput, history, { chatId });
-    } catch (e) {
-      console.error('[gateway] Agent error:', summarizeErrorForLog(e));
-      try {
-        await this.channel!.send(chatId, { text: "I'm having trouble right now. Please try again in a moment." });
-      } catch (fallbackError) {
-        console.error('[gateway] Failed to send fallback response:', summarizeErrorForLog(fallbackError));
-      }
-      return;
-    }
-
-    // Persist-first (RES-P0-4): record the turn BEFORE sending so a crash
-    // between the agent run and the channel write never loses the turn the
-    // user is about to read. Contract decision: if persistence fails we STILL
-    // send the real response (UX wins; the divergence is logged sanitized) —
-    // losing an expensive LLM response is worse than a logged disk divergence.
-    let persistFailed = false;
-    try {
-      await this.sessions!.recordTurn(chatId, [
-        { role: 'user', content: agentInput },
-        ...result.trace,
-      ]);
-    } catch (e) {
-      persistFailed = true;
-      console.error(
-        '[gateway] Pre-send persistence error (sending response anyway; logged divergence):',
-        summarizeErrorForLog(e),
-      );
-    }
-
-    try {
-      await this.channel!.send(chatId, { text: result.text });
-    } catch (e) {
-      console.error('[gateway] Send error:', summarizeErrorForLog(e));
-      try {
-        await this.channel!.send(chatId, { text: "I'm having trouble right now. Please try again in a moment." });
-      } catch (fallbackError) {
-        console.error('[gateway] Failed to send fallback response:', summarizeErrorForLog(fallbackError));
-      }
-      return;
-    }
-
-    if (!persistFailed) {
-      try {
-        await this.debouncedReconcile(chatId);
-      } catch (e) {
-        console.error('[gateway] Reconciliation error:', summarizeErrorForLog(e));
-      }
+      await this.trackOperation(() => this.requireRouter().route(
+        incoming,
+        (text) => this.channel!.send(incoming.chatId, { text }),
+      ));
+    } catch (error) {
+      console.error('[gateway] Handler error:', summarizeErrorForLog(error));
     }
   }
 
   async stop(): Promise<void> {
+    if (this.stopped) return;
+    if (this.stopPromise) return this.stopPromise;
+    this.stopping = true;
+    this.runtime?.beginStopping();
+    const shared = this.stopResources().finally(() => {
+      this.stopped = true;
+      if (this.stopPromise === shared) this.stopPromise = undefined;
+    });
+    this.stopPromise = shared;
+    return shared;
+  }
+
+  private async stopResources(): Promise<void> {
     for (const timer of this.reconcileTimers.values()) {
       clearTimeout(timer);
     }
     this.reconcileTimers.clear();
     let firstError: unknown;
     try {
-      await this.scheduler?.stop();
+      this.semaphore?.shutdown();
     } catch (error) {
-      firstError = firstError ?? error;
-      console.warn('[gateway] Failed to stop scheduler:', summarizeErrorForLog(error));
+      console.warn('[gateway] Failed to stop LLM semaphore:', summarizeErrorForLog(error));
     }
     try {
       await this.channel?.disconnect();
@@ -443,68 +359,141 @@ export class Gateway {
       firstError = firstError ?? error;
       console.warn('[gateway] Failed to disconnect channel:', summarizeErrorForLog(error));
     }
+
     try {
-      this.closeStore();
+      if (this.manager) {
+        // RR-STRUCT R-S5a: drains + closes EVERY built profile's runtime (not just the default).
+        await this.manager.drainAndCloseAll();
+      } else {
+        // Test-double seam (attachGatewayTestRuntime): start() never ran, so no manager exists —
+        // fall back to closing the directly-attached runtime, exactly as pre-R-S5a.
+        await this.runtime?.drainAndClose();
+      }
     } catch (error) {
-      console.warn('[gateway] Failed to close store:', summarizeErrorForLog(error));
+      firstError = firstError ?? error;
     }
+
     console.log('[gateway] Stopped.');
     if (firstError) {
       throw firstError;
     }
   }
 
+  /**
+   * RR-STRUCT R-S5b (mini-plan v3 §3.1 Finding-6, §3.8 A-F03; the R-S5a deferral): starts EACH
+   * built profile's OWN heartbeat scheduler (R-S5a built every runtime with `canSchedule:false`
+   * and started only the default's). Boot order is unchanged — the Router is created before
+   * this runs, so the R-S5a scheduler-recovery race guard (recovery invoking
+   * `runScheduledJob → handleScheduledJob → requireRouter()` before the router exists) still
+   * holds for every profile. No-manager (test-double) mode starts just the attached runtime.
+   */
   private async initializeScheduler(): Promise<void> {
-    if (!this.config.heartbeat.enabled) {
-      return;
+    if (!this.config.heartbeat.enabled || !this.channel) return;
+    const runtimes = this.manager ? this.manager.all() : (this.runtime ? [this.runtime] : []);
+    for (const runtime of runtimes) {
+      if (!runtime.agentLoop || !runtime.sessions) continue;
+      if (!runtime.scheduler) {
+        await runtime.initializeScheduler({
+          schedulerPaths: this.schedulerPathsFor(runtime.profileId),
+          // RR2-B1: the trigger closure captures THIS profile's concrete runtime — the job's
+          // `chatId` never re-selects a runtime — and the destination guard is threaded into
+          // the scheduler so create/update/resume/registration refuse foreign addresses.
+          runScheduledJob: (job) => this.handleScheduledJob(job, runtime, true),
+          canAddressChat: (chatId) => this.canChatIdAddressProfile(chatId, runtime.profileId),
+        });
+      }
+      if (runtime.scheduler) {
+        const startupChatId = await this.resolveStartupPolicyChatIdFor(runtime);
+        if (startupChatId) await this.reconcileHeartbeatPolicies(startupChatId);
+        await syncHeartbeatMarkdown(runtime.workspace, await runtime.scheduler.listJobs());
+      }
     }
-    if (!this.channel || !this.agentLoop || !this.sessions) {
-      return;
-    }
-
-    const profileId = (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
-    const { storePath, auditLogPath } = this.resolveSchedulerPaths(profileId);
-    const store = new HeartbeatStore(storePath, profileId);
-    this.scheduler = new HeartbeatScheduler(
-      store,
-      async (job) => this.handleScheduledJob(job, true),
-      this.config.heartbeat.timezone,
-      {
-        auditLogPath,
-        defaultMaxRetries: this.config.heartbeat.retry.maxRetries,
-        maxGlobalTriggersPerMinute: this.config.heartbeat.rateLimit.maxGlobalTriggersPerMinute,
-        maxPerChatTriggersPerMinute: this.config.heartbeat.rateLimit.maxPerChatTriggersPerMinute,
-        recoveryEnabled: this.config.heartbeat.recovery.enabled,
-        recoveryWindowMinutes: this.config.heartbeat.recovery.windowMinutes,
-        retryBackoffMinutes: this.config.heartbeat.retry.backoffMinutes,
-      },
-    );
-    await this.scheduler.start();
-    const startupChatId = await this.resolveStartupPolicyChatId();
-    if (startupChatId) {
-      await this.reconcileHeartbeatPolicies(startupChatId);
-    }
-    await syncHeartbeatMarkdown(this.getEffectiveWorkspace(), await this.scheduler.listJobs());
   }
 
-  private async handleScheduledJob(job: HeartbeatJob, invokedByScheduler: boolean = false): Promise<void> {
-    const profileId = this.getProfileForChat(job.chatId);
-    if (profileId === null) {
-      console.warn(`[gateway] Skipping heartbeat job ${job.id}: chat is not paired to any profile.`);
+  /**
+   * RR-STRUCT R-S5b: scheduler paths per OWNING profile. The default (or legacy no-registry
+   * mode) goes through the `hasBeenMigrated`-gated `resolveSchedulerPaths` exactly as before;
+   * a NON-DEFAULT profile resolves DIRECTLY from the registry — never through that gate
+   * (preserves the R-S5a invariant its spy test enforces: `resolveSchedulerPaths` is only
+   * ever called with the default profileId).
+   */
+  private schedulerPathsFor(profileId: ProfileId): { storePath: string; auditLogPath: string } {
+    const defaultProfileId = (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
+    if (profileId === defaultProfileId || !this.profileRegistry) {
+      return this.resolveSchedulerPaths(profileId);
+    }
+    return {
+      storePath: this.profileRegistry.profileSchedulerStore(profileId),
+      auditLogPath: this.profileRegistry.profileAuditLog(profileId),
+    };
+  }
+
+  /**
+   * RR2-B1 (R2-10/11) destination-ownership predicate: `chatId` may be addressed by work
+   * running as `profileId` ONLY when the (optional) profile registry currently pairs that
+   * chat to that profile. Side-effect-free: it READS `registry.getProfileForChat` only —
+   * never Router.resolveProfileForChat / getOrCreateDefaultProfile / pairChatToProfile, and
+   * it never builds or initializes another runtime. A missing/unreadable registry is FALSE
+   * (no implicit default authorization), and lookup failures are logged sanitized and
+   * refused. `job.chatId` is a destination, never authority.
+   */
+  private canChatIdAddressProfile(chatId: string, profileId: ProfileId): boolean {
+    try {
+      const resolved = this.profileRegistry?.getProfileForChat(chatId);
+      if (!resolved) return false;
+      return resolved.profileId === profileId;
+    } catch (error) {
+      console.warn('[gateway] Scheduled-work destination lookup failed; refusing:', summarizeErrorForLog(error));
+      return false;
+    }
+  }
+
+  private async recordSuppressedOutcomeOnOwner(owner: ProfileRuntime, jobId: string): Promise<void> {
+    const scheduler = owner.scheduler;
+    if (!scheduler) return;
+    try {
+      await scheduler.recordOutcome(jobId, 'skipped-unowned-chat');
+    } catch (recordError) {
+      console.warn('[gateway] Failed to record unowned-chat suppression:', summarizeErrorForLog(recordError));
+    }
+  }
+
+  /**
+   * RR2-B1: scheduled dispatch requires an explicit trusted runtime. `owner` is the
+   * ProfileRuntime whose scheduler created/fired this job — every trigger closure captures
+   * its concrete runtime at construction, so `job.chatId` never re-selects a runtime. All
+   * session/turn/scheduler/outcome state stays on the owner; a foreign or unpaired
+   * destination is refused BEFORE any session, tool, model, delivery-policy or channel work.
+   */
+  private async handleScheduledJob(
+    job: HeartbeatJob,
+    owner: ProfileRuntime,
+    invokedByScheduler = false,
+  ): Promise<void> {
+    if (this.stopping) return;
+    if (!this.canChatIdAddressProfile(job.chatId, owner.profileId)) {
+      console.warn(
+        `[gateway] Suppressing heartbeat job ${job.id}: destination chat is not owned by profile "${owner.profileId}".`,
+      );
+      await this.recordSuppressedOutcomeOnOwner(owner, job.id);
       return;
     }
+    const runtime = owner;
+    const sessions = runtime.sessions;
+    const scheduler = runtime.scheduler;
+    const coordinator = runtime.turnCoordinator;
+    if (!sessions || !coordinator) return;
     const decision = decideHeartbeatDelivery(job, {
       now: new Date(Date.now()),
       quietHours: this.config.heartbeat.policy.quietHours,
-      lastChatActivityAt: this.sessions!.getLastActiveAt(job.chatId),
+      lastChatActivityAt: sessions.getLastActiveAt(job.chatId),
       skipIfChatActiveWithinMinutes: this.config.heartbeat.policy.skipIfChatActiveWithinMinutes,
     });
     if (decision.action === 'skip') {
-      await this.scheduler?.recordOutcome(job.id, decision.reason);
+      await scheduler?.recordOutcome(job.id, decision.reason);
       return;
     }
 
-    const history = await this.sessions!.prepareHistory(job.chatId);
     const input = [
       '[Heartbeat Trigger]',
       `Job id: ${job.id}`,
@@ -512,45 +501,68 @@ export class Gateway {
       `Prompt: ${job.prompt}`,
     ].join('\n');
 
+    // RR2-B1: the destination can be REASSIGNED while the model runs. Re-check ownership
+    // immediately before channel.send (the delivery gate) and again before recording a
+    // sent/noop outcome, so a mid-turn reassignment is refused and suppressed — never
+    // delivered, never recorded as an honest success, never pushed into retry logic.
+    let delivered = false;
     try {
-      const result = await this.agentLoop!.run(input, history, { chatId: job.chatId, origin: 'heartbeat' });
-      if (result.text === HEARTBEAT_NOOP) {
-        await this.sessions!.recordTurn(job.chatId, [
-          { role: 'user', content: input },
-          ...result.trace,
-        ]);
-        await this.scheduler?.recordOutcome(job.id, 'noop');
-        await this.reconcileHeartbeatPolicies(job.chatId);
+      // RR-STRUCT R-S3b (C-39 for heartbeats): thread the per-occurrence turnId so a
+      // `ledger_record` inside this turn gets a deterministic idempotency key — a
+      // scheduler RETRY of this occurrence dedupes instead of double-writing.
+      const turnId = heartbeatTurnId(job);
+      const result = await coordinator.runHeartbeat({
+        chatId: job.chatId,
+        input,
+        turnId,
+        egress: async (text) => {
+          if (!this.canChatIdAddressProfile(job.chatId, owner.profileId)) {
+            throw new HeartbeatDestinationSuppressedError();
+          }
+          await this.channel!.send(job.chatId, { text });
+          delivered = true;
+        },
+        afterDelivery: async (agentResult) => {
+          if (!delivered && !this.canChatIdAddressProfile(job.chatId, owner.profileId)) {
+            throw new HeartbeatDestinationSuppressedError();
+          }
+          await scheduler?.recordOutcome(job.id, agentResult.text === HEARTBEAT_NOOP ? 'noop' : 'sent');
+          await this.reconcileAfterScheduledDelivery(job.chatId, owner);
+        },
+      });
+      if (result.status === 'preempted') {
+        try {
+          await scheduler?.recordOutcome(job.id, 'skipped-recent-activity');
+        } catch (recordError) {
+          console.warn('[gateway] Failed to record preempted heartbeat skip:', summarizeErrorForLog(recordError));
+        }
+      }
+    } catch (error) {
+      if (error instanceof HeartbeatDestinationSuppressedError) {
+        console.warn(
+          `[gateway] Suppressing heartbeat delivery for job ${job.id}: destination left this profile's ownership mid-turn.`,
+        );
+        await this.recordSuppressedOutcomeOnOwner(owner, job.id);
         return;
       }
-
-      await this.channel!.send(job.chatId, { text: result.text });
-      await this.sessions!.recordTurn(job.chatId, [
-        { role: 'user', content: input },
-        ...result.trace,
-      ]);
-      await this.scheduler?.recordOutcome(job.id, 'sent');
-      await this.reconcileHeartbeatPolicies(job.chatId);
-    } catch (error) {
-      if (error instanceof HeartbeatQueueFullError) {
+      if (error instanceof HeartbeatQueueFullError || error instanceof TurnQueueFullError) {
         console.warn(`[gateway] Heartbeat queue full for job ${job.id}; scheduler will retry.`);
-        // recordFailure itself touches disk; a storage failure here must not
-        // escape (it would double-count the failure via executeJob's catch).
-        try {
-          await this.scheduler?.recordFailure(job.id, 'heartbeat queue full');
-        } catch (recordError) {
-          console.warn(
-            `[gateway] Failed to record queue-full for job ${job.id}:`,
-            summarizeErrorForLog(recordError),
-          );
+        if (scheduler) {
+          try {
+            await scheduler.recordFailure(job.id, 'heartbeat queue full');
+          } catch (recordError) {
+            console.warn(
+              `[gateway] Failed to record queue-full for job ${job.id}:`,
+              summarizeErrorForLog(recordError),
+            );
+          }
         }
         return;
       }
 
-      if (!invokedByScheduler) {
-        // lastError is persisted to disk — sanitize; provider/agent errors can echo PHI.
+      if (!invokedByScheduler && scheduler) {
         try {
-          await this.scheduler?.recordFailure(job.id, summarizeErrorForLog(error));
+          await scheduler.recordFailure(job.id, summarizeErrorForLog(error));
         } catch (recordError) {
           console.warn(
             `[gateway] Failed to record heartbeat failure for job ${job.id}:`,
@@ -562,23 +574,81 @@ export class Gateway {
     }
   }
 
+  private async reconcileAfterScheduledDelivery(chatId: string, owner: ProfileRuntime): Promise<void> {
+    try {
+      // RR2-B1: reconciliation after a scheduled job stays owner-bound. If ownership no
+      // longer holds, skip — never re-resolve a now-foreign chat into another runtime.
+      if (!this.canChatIdAddressProfile(chatId, owner.profileId)) {
+        console.warn(
+          '[gateway] Skipping post-delivery heartbeat reconciliation: destination is no longer owned by this profile.',
+        );
+        return;
+      }
+      await this.reconcileHeartbeatPoliciesOnRuntime(owner, chatId);
+    } catch (error) {
+      console.warn('[gateway] Post-delivery heartbeat reconciliation failed:', summarizeErrorForLog(error));
+    }
+  }
+
+  /**
+   * RR-STRUCT R-S5b: reconcile runs against the runtime OWNING `chatId` — its scheduler +
+   * workspace — never the ambient default. A non-default chat's reconcile writes ONLY that
+   * profile's `HEARTBEATS.md` + scheduler store (the pre-R-S5b early-return for non-default
+   * chats is retired along with the refusal).
+   */
   private async reconcileHeartbeatPolicies(chatId: string): Promise<void> {
-    if (!this.scheduler) {
+    if (this.stopping) {
       return;
     }
+    // Sync-first: every already-built profile (boot eager-build, the overwhelming common case)
+    // resolves with ZERO async hops, preserving the exact pre-R-S5b microtask timing the
+    // debounce path is pinned to. The async fallback on-demand builds a profile paired after
+    // boot that was never built (lazy serving). NON-JOB callers only (user-turn reconcile +
+    // debounce + startup): scheduled delivery uses the owner-bound path below.
+    const runtime = this.runtimeForChatSync(chatId) ?? await this.runtimeForChat(chatId);
+    if (!runtime?.scheduler) {
+      return;
+    }
+    // RR2-B1: fail-closed, matching the scheduler's createJob guard. An unpaired chat
+    // (or a lookup failure) must not arm policy jobs on the resolved runtime — and the
+    // refusal must degrade here (sanitized warn, no reconcile) instead of propagating a
+    // createJob ownership error through reconcilePolicyJobs' rethrow path.
+    if (!this.canChatIdAddressProfile(chatId, runtime.profileId)) {
+      console.warn('[gateway] Skipping heartbeat policy reconciliation: chat is not owned by the resolving profile.');
+      return;
+    }
+    await this.reconcileHeartbeatPoliciesOnRuntime(runtime, chatId);
+  }
 
+  /**
+   * RR2-B1: the reconcile body, bound to an explicit runtime. Called by
+   * `reconcileAfterScheduledDelivery` with the OWNING runtime (never a chat-derived
+   * re-resolution), and by `reconcileHeartbeatPolicies` for non-job callers (existing
+   * chat-resolution behavior retained there).
+   */
+  private async reconcileHeartbeatPoliciesOnRuntime(runtime: ProfileRuntime, chatId: string): Promise<void> {
+    const scheduler = runtime.scheduler;
+    if (!scheduler) {
+      return;
+    }
     const desired = await buildDesiredHeartbeatJobs({
-      workspacePath: this.getEffectiveWorkspace(),
+      workspacePath: runtime.workspace,
       chatId,
       timezone: this.config.heartbeat.timezone,
       policy: this.config.heartbeat.policy,
     });
-    await reconcilePolicyJobs(this.scheduler, desired);
-    await syncHeartbeatMarkdown(this.getEffectiveWorkspace(), await this.scheduler.listJobs());
+    await reconcilePolicyJobs(scheduler, desired);
+    await syncHeartbeatMarkdown(runtime.workspace, await scheduler.listJobs());
   }
 
   private async debouncedReconcile(chatId: string): Promise<void> {
-    if (!this.scheduler) {
+    if (this.stopping) {
+      return;
+    }
+    // Synchronous resolve (no async hop): the debounce timer must be scheduled synchronously
+    // so the window's timer semantics hold exactly as pre-R-S5b (fake-timer-pinned).
+    const runtime = this.runtimeForChatSync(chatId);
+    if (!runtime?.scheduler) {
       return;
     }
 
@@ -588,99 +658,65 @@ export class Gateway {
     }
     const timer = setTimeout(() => {
       this.reconcileTimers.delete(chatId);
-      void this.reconcileHeartbeatPolicies(chatId);
+      this.launchBackgroundReconcile(chatId);
     }, 30_000);
     timer.unref();
     this.reconcileTimers.set(chatId, timer);
   }
 
+  /**
+   * Kept for the single-runtime/test-double surface (F11 test calls this directly): resolves
+   * the startup-policy chat for the DEFAULT (attached) runtime, exactly as before.
+   */
   private async resolveStartupPolicyChatId(): Promise<string | undefined> {
-    // F11: only READ which chat to reconcile heartbeat policies for — never
-    // auto-pair here. Auto-pair is a first-CONTACT bridge (getProfileForChat on
-    // a real inbound message). Consuming it at boot for a stale session/job
-    // chatId (e.g. pairing data lost, session JSONL survived) would permanently
-    // close pairing before the owner's first message — and could hand a
-    // leaked-token stranger the default profile. reconcileHeartbeatPolicies and
-    // handleScheduledJob use the chatId directly / re-check pairing themselves.
-    const sessionChatId = this.sessions?.getMostRecentChatId();
-    if (sessionChatId) {
+    return this.resolveStartupPolicyChatIdFor(this.runtime);
+  }
+
+  /**
+   * RR-STRUCT R-S5b: startup-policy resolution SCOPED to one profile's runtime — its most
+   * recent session chat or scheduler job belonging to THAT profile (an unpaired/stale chat
+   * belongs to the default only, preserving the F11 no-auto-pair-at-boot invariant for every
+   * profile: this method only READS the registry, never pairs).
+   */
+  private async resolveStartupPolicyChatIdFor(runtime: ProfileRuntime | undefined): Promise<string | undefined> {
+    if (!runtime) return undefined;
+    const sessionChatId = runtime.sessions?.getMostRecentChatId();
+    if (sessionChatId && this.chatBelongsToProfile(sessionChatId, runtime.profileId)) {
       return sessionChatId;
     }
 
-    const jobs = await this.scheduler!.listJobs();
-    return jobs.find((job) => job.chatId !== '__startup__')?.chatId;
+    if (!runtime.scheduler) return undefined;
+    const jobs = await runtime.scheduler.listJobs();
+    return jobs.find((job) => job.chatId !== '__startup__' && this.chatBelongsToProfile(job.chatId, runtime.profileId))?.chatId;
   }
 
-  private buildAgentInput(incoming: IncomingMessage): string {
-    const parts: string[] = [incoming.text];
-    if (incoming.mediaPath) {
-      parts.push('', `Uploaded media path (relative to workspace): ${incoming.mediaPath}`);
-    }
-    if (incoming.replyToMessageId) {
-      parts.push('', `Reply to message id: ${incoming.replyToMessageId}`);
-    }
-    if (incoming.userId) {
-      parts.push('', `User id: ${incoming.userId}`);
-    }
-    return parts.join('\n');
+  private launchBackgroundReconcile(chatId: string): void {
+    if (this.stopping) return;
+    // Track the background op on the OWNING runtime so each profile's shutdown drain accounts
+    // for its own reconciles (falls back to the default-tracked op if unresolvable). The
+    // reconcile itself (`reconcileHeartbeatPolicies`) re-resolves async — this stays sync so
+    // the timer callback's fire-and-track semantics hold under fake timers.
+    const runtime = this.runtimeForChatSync(chatId) ?? this.runtime;
+    if (!runtime) return;
+    runtime.trackBackgroundOperation('heartbeat reconciliation', () => this.reconcileHeartbeatPolicies(chatId));
   }
 
-  private async handleOnboarding(chatId: string, input: string): Promise<string | undefined> {
-    const workspace = this.getEffectiveWorkspace();
-    if (input.trim() === '/onboarding restart' || input.trim() === '/profile update') {
-      const flow = new OnboardingFlow(
-        new OnboardingStore(workspace),
-        workspace,
-        this.config.heartbeat.timezone,
-      );
-      const result = await flow.handle('restart onboarding');
-      await this.sessions?.recordTurn(chatId, [
-        { role: 'user', content: input },
-        { role: 'assistant', content: result.response },
-      ]);
-      return result.response;
+  private trackOperation<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.runtime) {
+      return this.runtime.trackOperation(operation);
     }
-
-    const store = new OnboardingStore(workspace);
-    const flow = new OnboardingFlow(store, workspace, this.config.heartbeat.timezone);
-    if (await flow.isComplete()) {
-      return undefined;
-    }
-
-    const result = await flow.handle(input);
-    if (!result.response) {
-      return undefined;
-    }
-    await this.sessions?.recordTurn(chatId, [
-      { role: 'user', content: input },
-      { role: 'assistant', content: result.response },
-    ]);
-    return result.response;
+    return Promise.resolve().then(operation);
   }
 
-  private handleEmergencyInput(input: string): string | undefined {
-    const cleanInput = input
-      .split(/\r?\n/)
-      .filter((line) => !/^\s*(user id|reply to message id|uploaded media path)\s*:/i.test(line))
-      .join('\n');
-    if (!EMERGENCY_PATTERN.test(cleanInput)) {
-      return undefined;
-    }
-    return EMERGENCY_RESPONSE;
+  private trackBackgroundOperation(label: string, operation: () => Promise<void>): void {
+    if (this.stopping) return;
+    this.runtime?.trackBackgroundOperation(label, operation);
   }
 
-  private closeStore(): void {
-    try {
-      this.store?.close();
-    } catch (error) {
-      console.warn('[gateway] Failed to close memory store:', summarizeErrorForLog(error));
-    } finally {
-      this.store = undefined;
-    }
+  private async drainBackgroundOperations(): Promise<void> {
+    await this.runtime?.drainBackgroundOperations();
   }
 
-  // Copies workspace template files from the project's workspace/ dir to the workspace/
-  // Only copies if the file does not already exist (preserves user edits).
   private bootstrapWorkspace(workspacePath: string): void {
     try {
       ensureWorkspaceBootstrap(workspacePath, {
@@ -693,9 +729,6 @@ export class Gateway {
     }
   }
 
-  // Constructs the ProfileRegistry. Never throws — a construction failure
-  // (e.g. an unwritable baseDir) degrades to "no profile registry", which
-  // callers treat as "use the legacy single-user paths" everywhere below.
   private tryCreateProfileRegistry(baseDir: string): ProfileRegistry | undefined {
     try {
       return new ProfileRegistry(baseDir);
@@ -708,16 +741,35 @@ export class Gateway {
     }
   }
 
-  // Idempotently migrates the legacy single-user workspace into the
-  // profile-scoped layout (via ProfileRegistry.migrateLegacyWorkspace, which
-  // already handles the sentinel + idempotent per-file copy) and decides
-  // which workspace path the rest of startup should use.
-  //
-  // Decision rule: only switch to the profile-scoped workspace once the
-  // migration sentinel is actually present (i.e. migration is confirmed
-  // complete with zero errors). A failed or partial migration must never
-  // brick the daemon, so on any error — or on an unexpected exception — this
-  // falls back to the legacy workspace path untouched.
+  private migrateLegacySessionsBeforeProfileSeal(
+    registry: ProfileRegistry,
+    profileId: ProfileId,
+    legacyWorkspace: string,
+  ): boolean {
+    const legacySessionsPath = path.join(path.dirname(legacyWorkspace), 'sessions');
+    try {
+      if (!fs.existsSync(legacySessionsPath)) return true;
+      const legacyFiles = fs.readdirSync(legacySessionsPath)
+        .filter((file) => file.startsWith('active-') && file.endsWith('.jsonl'));
+      if (legacyFiles.length === 0) return true;
+
+      const migration = new SessionManager({
+        sessionsPath: registry.profileSessions(profileId),
+        legacySessionsPath,
+        perChatArchive: true,
+        compaction: this.config.sessions.compaction,
+      });
+      if (!migration.didCompleteLegacyMigration) {
+        console.warn('[gateway] Legacy global session migration did not complete; profile sentinel remains unsealed.');
+        return false;
+      }
+      return true;
+    } catch (error) {
+      console.error('[gateway] Legacy global session migration failed; profile sentinel remains unsealed:', summarizeErrorForLog(error));
+      return false;
+    }
+  }
+
   private migrateAndResolveWorkspace(
     registry: ProfileRegistry,
     profileId: ProfileId,
@@ -725,9 +777,16 @@ export class Gateway {
   ): string {
     try {
       if (registry.hasBeenMigrated(profileId, legacyWorkspace)) {
+        if (!this.migrateLegacySessionsBeforeProfileSeal(registry, profileId, legacyWorkspace)) {
+          return legacyWorkspace;
+        }
         const profileWorkspace = registry.profileWorkspace(profileId);
         console.log(`[gateway] Profile "${profileId}" already migrated; using ${profileWorkspace}`);
         return profileWorkspace;
+      }
+
+      if (!this.migrateLegacySessionsBeforeProfileSeal(registry, profileId, legacyWorkspace)) {
+        return legacyWorkspace;
       }
 
       const result = registry.migrateLegacyWorkspace(legacyWorkspace);
@@ -735,8 +794,6 @@ export class Gateway {
         `[gateway] Legacy workspace migration: migrated=${result.migrated} skipped=${result.skipped} errors=${result.errors.length}`,
       );
       if (result.errors.length > 0) {
-        // Error strings carry workspace-relative health-file paths (PHI
-        // context) — log the count only, never the list.
         console.warn(`[gateway] Migration encountered ${result.errors.length} error(s); details withheld from logs.`);
       }
 
@@ -759,47 +816,183 @@ export class Gateway {
     }
   }
 
-  private async runBootHealthchecks(): Promise<void> {
-    try {
-      const healthResults = await checkSystemReadiness(this.config, { allowNetworkChecks: true });
-      // #3: config/reachability checks alone over-report OK — a key-present but
-      // subscription-blocked or tool-incapable main model still shows "OK". Fold
-      // a real, tool-bearing completion probe into the main-provider entry so
-      // /status reflects whether the model actually answers.
-      await this.probeMainCompletionInto(healthResults);
-      this.bootHealth = healthResults;
-      const allReady = healthResults.providers.every((p) => p.ready) && healthResults.telegram.ready;
-      if (!allReady) {
-        console.warn('[gateway] Boot healthcheck: NOT ALL READY');
-        for (const r of [...healthResults.providers, healthResults.telegram]) {
-          if (!r.ready) {
-            console.warn(`  ${r.label}: ${r.details.join(', ')}`);
-            if (r.actionHint) {
-              console.warn(`  → ${r.actionHint}`);
-            }
-          }
-        }
-      } else {
-        console.log('[gateway] Boot healthcheck: all systems ready');
+  /**
+   * RR-STRUCT R-S5a (mini-plan v3 §3.8 A-F04 — SAFETY-CRITICAL): the `buildRuntimeFor` injected
+   * into `ProfileRuntimeManager`. Branches by profileId:
+   *  - the DEFAULT profile (or ANY profile when there is no ProfileRegistry — legacy no-registry
+   *    mode, A-F11) resolves paths via the EXACT SAME migration path as pre-R-S5a
+   *    (`migrateAndResolveWorkspace` / `resolveSchedulerPaths`) — unchanged.
+   *  - any NON-DEFAULT profile NEVER calls `migrateAndResolveWorkspace` or
+   *    `migrateLegacySessionsBeforeProfileSeal` — it has no legacy data, and running either
+   *    against it would leak the default user's legacy workspace/sessions into it (the design
+   *    review reproduced exactly this — `505/exec/reviews/rr-struct-design-review-isolation.md`
+   *    F-04). Instead every path is resolved DIRECTLY from the registry
+   *    (`profileSearchDb`/`profileSessions`/`profileSchedulerStore`/`profileAuditLog`, no
+   *    `hasBeenMigrated` gate, no `legacySessionsPath`) and the workspace is bootstrapped CLEAN —
+   *    generic template files only (`ensureWorkspaceBootstrap`, the same primitive
+   *    `bootstrapWorkspace()` uses for the legacy workspace — ships no PHI, just static repo
+   *    assets), never a copy of the legacy/default content.
+   */
+  private async buildRuntimeFor(profileId: ProfileId): Promise<ProfileRuntime> {
+    const { config } = this;
+    const defaultProfileId = (config.profiles?.defaultProfileId ?? 'default') as ProfileId;
+    const registry = this.profileRegistry;
+    const isDefault = profileId === defaultProfileId;
+
+    let workspace: string;
+    let dbPath: string;
+    let sessionsPath: string | undefined;
+    let schedulerPaths: { storePath: string; auditLogPath: string };
+
+    if (isDefault || !registry) {
+      const legacyWorkspace = config.memory.workspace;
+      workspace = registry
+        ? this.migrateAndResolveWorkspace(registry, profileId, legacyWorkspace)
+        : legacyWorkspace;
+      this.resolvedMemoryWorkspace = workspace;
+      const usingProfileWorkspace = workspace !== legacyWorkspace;
+
+      dbPath = usingProfileWorkspace && registry
+        ? registry.profileSearchDb(profileId)
+        : path.join(legacyWorkspace, '..', 'search.db');
+
+      sessionsPath = registry
+        ? (usingProfileWorkspace
+          ? registry.profileSessions(profileId)
+          : path.join(path.dirname(legacyWorkspace), 'sessions'))
+        : undefined;
+
+      schedulerPaths = this.resolveSchedulerPaths(profileId);
+    } else {
+      workspace = registry.profileWorkspace(profileId);
+      try {
+        ensureWorkspaceBootstrap(workspace, {
+          preserveExisting: true,
+          log: (message) => console.log(`[gateway] [profile:${profileId}] ${message}`),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`Workspace bootstrap failed for profile "${profileId}": ${message}`);
       }
+      dbPath = registry.profileSearchDb(profileId);
+      sessionsPath = registry.profileSessions(profileId);
+      schedulerPaths = {
+        storePath: registry.profileSchedulerStore(profileId),
+        auditLogPath: registry.profileAuditLog(profileId),
+      };
+    }
+
+    return ProfileRuntime.create({
+      profileId,
+      workspace,
+      dbPath,
+      sessionsPath,
+      schedulerPaths,
+      config,
+      mainProvider: this.mainProvider!,
+      semaphore: this.semaphore!,
+      // RR-STRUCT R-S5a: scheduler recovery must not invoke a callback before
+      // ProfileRuntime.create returns. Gateway explicitly initializes every runtime's
+      // scheduler AFTER boot (initializeScheduler), where the concrete runtime exists to
+      // capture in the trigger closure and the destination guard is threaded (RR2-B1).
+      // RR2-B1: no owner-less `runScheduledJob` is passed here — a closure captured at
+      // build time could not bind this runtime, and canSchedule stays false so the
+      // direct-factory activation path (which requires canAddressChat) is not used.
+      canSchedule: false,
+      reconcile: (chatId) => this.debouncedReconcile(chatId),
+      sideEffectLookup: (entity) => this.lookupSideEffects(this.sideEffectProvider ?? this.mainProvider!, entity),
+    });
+  }
+
+  /** Every profile the manager should eager-build at boot: the default (always) plus every
+   *  profile with >=1 paired chat (mini-plan v3 §3.8/§5 R-S5a). A profile that exists in the
+   *  registry but has never been paired to a chat has nothing to serve yet and is skipped. */
+  private pairedProfileIds(defaultProfileId: ProfileId): ProfileId[] {
+    if (!this.profileRegistry) return [defaultProfileId];
+    const paired = this.profileRegistry.getAllProfiles()
+      .filter((profile) => profile.chatIds.length > 0)
+      .map((profile) => profile.profileId);
+    return [...new Set([defaultProfileId, ...paired])];
+  }
+
+  private async runBootHealthchecks(): Promise<void> {
+    const controller = new AbortController();
+    const readiness = checkSystemReadiness(this.config, {
+      allowNetworkChecks: true,
+      overallTimeoutMs: BOOT_HEALTHCHECK_BUDGET_MS,
+      signal: controller.signal,
+    });
+    const completion = this.mainProvider && typeof probeChatCompletion === 'function'
+      ? probeChatCompletion(this.mainProvider, {
+        label: 'main provider',
+        timeoutMs: BOOT_HEALTHCHECK_BUDGET_MS,
+        signal: controller.signal,
+      })
+      : Promise.resolve(undefined);
+    const allChecks = Promise.all([readiness, completion]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    const deadline = new Promise<null>((resolve) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+        resolve(null);
+      }, BOOT_HEALTHCHECK_BUDGET_MS);
+      timer.unref?.();
+    });
+    try {
+      const result = await Promise.race([allChecks, deadline]);
+      if (result === null) {
+        this.bootHealth = pendingBootHealth();
+        console.warn('[gateway] Boot healthcheck exceeded startup budget; continuing in degraded health-check-pending state');
+        void allChecks
+          .then(([healthResults, completionResult]) => {
+            if (this.stopping) return;
+            this.finishBootHealthchecks(healthResults, completionResult);
+          })
+          .catch((error) => {
+            console.warn('[gateway] Deferred boot healthcheck failed:', summarizeErrorForLog(error));
+          });
+        return;
+      }
+      this.finishBootHealthchecks(result[0], result[1]);
     } catch (error) {
       console.warn('[gateway] Boot healthcheck failed:', summarizeErrorForLog(error));
+    } finally {
+      if (!timedOut) controller.abort();
+      if (timer) clearTimeout(timer);
     }
   }
 
-  // #3: run the live completion probe on the MAIN provider only (it is the one
-  // that must support tool calling) and fold the result into its readiness
-  // entry. Skips when the config-level check already failed the main provider
-  // (nothing to probe) or the provider is unavailable. Never throws.
-  private async probeMainCompletionInto(
+  private finishBootHealthchecks(
     healthResults: { providers: ReadinessResult[]; telegram: ReadinessResult },
-  ): Promise<void> {
-    const idx = healthResults.providers.findIndex((p) => p.label === 'main provider');
-    if (idx < 0 || !this.mainProvider || !healthResults.providers[idx].ready) {
-      return;
+    completion?: ReadinessResult,
+  ): void {
+    this.mergeMainCompletionResult(healthResults, completion);
+    this.bootHealth = healthResults;
+    const allReady = healthResults.providers.every((p) => p.ready) && healthResults.telegram.ready;
+    if (!allReady) {
+      console.warn('[gateway] Boot healthcheck: NOT ALL READY');
+      for (const r of [...healthResults.providers, healthResults.telegram]) {
+        if (!r.ready) {
+          console.warn(`  ${r.label}: ${r.details.join(', ')}`);
+          if (r.actionHint) {
+            console.warn(`  → ${r.actionHint}`);
+          }
+        }
+      }
+    } else {
+      console.log('[gateway] Boot healthcheck: all systems ready');
     }
+  }
+
+  private mergeMainCompletionResult(
+    healthResults: { providers: ReadinessResult[]; telegram: ReadinessResult },
+    completion?: ReadinessResult,
+  ): void {
+    const idx = healthResults.providers.findIndex((p) => p.label === 'main provider');
+    if (idx < 0 || !completion || !healthResults.providers[idx].ready) return;
     const base = healthResults.providers[idx];
-    const completion = await probeChatCompletion(this.mainProvider, { label: 'main provider' });
     if (!completion.ready) {
       healthResults.providers[idx] = {
         ...base,
@@ -851,14 +1044,14 @@ export class Gateway {
     if (!h) {
       return 'System health check not yet complete.';
     }
+    const pending = [...h.providers, h.telegram].some((result) => result.reasonCode === 'healthcheck-timeout');
+    const promptMode = this.runtime?.promptMode ?? 'boot-cached';
     const lines = [
-      'System Health:',
-      ...h.providers.map((p) => `  ${p.label}: ${p.ready ? 'OK' : 'FAIL'}`),
-      `  telegram: ${h.telegram.ready ? 'OK' : 'FAIL'}`,
+      `System Health${pending ? ' (health-check-pending)' : ''}:`,
+      ...h.providers.map((p) => `  ${p.label}: ${readinessLabel(p)}`),
+      `  telegram: ${readinessLabel(h.telegram)}`,
+      `  prompt: ${promptMode}${promptMode === 'boot-cached' ? ' (recall off — degraded)' : ''}`,
     ];
-    // Security warnings carry config internals (provider baseUrls, workspace
-    // filesystem paths) and must never reach a network channel — surface the
-    // count only; full text stays on the local console/CLI.
     if (this.securityWarnings.length > 0) {
       lines.push('', `Security warnings: ${this.securityWarnings.length} (details in local logs)`);
     }
@@ -867,37 +1060,87 @@ export class Gateway {
   }
 
   private getEffectiveWorkspace(): string {
-    return this.resolvedMemoryWorkspace ?? this.config.memory.workspace;
+    return this.runtime?.workspace || this.resolvedMemoryWorkspace || this.config.memory?.workspace || '';
   }
 
-  // P0 persists pairings only; runtime dispatch is single-profile at boot.
-  // Auto-pair is a first-contact bridge (PD-16 pairing codes land in P6): it
-  // fires ONLY while no chat is paired to any profile. Once the owner's first
-  // chat is paired, every other unknown chatId is refused (returns null) —
-  // otherwise a leaked bot token would let a stranger pair themselves to the
-  // default profile and read the owner's health memory through the chat tools.
-  private getProfileForChat(chatId: string): ProfileId | null {
-    if (!this.profileRegistry) {
-      return (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
-    }
-    const existing = this.profileRegistry.getProfileForChat(chatId);
-    if (existing) {
-      return existing.profileId;
-    }
-    const anyChatPaired = this.profileRegistry.getAllProfiles().some((p) => p.chatIds.length > 0);
-    if (anyChatPaired) {
-      console.warn(`[gateway] Refused unrecognized chat ${chatId} (auto-pair closed after first pairing)`);
-      return null;
-    }
-    const defaultProfile = this.profileRegistry.getOrCreateDefaultProfile();
-    this.profileRegistry.pairChatToProfile(chatId, defaultProfile.profileId);
-    console.log(`[gateway] Paired chat ${chatId} to profile "${defaultProfile.profileId}" (first-contact auto-pair)`);
-    return defaultProfile.profileId;
+  private mediaStagingDir(): string {
+    return path.join(os.homedir(), '.redacted', '.staging', 'media');
   }
 
-  // Same sentinel-gated fallback as migrateAndResolveWorkspace: heartbeat
-  // store + scheduler audit log only move to profile-scoped paths once the
-  // workspace migration sentinel confirms migration completed cleanly.
+  private createRouter(): GatewayMessageRouter {
+    return new GatewayMessageRouter({
+      config: this.config,
+      runtime: this.runtime,
+      profileRegistry: this.profileRegistry,
+      stagingDir: this.mediaStagingDir(),
+      stagingBaseDir: os.homedir(),
+      buildBootStatusText: () => this.buildBootStatusText(),
+      // RR-STRUCT R-S5b (mini-plan v3 §3.2): the Router dispatches every turn to the runtime
+      // OWNING the resolved profile. Manager-backed in production; when no manager exists
+      // (the `attachGatewayTestRuntime` test-double seam, which never builds one) every
+      // profileId resolves to the single attached runtime — one resolver-based code path,
+      // both worlds working. Never rejects: a degraded profile yields `undefined` and the
+      // Router emits the canned degraded reply instead of crashing.
+      resolveRuntime: (profileId) => this.resolveRuntimeForProfile(profileId),
+    });
+  }
+
+  /**
+   * RR-STRUCT R-S5b: the single per-profile runtime accessor every dispatch path funnels
+   * through (message routing via the Router's resolver, scheduled jobs, reconciles).
+   * `manager.get` is a memoized map read (single-flight); a persistently-broken profile
+   * rejects per call (rejection-evict + retry, Finding-7a) and degrades to `undefined`
+   * with a sanitized log — never a throw to the daemon.
+   */
+  private async resolveRuntimeForProfile(profileId: ProfileId): Promise<ProfileRuntime | undefined> {
+    try {
+      if (this.manager) return await this.manager.get(profileId);
+      return this.runtime;
+    } catch (error) {
+      console.warn(
+        `[gateway] Profile "${profileId}" runtime unavailable; degrading work for that profile:`,
+        summarizeErrorForLog(error),
+      );
+      return undefined;
+    }
+  }
+
+  /** The runtime OWNING `chatId` (registry lookup only — never auto-pairs; an unpaired chat
+   *  falls back to the default exactly as the pre-R-S5b reconcile did). May on-demand BUILD a
+   *  not-yet-built profile via the manager (single-flight, memoized) — for foreground paths
+   *  (turns, jobs, startup) where the caller already awaits. */
+  private async runtimeForChat(chatId: string): Promise<ProfileRuntime | undefined> {
+    const resolved = this.profileRegistry?.getProfileForChat(chatId);
+    const profileId = resolved?.profileId ?? (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
+    return this.resolveRuntimeForProfile(profileId);
+  }
+
+  /** Synchronous twin of `runtimeForChat` for the timer-driven reconcile path (see
+   *  `ProfileRuntimeManager.getIfBuilt`): never builds, never awaits — `undefined` means
+   *  "nothing to reconcile right now". */
+  private runtimeForChatSync(chatId: string): ProfileRuntime | undefined {
+    const resolved = this.profileRegistry?.getProfileForChat(chatId);
+    const profileId = resolved?.profileId ?? (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
+    if (this.manager) return this.manager.getIfBuilt(profileId);
+    return this.runtime;
+  }
+
+  private chatBelongsToProfile(chatId: string, profileId: ProfileId): boolean {
+    const resolved = this.profileRegistry?.getProfileForChat(chatId);
+    if (!resolved) return profileId === (this.config.profiles?.defaultProfileId ?? 'default');
+    return resolved.profileId === profileId;
+  }
+
+  private requireRuntimeForAccess(): ProfileRuntime {
+    if (!this.runtime) throw new Error('Gateway runtime must be attached or started before field access');
+    return this.runtime;
+  }
+
+  private requireRouter(): GatewayMessageRouter {
+    if (!this.router) this.router = this.createRouter();
+    return this.router;
+  }
+
   private resolveSchedulerPaths(profileId: ProfileId): { storePath: string; auditLogPath: string } {
     const legacy = { storePath: this.config.heartbeat.storePath, auditLogPath: this.config.heartbeat.audit.path };
     if (!this.profileRegistry) {
@@ -921,4 +1164,3 @@ export class Gateway {
     }
   }
 }
-

@@ -6,6 +6,7 @@ import JSON5 from 'json5';
 import type { AppConfig } from './types';
 import { cloneDefaultConfig } from './defaults';
 import { secureMkdir } from '../security';
+import { BUILT_IN_EMERGENCY_KEYWORDS } from '../safety/emergency-detector';
 
 export interface LoadConfigOptions {
   configPath?: string;
@@ -62,6 +63,12 @@ export async function loadConfig(input?: string | LoadConfigOptions): Promise<Ap
   const raw = fs.readFileSync(resolvedPath, 'utf8');
   const userConfig = JSON5.parse(raw) as Partial<AppConfig>;
   const merged = deepMerge(defaults, userConfig);
+  merged.emergency = {
+    keywords: [...new Set([
+      ...BUILT_IN_EMERGENCY_KEYWORDS,
+      ...(Array.isArray(userConfig.emergency?.keywords) ? userConfig.emergency.keywords : []),
+    ])],
+  };
   removeDefaultBaseUrlForCloudProviders(merged, userConfig);
 
   // Resolve ~ in paths

@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import type { AppConfig } from '../../src/config/types';
+import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 
 describe('Gateway onboarding integration', () => {
   let tmpDir: string;
@@ -63,10 +64,10 @@ describe('Gateway onboarding integration', () => {
     const gateway = new Gateway(config);
     const run = jest.fn().mockResolvedValue({ text: 'normal agent', trace: [{ role: 'assistant', content: 'normal agent' }] });
     const recordTurn = jest.fn().mockResolvedValue(undefined);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = { prepareHistory: jest.fn().mockResolvedValue([]), recordTurn };
+    attachGatewayTestRuntime(gateway, config, {
+      agentLoop: { run },
+      sessions: { prepareHistory: jest.fn().mockResolvedValue([]), recordTurn },
+    });
 
     const response = await gateway.handleTestMessage('chat-1', 'hello');
 
@@ -82,13 +83,14 @@ describe('Gateway onboarding integration', () => {
     fs.writeFileSync(path.join(config.memory.workspace, 'HEALTH_PROFILE.md'), '# Health Profile\n', 'utf8');
     const gateway = new Gateway(config);
     const run = jest.fn().mockResolvedValue({ text: 'normal agent', trace: [{ role: 'assistant', content: 'normal agent' }] });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = {
-      prepareHistory: jest.fn().mockResolvedValue([]),
-      recordTurn: jest.fn().mockResolvedValue(undefined),
-    };
+    attachGatewayTestRuntime(gateway, config, {
+      agentLoop: { run },
+      sessions: {
+        prepareHistory: jest.fn().mockResolvedValue([]),
+        recordTurn: jest.fn().mockResolvedValue(undefined),
+        recordPromptUsage: jest.fn().mockResolvedValue(undefined),
+      },
+    });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).reconcileHeartbeatPolicies = jest.fn().mockResolvedValue(undefined);
 
@@ -109,7 +111,7 @@ describe('Gateway onboarding integration', () => {
     const response = await gateway.handleTestMessage('chat-1', 'Can I eat daal chawal?');
 
     expect(response).toBe('normal agent');
-    expect(run).toHaveBeenCalledWith('Can I eat daal chawal?', [], { chatId: 'chat-1' });
+    expect(run).toHaveBeenCalledWith('Can I eat daal chawal?', [], { chatId: 'chat-1', mode: 'chat' });
   });
 
   it('bypasses onboarding for urgent health messages without calling the agent loop', async () => {
@@ -119,14 +121,52 @@ describe('Gateway onboarding integration', () => {
     fs.writeFileSync(path.join(config.memory.workspace, 'HEALTH_PROFILE.md'), '# Health Profile\n', 'utf8');
     const gateway = new Gateway(config);
     const run = jest.fn();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = { prepareHistory: jest.fn().mockResolvedValue([]), recordTurn: jest.fn().mockResolvedValue(undefined) };
+    attachGatewayTestRuntime(gateway, config, {
+      agentLoop: { run },
+      sessions: { prepareHistory: jest.fn().mockResolvedValue([]), recordTurn: jest.fn().mockResolvedValue(undefined) },
+    });
 
     const response = await gateway.handleTestMessage('chat-1', 'I have chest pain and cannot breathe');
 
-    expect(response).toContain('emergency');
+    expect(response).toContain('This may be an emergency');
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it('uses the expanded emergency detector before onboarding or the agent loop', async () => {
+    const config = makeConfig();
+    fs.mkdirSync(config.memory.workspace, { recursive: true });
+    fs.writeFileSync(path.join(config.memory.workspace, 'USER.md'), '# User Preferences\n', 'utf8');
+    fs.writeFileSync(path.join(config.memory.workspace, 'HEALTH_PROFILE.md'), '# Health Profile\n', 'utf8');
+    const gateway = new Gateway(config);
+    const run = jest.fn();
+    attachGatewayTestRuntime(gateway, config, {
+      agentLoop: { run },
+      sessions: { prepareHistory: jest.fn().mockResolvedValue([]), recordTurn: jest.fn().mockResolvedValue(undefined) },
+    });
+
+    const response = await gateway.handleTestMessage('chat-1', 'I want to kill myself');
+
+    expect(response).toContain('This may be an emergency');
+    expect(response).toContain('I am an AI health companion, not a doctor');
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it('extends gateway emergency routing with configured literal keywords', async () => {
+    const config = makeConfig();
+    (config as never as { emergency: { keywords: string[] } }).emergency = { keywords: ['code violet'] };
+    fs.mkdirSync(config.memory.workspace, { recursive: true });
+    fs.writeFileSync(path.join(config.memory.workspace, 'USER.md'), '# User Preferences\n', 'utf8');
+    fs.writeFileSync(path.join(config.memory.workspace, 'HEALTH_PROFILE.md'), '# Health Profile\n', 'utf8');
+    const gateway = new Gateway(config);
+    const run = jest.fn();
+    attachGatewayTestRuntime(gateway, config, {
+      agentLoop: { run },
+      sessions: { prepareHistory: jest.fn().mockResolvedValue([]), recordTurn: jest.fn().mockResolvedValue(undefined) },
+    });
+
+    const response = await gateway.handleTestMessage('chat-1', 'Please start code violet now');
+
+    expect(response).toContain('This may be an emergency');
     expect(run).not.toHaveBeenCalled();
   });
 
@@ -143,10 +183,10 @@ describe('Gateway onboarding integration', () => {
     const gateway = new Gateway(config);
     const run = jest.fn().mockResolvedValue({ text: 'normal agent', trace: [{ role: 'assistant', content: 'normal agent' }] });
     const recordTurn = jest.fn().mockResolvedValue(undefined);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = { prepareHistory: jest.fn().mockResolvedValue([]), recordTurn };
+    attachGatewayTestRuntime(gateway, config, {
+      agentLoop: { run },
+      sessions: { prepareHistory: jest.fn().mockResolvedValue([]), recordTurn },
+    });
 
     const response = await gateway.handleTestMessage('chat-1', 'I have severe chest pain and cannot breathe');
 
@@ -169,10 +209,10 @@ describe('Gateway onboarding integration', () => {
     fs.writeFileSync(path.join(config.memory.workspace, '.redacted', 'onboarding.json'), '{bad-json', 'utf8');
     const gateway = new Gateway(config);
     const run = jest.fn();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = { prepareHistory: jest.fn().mockResolvedValue([]), recordTurn: jest.fn().mockResolvedValue(undefined) };
+    attachGatewayTestRuntime(gateway, config, {
+      agentLoop: { run },
+      sessions: { prepareHistory: jest.fn().mockResolvedValue([]), recordTurn: jest.fn().mockResolvedValue(undefined) },
+    });
 
     const response = await gateway.handleTestMessage('chat-1', 'hello');
 
@@ -192,10 +232,10 @@ describe('Gateway onboarding integration', () => {
     fs.writeFileSync(path.join(config.memory.workspace, 'HEALTH_PROFILE.md'), '# Health Profile\n', 'utf8');
     const gateway = new Gateway(config);
     const sent: string[] = [];
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run: jest.fn() };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = { prepareHistory: jest.fn().mockResolvedValue([]), recordTurn: jest.fn().mockResolvedValue(undefined) };
+    attachGatewayTestRuntime(gateway, config, {
+      agentLoop: { run: jest.fn() },
+      sessions: { prepareHistory: jest.fn().mockResolvedValue([]), recordTurn: jest.fn().mockResolvedValue(undefined) },
+    });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn(async (_chatId: string, message: { text: string }) => sent.push(message.text)) };
 
@@ -220,10 +260,10 @@ describe('Gateway onboarding integration', () => {
     const gateway = new Gateway(config);
     const run = jest.fn();
     const sent: string[] = [];
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = { prepareHistory: jest.fn().mockResolvedValue([]), recordTurn: jest.fn().mockResolvedValue(undefined) };
+    attachGatewayTestRuntime(gateway, config, {
+      agentLoop: { run },
+      sessions: { prepareHistory: jest.fn().mockResolvedValue([]), recordTurn: jest.fn().mockResolvedValue(undefined) },
+    });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn(async (_chatId: string, message: { text: string }) => sent.push(message.text)) };
 

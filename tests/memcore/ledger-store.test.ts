@@ -21,6 +21,23 @@ const userProv: Provenance = { source: 'user', confidence: 1, anchor: 'memory/us
 const sensorProv: Provenance = { source: 'sensor', confidence: 0.8, anchor: 'memory/sensor.md#L1', capturedAt: '', note: 'Device reading' };
 const labProv: Provenance = { source: 'lab', confidence: 0.9, anchor: 'memory/lab.md#L1', capturedAt: '', note: 'Lab result' };
 describe('LedgerStore', () => {
+  it('refuses a symlinked ledger lane instead of writing outside the profile root', async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-ledger-outside-'));
+    try {
+      fs.symlinkSync(outside, path.join(tmpDir, 'ledger'), 'dir');
+
+      await expect(store.recordFact({
+        entity: 'metformin',
+        type: 'medication',
+        fields: { dose: '850mg' },
+        provenance: docProv,
+      })).rejects.toThrow();
+      expect(fs.readdirSync(outside)).toEqual([]);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   describe('v1 create', () => {
     it('creates v1 when no prior version exists', async () => {
       const result = await store.recordFact({
@@ -77,18 +94,22 @@ describe('LedgerStore', () => {
   });
 
   describe('higher-authority supersede', () => {
-    it('doctor supersedes user fact with conflict', async () => {
+    // W-C/D fix pass (AR / C2): a conflicting MED change needs user confirmation
+    // regardless of authority rank — the old assertion here enshrined the
+    // authority-rank bypass the hostile panel flagged as CRITICAL.
+    it('doctor conflicting med change needs confirmation; confirm applies v2', async () => {
       await store.recordFact({
         entity: 'lisinopril', type: 'medication', fields: { dose: '10mg' }, provenance: userProv,
       });
       const result = await store.recordFact({
         entity: 'lisinopril', type: 'medication', fields: { dose: '20mg' }, provenance: docProv,
       });
-      expect(result.kind).toBe('applied');
-      if (result.kind === 'applied') {
-        expect(result.fact.version).toBe(2);
-        expect(result.fact.status).toBe('active');
-        expect(result.fact.fields.dose).toBe('20mg');
+      expect(result.kind).toBe('needs-confirmation');
+      if (result.kind === 'needs-confirmation') {
+        const fact = await store.confirm(result.token.uuid);
+        expect(fact.version).toBe(2);
+        expect(fact.status).toBe('active');
+        expect(fact.fields.dose).toBe('20mg');
       }
     });
 
@@ -232,6 +253,7 @@ describe('LedgerStore', () => {
       });
       const result = await store.retract({ entity: 'penicillin', type: 'allergy', provenance: docProv });
       expect(result.kind).toBe('needs-confirmation');
+      if (result.kind !== 'needs-confirmation') return;
       expect(result.token).toBeDefined();
     });
 
@@ -242,6 +264,7 @@ describe('LedgerStore', () => {
       });
       const result = await store.retract({ entity: 'penicillin', type: 'allergy', provenance: docProv });
       expect(result.kind).toBe('needs-confirmation');
+      if (result.kind !== 'needs-confirmation') return;
       await store.confirm(result.token!.uuid);
       const active = await store.getActive('penicillin', 'allergy');
       expect(active).toBeNull();
@@ -314,12 +337,8 @@ describe('LedgerStore', () => {
       await store.recordFact({
         entity: 'metformin', type: 'medication', fields: { dose: '500mg' }, provenance: docProv,
       });
-
-      const data = await store['readFacts']('medication');
-      const v1 = data.find(f => f.entity === 'metformin' && f.version === 1)!;
-      v1.status = 'paused';
-      v1.fields.pre_pause_summary = 'Held for surgery' as unknown as string[];
-      await store['writeFacts']('medication', data);
+      // Build the paused state through the PUBLIC pause() API (no private-member hacking).
+      await store.pause('metformin', 'medication', docProv, { prePauseSummary: 'Held for surgery' });
 
       const result = await store.recordFact({
         entity: 'metformin', type: 'medication',
@@ -333,48 +352,49 @@ describe('LedgerStore', () => {
       }
     });
 
-    it('resume=true on paused entity produces active', async () => {
+    it('resume=true on a paused MEDICATION requires confirmation, then produces active (H-1)', async () => {
+      // H-1 (medical-safety): resuming a paused med/allergy must NOT bypass the confirmation gate.
+      // This test previously asserted an INSTANT `applied` — that was the bypass bug the P1-gate
+      // audit flagged. The intent (resume yields an active fact) is preserved via the confirm path.
       await store.recordFact({
         entity: 'metformin', type: 'medication', fields: { dose: '500mg' }, provenance: docProv,
       });
-      const data = await store['readFacts']('medication');
-      const v1 = data.find(f => f.entity === 'metformin' && f.version === 1)!;
-      v1.status = 'paused';
-      await store['writeFacts']('medication', data);
+      await store.pause('metformin', 'medication', docProv, { prePauseSummary: 'Held for surgery' });
 
       const result = await store.recordFact({
         entity: 'metformin', type: 'medication',
         fields: { dose: '500mg' },
         provenance: docProv, resume: true,
       });
-      expect(result.kind).toBe('applied');
-      if (result.kind !== 'applied') return;
-      expect(result.fact.status).toBe('active');
-      expect(result.fact.version).toBe(2);
-      const after = await store.getChain('metformin', 'medication');
-      expect(after.find(f => f.version === 1)!.status).toBe('superseded');
+      expect(result.kind).toBe('needs-confirmation');
+      if (result.kind !== 'needs-confirmation') return;
+      const fact = await store.confirm(result.token.uuid);
+      expect(fact.status).toBe('active');
       const activeNow = await store.getActive('metformin', 'medication');
-      expect(activeNow?.version).toBe(2);
+      expect(activeNow?.id).toBe(fact.id);
+      // no version remains paused after the resume is confirmed
+      const chain = await store.getChain('metformin', 'medication');
+      expect(chain.filter(f => f.status === 'paused')).toHaveLength(0);
     });
   });
 
   describe('A6 — discontinued restart', () => {
-    it('restart of discontinued med creates new chain', async () => {
+    it('restart of a discontinued med creates a new active version carrying restartOf', async () => {
       await store.recordFact({
         entity: 'metformin', type: 'medication', fields: { dose: '500mg' }, provenance: docProv,
       });
-      const chain = await store.getChain('metformin', 'medication');
-      const lastId = chain[0].id;
+      // Actually discontinue (med-class → confirm), then actually restart() — the real contract.
+      const disc = await store.discontinue('metformin', 'medication', docProv);
+      expect(disc.kind).toBe('needs-confirmation');
+      if (disc.kind === 'needs-confirmation') await store.confirm(disc.token.uuid);
+      const discontinued = (await store.getChain('metformin', 'medication')).find(f => f.status === 'discontinued')!;
 
-      const result = await store.recordFact({
-        entity: 'metformin', type: 'medication',
-        fields: { dose: '500mg', restartOf: lastId },
-        provenance: docProv,
-      });
-      expect(result.kind).toBe('applied');
-      if (result.kind === 'applied') {
-        expect(result.fact.fields.restartOf).toBe(lastId);
-      }
+      const res = await store.restart('metformin', 'medication', docProv, { dose: '850mg' });
+      expect(res.kind).toBe('needs-confirmation');
+      if (res.kind !== 'needs-confirmation') return;
+      const fact = await store.confirm(res.token.uuid);
+      expect(fact.status).toBe('active');
+      expect(fact.fields.restartOf).toBe(discontinued.id);
     });
   });
 });

@@ -32,6 +32,26 @@ describe('Memory Tools', () => {
     expect(result.isError).toBe(true);
   });
 
+  it('bounds oversized memory_get output and includes a truncation marker', async () => {
+    const oversized = 'health detail '.repeat(2_000);
+    await engine.writeFile('large.md', oversized);
+    const tool = tools.find(t => t.name === 'memory_get')!;
+
+    const result = await tool.execute({ path: 'large.md' });
+    const text = result.content[0].text;
+    expect(text.length).toBeLessThan(oversized.length);
+    expect(text).toMatch(/truncated/i);
+  });
+
+  it('rejects an oversized memory_write before touching the file', async () => {
+    const tool = tools.find(t => t.name === 'memory_write')!;
+    const result = await tool.execute({ path: 'too-large.md', content: 'x'.repeat(20_000), mode: 'overwrite' });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/size|limit|large/i);
+    expect(await engine.readFile('too-large.md')).toBeNull();
+  });
+
   it('memory_get returns a clear error for directory paths', async () => {
     fs.mkdirSync(path.join(tmpDir, 'medications'), { recursive: true });
 
@@ -41,6 +61,15 @@ describe('Memory Tools', () => {
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('Path is a directory');
     expect(result.content[0].text).toContain('medications');
+  });
+
+  it('memory_get returns a clean error for a traversal path', async () => {
+    const tool = tools.find(t => t.name === 'memory_get')!;
+    const result = await tool.execute({ path: '../SAFETY' });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Invalid path');
+    expect(result.content[0].text).not.toContain('SAFETY');
   });
 
   it('memory_write creates a file', async () => {

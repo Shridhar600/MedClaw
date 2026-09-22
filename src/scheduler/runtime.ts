@@ -25,12 +25,23 @@ interface HeartbeatSchedulerOptions {
   recoveryEnabled?: boolean;
   recoveryWindowMinutes?: number;
   retryBackoffMinutes?: number;
+  /**
+   * RR2-B1 (R2-10/11): destination-ownership capability, closed over the OWNING profile's
+   * identity. Optional so standalone/non-profile scheduler use keeps this module's
+   * path-agnostic interface; every actual daemon ProfileRuntime supplies it (a
+   * `canSchedule:true` factory path without one refuses scheduler activation — see
+   * `ProfileRuntime.create`). When present it gates createJob/updateJob/resume/start
+   * registration so a foreign-addressed record can never be created, re-pointed, or
+   * re-enabled unnoticed; `job.chatId` is a destination, never authority.
+   */
+  canAddressChat?: (chatId: string) => boolean;
 }
 
 export class HeartbeatScheduler {
   private tasks: Map<string, cron.ScheduledTask> = new Map();
   private wakeupTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
-  private readonly inFlight: Set<string> = new Set();
+  private readonly inFlight: Map<string, Promise<void>> = new Map();
+  private readonly transitionChains: Map<string, Promise<void>> = new Map();
   private readonly auditLog?: SchedulerAuditLog;
   private readonly defaultMaxRetries: number;
   private readonly rateLimiter: HeartbeatRateLimiter;
@@ -38,6 +49,8 @@ export class HeartbeatScheduler {
   private readonly recoveryEnabled: boolean;
   private readonly recoveryWindowMinutes: number;
   private readonly retryBackoffMinutes: number;
+  private readonly canAddressChat?: (chatId: string) => boolean;
+  private stopping = false;
 
   constructor(
     private readonly store: HeartbeatStore,
@@ -55,9 +68,26 @@ export class HeartbeatScheduler {
     this.recoveryEnabled = options.recoveryEnabled ?? false;
     this.recoveryWindowMinutes = options.recoveryWindowMinutes ?? 60;
     this.retryBackoffMinutes = options.retryBackoffMinutes ?? 5;
+    this.canAddressChat = options.canAddressChat;
+  }
+
+  /**
+   * RR2-B1: is `chatId` an addressable destination for THIS profile's scheduler? Absent guard
+   * (standalone/non-profile use) keeps the legacy unguarded behavior. A throwing lookup is a
+   * refusal, never an authorization.
+   */
+  private isDestinationAddressable(chatId: string): boolean {
+    if (!this.canAddressChat) return true;
+    try {
+      return this.canAddressChat(chatId) === true;
+    } catch (error) {
+      console.warn('[scheduler] Destination ownership lookup failed; refusing:', summarizeErrorForLog(error));
+      return false;
+    }
   }
 
   async stop(): Promise<void> {
+    this.stopping = true;
     for (const task of this.tasks.values()) {
       task.stop();
     }
@@ -66,29 +96,14 @@ export class HeartbeatScheduler {
     }
     this.tasks.clear();
     this.wakeupTimers.clear();
-    // RES-P2-3: no new cron ticks can fire (tasks stopped), but a job already
-    // executing executeJob must be allowed to finish before stop() resolves so
-    // callers (e.g. gateway.stop on SIGTERM) do not tear down the process
-    // while a heartbeat trigger is mid-flight. Bounded wait so a stuck job
-    // never blocks shutdown forever.
-    await this.drainInFlight(10_000);
+    // No new launch can pass the stopping gate. Existing jobs are awaited without a
+    // time cap so callers never close their stores while a heartbeat still writes.
+    await this.drainInFlight();
   }
 
-  private async drainInFlight(capMs = 10_000): Promise<void> {
-    const pollMs = 50;
-    const deadline = Date.now() + capMs;
+  private async drainInFlight(): Promise<void> {
     while (this.inFlight.size > 0) {
-      if (Date.now() >= deadline) {
-        console.warn(
-          `[scheduler] stop() waited ${capMs}ms for inFlight jobs; ${this.inFlight.size} still running, giving up.`,
-        );
-        return;
-      }
-      await new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, pollMs);
-        // Never keep the event loop alive solely for the drain poll.
-        t.unref?.();
-      });
+      await Promise.allSettled([...this.inFlight.values()]);
     }
   }
 
@@ -108,7 +123,13 @@ export class HeartbeatScheduler {
   }
 
   async createJob(input: CreateHeartbeatJobInput): Promise<HeartbeatJob> {
+    if (this.stopping) throw new Error('heartbeat scheduler is stopped');
     this.validateCron(input.cron);
+    // RR2-B1: refuse to persist a destination this profile does not own (cron_manage's
+    // optional chatId stays; same-profile alternates pass, foreign/unpaired refuse).
+    if (!this.isDestinationAddressable(input.chatId)) {
+      throw new Error('Refusing to create a heartbeat job for a chat this profile does not own.');
+    }
     const created = await this.store.create({
       ...input,
       timezone: input.timezone ?? this.defaultTimezone,
@@ -122,6 +143,7 @@ export class HeartbeatScheduler {
   }
 
   async updateJob(id: string, patch: UpdateHeartbeatJobInput): Promise<HeartbeatJob> {
+    if (this.stopping) throw new Error('heartbeat scheduler is stopped');
     const current = await this.store.get(id);
     if (!current) {
       throw new Error(`Heartbeat job not found: ${id}`);
@@ -130,6 +152,14 @@ export class HeartbeatScheduler {
     const nextCron = patch.cron ?? current.cron;
     if ((patch.enabled ?? current.enabled) !== false) {
       this.validateCron(nextCron);
+    }
+
+    // RR2-B1: refuse both re-pointing a job at a foreign chat and re-enabling a
+    // foreign-addressed record — either would re-arm work against another profile.
+    const nextChatId = patch.chatId ?? current.chatId;
+    const willBeEnabled = (patch.enabled ?? current.enabled) !== false;
+    if (willBeEnabled && !this.isDestinationAddressable(nextChatId)) {
+      throw new Error('Refusing to keep a heartbeat job pointed at a chat this profile does not own.');
     }
 
     const updated = await this.store.update(id, patch);
@@ -143,20 +173,27 @@ export class HeartbeatScheduler {
   }
 
   async deleteJob(id: string): Promise<boolean> {
+    if (this.stopping) return false;
     this.unregister(id);
     return this.store.remove(id);
   }
 
   async pause(id: string): Promise<HeartbeatJob> {
+    if (this.stopping) throw new Error('heartbeat scheduler is stopped');
     const updated = await this.store.update(id, { enabled: false });
     this.unregister(id);
     return updated;
   }
 
   async resume(id: string): Promise<HeartbeatJob> {
+    if (this.stopping) throw new Error('heartbeat scheduler is stopped');
     const job = await this.store.get(id);
     if (!job) {
       throw new Error(`Heartbeat job not found: ${id}`);
+    }
+    // RR2-B1: a persisted foreign-addressed record cannot be re-enabled unnoticed.
+    if (!this.isDestinationAddressable(job.chatId)) {
+      throw new Error('Refusing to resume a heartbeat job addressed to a chat this profile does not own.');
     }
     this.validateCron(job.cron);
     const updated = await this.store.update(id, { enabled: true });
@@ -166,6 +203,7 @@ export class HeartbeatScheduler {
   }
 
   async runNow(id: string): Promise<void> {
+    if (this.stopping) return;
     const job = await this.store.get(id);
     if (!job) {
       throw new Error(`Heartbeat job not found: ${id}`);
@@ -177,69 +215,74 @@ export class HeartbeatScheduler {
   }
 
   async recordOutcome(id: string, outcome: HeartbeatLastOutcome): Promise<void> {
-    const job = await this.store.get(id);
-    if (!job) {
-      throw new Error(`Heartbeat job not found: ${id}`);
-    }
-    const now = this.now().toISOString();
-    const updated = await this.store.update(id, {
-      lastOutcome: outcome,
-      lastOutcomeAt: now,
-      lastError: outcome === 'error' ? job.lastError : undefined,
-      deliveryState: outcome === 'error' ? job.deliveryState : 'ready',
-      nextRetryAt: outcome === 'error' ? job.nextRetryAt : undefined,
-      deadLetterReason: outcome === 'error' ? job.deadLetterReason : undefined,
-      lastAttemptAt: now,
-      lastDeliveredAt: outcome === 'sent' ? now : job.lastDeliveredAt,
+    await this.withJobTransition(id, async () => {
+      const job = await this.store.get(id);
+      if (!job) {
+        throw new Error(`Heartbeat job not found: ${id}`);
+      }
+      const now = this.now().toISOString();
+      const updated = await this.store.update(id, {
+        lastOutcome: outcome,
+        lastOutcomeAt: now,
+        lastError: outcome === 'error' ? job.lastError : undefined,
+        deliveryState: outcome === 'error' ? job.deliveryState : 'ready',
+        nextRetryAt: outcome === 'error' ? job.nextRetryAt : undefined,
+        deadLetterReason: outcome === 'error' ? job.deadLetterReason : undefined,
+        lastAttemptAt: now,
+        lastDeliveredAt: outcome === 'sent' ? now : job.lastDeliveredAt,
+      });
+      this.scheduleStateWakeup(updated);
+      await this.appendAudit(job, this.toAuditEventType(outcome), { outcome });
     });
-    this.scheduleStateWakeup(updated);
-    await this.appendAudit(job, this.toAuditEventType(outcome), { outcome });
   }
 
   async recordFailure(id: string, message: string): Promise<HeartbeatJob> {
-    const job = await this.store.get(id);
-    if (!job) {
-      throw new Error(`Heartbeat job not found: ${id}`);
-    }
+    return this.withJobTransition(id, async () => {
+      const job = await this.store.get(id);
+      if (!job) {
+        throw new Error(`Heartbeat job not found: ${id}`);
+      }
 
-    const failedAt = this.now().toISOString();
-    const decision = determineRetryAction(
-      job,
-      {
-        outcome: 'error',
-        failedAt,
-        errorMessage: message,
-      },
-      { backoffMinutes: this.retryBackoffMinutes },
-    );
+      const failedAt = this.now().toISOString();
+      const decision = determineRetryAction(
+        job,
+        {
+          outcome: 'error',
+          failedAt,
+          errorMessage: message,
+        },
+        { backoffMinutes: this.retryBackoffMinutes },
+      );
 
-    if (decision.action === 'none') {
-      await this.store.markError(id, message);
-      this.clearStateWakeup(id);
-      await this.appendAudit(job, 'send_failed', { error: message, action: 'none' });
-      return (await this.store.get(id))!;
-    }
+      if (decision.action === 'none') {
+        await this.store.markError(id, message);
+        this.clearStateWakeup(id);
+        await this.appendAudit(job, 'send_failed', { error: message, action: 'none' });
+        return (await this.store.get(id))!;
+      }
 
-    const updated = await this.store.update(id, decision.patch);
-    this.scheduleStateWakeup(updated);
-    await this.appendAudit(updated, 'send_failed', { error: message });
-    await this.appendAudit(
-      updated,
-      decision.action === 'retry' ? 'retry_scheduled' : 'dead_lettered',
-      decision.action === 'retry'
-        ? { nextRetryAt: updated.nextRetryAt, retryCount: updated.retryCount }
-        : { retryCount: updated.retryCount, reason: updated.deadLetterReason },
-    );
-    return updated;
+      const updated = await this.store.update(id, decision.patch);
+      this.scheduleStateWakeup(updated);
+      await this.appendAudit(updated, 'send_failed', { error: message });
+      await this.appendAudit(
+        updated,
+        decision.action === 'retry' ? 'retry_scheduled' : 'dead_lettered',
+        decision.action === 'retry'
+          ? { nextRetryAt: updated.nextRetryAt, retryCount: updated.retryCount }
+          : { retryCount: updated.retryCount, reason: updated.deadLetterReason },
+      );
+      return updated;
+    });
   }
 
   private register(job: HeartbeatJob): void {
+    if (this.stopping) return;
     this.unregister(job.id);
     this.validateCron(job.cron);
     const task = cron.schedule(
       job.cron,
       () => {
-        void this.executeJob(job);
+        this.launchDetached(job);
       },
       {
         scheduled: true,
@@ -265,11 +308,21 @@ export class HeartbeatScheduler {
   }
 
   private async executeJob(job: HeartbeatJob): Promise<void> {
+    if (this.stopping) return;
     if (this.inFlight.has(job.id)) {
       console.log(`[scheduler] Skipping tick for ${job.id}: previous run still in flight`);
       return;
     }
-    this.inFlight.add(job.id);
+    const run = this.executeJobBody(job);
+    this.inFlight.set(job.id, run);
+    try {
+      await run;
+    } finally {
+      if (this.inFlight.get(job.id) === run) this.inFlight.delete(job.id);
+    }
+  }
+
+  private async executeJobBody(job: HeartbeatJob): Promise<void> {
     try {
       let current = await this.store.get(job.id);
       if (!current || !current.enabled) {
@@ -318,28 +371,32 @@ export class HeartbeatScheduler {
         return;
       }
 
-      try {
-        await this.trigger(current);
-        await this.store.markRun(current.id, now.toISOString());
-      } catch (error) {
-        // lastError is persisted and this line hits the console — sanitize;
-        // provider/agent errors can echo PHI in their messages.
-        const message = summarizeErrorForLog(error);
-        console.error(`[scheduler] Heartbeat job failed (${current.id}):`, message);
-        try {
-          await this.recordFailure(current.id, message);
-        } catch (recordError) {
-          // executeJob is invoked fire-and-forget from cron ticks; a storage
-          // failure here must not become an unhandled rejection.
-          console.error(
-            `[scheduler] Failed to record heartbeat failure (${current.id}):`,
-            summarizeErrorForLog(recordError),
-          );
-        }
-      }
-    } finally {
-      this.inFlight.delete(job.id);
+      await this.trigger(current);
+      await this.store.markRun(current.id, now.toISOString());
+    } catch (error) {
+      await this.recordExecutionFailure(job.id, error);
     }
+  }
+
+  private async recordExecutionFailure(id: string, error: unknown): Promise<void> {
+    const message = summarizeErrorForLog(error);
+    console.error(`[scheduler] Heartbeat job failed (${id}):`, message);
+    try {
+      await this.recordFailure(id, message);
+    } catch (recordError) {
+      console.error(
+        `[scheduler] Failed to record heartbeat failure (${id}):`,
+        summarizeErrorForLog(recordError),
+      );
+    }
+  }
+
+  private launchDetached(job: HeartbeatJob): void {
+    // Keep the catch at the detached boundary even though executeJob has its own
+    // state-machine guard. This protects future changes from bare void rejections.
+    void this.executeJob(job).catch((error) => {
+      void this.recordExecutionFailure(job.id, error);
+    });
   }
 
   private async disableInvalidJob(job: HeartbeatJob, message: string): Promise<void> {
@@ -353,16 +410,25 @@ export class HeartbeatScheduler {
   }
 
   async start(): Promise<void> {
+    this.stopping = false;
     const jobs = await this.store.list();
     for (const job of jobs) {
       if (!job.enabled) {
+        continue;
+      }
+      // RR2-B1: a persisted foreign-addressed record must not silently come back live at
+      // boot — disable + markError (same A1 boundary treatment as invalid-cron records).
+      if (!this.isDestinationAddressable(job.chatId)) {
+        const refusalMessage = 'heartbeat job destination is not owned by this profile';
+        await this.disableInvalidJob(job, refusalMessage);
+        console.error(`[scheduler] Refused to register heartbeat job (${job.id}): ${refusalMessage}`);
         continue;
       }
       try {
         this.register(job);
         this.scheduleStateWakeup(job);
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = summarizeErrorForLog(error);
         await this.disableInvalidJob(job, message);
         console.error(`[scheduler] Failed to register heartbeat job (${job.id}):`, message);
       }
@@ -420,6 +486,7 @@ export class HeartbeatScheduler {
 
   private scheduleStateWakeup(job: HeartbeatJob): void {
     this.clearStateWakeup(job.id);
+    if (this.stopping) return;
     if (!job.enabled || job.deliveryState === 'dead-letter') {
       return;
     }
@@ -432,7 +499,7 @@ export class HeartbeatScheduler {
     const delayMs = Math.max(0, dueAt.getTime() - this.now().getTime());
     const timer = setTimeout(() => {
       this.wakeupTimers.delete(job.id);
-      void this.executeJob(job);
+      this.launchDetached(job);
     }, delayMs);
     timer.unref?.();
     this.wakeupTimers.set(job.id, timer);
@@ -454,5 +521,23 @@ export class HeartbeatScheduler {
       return new Date(job.snoozedUntil);
     }
     return undefined;
+  }
+
+  private withJobTransition<T>(id: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.transitionChains.get(id) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    const chain = previous.then(() => current);
+    this.transitionChains.set(id, chain);
+
+    return (async () => {
+      await previous;
+      try {
+        return await operation();
+      } finally {
+        release();
+        if (this.transitionChains.get(id) === chain) this.transitionChains.delete(id);
+      }
+    })();
   }
 }

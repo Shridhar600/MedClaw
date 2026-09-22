@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { createHash } from 'crypto';
 import { ProfileRegistry } from '../../src/profiles/registry';
 import type { ProfileId } from '../../src/profiles/types';
 
@@ -348,6 +349,24 @@ describe('ProfileRegistry', () => {
       // legacy-forever bug hid here — the test only checked migrated===0.
       expect(second.errors).toEqual([]);
       expect(registry.hasBeenMigrated('default' as ProfileId, legacyDir)).toBe(true);
+    });
+
+    it('does not trust a torn migration sentinel', () => {
+      fs.writeFileSync(path.join(legacyDir, 'data.txt'), 'info', 'utf8');
+      const profile = registry.getOrCreateDefaultProfile();
+      const hash = createHash('sha256').update(legacyDir).digest('hex').slice(0, 12);
+      const sentinel = path.join(registry.profileDir(profile.profileId), `.migrated-from-${hash}`);
+      fs.mkdirSync(path.dirname(sentinel), { recursive: true });
+      fs.writeFileSync(sentinel, '{"version":1');
+
+      expect(registry.hasBeenMigrated(profile.profileId, legacyDir)).toBe(false);
+      const result = registry.migrateLegacyWorkspace(legacyDir);
+
+      expect(result.errors).toEqual([]);
+      expect(JSON.parse(fs.readFileSync(sentinel, 'utf8'))).toMatchObject({
+        version: 1,
+        completed: true,
+      });
     });
 
     it('handles missing legacy workspace gracefully', () => {

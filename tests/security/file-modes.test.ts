@@ -191,47 +191,43 @@ describe('PHI file modes', () => {
   describe('SessionManager', () => {
     const mkMsg = (role: 'user' | 'assistant', content: string) => ({ role, content });
 
-    it('sessions dir and active JSONL are 0o700 / 0o600', async () => {
+    it('sessions dir and day-file archive are 0o700 / 0o600', async () => {
       const sessionsPath = path.join(root, 'sessions');
       const sm = new SessionManager(60, 1440, sessionsPath, undefined, undefined, undefined, 'default');
       await sm.recordTurn('123', [mkMsg('user', 'my back hurts'), mkMsg('assistant', 'sorry to hear')]);
       expectDirMode(sessionsPath);
-      expectFileMode(path.join(sessionsPath, 'active-123.jsonl'));
+      expectFileMode(path.join(sessionsPath, new Date().toISOString().slice(0, 10) + '.jsonl'));
     });
 
-    it('archive + summary dirs/files are 0o700 / 0o600 after reset', async () => {
+    // P2b/D3.6 (DD9): /new is a window-archive — the archive/ + summaries/ side-files are retired. The
+    // day-file archive is preserved 0600 and continues; the replacement window is durable and empty.
+    it('reset preserves the day-file archive 0600 and writes an empty window (no archive/summaries side-files)', async () => {
       const sessionsPath = path.join(root, 'sessions2');
       const sm = new SessionManager(60, 1440, sessionsPath, undefined, undefined, undefined, 'default');
       await sm.recordTurn('456', [mkMsg('user', 'hi'), mkMsg('assistant', 'hello')]);
       await sm.resetSession('456');
 
-      const archiveDir = path.join(sessionsPath, 'archive');
-      const summariesDir = path.join(sessionsPath, 'summaries');
-      expectDirMode(archiveDir);
-      expectDirMode(summariesDir);
+      // The retired side-files are never created.
+      expect(fs.existsSync(path.join(sessionsPath, 'archive'))).toBe(false);
+      expect(fs.existsSync(path.join(sessionsPath, 'summaries'))).toBe(false);
 
-      const archives = listFiles(archiveDir).filter((p) => p.endsWith('.jsonl'));
-      expect(archives.length).toBe(1);
-      expectFileMode(archives[0]);
-
-      const summaries = listFiles(summariesDir).filter((p) => p.endsWith('.md'));
-      expect(summaries.length).toBe(1);
-      expectFileMode(summaries[0]);
-
-      // The active file must have been moved away.
-      expect(fs.existsSync(path.join(sessionsPath, 'active-456.jsonl'))).toBe(false);
+      // The append-only day file is preserved at 0600 (searchable), and the replacement window is 0600.
+      expectDirMode(sessionsPath);
+      expectFileMode(path.join(sessionsPath, new Date().toISOString().slice(0, 10) + '.jsonl'));
+      expectFileMode(path.join(sessionsPath, 'session-window.json'));
+      expect(JSON.parse(fs.readFileSync(path.join(sessionsPath, 'session-window.json'), 'utf8')).summaryBlock).toBe('');
     });
 
-    it('append to a pre-existing loose active JSONL tightens it to 0o600', async () => {
+    it('append to a pre-existing loose day file tightens it to 0o600', async () => {
       const sessionsPath = path.join(root, 'sessions3');
       fs.mkdirSync(sessionsPath, 0o755);
-      const active = path.join(sessionsPath, 'active-789.jsonl');
-      fs.writeFileSync(active, '{"timestamp":"t","role":"user","content":"x","chatId":"789"}\n', { mode: 0o644 });
-      expect(modeOf(active)).toBe(0o644);
+      const day = path.join(sessionsPath, new Date().toISOString().slice(0, 10) + '.jsonl');
+      fs.writeFileSync(day, '{"timestamp":"t","role":"user","content":"x","chatId":"789"}\n', { mode: 0o644 });
+      expect(modeOf(day)).toBe(0o644);
 
       const sm = new SessionManager(60, 1440, sessionsPath, undefined, undefined, undefined, 'default');
       await sm.recordTurn('789', [mkMsg('assistant', 'ok')]);
-      expectFileMode(active);
+      expectFileMode(day);
       expectDirMode(sessionsPath);
     });
   });

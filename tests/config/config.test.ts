@@ -22,6 +22,16 @@ describe('loadConfig', () => {
     expect(config.agent.disclaimerEnabled).toBe(true);
     expect(config.providers.main.type).toBe('ollama');
     expect(config.memory.workspace).toContain('.redacted');
+    expect((config as never as { emergency: { keywords: string[] } }).emergency.keywords).toContain('want to die');
+  });
+
+  it('loads configured emergency keywords without removing the built-in defaults', async () => {
+    const cfgPath = path.join(tmpDir, 'config.json');
+    fs.writeFileSync(cfgPath, JSON.stringify({ emergency: { keywords: ['code violet'] } }));
+
+    const config = await loadConfig(cfgPath) as never as { emergency: { keywords: string[] } };
+
+    expect(config.emergency.keywords).toEqual(expect.arrayContaining(['want to die', 'code violet']));
   });
 
   it('fails with init guidance when config is required but missing', async () => {

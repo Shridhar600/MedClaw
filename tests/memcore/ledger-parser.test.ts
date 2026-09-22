@@ -83,7 +83,7 @@ describe('ledger-parser', () => {
       expect(parsed).toEqual([]);
     });
 
-    it('handles corrupt block with PARSE-ERROR quarantine and still parses other entities', () => {
+    it('QUARANTINES a corrupt block (no provenance) instead of fabricating an active fact', () => {
       const md = `## metformin
 ### v2 (active)
 - dose: 850mg 1x/day
@@ -100,11 +100,27 @@ this is garbage that should not parse
 - provenance: user (1.00) · memory/2026-07-07.md#L15
 `;
       const parsed = parseLedgerFile(md, { type: 'medication', profileId: 'test' });
-      expect(parsed.length).toBeGreaterThanOrEqual(2);
-      const goodFacts = parsed.filter(f => f.fields._quarantine === undefined);
-      expect(goodFacts.length).toBeGreaterThanOrEqual(2);
+      // valid entities still parse
       expect(parsed.some(f => f.entity === 'metformin')).toBe(true);
       expect(parsed.some(f => f.entity === 'ibuprofen')).toBe(true);
+      // the broken block is preserved as a QUARANTINE fact, not silently fabricated
+      const quarantined = parsed.filter(f => f.fields._quarantine !== undefined);
+      expect(quarantined).toHaveLength(1);
+      // the garbage line NEVER becomes a real structured field on any fact
+      expect(parsed.some(f => f.fields._quarantine === undefined && f.fields.incomplete !== undefined)).toBe(false);
+    });
+
+    it('quarantines malformed field lines and out-of-range provenance confidence', () => {
+      const md = `## metformin
+### v1 (active)
+- dose 999mg
+- provenance: doctor (99.00) · memory/2026-07-07.md#L14
+`;
+
+      const [parsed] = parseLedgerFile(md, { type: 'medication', profileId: 'test' });
+      expect(parsed.fields._quarantine).toBeDefined();
+      expect(parsed.status).toBe('active');
+      expect(parsed.version).toBe(0);
     });
 
     it('parses provenance note in quotes', () => {
@@ -252,6 +268,23 @@ this is garbage that should not parse
       ];
       const parsed = roundTrip(facts);
       expect(parsed[0].visibility).toBe('shareable-summary');
+    });
+  });
+
+  describe('cross-entity + discontinue round-trip (Task 3)', () => {
+    it('round-trips replaces/replacedBy/corrects/correctedBy/discontinuedReason as top-level fields', () => {
+      const f = makeFact({
+        entity: 'naproxen', version: 2, status: 'discontinued',
+        replaces: 'ibuprofen@v1', replacedBy: 'aspirin@v1',
+        corrects: 'ibuprofen@v1', correctedBy: 'aspirin@v1',
+        discontinuedReason: 'doctor-discontinued',
+      });
+      const [parsed] = roundTrip([f]);
+      expect(parsed.replaces).toBe('ibuprofen@v1');
+      expect(parsed.replacedBy).toBe('aspirin@v1');
+      expect(parsed.corrects).toBe('ibuprofen@v1');
+      expect(parsed.correctedBy).toBe('aspirin@v1');
+      expect(parsed.discontinuedReason).toBe('doctor-discontinued');
     });
   });
 });

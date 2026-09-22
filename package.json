@@ -11,6 +11,7 @@
     "build": "tsc --project tsconfig.json",
     "typecheck": "tsc --noEmit",
     "test": "jest",
+    "test:e2e": "jest tests/e2e --runInBand",
     "lint": "eslint src tests --ext .ts",
     "arch:check": "depcruise src --config .dependency-cruiser.cjs"
   },

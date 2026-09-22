@@ -1,49 +1,221 @@
-export type SemaphorePriority = 'user' | 'heartbeat';
+// Priority order (highest first): user > heartbeat > background. `background` (F8) is for work that
+// must never starve or collide with user turns — compaction LLM calls, future P4/P5 writers — and
+// deliberately sits below heartbeat so it does not consume heartbeat queue slots (v2-H-4).
+export type SemaphorePriority = 'user' | 'heartbeat' | 'background';
 
-// Typed sentinel so callers (gateway queue-full handling) can instanceof-check
-// instead of matching the message string, which breaks silently under wrapping.
-export class HeartbeatQueueFullError extends Error {
+/** Typed overload sentinel. Callers must branch on the type, not the message. */
+export class SemaphoreQueueFullError extends Error {
+  constructor(readonly priority: SemaphorePriority) {
+    super(`${priority} queue full`);
+    this.name = 'SemaphoreQueueFullError';
+  }
+}
+
+export class HeartbeatQueueFullError extends SemaphoreQueueFullError {
   constructor() {
-    super('heartbeat queue full');
+    super('heartbeat');
     this.name = 'HeartbeatQueueFullError';
   }
 }
 
-interface QueueEntry {
-  fn: () => Promise<void>;
+export class UserQueueFullError extends SemaphoreQueueFullError {
+  constructor() {
+    super('user');
+    this.name = 'UserQueueFullError';
+  }
 }
 
-const MAX_QUEUED_HEARTBEATS = 10;
+export class BackgroundQueueFullError extends SemaphoreQueueFullError {
+  constructor() {
+    super('background');
+    this.name = 'BackgroundQueueFullError';
+  }
+}
+
+export class SemaphoreShutdownError extends Error {
+  /** Matches the non-retryable client-cancel class used by the compaction retry guard. */
+  readonly status = 499;
+
+  constructor() {
+    super('LLM semaphore is shut down');
+    this.name = 'SemaphoreShutdownError';
+  }
+}
+
+export class HeartbeatPreemptedError extends Error {
+  constructor() {
+    super('heartbeat preempted by user turn');
+    this.name = 'HeartbeatPreemptedError';
+  }
+}
+
+export interface SemaphoreEntryMetadata {
+  readonly chatId?: string;
+  readonly origin?: SemaphorePriority;
+  readonly [key: string]: unknown;
+}
+
+interface QueueEntry {
+  fn: () => Promise<void>;
+  reject: (reason: unknown) => void;
+  meta: SemaphoreEntryMetadata;
+}
+
+export interface LLMSemaphoreOptions {
+  maxQueuedUsers?: number;
+  maxQueuedHeartbeats?: number;
+  maxQueuedBackground?: number;
+  /** Run one waiting background job after this many consecutive user jobs. */
+  maxConsecutiveUserJobsWithBackground?: number;
+}
+
+const DEFAULT_MAX_QUEUED_USERS = 100;
+const DEFAULT_MAX_QUEUED_HEARTBEATS = 10;
+const DEFAULT_MAX_QUEUED_BACKGROUND = 20;
+const DEFAULT_MAX_CONSECUTIVE_USER_JOBS_WITH_BACKGROUND = 8;
 
 export class LLMSemaphore {
   private running = false;
   private userQueue: QueueEntry[] = [];
   private heartbeatQueue: QueueEntry[] = [];
+  private backgroundQueue: QueueEntry[] = [];
+  private consecutivePriorityJobs = 0;
+  private closed = false;
 
-  async run<T>(priority: SemaphorePriority, fn: () => Promise<T>): Promise<T> {
-    if (priority === 'heartbeat' && this.heartbeatQueue.length >= MAX_QUEUED_HEARTBEATS) {
-      return Promise.reject(new HeartbeatQueueFullError());
+  private readonly maxQueuedUsers: number;
+  private readonly maxQueuedHeartbeats: number;
+  private readonly maxQueuedBackground: number;
+  private readonly maxConsecutiveUserJobsWithBackground: number;
+
+  constructor(options: LLMSemaphoreOptions = {}) {
+    this.maxQueuedUsers = options.maxQueuedUsers ?? DEFAULT_MAX_QUEUED_USERS;
+    this.maxQueuedHeartbeats = options.maxQueuedHeartbeats ?? DEFAULT_MAX_QUEUED_HEARTBEATS;
+    this.maxQueuedBackground = options.maxQueuedBackground ?? DEFAULT_MAX_QUEUED_BACKGROUND;
+    this.maxConsecutiveUserJobsWithBackground = options.maxConsecutiveUserJobsWithBackground
+      ?? DEFAULT_MAX_CONSECUTIVE_USER_JOBS_WITH_BACKGROUND;
+  }
+
+  async run<T>(
+    priority: SemaphorePriority,
+    fn: () => Promise<T>,
+    meta?: SemaphoreEntryMetadata,
+  ): Promise<T> {
+    if (this.closed) {
+      return Promise.reject(new SemaphoreShutdownError());
+    }
+
+    const queue = this.queueFor(priority);
+    const limit = this.limitFor(priority);
+    if (queue.length >= limit) {
+      return Promise.reject(this.queueFullErrorFor(priority));
     }
 
     return new Promise<T>((resolve, reject) => {
-      const entry: QueueEntry = { fn: () => fn().then(resolve, reject) };
-      if (priority === 'user') {
-        this.userQueue.push(entry);
-      } else {
-        this.heartbeatQueue.push(entry);
+      if (this.closed) {
+        reject(new SemaphoreShutdownError());
+        return;
       }
+      const entry: QueueEntry = {
+        fn: async () => {
+          try {
+            resolve(await fn());
+          } catch (error) {
+            reject(error);
+          }
+        },
+        reject,
+        meta: meta ?? {},
+      };
+      queue.push(entry);
       void this.drain();
     });
+  }
+
+  /** Evict matching queued entries. The active job is already removed from its queue and is untouched. */
+  abortQueueEntry(predicate: (meta: SemaphoreEntryMetadata) => boolean): number {
+    let aborted = 0;
+    for (const queue of [this.userQueue, this.heartbeatQueue, this.backgroundQueue]) {
+      for (let index = queue.length - 1; index >= 0; index--) {
+        const entry = queue[index];
+        let matches = false;
+        try {
+          matches = predicate(entry.meta);
+        } catch {
+          // A caller predicate cannot be allowed to leave a partially mutated queue or break drain().
+        }
+        if (!matches) continue;
+        queue.splice(index, 1);
+        entry.reject(new HeartbeatPreemptedError());
+        aborted += 1;
+      }
+    }
+    return aborted;
+  }
+
+  /** Reject pending work and refuse future enqueues. The active call is not interrupted. */
+  shutdown(): void {
+    if (this.closed) return;
+    this.closed = true;
+    const error = new SemaphoreShutdownError();
+    for (const queue of [this.userQueue, this.heartbeatQueue, this.backgroundQueue]) {
+      for (const entry of queue) entry.reject(error);
+      queue.length = 0;
+    }
+  }
+
+  private hasWork(): boolean {
+    return this.userQueue.length > 0 || this.heartbeatQueue.length > 0 || this.backgroundQueue.length > 0;
+  }
+
+  private queueFor(priority: SemaphorePriority): QueueEntry[] {
+    if (priority === 'user') return this.userQueue;
+    if (priority === 'heartbeat') return this.heartbeatQueue;
+    return this.backgroundQueue;
+  }
+
+  private limitFor(priority: SemaphorePriority): number {
+    if (priority === 'user') return this.maxQueuedUsers;
+    if (priority === 'heartbeat') return this.maxQueuedHeartbeats;
+    return this.maxQueuedBackground;
+  }
+
+  private queueFullErrorFor(priority: SemaphorePriority): SemaphoreQueueFullError {
+    if (priority === 'user') return new UserQueueFullError();
+    if (priority === 'heartbeat') return new HeartbeatQueueFullError();
+    return new BackgroundQueueFullError();
+  }
+
+  private nextJob(): QueueEntry {
+    // User remains ahead of heartbeat. A waiting background job receives one reserved turn after a
+    // bounded user burst, so a continuous stream of users cannot starve background maintenance forever.
+    if (this.userQueue.length > 0) {
+      if (this.backgroundQueue.length > 0
+        && this.consecutivePriorityJobs >= this.maxConsecutiveUserJobsWithBackground) {
+        this.consecutivePriorityJobs = 0;
+        return this.backgroundQueue.shift()!;
+      }
+      this.consecutivePriorityJobs += 1;
+      return this.userQueue.shift()!;
+    }
+    if (this.heartbeatQueue.length > 0) {
+      if (this.backgroundQueue.length > 0
+        && this.consecutivePriorityJobs >= this.maxConsecutiveUserJobsWithBackground) {
+        this.consecutivePriorityJobs = 0;
+        return this.backgroundQueue.shift()!;
+      }
+      this.consecutivePriorityJobs += 1;
+      return this.heartbeatQueue.shift()!;
+    }
+    this.consecutivePriorityJobs = 0;
+    return this.backgroundQueue.shift()!;
   }
 
   private async drain(): Promise<void> {
     if (this.running) return;
     this.running = true;
     try {
-      // User priority is absolute: drain the user queue fully before
-      // touching any queued heartbeat work.
-      while (this.userQueue.length > 0 || this.heartbeatQueue.length > 0) {
-        const job = this.userQueue.length > 0 ? this.userQueue.shift()! : this.heartbeatQueue.shift()!;
+      while (this.hasWork()) {
+        const job = this.nextJob();
         try {
           await job.fn();
         } catch {
@@ -53,7 +225,7 @@ export class LLMSemaphore {
     } finally {
       this.running = false;
       // If more jobs were added during the finally block, restart drain
-      if (this.userQueue.length > 0 || this.heartbeatQueue.length > 0) {
+      if (!this.closed && this.hasWork()) {
         void this.drain();
       }
     }

@@ -1,9 +1,9 @@
 import { writeOnboardingProfile } from './profile-writer';
 import { OnboardingStore } from './store';
 import type { OnboardingAnswers, OnboardingResult, OnboardingState, OnboardingStep } from './types';
+import { EMERGENCY_RESPONSE, isEmergencyInput } from '../safety/emergency-detector';
+import { MEDICAL_DISCLAIMER } from '../safety/medical-disclaimer';
 
-const EMERGENCY_PATTERN =
-  /\b(chest pain|can't breathe|cannot breathe|difficulty breathing|stroke|heart attack|severe bleeding|suicidal|emergency)\b/i;
 const SKIP_PATTERN = /^(skip|later)$/i;
 const CONFIRM_PATTERN = /^(confirm|yes|y)\b/i;
 
@@ -12,6 +12,7 @@ export class OnboardingFlow {
     private readonly store: OnboardingStore,
     private readonly workspacePath: string,
     private readonly defaultTimezone: string,
+    private readonly emergencyKeywords: readonly string[] = [],
   ) {}
 
   async isComplete(): Promise<boolean> {
@@ -19,14 +20,16 @@ export class OnboardingFlow {
   }
 
   async handle(input: string): Promise<OnboardingResult> {
-    const cleanInput = sanitizeOnboardingInput(input);
-    if (EMERGENCY_PATTERN.test(cleanInput)) {
+    // RR2-A2 raw-input boundary: check the raw input BEFORE the onboarding
+    // sanitizer discards metadata-like lines — those lines can be user-authored
+    // crisis text. The sanitizer still applies to ordinary onboarding answers.
+    if (isEmergencyInput(input, this.emergencyKeywords)) {
       return {
         bypass: true,
-        response:
-          'This may be an emergency. Please contact local emergency services now or go to the nearest emergency department. If you can, ask someone nearby to stay with you while you get help.',
+        response: EMERGENCY_RESPONSE,
       };
     }
+    const cleanInput = sanitizeOnboardingInput(input);
 
     const state = await this.store.load();
     if (/^restart onboarding$/i.test(cleanInput)) {
@@ -62,8 +65,7 @@ export class OnboardingFlow {
       disclaimerShownAt: now,
     });
     return {
-      response:
-        'Before we start: I am a personal health companion, not a doctor, and I cannot diagnose or replace emergency care. What is your preferred name?',
+      response: 'Before we start: I am a personal health companion. What is your preferred name?' + MEDICAL_DISCLAIMER,
     };
   }
 
@@ -73,16 +75,26 @@ export class OnboardingFlow {
     let response: string;
 
     switch (state.currentStep) {
-      case 'name':
+      case 'name': {
+        // I1: a sentence-length blob is not a name — re-ask instead of storing it.
+        if (!isPlausibleName(answer)) {
+          return { response: 'Sorry, that seems too long to be a name. What should I call you?' };
+        }
         answers.name = answer;
         nextStep = 'age';
-        response = 'What is your age or age range?';
+        response = `Got it — ${answer}. What is your age or age range?`;
         break;
-      case 'age':
+      }
+      case 'age': {
+        // I1: an age must contain a plausible number; otherwise stay on this step.
+        if (!isPlausibleAge(answer)) {
+          return { response: 'Sorry, I could not catch a valid age there. What is your age in years? (for example: 56)' };
+        }
         answers.age = answer;
         nextStep = 'timezone';
-        response = `Please confirm your timezone. I have ${answers.timezone ?? this.defaultTimezone}.`;
+        response = `Got it — ${answer}. Please confirm your timezone. I have ${answers.timezone ?? this.defaultTimezone}.`;
         break;
+      }
       case 'timezone': {
         // forka #5: don't store the raw phrase as the timezone. Affirmative or
         // empty → keep the offered default. Otherwise accept the answer only if
@@ -98,28 +110,28 @@ export class OnboardingFlow {
           answers.timezone = trimmed.split(/\s+/).find(isValidTimezone) ?? fallback;
         }
         nextStep = 'conditions';
-        response = 'Any major health conditions I should remember?';
+        response = `Got it — ${answers.timezone}. Any major health conditions I should remember?`;
         break;
       }
       case 'conditions':
         answers.conditions = answer;
         nextStep = 'medications';
-        response = 'What current medications or supplements should I remember?';
+        response = `Noted — ${answer}. What current medications or supplements should I remember?`;
         break;
       case 'medications':
         answers.medications = answer;
         nextStep = 'allergies';
-        response = 'Any medication, food, or other allergies?';
+        response = `Noted — ${answer}. Any medication, food, or other allergies?`;
         break;
       case 'allergies':
         answers.allergies = answer;
         nextStep = 'goals';
-        response = 'What are your main health goals?';
+        response = `Noted — ${answer}. What are your main health goals?`;
         break;
       case 'goals':
         answers.goals = answer;
         nextStep = 'reminders';
-        response = 'What reminder preferences should I use for check-ins, medications, or routines?';
+        response = `Noted — ${answer}. What reminder preferences should I use for check-ins, medications, or routines?`;
         break;
       case 'reminders':
         answers.reminderPreferences = answer;
@@ -193,6 +205,24 @@ function sanitizeOnboardingInput(input: string): string {
 
 function isAffirmative(input: string): boolean {
   return /^(yes|y|correct|confirm|ok|okay)$/i.test(input.trim());
+}
+
+// I1: a name is short — reject sentence-length blobs (health facts, questions)
+// from occupying the name slot. 6 words / 60 chars covers "Rajesh Kumar Sharma".
+function isPlausibleName(answer: string): boolean {
+  const trimmed = answer.trim();
+  if (trimmed.length === 0 || trimmed.length > 60) return false;
+  return trimmed.split(/\s+/).length <= 6;
+}
+
+// I1: an age must contain a human-plausible number (1-120), optionally with
+// trailing words ("56 saal", "55-60 range"). The raw answer is still what gets
+// stored — validation only gates the step.
+function isPlausibleAge(answer: string): boolean {
+  const match = answer.match(/\d{1,3}/);
+  if (!match) return false;
+  const n = parseInt(match[0], 10);
+  return n >= 1 && n <= 120;
 }
 
 // forka #5: validate an IANA timezone without a dependency — Intl throws a

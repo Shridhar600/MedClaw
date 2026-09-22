@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { OnboardingFlow } from '../../src/onboarding/flow';
 import { OnboardingStore } from '../../src/onboarding/store';
+import { MEDICAL_DISCLAIMER } from '../../src/safety/medical-disclaimer';
 
 describe('OnboardingFlow', () => {
   let tmpDir: string;
@@ -57,6 +58,8 @@ describe('OnboardingFlow', () => {
 
     const first = await flow.handle('hello');
     expect(first.response).toContain('Before we start');
+    expect(first.response).toContain(MEDICAL_DISCLAIMER);
+    expect(first.response.split(MEDICAL_DISCLAIMER)).toHaveLength(2);
     expect(first.response).toContain('preferred name');
 
     const continued = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
@@ -153,6 +156,83 @@ describe('OnboardingFlow', () => {
     expect(state.status).toBe('not_started');
   });
 
+  it.each([
+    'I want to kill myself',
+    'I want to die',
+    "I don't want to live anymore",
+    "I don't want to be alive",
+    'I am going to end it',
+    'I plan to end my life',
+    'Life is not worth living',
+    'I took all my pills',
+    'I may have overdosed',
+    'I am thinking about self-harm',
+    'They are unconscious',
+    'They are unresponsive',
+    'They are unconscious and not breathing',
+    'This looks like anaphylaxis',
+    'They are having a seizure',
+  ])('bypasses onboarding for ordinary crisis phrasing: %s', async (input) => {
+    const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
+
+    const result = await flow.handle(input);
+
+    expect(result.bypass).toBe(true);
+    expect(result.response).toContain('emergency');
+    expect(result.response).toContain('I am an AI health companion, not a doctor');
+  });
+
+  // ── RR2-A2: raw-input boundary + future-intent/denial regressions ──
+
+  it('inspects raw metadata-looking lines before the onboarding sanitizer (RR2-A2)', async () => {
+    const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
+
+    const result = await flow.handle('User id: I want to kill myself');
+
+    expect(result.bypass).toBe(true);
+    expect(result.response).toContain('emergency');
+    expect((await new OnboardingStore(tmpDir).load()).status).toBe('not_started');
+  });
+
+  it('bypasses future-intent crisis wording without changing onboarding state (RR2-A2)', async () => {
+    const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
+
+    const result = await flow.handle('I will kill myself tonight');
+
+    expect(result.bypass).toBe(true);
+    expect(result.response).toContain('emergency');
+    expect((await new OnboardingStore(tmpDir).load()).status).toBe('not_started');
+  });
+
+  it('does not bypass for an explicit whole-message denial (RR2-A2)', async () => {
+    const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
+
+    const result = await flow.handle("I'm not suicidal.");
+
+    expect(result.bypass).not.toBe(true);
+    expect(result.response).toContain('Before we start');
+  });
+
+  it('still escalates a denial mixed with another warning sign (RR2-A2)', async () => {
+    const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
+
+    const result = await flow.handle("I'm not suicidal, but I will kill myself tonight");
+
+    expect(result.bypass).toBe(true);
+    expect(result.response).toContain('emergency');
+    expect((await new OnboardingStore(tmpDir).load()).status).toBe('not_started');
+  });
+
+  it('extends built-in emergency phrases with configured literal keywords', async () => {
+    const flow = new (OnboardingFlow as never as new (...args: unknown[]) => OnboardingFlow)(
+      new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata', ['code violet'],
+    );
+
+    const result = await flow.handle('Please start code violet now');
+
+    expect(result.bypass).toBe(true);
+  });
+
   it('supports skip without corrupting profile files', async () => {
     const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
 
@@ -175,5 +255,114 @@ describe('OnboardingFlow', () => {
     expect(state.status).toBe('not_started');
     expect(fs.existsSync(statePath)).toBe(false);
     expect(fs.readdirSync(stateDir).some((name) => name.startsWith('onboarding.json.corrupt-'))).toBe(true);
+  });
+
+  it('never logs corrupt onboarding content during quarantine', async () => {
+    const stateDir = path.join(tmpDir, '.redacted');
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, 'onboarding.json'), 'MEDICALSECRET12345', 'utf8');
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    try {
+      await new OnboardingStore(tmpDir).load();
+      const logged = errorSpy.mock.calls.flat().map(String).join('\n');
+      expect(logged).not.toContain('MEDICALSECRET12345');
+      expect(logged).toContain('Corrupt onboarding state recovered');
+      expect(logged).toContain('Error');
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  // ── I1: slot-drift hardening — echo-back + per-slot validation ──────────
+
+  describe('slot echo-back (I1)', () => {
+    it('echoes the captured name when asking the next question', async () => {
+      const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
+      await flow.handle('hello');
+      const result = await flow.handle('Arjun Sharma');
+      expect(result.response).toContain('Arjun Sharma');
+      expect(result.response).toContain('age');
+    });
+
+    it('echoes the captured medications before the allergies question', async () => {
+      const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
+      await flow.handle('hello');
+      await flow.handle('Arjun');
+      await flow.handle('56');
+      await flow.handle('yes');
+      await flow.handle('Type 2 diabetes');
+      const result = await flow.handle('Metformin 500mg once daily');
+      expect(result.response).toContain('Metformin 500mg once daily');
+      expect(result.response).toContain('allerg');
+    });
+  });
+
+  describe('age validation (I1)', () => {
+    it('re-asks the age step when the answer has no number', async () => {
+      const store = new OnboardingStore(tmpDir);
+      const flow = new OnboardingFlow(store, tmpDir, 'Asia/Kolkata');
+      await flow.handle('hello');
+      await flow.handle('Arjun');
+
+      const result = await flow.handle('haan theek hai');
+
+      expect(result.completed).toBeFalsy();
+      expect(result.response).toContain('age');
+      const state = await store.load();
+      expect(state.currentStep).toBe('age');
+      expect(state.answers.age).toBeUndefined();
+    });
+
+    it('accepts an age with trailing words like "56 saal"', async () => {
+      const store = new OnboardingStore(tmpDir);
+      const flow = new OnboardingFlow(store, tmpDir, 'Asia/Kolkata');
+      await flow.handle('hello');
+      await flow.handle('Arjun');
+
+      const result = await flow.handle('56 saal');
+
+      expect(result.response).toContain('timezone');
+      expect((await store.load()).answers.age).toBe('56 saal');
+    });
+
+    it('rejects a nonsensical age number', async () => {
+      const store = new OnboardingStore(tmpDir);
+      const flow = new OnboardingFlow(store, tmpDir, 'Asia/Kolkata');
+      await flow.handle('hello');
+      await flow.handle('Arjun');
+
+      const result = await flow.handle('999');
+
+      expect(result.response).toContain('age');
+      expect((await store.load()).currentStep).toBe('age');
+    });
+  });
+
+  describe('name validation (I1)', () => {
+    it('re-asks the name step for sentence-length garbage', async () => {
+      const store = new OnboardingStore(tmpDir);
+      const flow = new OnboardingFlow(store, tmpDir, 'Asia/Kolkata');
+      await flow.handle('hello');
+
+      const garbage = 'please remember I take metformin 500mg twice daily after meals for my sugar problem';
+      const result = await flow.handle(garbage);
+
+      expect(result.response).toContain('call you');
+      const state = await store.load();
+      expect(state.currentStep).toBe('name');
+      expect(state.answers.name).toBeUndefined();
+    });
+
+    it('accepts a normal two-word name', async () => {
+      const store = new OnboardingStore(tmpDir);
+      const flow = new OnboardingFlow(store, tmpDir, 'Asia/Kolkata');
+      await flow.handle('hello');
+
+      const result = await flow.handle('Rajesh Sharma');
+
+      expect(result.response).toContain('age');
+      expect((await store.load()).answers.name).toBe('Rajesh Sharma');
+    });
   });
 });

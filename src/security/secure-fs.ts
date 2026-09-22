@@ -7,13 +7,27 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { summarizeErrorForLog } from './log';
 
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 
+// PPHI (SB-14): warn carries the OPERATION and the target BASENAME (a file-type
+// name, never identifying) plus a sanitized error IDENTITY — never the
+// absolute path and never err.message, which can echo directory structure or
+// content. Native fs errors can fail `instanceof Error` across realm boundaries
+// (jest VMs; mirrors the better-sqlite3 trap), so fall back to name/code.
+function safeReason(err: unknown): string {
+  if (err instanceof Error) return summarizeErrorForLog(err);
+  const e = err as { name?: unknown; code?: unknown };
+  if (e !== null && typeof e === 'object' && typeof e.name === 'string') {
+    return typeof e.code === 'string' ? `${e.name} [${e.code}]` : e.name;
+  }
+  return typeof err;
+}
+
 function warn(operation: string, target: string, err: unknown): void {
-  const reason = err instanceof Error ? err.message : String(err);
-  console.warn(`[security] ${operation} failed for ${target}: ${reason}`);
+  console.warn(`[security] ${operation} failed for ${path.basename(target)}: ${safeReason(err)}`);
 }
 
 /** Create a directory (and parents) at 0o700. Warn-and-continue on chmod failure. */

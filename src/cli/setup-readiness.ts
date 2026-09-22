@@ -66,6 +66,8 @@ function providerDisplayName(provider: AppConfig['providers']['main']): string {
       return 'Anthropic';
     case 'google':
       return 'Google';
+    case 'openrouter':
+      return 'OpenRouter';
     case 'ollama':
       return 'Ollama';
   }

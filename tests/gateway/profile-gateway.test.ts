@@ -6,6 +6,7 @@ import { ProfileRegistry } from '../../src/profiles/registry';
 import { SessionManager } from '../../src/gateway/session';
 import type { AppConfig } from '../../src/config/types';
 import type { ProfileId } from '../../src/profiles/types';
+import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 
 jest.mock('../../src/memory/indexer', () => ({
   MemoryIndexer: jest.fn().mockImplementation(() => ({
@@ -125,10 +126,10 @@ describe('Gateway chat→profile pairing', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).profileRegistry = registry;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = sessions;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = makeMockAgentLoop();
+    attachGatewayTestRuntime(gateway, config, {
+      sessions,
+      agentLoop: makeMockAgentLoop(),
+    });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
 
@@ -215,6 +216,45 @@ describe('Gateway chat→profile pairing', () => {
     }
   });
 
+  // RR-STRUCT R-S5b: the RR-4 refusal is RETIRED. In the test-double seam (no manager)
+  // every profileId resolves to the single attached runtime, so a paired non-default chat is
+  // now SERVED by it. (Per-profile isolation under live dispatch is proven in
+  // tests/profiles/rs5b-multi-profile-dispatch.test.ts against real runtimes.)
+  it('serves a paired non-default chat via the attached runtime (test-double seam, no manager)', async () => {
+    const config = makeConfig(tmpDir);
+    const { gateway, registry, sessions } = buildGatewayWithRegistry(config);
+    const workProfile = registry.createProfile('work');
+    registry.pairChatToProfile('work-chat-42', workProfile.profileId);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const agent = gateway.runtimeInstance!.agentLoop!;
+    const reply = await gateway.handleTestMessage('work-chat-42', 'show my private health history');
+
+    expect(reply).toBe('OK');
+    expect(reply).not.toContain('not recognized');
+    expect(agent.run).toHaveBeenCalledTimes(1);
+    expect(sessions.getHistory('work-chat-42')).toHaveLength(2);
+  });
+
+  it('handleMessage also serves a paired non-default chat while preserving emergency guidance', async () => {
+    const config = makeConfig(tmpDir);
+    const { gateway, registry } = buildGatewayWithRegistry(config);
+    const workProfile = registry.createProfile('work');
+    registry.pairChatToProfile('work-chat-42', workProfile.profileId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const send = (gateway as any).channel.send as jest.Mock;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (gateway as any).handleMessage({ chatId: 'work-chat-42', text: 'show my private health history' });
+    expect(send.mock.calls.at(-1)?.[1].text).toBe('OK');
+    expect(send.mock.calls.at(-1)?.[1].text).not.toContain('not recognized');
+
+    send.mockClear();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (gateway as any).handleMessage({ chatId: 'work-chat-42', text: 'severe chest pain right now' });
+    expect(send).toHaveBeenCalledWith('work-chat-42', expect.objectContaining({ text: expect.stringMatching(/emergency/i) }));
+  });
+
   it('registry-less config still routes with default profileId (no crash)', async () => {
     const config = makeConfig(tmpDir, { withProfiles: false });
     const gateway = new Gateway(config);
@@ -229,10 +269,10 @@ describe('Gateway chat→profile pairing', () => {
       'default',
     );
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = sessions;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = makeMockAgentLoop();
+    attachGatewayTestRuntime(gateway, config, {
+      sessions,
+      agentLoop: makeMockAgentLoop(),
+    });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -260,10 +300,10 @@ describe('Gateway chat→profile pairing', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).profileRegistry = registry;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = sessions;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = makeMockAgentLoop();
+    attachGatewayTestRuntime(gateway, config, {
+      sessions,
+      agentLoop: makeMockAgentLoop(),
+    });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
 
@@ -286,8 +326,7 @@ describe('Gateway chat→profile pairing', () => {
 
     expect(reply).toBe('Starting fresh session. Your health memory is preserved.');
     expect(resetSpy).toHaveBeenCalledWith('owner-chat');
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((gateway as any).agentLoop.run).not.toHaveBeenCalled();
+    expect(gateway.runtimeInstance?.agentLoop?.run).not.toHaveBeenCalled();
   });
 
   it('refuses an unknown chat once another chat is already paired (auto-pair closes)', async () => {
@@ -307,8 +346,7 @@ describe('Gateway chat→profile pairing', () => {
     }
 
     // And the agent never ran for the stranger — only the owner's turn.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const agentLoop = (gateway as any).agentLoop;
+    const agentLoop = gateway.runtimeInstance!.agentLoop!;
     expect(agentLoop.run).toHaveBeenCalledTimes(1);
   });
 
@@ -326,8 +364,7 @@ describe('Gateway chat→profile pairing', () => {
     for (const p of onDisk.profiles) {
       expect(p.chatIds).not.toContain('stranger-chat');
     }
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const agentLoop = (gateway as any).agentLoop;
+    const agentLoop = gateway.runtimeInstance!.agentLoop!;
     expect(agentLoop.run).toHaveBeenCalledTimes(1);
   });
 
@@ -362,9 +399,9 @@ describe('Gateway chat→profile pairing', () => {
     expect(sentText).not.toContain('System Health');
   });
 
-  it('handleScheduledJob resolves profileId for job.chatId without crashing', async () => {
+  it('handleScheduledJob refuses an unpaired destination WITHOUT consuming first-contact pairing', async () => {
     const config = makeConfig(tmpDir);
-    const { gateway } = buildGatewayWithRegistry(config);
+    const { gateway, registry } = buildGatewayWithRegistry(config);
 
     const job = {
       id: 'job-1',
@@ -384,12 +421,21 @@ describe('Gateway chat→profile pairing', () => {
       updatedAt: new Date().toISOString(),
     };
 
+    // RR2-B1 (R2-10): the scheduled handler takes the OWNING runtime explicitly; the job's
+    // chatId is a destination only. An unpaired chat must be refused — never auto-paired
+    // from the scheduler path. (Pre-B1 this test asserted the DEFECT: that the default
+    // profile's chatIds came to contain 'heartbeat-chat-1' after the dispatch.)
+    const runtime = gateway.runtimeInstance!;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (gateway as any).handleScheduledJob(job, false);
+    await (gateway as any).handleScheduledJob(job, runtime, false);
 
     const onDisk = readProfilesJson(config.profiles!.baseDir);
     const defaultProfile = onDisk.profiles.find((p) => p.profileId === 'default');
     expect(defaultProfile).toBeDefined();
-    expect(defaultProfile!.chatIds).toContain('heartbeat-chat-1');
+    expect(defaultProfile!.chatIds).not.toContain('heartbeat-chat-1');
+    expect(registry.getProfileForChat('heartbeat-chat-1')).toBeUndefined();
+    // A genuine first-contact message can still claim the pairing afterwards.
+    await gateway.handleTestMessage('genuine-new-chat', 'hello');
+    expect(registry.getProfileForChat('genuine-new-chat')?.profileId).toBe('default');
   });
 });

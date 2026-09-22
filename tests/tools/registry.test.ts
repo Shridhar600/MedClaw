@@ -1,5 +1,5 @@
 import { ToolRegistry } from '../../src/tools/registry';
-import type { Tool } from '../../src/tools/types';
+import type { Tool, ToolResult } from '../../src/tools/types';
 
 const echoTool: Tool = {
   name: 'echo',
@@ -52,5 +52,33 @@ describe('ToolRegistry', () => {
   it('throws when executing unknown tool', async () => {
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
     await expect(registry.execute('nonexistent', {})).rejects.toThrow('Tool not found: nonexistent');
+  });
+
+  it('enforces declared maxLength and maxItems schema limits before execution', async () => {
+    const execute: Tool['execute'] = jest.fn(async (): Promise<ToolResult> => ({
+      content: [{ type: 'text', text: 'executed' }],
+    }));
+    const bounded: Tool = {
+      name: 'bounded',
+      group: 'group:test',
+      description: 'Bounded input',
+      parameters: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', maxLength: 5 },
+          ids: { type: 'array', maxItems: 2 },
+        },
+      },
+      execute,
+    };
+    const registry = new ToolRegistry({ allow: ['*'], deny: [] });
+    registry.register(bounded);
+
+    const long = await registry.execute('bounded', { text: '123456' });
+    const many = await registry.execute('bounded', { ids: ['a', 'b', 'c'] });
+
+    expect(long.isError).toBe(true);
+    expect(many.isError).toBe(true);
+    expect(execute).not.toHaveBeenCalled();
   });
 });

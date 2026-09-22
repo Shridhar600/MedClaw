@@ -1,8 +1,10 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import type { AppConfig } from '../../src/config/types';
+import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 
 describe('Gateway media flow', () => {
   afterEach(() => {
@@ -69,14 +71,13 @@ describe('Gateway media flow', () => {
     const prepareHistory = jest.fn().mockResolvedValue([]);
     const recordTurn = jest.fn().mockResolvedValue(undefined);
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    attachGatewayTestRuntime(gateway, makeConfig(), {
+      agentLoop: { run },
+      sessions: { prepareHistory, recordTurn, resetSession: jest.fn() },
+    });
+    const runtime = (gateway as any).runtime;
+    runtime.turnCoordinator.handleOnboarding = jest.fn().mockResolvedValue(undefined);
     (gateway as any).channel = { send };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = { prepareHistory, recordTurn, resetSession: jest.fn() };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({
@@ -106,18 +107,16 @@ describe('Gateway media flow', () => {
       healthResponse: false,
     });
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    attachGatewayTestRuntime(gateway, makeConfig(), {
+      agentLoop: { run },
+      sessions: {
+        prepareHistory: jest.fn().mockResolvedValue([]),
+        recordTurn: jest.fn().mockResolvedValue(undefined),
+        resetSession: jest.fn(),
+      },
+    });
+    (gateway as any).runtime.turnCoordinator.handleOnboarding = jest.fn().mockResolvedValue(undefined);
     (gateway as any).channel = { send };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = {
-      prepareHistory: jest.fn().mockResolvedValue([]),
-      recordTurn: jest.fn().mockResolvedValue(undefined),
-      resetSession: jest.fn(),
-    };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({
@@ -135,20 +134,16 @@ describe('Gateway media flow', () => {
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     const send = jest.fn().mockResolvedValue(undefined);
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    attachGatewayTestRuntime(gateway, makeConfig(), {
+      agentLoop: { run: jest.fn().mockRejectedValue(new Error('private report sodium value 130')) },
+      sessions: {
+        prepareHistory: jest.fn().mockResolvedValue([]),
+        recordTurn: jest.fn().mockResolvedValue(undefined),
+        resetSession: jest.fn(),
+      },
+    });
+    (gateway as any).runtime.turnCoordinator.handleOnboarding = jest.fn().mockResolvedValue(undefined);
     (gateway as any).channel = { send };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = {
-      run: jest.fn().mockRejectedValue(new Error('private report sodium value 130')),
-    };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = {
-      prepareHistory: jest.fn().mockResolvedValue([]),
-      recordTurn: jest.fn().mockResolvedValue(undefined),
-      resetSession: jest.fn(),
-    };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({
@@ -167,18 +162,16 @@ describe('Gateway media flow', () => {
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn();
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    attachGatewayTestRuntime(gateway, makeConfig(), {
+      agentLoop: { run },
+      sessions: {
+        prepareHistory: jest.fn().mockRejectedValue(new Error('private session glucose context')),
+        recordTurn: jest.fn(),
+        resetSession: jest.fn(),
+      },
+    });
+    (gateway as any).runtime.turnCoordinator.handleOnboarding = jest.fn().mockResolvedValue(undefined);
     (gateway as any).channel = { send };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = {
-      prepareHistory: jest.fn().mockRejectedValue(new Error('private session glucose context')),
-      recordTurn: jest.fn(),
-      resetSession: jest.fn(),
-    };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await expect((gateway as any).handleMessage({
@@ -206,18 +199,16 @@ describe('Gateway media flow', () => {
       healthResponse: false,
     });
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    attachGatewayTestRuntime(gateway, makeConfig(), {
+      agentLoop: { run },
+      sessions: {
+        prepareHistory: jest.fn().mockResolvedValue([]),
+        recordTurn: jest.fn().mockRejectedValue(new Error('private persistence sodium context')),
+        resetSession: jest.fn(),
+      },
+    });
+    (gateway as any).runtime.turnCoordinator.handleOnboarding = jest.fn().mockResolvedValue(undefined);
     (gateway as any).channel = { send };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = {
-      prepareHistory: jest.fn().mockResolvedValue([]),
-      recordTurn: jest.fn().mockRejectedValue(new Error('private persistence sodium context')),
-      resetSession: jest.fn(),
-    };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).reconcileHeartbeatPolicies = jest.fn().mockResolvedValue(undefined);
 
@@ -236,8 +227,7 @@ describe('Gateway media flow', () => {
   it('closes the search store on stop', async () => {
     const gateway = new Gateway(makeConfig());
     const close = jest.fn();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).store = { close };
+    attachGatewayTestRuntime(gateway, makeConfig(), { store: { close } });
 
     await gateway.stop();
 
@@ -247,9 +237,7 @@ describe('Gateway media flow', () => {
   it('still closes the search store when channel disconnect fails during stop', async () => {
     const gateway = new Gateway(makeConfig());
     const close = jest.fn();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).store = { close };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    attachGatewayTestRuntime(gateway, makeConfig(), { store: { close } });
     (gateway as any).channel = { disconnect: jest.fn().mockRejectedValue(new Error('disconnect failed')) };
 
     await expect(gateway.stop()).rejects.toThrow('disconnect failed');
@@ -275,12 +263,11 @@ describe('Gateway media flow', () => {
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn();
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    attachGatewayTestRuntime(gateway, makeConfig(), {
+      agentLoop: { run },
+      sessions: { prepareHistory: jest.fn(), recordTurn: jest.fn(), resetSession: jest.fn() },
+    });
     (gateway as any).channel = { send };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = { prepareHistory: jest.fn(), recordTurn: jest.fn(), resetSession: jest.fn() };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({
@@ -303,12 +290,11 @@ describe('Gateway media flow', () => {
     const recordTurn = jest.fn().mockResolvedValue(undefined);
     const prepareHistory = jest.fn().mockResolvedValue([]);
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    attachGatewayTestRuntime(gateway, makeConfig(), {
+      agentLoop: { run },
+      sessions: { prepareHistory, recordTurn, resetSession: jest.fn() },
+    });
     (gateway as any).channel = { send };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = { prepareHistory, recordTurn, resetSession: jest.fn() };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({
@@ -337,12 +323,11 @@ describe('Gateway media flow', () => {
     const recordTurn = jest.fn().mockResolvedValue(undefined);
     const prepareHistory = jest.fn().mockResolvedValue([]);
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    attachGatewayTestRuntime(gateway, makeConfig(), {
+      agentLoop: { run },
+      sessions: { prepareHistory, recordTurn, resetSession: jest.fn() },
+    });
     (gateway as any).channel = { send };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = { prepareHistory, recordTurn, resetSession: jest.fn() };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({
@@ -375,12 +360,11 @@ describe('Gateway media flow', () => {
     const recordTurn = jest.fn().mockRejectedValue(new Error('disk write failed'));
     const prepareHistory = jest.fn().mockResolvedValue([]);
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    attachGatewayTestRuntime(gateway, makeConfig(), {
+      agentLoop: { run },
+      sessions: { prepareHistory, recordTurn, resetSession: jest.fn() },
+    });
     (gateway as any).channel = { send };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = { prepareHistory, recordTurn, resetSession: jest.fn() };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await expect((gateway as any).handleMessage({
@@ -404,12 +388,11 @@ describe('Gateway media flow', () => {
     const recordTurn = jest.fn();
     const prepareHistory = jest.fn().mockResolvedValue([]);
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    attachGatewayTestRuntime(gateway, makeConfig(), {
+      agentLoop: { run },
+      sessions: { prepareHistory, recordTurn, resetSession: jest.fn() },
+    });
     (gateway as any).channel = { send };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = { prepareHistory, recordTurn, resetSession: jest.fn() };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await expect((gateway as any).handleMessage({
@@ -420,7 +403,9 @@ describe('Gateway media flow', () => {
     })).resolves.toBeUndefined();
 
     expect(run).not.toHaveBeenCalled();
-    expect(recordTurn).not.toHaveBeenCalled();
+    // Persist-before-send records the failure trace even when the channel rejects, so the
+    // failed interaction remains durable and searchable.
+    expect(recordTurn).toHaveBeenCalledTimes(1);
     expect(errorSpy.mock.calls.flat().join('\n')).not.toContain('glucose');
   });
 
@@ -431,12 +416,11 @@ describe('Gateway media flow', () => {
     const recordTurn = jest.fn().mockResolvedValue(undefined);
     const prepareHistory = jest.fn().mockRejectedValue(new Error('session unavailable'));
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    attachGatewayTestRuntime(gateway, makeConfig(), {
+      agentLoop: { run },
+      sessions: { prepareHistory, recordTurn, resetSession: jest.fn() },
+    });
     (gateway as any).channel = { send };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = { prepareHistory, recordTurn, resetSession: jest.fn() };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await expect((gateway as any).handleMessage({
@@ -511,14 +495,12 @@ describe('Gateway persist-before-send (RES-P0-4)', () => {
     const prepareHistory = jest.fn().mockResolvedValue([]);
     const recordTurn = jest.fn().mockResolvedValue(undefined);
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    attachGatewayTestRuntime(gateway, makeConfig(), {
+      agentLoop: { run },
+      sessions: { prepareHistory, recordTurn, resetSession: jest.fn() },
+    });
     (gateway as any).channel = { send };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = { prepareHistory, recordTurn, resetSession: jest.fn() };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
+    (gateway as any).runtime.turnCoordinator.handleOnboarding = jest.fn().mockResolvedValue(undefined);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({
@@ -547,14 +529,12 @@ describe('Gateway persist-before-send (RES-P0-4)', () => {
     const recordTurn = jest.fn().mockRejectedValue(new Error('private persistence sodium context PHI'));
     const prepareHistory = jest.fn().mockResolvedValue([]);
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    attachGatewayTestRuntime(gateway, makeConfig(), {
+      agentLoop: { run },
+      sessions: { prepareHistory, recordTurn, resetSession: jest.fn() },
+    });
     (gateway as any).channel = { send };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = { prepareHistory, recordTurn, resetSession: jest.fn() };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
+    (gateway as any).runtime.turnCoordinator.handleOnboarding = jest.fn().mockResolvedValue(undefined);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).reconcileHeartbeatPolicies = jest.fn().mockResolvedValue(undefined);
 
@@ -583,14 +563,12 @@ describe('Gateway persist-before-send (RES-P0-4)', () => {
     const recordTurn = jest.fn().mockResolvedValue(undefined);
     const prepareHistory = jest.fn().mockResolvedValue([]);
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    attachGatewayTestRuntime(gateway, makeConfig(), {
+      agentLoop: { run },
+      sessions: { prepareHistory, recordTurn, resetSession: jest.fn() },
+    });
     (gateway as any).channel = { send };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = { prepareHistory, recordTurn, resetSession: jest.fn() };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
+    (gateway as any).runtime.turnCoordinator.handleOnboarding = jest.fn().mockResolvedValue(undefined);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({

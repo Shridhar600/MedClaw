@@ -1,9 +1,13 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { SessionManager } from '../../src/gateway/session';
 import type { AppConfig } from '../../src/config/types';
+import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
+import { ProfileRegistry } from '../../src/profiles/registry';
+import type { ProfileId } from '../../src/profiles/types';
 
 jest.mock('../../src/memory/indexer', () => ({
   MemoryIndexer: jest.fn().mockImplementation(() => ({
@@ -107,12 +111,22 @@ describe('Gateway reconciler debounce', () => {
     const mockScheduler = {
       listJobs: jest.fn().mockResolvedValue([]),
     };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = sessions;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).scheduler = mockScheduler;
+    attachGatewayTestRuntime(gateway, config, {
+      sessions,
+      scheduler: mockScheduler,
+    });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).resolvedMemoryWorkspace = config.memory.workspace;
+    // RR2-B1 setup migration: the policy-reconcile path refuses chats the resolving profile
+    // does not own; pair the fixture chats so the debounce/timer assertions keep their meaning.
+    const baseDir = path.join(tmpDir, 'profiles-base');
+    fs.mkdirSync(baseDir, { recursive: true });
+    const pairingRegistry = new ProfileRegistry(baseDir);
+    pairingRegistry.getOrCreateDefaultProfile();
+    for (const chatId of ['chat-1', 'chat-A', 'chat-B']) {
+      pairingRegistry.pairChatToProfile(chatId, 'default' as ProfileId);
+    }
+    (gateway as any).profileRegistry = pairingRegistry;
     return { gateway, config };
   }
 
@@ -190,20 +204,27 @@ describe('Gateway reconciler debounce', () => {
     const disconnect = jest.fn().mockResolvedValue(undefined);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined), disconnect };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).agentLoop = { run: jest.fn().mockResolvedValue({ text: 'ok', trace: [] }) };
+    const runtime = attachGatewayTestRuntime(gateway, config, {
+      agentLoop: { run: jest.fn().mockResolvedValue({ text: 'ok', trace: [] }) },
+    });
     const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
     await sessions.recordTurn('chat-1', [{ role: 'user', content: 'Seed startup chat.' }]);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = sessions;
+    (runtime as any).sessions = sessions;
+    // RR2-B1 setup migration: pair the startup chat so the guarded policy reconcile runs.
+    {
+      const baseDir = path.join(tmpDir, 'profiles-base');
+      fs.mkdirSync(baseDir, { recursive: true });
+      const pairingRegistry = new ProfileRegistry(baseDir);
+      pairingRegistry.getOrCreateDefaultProfile();
+      pairingRegistry.pairChatToProfile('chat-1', 'default' as ProfileId);
+      (gateway as any).profileRegistry = pairingRegistry;
+    }
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).initializeScheduler();
 
     expect(mockReconcile).toHaveBeenCalled();
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (gateway as any).scheduler?.stop();
+    await (gateway.runtimeInstance as any).scheduler?.stop();
     await gateway.stop();
   });
 
@@ -235,8 +256,7 @@ describe('Gateway reconciler debounce', () => {
       listJobs: jest.fn().mockResolvedValue([]),
       stop: jest.fn().mockResolvedValue(undefined),
     };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).scheduler = mockScheduler;
+    (gateway.runtimeInstance as any).scheduler = mockScheduler;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).debouncedReconcile('chat-1');

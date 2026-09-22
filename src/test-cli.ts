@@ -7,11 +7,10 @@ import { ContextAssembler } from './agent/context';
 import { MemoryEngine } from './memory/memory-engine';
 import { ToolRegistry } from './tools/registry';
 import { createMemoryTools } from './tools/memory-tools';
-import { createMedicalTools } from './tools/medical-tools';
 import { SqliteStore } from './memory/sqlite-store';
 import { MemorySearch } from './memory/search';
 import { createProvider } from './providers/factory';
-import { SessionManager } from './gateway/session';
+import { SessionManager, type SessionManagerOptions } from './gateway/session';
 import { createInterface } from 'readline';
 import { secureMkdir } from './security';
 
@@ -126,6 +125,29 @@ const HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
+/** Build the supported local web/CLI session seam with per-chat archive isolation enabled. */
+export function createCliSessionManager(
+  options: Omit<SessionManagerOptions, 'perChatArchive'>,
+): SessionManager {
+  return new SessionManager({ ...options, perChatArchive: true });
+}
+
+function countSessionFiles(dir: string): number {
+  let count = 0;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) count += countSessionFiles(full);
+    else if (entry.isFile() && entry.name.endsWith('.jsonl')) count += 1;
+  }
+  return count;
+}
+
 async function main(): Promise<void> {
   const config = await loadConfig();
 
@@ -147,31 +169,28 @@ async function main(): Promise<void> {
   const search = new MemorySearch(store, embeddingProvider, config.memory.search.hybridWeights);
 
   const mainProvider = createProvider(config.providers.main);
-  const medicalProvider = createProvider(config.providers.medical);
 
   const registry = new ToolRegistry(config.tools);
   for (const tool of createMemoryTools(memory, search)) registry.register(tool);
-  for (const tool of createMedicalTools(memory, search, medicalProvider, mainProvider, workspacePath, {
-    medicalProviderType: config.providers.medical.type,
-    medicalProviderBaseUrl: config.providers.medical.baseUrl,
-    allowRawMedicalMedia: config.providers.medical.allowRawMedicalMedia,
-    mainProviderType: config.providers.main.type,
-    mainProviderBaseUrl: config.providers.main.baseUrl,
-  })) registry.register(tool);
 
   const assembler = new ContextAssembler(memory, config.memory.bootstrapMaxChars);
   const systemMessages = await assembler.buildSystemMessages();
-  const agentLoop = new AgentLoop(mainProvider, registry, systemMessages, config.agent);
-
-  const sessionsPath = path.join(process.env.HOME ?? '', '.redacted', 'sessions');
-  const sessions = new SessionManager(
-    config.sessions.softResetAfterMinutes,
-    config.sessions.hardResetAfterMinutes,
-    sessionsPath,
+  const agentLoop = new AgentLoop(
     mainProvider,
     registry,
-    config.sessions.compaction,
+    async () => ({ messages: systemMessages, healthContextTouched: systemMessages.length > 0 }),
+    config.agent,
   );
+
+  const sessionsPath = path.join(process.env.HOME ?? '', '.redacted', 'sessions');
+  const sessions = createCliSessionManager({
+    sessionsPath,
+    softResetMinutes: config.sessions.softResetAfterMinutes,
+    hardResetMinutes: config.sessions.hardResetAfterMinutes,
+    provider: mainProvider,
+    toolRegistry: registry,
+    compaction: config.sessions.compaction,
+  });
 
   const app = express();
   app.use(express.json());
@@ -193,6 +212,8 @@ async function main(): Promise<void> {
         { role: 'user', content: text },
         ...result.trace,
       ]);
+      // M6: feed the real window-fill signal so the CLI harness exercises the spec-14 token triggers too.
+      await sessions.recordPromptUsage(chatId, result.lastPromptTokens);
       res.json({ response: result.text });
     } catch (e) {
       res.status(500).json({ error: String(e) });
@@ -245,10 +266,8 @@ async function main(): Promise<void> {
     }
 
     if (text === '/sessions') {
-      const files = fs.existsSync(sessionsPath)
-        ? fs.readdirSync(sessionsPath).filter(f => f.endsWith('.jsonl'))
-        : [];
-      process.stdout.write(`Active sessions: ${files.length}\n\n`);
+      const files = fs.existsSync(sessionsPath) ? countSessionFiles(sessionsPath) : 0;
+      process.stdout.write(`Active sessions: ${files}\n\n`);
       continue;
     }
 
@@ -261,6 +280,8 @@ async function main(): Promise<void> {
         { role: 'user', content: text },
         ...result.trace,
       ]);
+      // M6: feed the real window-fill signal so the CLI harness exercises the spec-14 token triggers too.
+      await sessions.recordPromptUsage(chatId, result.lastPromptTokens);
       process.stdout.write(`🤖 ${result.text}\n\n`);
     } catch (e) {
       process.stdout.write(`❌ Error: ${e}\n\n`);
@@ -268,7 +289,9 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((e) => {
-  process.stdout.write(`Fatal error: ${e}\n`);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((e) => {
+    process.stdout.write(`Fatal error: ${e}\n`);
+    process.exit(1);
+  });
+}

@@ -211,4 +211,20 @@ describe('HeartbeatStore', () => {
       errorSpy.mockRestore();
     }
   });
+
+  it('never logs corrupt heartbeat content during quarantine', async () => {
+    fs.mkdirSync(path.dirname(storePath), { recursive: true });
+    fs.writeFileSync(storePath, 'MEDICALSECRET12345', 'utf8');
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    try {
+      await new HeartbeatStore(storePath).list();
+      const logged = errorSpy.mock.calls.flat().map(String).join('\n');
+      expect(logged).not.toContain('MEDICALSECRET12345');
+      expect(logged).toContain('Corrupt heartbeat store recovered');
+      expect(logged).toContain('Error');
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
 });

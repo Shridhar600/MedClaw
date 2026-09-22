@@ -87,4 +87,40 @@ describe('ContextAssembler', () => {
     expect(system).toContain("Today's Log");
     expect(system).not.toContain("Yesterday's Log");
   });
+
+  it('injects a non-empty SAFETY.md in full and never truncates it (PLAT-05)', async () => {
+    const safety = '# SAFETY\n' + 'ALLERGY: penicillin — anaphylaxis. '.repeat(40);
+    await engine.writeFile('SAFETY.md', safety);
+    // Tiny budget, far smaller than SAFETY.md — the budget must NOT cut SAFETY.md.
+    assembler = new ContextAssembler(engine, 500);
+
+    const messages = await assembler.buildSystemMessages();
+    const system = messages[0].content ?? '';
+
+    expect(system).toContain(safety); // full, verbatim
+    expect(system).not.toContain('[TRUNCATED SAFETY.md'); // exempt from fitContent
+  });
+
+  it('places SAFETY.md before the budgeted core sections', async () => {
+    await engine.writeFile('SAFETY.md', '# SAFETY\n- ALLERGY: penicillin — anaphylaxis');
+    const messages = await assembler.buildSystemMessages();
+    const system = messages[0].content ?? '';
+
+    expect(system.indexOf('## SAFETY.md')).toBeGreaterThanOrEqual(0);
+    expect(system.indexOf('## SAFETY.md')).toBeLessThan(system.indexOf('## SOUL.md'));
+  });
+
+  it('skips an empty SAFETY.md and builds normally (PLAT-04)', async () => {
+    await engine.writeFile('SAFETY.md', '   \n\t  ');
+    const messages = await assembler.buildSystemMessages();
+    const system = messages[0].content ?? '';
+
+    expect(system).not.toContain('## SAFETY.md'); // empty => skipped, no dangling header
+    expect(system).toContain('You are a health companion');
+  });
+
+  it('builds normally when SAFETY.md is absent', async () => {
+    const messages = await assembler.buildSystemMessages();
+    expect(messages[0].content).toContain('You are a health companion');
+  });
 });

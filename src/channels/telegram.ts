@@ -1,31 +1,16 @@
 import { Bot, type PollingOptions } from 'grammy';
+import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { secureMkdir, secureWrite, summarizeErrorForLog } from '../security';
 import type { Channel, IncomingMessage, OutgoingMessage } from './types';
 
-export function redactTelegramBotTokens(text: string): string {
-  return text.replace(
-    /(https:\/\/api\.telegram\.org\/(?:file\/)?bot)[^/\s]+/g,
-    '$1<redacted>',
-  );
-}
-
-function summarizeError(error: unknown): string {
-  if (error instanceof Error) {
-    const name = redactTelegramBotTokens(error.name);
-    const message = redactTelegramBotTokens(error.message);
-    return `${name}: ${message}`;
-  }
-
-  return redactTelegramBotTokens(String(error));
-}
-
 export class TelegramChannel implements Channel {
   readonly name = 'telegram';
   private bot: Bot;
   private messageHandler?: (msg: IncomingMessage) => Promise<void>;
-  private workspacePath: string;
+  private stagingPath: string;
+  private trustedStagingBase?: string;
   // Reconnect state for the polling long-poll lifecycle. Network blips or a
   // bad/expired token make bot.start() reject; without an explicit .catch the
   // rejected promise becomes an unhandledRejection and the daemon dies (RES-P0-2).
@@ -35,9 +20,10 @@ export class TelegramChannel implements Channel {
   private readonly maxReconnectMs = 60_000;
   private startOptions?: PollingOptions;
 
-  constructor(botToken: string, workspacePath: string) {
+  constructor(botToken: string, stagingPath: string, trustedStagingBase?: string) {
     this.bot = new Bot(botToken);
-    this.workspacePath = workspacePath;
+    this.stagingPath = stagingPath;
+    this.trustedStagingBase = trustedStagingBase;
     // grammY's error boundary: any error thrown by handlers/middleware that is
     // not caught inside the handler lands here. Without it, such errors crash
     // the polling loop (RES-P0-1). Sanitized via summarizeErrorForLog (PHI bind).
@@ -59,13 +45,57 @@ export class TelegramChannel implements Channel {
     }
     const buffer = Buffer.from(await response.arrayBuffer());
 
-    const reportsDir = path.join(this.workspacePath, 'reports');
-    secureMkdir(reportsDir);
+    if (!this.hasTrustedStagingPath()) throw new Error('media staging path is not a trusted directory');
+    try {
+      fs.lstatSync(this.stagingPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      secureMkdir(this.stagingPath);
+    }
     const safeFileName = this.sanitizeFileName(fileName);
-    const relativePath = path.join('reports', `${Date.now()}-${crypto.randomUUID()}-${safeFileName}`);
-    const savePath = path.join(this.workspacePath, relativePath);
+    const savePath = path.join(this.stagingPath, `${Date.now()}-${crypto.randomUUID()}-${safeFileName}`);
     secureWrite(savePath, buffer);
-    return relativePath.split(path.sep).join('/');
+    return savePath;
+  }
+
+  private hasTrustedStagingPath(): boolean {
+    const staging = path.resolve(this.stagingPath);
+    if (!this.trustedStagingBase) {
+      try {
+        const stat = fs.lstatSync(staging);
+        return stat.isDirectory() && !stat.isSymbolicLink();
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === 'ENOENT';
+      }
+    }
+
+    const base = path.resolve(this.trustedStagingBase);
+    const relative = path.relative(base, staging);
+    if (
+      relative.length === 0
+      || relative === '..'
+      || relative.startsWith(`..${path.sep}`)
+      || path.isAbsolute(relative)
+    ) return false;
+    try {
+      const baseStat = fs.lstatSync(base);
+      if (!baseStat.isDirectory() || baseStat.isSymbolicLink()) return false;
+      let current = base;
+      for (const component of relative.split(path.sep)) {
+        current = path.join(current, component);
+        let stat: fs.Stats;
+        try {
+          stat = fs.lstatSync(current);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+          return false;
+        }
+        if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+      }
+      return isContained(fs.realpathSync(base), fs.realpathSync(staging));
+    } catch {
+      return false;
+    }
   }
 
   onMessage(handler: (msg: IncomingMessage) => Promise<void>): void {
@@ -78,6 +108,7 @@ export class TelegramChannel implements Channel {
           chatId: String(ctx.chat.id),
           userId: String(ctx.from?.id ?? ''),
           text: ctx.message.text,
+          messageId: String(ctx.message.message_id),
           replyToMessageId: ctx.message.reply_to_message?.message_id
             ? String(ctx.message.reply_to_message.message_id)
             : undefined,
@@ -104,7 +135,7 @@ export class TelegramChannel implements Channel {
       try {
         mediaPath = await this.downloadFile(fileId, fileName);
       } catch (e) {
-        console.error('[telegram] Failed to download document:', summarizeError(e));
+        console.error('[telegram] Failed to download document:', summarizeErrorForLog(e));
         mediaError = `Failed to download uploaded file ${fileName}. Please try uploading it again.`;
       }
 
@@ -113,6 +144,7 @@ export class TelegramChannel implements Channel {
           chatId: String(ctx.chat.id),
           userId: String(ctx.from?.id ?? ''),
           text: ctx.message.caption ?? `Uploaded: ${fileName}`,
+          messageId: String(ctx.message.message_id),
           mediaPath,
           mediaError,
           replyToMessageId: ctx.message.reply_to_message?.message_id
@@ -136,7 +168,7 @@ export class TelegramChannel implements Channel {
       try {
         mediaPath = await this.downloadFile(fileId, fileName);
       } catch (e) {
-        console.error('[telegram] Failed to download photo:', summarizeError(e));
+        console.error('[telegram] Failed to download photo:', summarizeErrorForLog(e));
         mediaError = 'Failed to download uploaded photo. Please try sending it again.';
       }
 
@@ -145,6 +177,7 @@ export class TelegramChannel implements Channel {
           chatId: String(ctx.chat.id),
           userId: String(ctx.from?.id ?? ''),
           text: ctx.message.caption ?? 'Sent a photo',
+          messageId: String(ctx.message.message_id),
           mediaPath,
           mediaError,
           replyToMessageId: ctx.message.reply_to_message?.message_id
@@ -221,4 +254,14 @@ export class TelegramChannel implements Channel {
     }
     await this.bot.stop();
   }
+}
+
+function isContained(base: string, candidate: string): boolean {
+  const relative = path.relative(base, candidate);
+  return relative.length === 0
+    || (
+      relative !== '..'
+      && !relative.startsWith(`..${path.sep}`)
+      && !path.isAbsolute(relative)
+    );
 }

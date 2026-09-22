@@ -6,6 +6,7 @@ import { getDefaultConfig, loadConfig, saveConfig } from '../config/config';
 import { validateConfig } from '../config/validation';
 import { providerEnvVar } from '../config/provider-env';
 import type { AppConfig, ProviderConfig } from '../config/types';
+import { OPENROUTER_DEFAULT_BASE_URL } from '../providers/openai';
 import { showConfig, showRedactedConfigSummary } from './admin';
 import { ensureWorkspaceTemplates, type CliIO } from './prompts';
 import { preflightStartCheck, type SetupReadinessDependencies } from './setup-readiness';
@@ -43,6 +44,7 @@ export interface ResolvedSetupValues {
 export const SUPPORTED_ONBOARDING_PROVIDERS: readonly ProviderConfig['type'][] = [
   'ollama',
   'openai',
+  'openrouter',
 ];
 
 export function isSupportedOnboardingProvider(
@@ -167,15 +169,20 @@ function applyProvider(
       baseUrl: ollamaUrl,
     };
   } else {
+    const cloudDefaults = modelDefaultsForProvider(providerType);
+    const isRouter = providerType === 'openrouter';
     config.providers.main = {
       type: providerType,
-      model: args.mainModel ?? 'gpt-4o-mini',
+      model: args.mainModel ?? cloudDefaults.main,
+      // OpenRouter has no SDK-default endpoint of its own — pin its router URL.
+      ...(isRouter ? { baseUrl: OPENROUTER_DEFAULT_BASE_URL, reasoningEffort: 'low' as const } : {}),
       ...(args.ollamaUrl ? { baseUrl: args.ollamaUrl } : {}),
       ...(apiKey ? { apiKey } : {}),
     };
     config.providers.embeddings = {
       type: providerType,
-      model: args.embeddingModel ?? 'text-embedding-3-small',
+      model: args.embeddingModel ?? cloudDefaults.embeddings,
+      ...(isRouter ? { baseUrl: OPENROUTER_DEFAULT_BASE_URL } : {}),
       ...(args.ollamaUrl ? { baseUrl: args.ollamaUrl } : {}),
       ...(apiKey ? { apiKey } : {}),
     };
@@ -213,6 +220,13 @@ export function modelDefaultsForProvider(providerType: ProviderConfig['type']): 
   // forka #11: medical defaults to on-device medgemma independent of the main
   // provider, so it is the same for cloud and Ollama here.
   const medical = getDefaultConfig().providers.medical.model;
+  if (providerType === 'openrouter') {
+    return {
+      main: 'stealth/ox-alpha',
+      medical,
+      embeddings: 'openai/text-embedding-3-small',
+    };
+  }
   if (providerType === 'openai' || providerType === 'anthropic' || providerType === 'google') {
     return {
       main: 'gpt-4o-mini',
@@ -237,6 +251,8 @@ export function providerLabel(providerType: ProviderConfig['type']): string {
       return 'Anthropic';
     case 'google':
       return 'Google';
+    case 'openrouter':
+      return 'OpenRouter';
     case 'ollama':
       return 'Ollama';
   }

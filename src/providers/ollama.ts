@@ -1,6 +1,24 @@
 // src/providers/ollama.ts
-import type { ImageAttachment, LLMProvider, LLMResponse, Message, ToolSchema } from './types';
+import type { ImageAttachment, LLMProvider, LLMResponse, Message, TokenUsage, ToolSchema } from './types';
 import type { ProviderConfig } from '../config/types';
+
+/** Map the OpenAI-compat wire `usage` object onto our TokenUsage (undefined when absent). */
+function toTokenUsage(usage: {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  completion_tokens_details?: { reasoning_tokens?: number };
+} | undefined): TokenUsage | undefined {
+  if (!usage || usage.prompt_tokens === undefined || usage.completion_tokens === undefined) {
+    return undefined;
+  }
+  return {
+    promptTokens: usage.prompt_tokens,
+    completionTokens: usage.completion_tokens,
+    totalTokens: usage.total_tokens ?? usage.prompt_tokens + usage.completion_tokens,
+    reasoningTokens: usage.completion_tokens_details?.reasoning_tokens,
+  };
+}
 
 export class OllamaProvider implements LLMProvider {
   readonly modelName: string;
@@ -46,23 +64,30 @@ export class OllamaProvider implements LLMProvider {
           }>;
         };
       }>;
+      usage?: {
+        prompt_tokens?: number;
+        completion_tokens?: number;
+        total_tokens?: number;
+        completion_tokens_details?: { reasoning_tokens?: number };
+      };
     };
 
     const message = data.choices[0].message;
+    const usage = toTokenUsage(data.usage);
 
     if (message.tool_calls && message.tool_calls.length > 0) {
-      const tc = message.tool_calls[0];
       return {
         type: 'tool_call',
-        toolCall: {
+        toolCalls: message.tool_calls.map((tc) => ({
           id: tc.id,
           name: tc.function.name,
           arguments: JSON.parse(tc.function.arguments) as Record<string, unknown>,
-        },
+        })),
+        usage,
       };
     }
 
-    return { type: 'text', text: message.content ?? '' };
+    return { type: 'text', text: message.content ?? '', usage };
   }
 
   async chatWithImages(messages: Message[], images: ImageAttachment[]): Promise<LLMResponse> {
@@ -100,17 +125,17 @@ export class OllamaProvider implements LLMProvider {
       };
     };
 
-    const toolCall = data.message.tool_calls?.[0];
-    if (toolCall) {
+    const visionToolCalls = data.message.tool_calls;
+    if (visionToolCalls && visionToolCalls.length > 0) {
       return {
         type: 'tool_call',
-        toolCall: {
-          id: toolCall.id ?? 'ollama_vision_tool_call',
-          name: toolCall.function.name,
-          arguments: typeof toolCall.function.arguments === 'string'
-            ? JSON.parse(toolCall.function.arguments) as Record<string, unknown>
-            : toolCall.function.arguments,
-        },
+        toolCalls: visionToolCalls.map((tc, i) => ({
+          id: tc.id ?? `ollama_vision_tool_call_${i}`,
+          name: tc.function.name,
+          arguments: typeof tc.function.arguments === 'string'
+            ? JSON.parse(tc.function.arguments) as Record<string, unknown>
+            : tc.function.arguments,
+        })),
       };
     }
 

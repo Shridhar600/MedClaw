@@ -1,10 +1,22 @@
 import type { Message } from '../providers/types';
 import type { MemoryEngine } from '../memory/memory-engine';
+import { assertSafetyInjected } from '../context2';
 
+// SAFETY.md is injected in full, before the budgeted sections, and is NEVER truncated
+// (PLAT-05 / D9). An empty SAFETY.md is allowed and skipped (PLAT-04).
+const SAFETY_FILE = 'SAFETY.md';
 // Files always loaded into every context
 const ALWAYS_LOAD = ['SOUL.md', 'HEALTH_PROFILE.md', 'USER.md', 'HEARTBEAT.md'];
 // Files loaded if they exist
 const LOAD_IF_PRESENT = ['MEMORY.md'];
+
+interface Section {
+  key: string;
+  title: string;
+  content: string;
+  // Non-truncatable sections are emitted in full regardless of the budget (SAFETY.md).
+  nonTruncatable?: boolean;
+}
 
 export class ContextAssembler {
   constructor(
@@ -14,7 +26,13 @@ export class ContextAssembler {
   ) {}
 
   async buildSystemMessages(): Promise<Message[]> {
-    const sections: Array<{ key: string; title: string; content: string }> = [];
+    const sections: Section[] = [];
+
+    // SAFETY.md first, in full, non-truncatable (PLAT-05 / D9). Empty => skipped (PLAT-04).
+    const safetyMd = await this.memory.readFile(SAFETY_FILE);
+    if (safetyMd && safetyMd.trim() !== '') {
+      sections.push({ key: SAFETY_FILE, title: SAFETY_FILE, content: safetyMd, nonTruncatable: true });
+    }
 
     // Core files (always attempted, stable order)
     for (const filename of ALWAYS_LOAD) {
@@ -55,16 +73,30 @@ export class ContextAssembler {
     }
 
     const systemContent = this.composeWithBudget(sections);
+
+    // Boot-time non-omission invariant (D9): a non-empty SAFETY.md must be present in full.
+    // A violation aborts the turn/boot (medical-safety > resilience).
+    assertSafetyInjected(systemContent, safetyMd);
+
     return [{ role: 'system', content: systemContent }];
   }
 
-  private composeWithBudget(sections: Array<{ key: string; title: string; content: string }>): string {
+  private composeWithBudget(sections: Section[]): string {
     const parts: string[] = [];
     let used = 0;
 
     for (const section of sections) {
       const separator = parts.length > 0 ? '\n\n---\n\n' : '';
       const header = `## ${section.title}\n\n`;
+
+      // Non-truncatable sections (SAFETY.md) are emitted in full, regardless of budget.
+      if (section.nonTruncatable) {
+        const chunk = `${separator}${header}${section.content}`;
+        parts.push(chunk);
+        used += chunk.length;
+        continue;
+      }
+
       const remaining = this.maxChars - used;
       if (remaining <= 0) break;
 

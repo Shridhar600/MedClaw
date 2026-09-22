@@ -38,16 +38,28 @@ export interface TextResponse {
   text: string;
 }
 
-export interface ToolCallResponse {
-  type: 'tool_call';
-  toolCall: {
-    id: string;
-    name: string;
-    arguments: Record<string, unknown>;
-  };
+/** Token consumption for the request (seam for the future eval/cost pipeline). */
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  reasoningTokens?: number;
 }
 
-export type LLMResponse = TextResponse | ToolCallResponse;
+export interface ToolCall {
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
+export interface ToolCallResponse {
+  type: 'tool_call';
+  /** ALL tool calls the model requested this turn — parallel-safe (C4.1); never just the first. */
+  toolCalls: ToolCall[];
+}
+
+/** Both response variants carry usage when the provider reports it (never required). */
+export type LLMResponse = (TextResponse | ToolCallResponse) & { usage?: TokenUsage };
 
 export interface LLMProvider {
   readonly modelName?: string;
@@ -61,4 +73,10 @@ export interface AgentRunResult {
   trace: Message[];
   usedTools: string[];
   healthResponse: boolean;
+  /**
+   * P2b A-MF1 / spec 14 §3 — the LAST provider call's `usage.promptTokens` this turn (a ReAct turn
+   * makes N calls; the final call carries the full accumulated context ⇒ the correct window-fill
+   * signal). `undefined` when the provider omitted usage ⇒ the Gateway falls back to a chars/4 estimate.
+   */
+  lastPromptTokens?: number;
 }

@@ -2,8 +2,10 @@ export type { VectorIndex, VectorStats, Chunk, ChunkWithScore } from './vector-i
 export type { KeywordIndex } from './keyword-index';
 export type { FactMirror, FactRecord } from './fact-mirror';
 export type { EventSink, EventRecord, TimeRange } from './event-sink';
+export type { ChunkStatsWriter, ChunkStat } from './chunk-stats';
 export type { EmbeddingPort } from './embedding-port';
 export type { BlobStore } from './blob-store';
 export type { KVCache } from './kv-cache';
 export type { Clock } from './clock';
 export type { IdGen } from './id-gen';
+export { SystemClock, CryptoIdGen, systemClock, uuidIdGen } from './defaults';
