@@ -1,14 +1,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { EffectiveConfig } from '../config/types';
-import { ProfileRegistry } from '../profiles';
-import type { OwnerAdmissionService, ProfileId } from '../profiles';
+import { asProfileId, resolveOwnerPaths } from '../profiles';
+import type { OwnerAdmissionService, OwnerPaths, ProfileId } from '../profiles';
 import type { AdmittedMessage, Channel, IncomingMessage } from '../channels/types';
 import { TelegramChannel } from '../channels/telegram';
 import { LLMSemaphore, HeartbeatQueueFullError } from '../tools/semaphore';
 import { deprecatedSessionWarnings } from '../config/deprecations';
 import { createProvider, type ProviderFactory } from '../providers/factory';
-import { SessionManager } from './session';
 import { syncHeartbeatMarkdown } from '../scheduler/heartbeat-markdown';
 import type { NightlySweepResult } from '../scheduler/transcript-sweep-job';
 import type { HeartbeatJob } from '../scheduler/types';
@@ -116,7 +115,6 @@ function readinessLabel(result: ReadinessResult): 'OK' | 'FAIL' | 'PENDING' {
 export class Gateway {
   private config: EffectiveConfig;
   private channel?: Channel;
-  private profileRegistry?: ProfileRegistry;
   private resolvedMemoryWorkspace?: string;
   private bootHealth?: { providers: ReadinessResult[]; telegram: ReadinessResult };
   private mainProvider?: LLMProvider;
@@ -140,7 +138,6 @@ export class Gateway {
   private manager?: ProfileRuntimeManager;
   private router?: GatewayMessageRouter;
   /** Overrides the legacy paired-profile enumeration while serving pairing only. */
-  private pairedProfileIdsCache?: ProfileId[];
 
   /**
    * S1 admission. When supplied, it is the sole authority for who may reach a clinical runtime,
@@ -156,6 +153,16 @@ export class Gateway {
   private unpairedOnly = false;
   /** The owner identity admission is configured for, used as the dispatch target when admitted. */
   private admissionOwnerId?: ProfileId;
+  /**
+   * The ONE derivation of this owner's resources, memoised from the validated config.
+   *
+   * S1 change: every durable path used to be resolved through the legacy `ProfileRegistry`
+   * migration branch (`migrateAndResolveWorkspace` / `hasBeenMigrated` / `resolveSchedulerPaths`),
+   * which could silently place the search database and session transcripts BESIDE — outside — the
+   * leased owner workspace. `config.profiles.baseDir` + `defaultProfileId` are mandatory in schema v2,
+   * so the Gateway derives the identical bundle with the identical pure function composition uses.
+   */
+  private ownerPathsCache?: OwnerPaths;
   private readonly buildProvider: ProviderFactory;
   private readonly mediaSource?: MediaSourcePort;
   private readonly mediaDiagnostics?: MediaStageDiagnostics;
@@ -282,7 +289,6 @@ export class Gateway {
       }
       if (admissionState.kind === 'unpaired') {
         this.unpairedOnly = true;
-        this.pairedProfileIdsCache = [];
         await this.startUnpaired(config);
         return;
       }
@@ -310,8 +316,11 @@ export class Gateway {
    */
   private async serveOwner(options: { connectChannel: boolean; runHealthchecks: boolean }): Promise<void> {
     const { config } = this;
-    const profilesConfig = config.profiles;
-    const profileId = (profilesConfig?.defaultProfileId ?? 'default') as ProfileId;
+
+    // The owner's derived paths. Resolved once, here, so a config that cannot name a valid owner
+    // refuses the boot BEFORE a provider, a runtime or a scheduler exists.
+    const ownerPaths = this.ownerPaths();
+    const profileId = ownerPaths.profileId;
 
     // Bootstrap workspace with template files on first run
     this.bootstrapWorkspace(config.memory.workspace);
@@ -321,11 +330,6 @@ export class Gateway {
     this.mediaIntake ??= new AbortController();
     const ownerStaging = this.mediaStagingDir();
     if (ownerStaging) sweepStagedMedia(ownerStaging, this.ownerStagingBase());
-
-    // Profiles: construct the registry. Legacy migration (idempotent) happens per-profile inside
-    // buildRuntimeFor below, restricted to the DEFAULT profile only (RR-STRUCT R-S5a Part B,
-    // mini-plan v3 §3.8 A-F04 — SAFETY-CRITICAL: a secondary profile must never see it).
-    this.profileRegistry = profilesConfig ? this.tryCreateProfileRegistry(profilesConfig.baseDir) : undefined;
 
     const mainProvider = this.buildProvider(config.providers.main);
     this.mainProvider = mainProvider;
@@ -365,7 +369,7 @@ export class Gateway {
     // broken storage degrades only that profile and never touches the default or aborts boot.
     this.manager = new ProfileRuntimeManager((id) => this.buildRuntimeFor(id));
     this.runtime = await this.manager.get(profileId);
-    await this.manager.buildAll(this.pairedProfileIds(profileId));
+    await this.manager.buildAll(this.pairedProfileIds());
 
     this.router = this.createRouter();
     if (options.connectChannel && this.channel && typeof this.channel.connect === 'function') {
@@ -742,7 +746,7 @@ export class Gateway {
       if (!runtime.agentLoop || !runtime.sessions) continue;
       if (!runtime.scheduler) {
         await runtime.initializeScheduler({
-          schedulerPaths: this.schedulerPathsFor(runtime.profileId),
+          schedulerPaths: this.schedulerPathsFor(),
           // RR2-B1: the trigger closure captures THIS profile's concrete runtime — the job's
           // `chatId` never re-selects a runtime — and the destination guard is threaded into
           // the scheduler so create/update/resume/registration refuse foreign addresses.
@@ -759,21 +763,12 @@ export class Gateway {
   }
 
   /**
-   * RR-STRUCT R-S5b: scheduler paths per OWNING profile. The default (or legacy no-registry
-   * mode) goes through the `hasBeenMigrated`-gated `resolveSchedulerPaths` exactly as before;
-   * a NON-DEFAULT profile resolves DIRECTLY from the registry — never through that gate
-   * (preserves the R-S5a invariant its spy test enforces: `resolveSchedulerPaths` is only
-   * ever called with the default profileId).
+   * Scheduler paths for the owner. Derived from the same bundle as every other owner resource, so the
+   * job store and audit log can no longer land on a legacy fallback path.
    */
-  private schedulerPathsFor(profileId: ProfileId): { storePath: string; auditLogPath: string } {
-    const defaultProfileId = (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
-    if (profileId === defaultProfileId || !this.profileRegistry) {
-      return this.resolveSchedulerPaths(profileId);
-    }
-    return {
-      storePath: this.profileRegistry.profileSchedulerStore(profileId),
-      auditLogPath: this.profileRegistry.profileAuditLog(profileId),
-    };
+  private schedulerPathsFor(): { storePath: string; auditLogPath: string } {
+    const ownerPaths = this.ownerPaths();
+    return { storePath: ownerPaths.schedulerStore, auditLogPath: ownerPaths.auditLog };
   }
 
   /**
@@ -1086,191 +1081,91 @@ export class Gateway {
     }
   }
 
-  private tryCreateProfileRegistry(baseDir: string): ProfileRegistry | undefined {
-    try {
-      return new ProfileRegistry(baseDir);
-    } catch (error) {
-      console.error(
-        '[gateway] Failed to initialize ProfileRegistry; continuing without profile-scoped storage:',
-        summarizeErrorForLog(error),
-      );
-      return undefined;
-    }
-  }
-
-  private migrateLegacySessionsBeforeProfileSeal(
-    registry: ProfileRegistry,
-    profileId: ProfileId,
-    legacyWorkspace: string,
-  ): boolean {
-    const legacySessionsPath = path.join(path.dirname(legacyWorkspace), 'sessions');
-    try {
-      if (!fs.existsSync(legacySessionsPath)) return true;
-      const legacyFiles = fs.readdirSync(legacySessionsPath)
-        .filter((file) => file.startsWith('active-') && file.endsWith('.jsonl'));
-      if (legacyFiles.length === 0) return true;
-
-      const migration = new SessionManager({
-        sessionsPath: registry.profileSessions(profileId),
-        legacySessionsPath,
-        perChatArchive: true,
-        compaction: this.config.sessions.compaction,
-      });
-      if (!migration.didCompleteLegacyMigration) {
-        console.warn('[gateway] Legacy global session migration did not complete; profile sentinel remains unsealed.');
-        return false;
-      }
-      return true;
-    } catch (error) {
-      console.error('[gateway] Legacy global session migration failed; profile sentinel remains unsealed:', summarizeErrorForLog(error));
-      return false;
-    }
-  }
-
-  private migrateAndResolveWorkspace(
-    registry: ProfileRegistry,
-    profileId: ProfileId,
-    legacyWorkspace: string,
-  ): string {
-    try {
-      if (registry.hasBeenMigrated(profileId, legacyWorkspace)) {
-        if (!this.migrateLegacySessionsBeforeProfileSeal(registry, profileId, legacyWorkspace)) {
-          return legacyWorkspace;
-        }
-        const profileWorkspace = registry.profileWorkspace(profileId);
-        console.log(`[gateway] Profile "${profileId}" already migrated; using ${profileWorkspace}`);
-        return profileWorkspace;
-      }
-
-      if (!this.migrateLegacySessionsBeforeProfileSeal(registry, profileId, legacyWorkspace)) {
-        return legacyWorkspace;
-      }
-
-      const result = registry.migrateLegacyWorkspace(legacyWorkspace);
-      console.log(
-        `[gateway] Legacy workspace migration: migrated=${result.migrated} skipped=${result.skipped} errors=${result.errors.length}`,
-      );
-      if (result.errors.length > 0) {
-        console.warn(`[gateway] Migration encountered ${result.errors.length} error(s); details withheld from logs.`);
-      }
-
-      if (registry.hasBeenMigrated(profileId, legacyWorkspace)) {
-        const profileWorkspace = registry.profileWorkspace(profileId);
-        console.log(`[gateway] Using profile-scoped workspace: ${profileWorkspace}`);
-        return profileWorkspace;
-      }
-
-      console.warn(
-        `[gateway] Migration did not complete (no sentinel written); falling back to legacy workspace: ${legacyWorkspace}`,
-      );
-      return legacyWorkspace;
-    } catch (error) {
-      console.error(
-        '[gateway] Profile migration failed unexpectedly; falling back to legacy workspace:',
-        summarizeErrorForLog(error),
-      );
-      return legacyWorkspace;
-    }
-  }
-
   /**
-   * RR-STRUCT R-S5a (mini-plan v3 §3.8 A-F04 — SAFETY-CRITICAL): the `buildRuntimeFor` injected
-   * into `ProfileRuntimeManager`. Branches by profileId:
-   *  - the DEFAULT profile (or ANY profile when there is no ProfileRegistry — legacy no-registry
-   *    mode, A-F11) resolves paths via the EXACT SAME migration path as pre-R-S5a
-   *    (`migrateAndResolveWorkspace` / `resolveSchedulerPaths`) — unchanged.
-   *  - any NON-DEFAULT profile NEVER calls `migrateAndResolveWorkspace` or
-   *    `migrateLegacySessionsBeforeProfileSeal` — it has no legacy data, and running either
-   *    against it would leak the default user's legacy workspace/sessions into it (the design
-   *    review reproduced exactly this — `505/exec/reviews/rr-struct-design-review-isolation.md`
-   *    F-04). Instead every path is resolved DIRECTLY from the registry
-   *    (`profileSearchDb`/`profileSessions`/`profileSchedulerStore`/`profileAuditLog`, no
-   *    `hasBeenMigrated` gate, no `legacySessionsPath`) and the workspace is bootstrapped CLEAN —
-   *    generic template files only (`ensureWorkspaceBootstrap`, the same primitive
-   *    `bootstrapWorkspace()` uses for the legacy workspace — ships no PHI, just static repo
-   *    assets), never a copy of the legacy/default content.
+   * Build the ONE runtime this daemon serves, from this owner's derived paths and nothing else.
+   *
+   * S1 change (the retirement of the legacy migration branch): this used to branch on
+   * `profileId === defaultProfileId`, call `migrateAndResolveWorkspace` — which copied the workspace
+   * into a registry profile directory and sealed a sentinel — and fall back to `search.db` and
+   * `sessions` paths one level ABOVE the workspace when that sentinel did not match. Since T1,
+   * `config.memory.workspace` already IS `<baseDir>/profiles/<ownerId>`, so the "migration" copied a
+   * directory onto itself, and because the sentinel was keyed on a hash of the SOURCE path while it was
+   * sealed under the DEFAULT profile, the read and the write could never agree: the owner's whole PHI
+   * tree was re-copied on every boot, forever, and the derived database could land outside the lease.
+   *
+   * Every path now comes from one pure derivation over already-validated config. There is no second
+   * authority, no sentinel, no copy, and no path that can exist outside the leased owner workspace.
    */
   private async buildRuntimeFor(profileId: ProfileId): Promise<ProfileRuntime> {
     const { config } = this;
-    const defaultProfileId = (config.profiles?.defaultProfileId ?? 'default') as ProfileId;
-    const registry = this.profileRegistry;
-    const isDefault = profileId === defaultProfileId;
+    const ownerPaths = this.ownerPaths();
 
-    let workspace: string;
-    let dbPath: string;
-    let sessionsPath: string | undefined;
-    let schedulerPaths: { storePath: string; auditLogPath: string };
-
-    if (isDefault || !registry) {
-      const legacyWorkspace = config.memory.workspace;
-      workspace = registry
-        ? this.migrateAndResolveWorkspace(registry, profileId, legacyWorkspace)
-        : legacyWorkspace;
-      this.resolvedMemoryWorkspace = workspace;
-      const usingProfileWorkspace = workspace !== legacyWorkspace;
-
-      dbPath = usingProfileWorkspace && registry
-        ? registry.profileSearchDb(profileId)
-        : path.join(legacyWorkspace, '..', 'search.db');
-
-      sessionsPath = registry
-        ? (usingProfileWorkspace
-          ? registry.profileSessions(profileId)
-          : path.join(path.dirname(legacyWorkspace), 'sessions'))
-        : undefined;
-
-      schedulerPaths = this.resolveSchedulerPaths(profileId);
-    } else {
-      workspace = registry.profileWorkspace(profileId);
-      try {
-        ensureWorkspaceBootstrap(workspace, {
-          preserveExisting: true,
-          log: (message) => console.log(`[gateway] [profile:${profileId}] ${message}`),
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        throw new Error(`Workspace bootstrap failed for profile "${profileId}": ${message}`);
-      }
-      dbPath = registry.profileSearchDb(profileId);
-      sessionsPath = registry.profileSessions(profileId);
-      schedulerPaths = {
-        storePath: registry.profileSchedulerStore(profileId),
-        auditLogPath: registry.profileAuditLog(profileId),
-      };
+    // Multi-profile activation is parked for S1. A request for any OTHER identity is refused rather
+    // than silently served from the selected owner's resources.
+    if (profileId !== ownerPaths.profileId) {
+      throw new Error(`Refusing to build a runtime for "${profileId}": this daemon serves owner "${ownerPaths.profileId}".`);
     }
 
+    const workspace = ownerPaths.workspace;
+    try {
+      ensureWorkspaceBootstrap(workspace, {
+        preserveExisting: true,
+        log: (message) => console.log(`[gateway] ${message}`),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Workspace bootstrap failed for owner "${ownerPaths.profileId}": ${message}`);
+    }
+
+    this.resolvedMemoryWorkspace = workspace;
+
     return ProfileRuntime.create({
-      profileId,
+      profileId: ownerPaths.profileId,
       workspace,
-      dbPath,
-      sessionsPath,
-      schedulerPaths,
+      dbPath: ownerPaths.searchDb,
+      sessionsPath: ownerPaths.sessions,
+      schedulerPaths: {
+        storePath: ownerPaths.schedulerStore,
+        auditLogPath: ownerPaths.auditLog,
+      },
       config,
       mainProvider: this.mainProvider!,
       createProvider: this.buildProvider,
       semaphore: this.semaphore!,
-      // RR-STRUCT R-S5a: scheduler recovery must not invoke a callback before
-      // ProfileRuntime.create returns. Gateway explicitly initializes every runtime's
-      // scheduler AFTER boot (initializeScheduler), where the concrete runtime exists to
-      // capture in the trigger closure and the destination guard is threaded (RR2-B1).
-      // RR2-B1: no owner-less `runScheduledJob` is passed here — a closure captured at
-      // build time could not bind this runtime, and canSchedule stays false so the
-      // direct-factory activation path (which requires canAddressChat) is not used.
+      // RR-STRUCT R-S5a: scheduler recovery must not invoke a callback before ProfileRuntime.create
+      // returns. Gateway explicitly initializes the runtime's scheduler AFTER boot
+      // (initializeScheduler), where the concrete runtime exists to capture in the trigger closure and
+      // the destination guard is threaded (RR2-B1).
+      // RR2-B1: no owner-less `runScheduledJob` is passed here — a closure captured at build time
+      // could not bind this runtime, and canSchedule stays false so the direct-factory activation path
+      // (which requires canAddressChat) is not used.
       canSchedule: false,
       reconcile: (chatId) => this.debouncedReconcile(chatId),
       sideEffectLookup: (entity) => this.lookupSideEffects(this.sideEffectProvider ?? this.mainProvider!, entity),
     });
   }
 
-  /** Every profile the manager should eager-build at boot: the default (always) plus every
-   *  profile with >=1 paired chat (mini-plan v3 §3.8/§5 R-S5a). A profile that exists in the
-   *  registry but has never been paired to a chat has nothing to serve yet and is skipped. */
-  private pairedProfileIds(defaultProfileId: ProfileId): ProfileId[] {
-    if (!this.profileRegistry) return [defaultProfileId];
-    const paired = this.profileRegistry.getAllProfiles()
-      .filter((profile) => profile.chatIds.length > 0)
-      .map((profile) => profile.profileId);
-    return [...new Set([defaultProfileId, ...paired])];
+  /**
+   * The single derived-path bundle for the selected owner, computed once.
+   *
+   * `profiles.baseDir` and `defaultProfileId` are required by the schema-v2 decoder, so this cannot
+   * fall back to a default identity or a home-relative path. A hand-built config that omits them is a
+   * caller programming error and throws here rather than inventing a location.
+   */
+  private ownerPaths(): OwnerPaths {
+    if (this.ownerPathsCache) return this.ownerPathsCache;
+    const profilesConfig = this.config.profiles;
+    const ownerId = asProfileId(profilesConfig?.defaultProfileId ?? '');
+    if (!profilesConfig || ownerId === undefined) {
+      throw new Error('Refusing to serve: no valid owner identity is configured. Re-run setup.');
+    }
+    this.ownerPathsCache = resolveOwnerPaths(profilesConfig.baseDir, ownerId);
+    return this.ownerPathsCache;
+  }
+
+  /** The owner, and only the owner. Multi-profile eager activation is retired in S1. */
+  private pairedProfileIds(): ProfileId[] {
+    return [this.ownerPaths().profileId];
   }
 
   private async runBootHealthchecks(): Promise<void> {
@@ -1504,7 +1399,6 @@ export class Gateway {
       runtime: this.runtime,
       admission: this.admission,
       ownerId: this.admissionOwnerId ?? ((this.config.profiles?.defaultProfileId ?? 'default') as ProfileId),
-      profileRegistry: this.profileRegistry,
       stagingDir: this.mediaStagingDir(),
       // The trusted base is the owner's own workspace, never `$HOME`: a home-wide base let one
       // installation adopt or delete another installation's staged file.
@@ -1540,30 +1434,36 @@ export class Gateway {
     }
   }
 
-  /** The runtime OWNING `chatId` (registry lookup only — never auto-pairs; an unpaired chat
-   *  falls back to the default exactly as the pre-R-S5b reconcile did). May on-demand BUILD a
-   *  not-yet-built profile via the manager (single-flight, memoized) — for foreground paths
-   *  (turns, jobs, startup) where the caller already awaits. */
+  /**
+   * The runtime that owns `chatId`, or `undefined`.
+   *
+   * S1 change: this resolved a chat through `ProfileRegistry.getProfileForChat` and, when the chat was
+   * not in the registry, fell back to the DEFAULT profile — "unpaired == default". That fallback is the
+   * silent grant that let any chat select a runtime. Ownership is now the owner RECORD, read through
+   * `canChatIdAddressProfile`, so an unbound chat resolves to nothing.
+   */
   private async runtimeForChat(chatId: string): Promise<ProfileRuntime | undefined> {
-    const resolved = this.profileRegistry?.getProfileForChat(chatId);
-    const profileId = resolved?.profileId ?? (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
-    return this.resolveRuntimeForProfile(profileId);
+    const ownerPaths = this.ownerPaths();
+    if (!this.canChatIdAddressProfile(chatId, ownerPaths.profileId)) return undefined;
+    return this.resolveRuntimeForProfile(ownerPaths.profileId);
   }
 
-  /** Synchronous twin of `runtimeForChat` for the timer-driven reconcile path (see
-   *  `ProfileRuntimeManager.getIfBuilt`): never builds, never awaits — `undefined` means
-   *  "nothing to reconcile right now". */
+  /**
+   * Synchronous twin of `runtimeForChat` for the timer-driven reconcile path (see
+   * `ProfileRuntimeManager.getIfBuilt`): never builds, never awaits — `undefined` means
+   * "nothing to reconcile right now".
+   */
   private runtimeForChatSync(chatId: string): ProfileRuntime | undefined {
-    const resolved = this.profileRegistry?.getProfileForChat(chatId);
-    const profileId = resolved?.profileId ?? (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
-    if (this.manager) return this.manager.getIfBuilt(profileId);
+    const ownerPaths = this.ownerPaths();
+    if (!this.canChatIdAddressProfile(chatId, ownerPaths.profileId)) return undefined;
+    if (this.manager) return this.manager.getIfBuilt(ownerPaths.profileId);
     return this.runtime;
   }
 
+  /** Whether `chatId` is a destination this daemon's owner may address. Same authority as
+   *  `canChatIdAddressProfile`: the owner record, fail-closed, never a registry. */
   private chatBelongsToProfile(chatId: string, profileId: ProfileId): boolean {
-    const resolved = this.profileRegistry?.getProfileForChat(chatId);
-    if (!resolved) return profileId === (this.config.profiles?.defaultProfileId ?? 'default');
-    return resolved.profileId === profileId;
+    return this.canChatIdAddressProfile(chatId, profileId);
   }
 
   private requireRuntimeForAccess(): ProfileRuntime {
@@ -1576,26 +1476,4 @@ export class Gateway {
     return this.router;
   }
 
-  private resolveSchedulerPaths(profileId: ProfileId): { storePath: string; auditLogPath: string } {
-    const legacy = { storePath: this.config.heartbeat.storePath, auditLogPath: this.config.heartbeat.audit.path };
-    if (!this.profileRegistry) {
-      return legacy;
-    }
-    try {
-      if (!this.profileRegistry.hasBeenMigrated(profileId, this.config.memory.workspace)) {
-        console.warn('[gateway] Profile migration incomplete; using legacy heartbeat/audit paths.');
-        return legacy;
-      }
-      const storePath = this.profileRegistry.profileSchedulerStore(profileId);
-      const auditLogPath = this.profileRegistry.profileAuditLog(profileId);
-      console.log(`[gateway] Using profile-scoped scheduler paths: store=${storePath} audit=${auditLogPath}`);
-      return { storePath, auditLogPath };
-    } catch (error) {
-      console.error(
-        '[gateway] Failed to resolve profile-scoped scheduler paths; falling back to legacy paths:',
-        summarizeErrorForLog(error),
-      );
-      return legacy;
-    }
-  }
 }

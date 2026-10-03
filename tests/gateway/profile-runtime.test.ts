@@ -264,28 +264,26 @@ describe('ProfileRuntime Seam Tests (R-S1)', () => {
     expect(sweepResult).toEqual({ scanned: false, added: 0 });
   });
 
-  it('legacy mode without profiles config builds runtime on legacy paths and operates', async () => {
-    // RETIRED -> 'no profiles section' is no longer a supported document shape.
+  it('REFUSES a document with no owner identity instead of serving on a legacy path', async () => {
+    // S1 change (OLD -> NEW). OLD: "legacy mode without profiles config builds runtime on legacy
+    // paths and operates" — it booted, built a runtime on `config.memory.workspace`, and answered
+    // messages, using the literal identity `'default'` inferred from an ABSENT section. That is the
+    // shape of document the schema-v2 decoder rejects outright, so the state it exercised cannot be
+    // reached through any supported configuration: it only survived because this suite bypassed the
+    // decoder with a hand-built object. Serving it meant inferring an owner from nothing, which is
+    // exactly what plan 15 §2.1 forbids.
+    //
+    // NEW invariant, and the one that matters: a configuration naming no owner REFUSES TO SERVE. It
+    // does not fall back to `'default'`, does not touch the workspace, and does not build a runtime.
+    // A missing owner is a programming error in the caller, not a mode.
     const config = withoutOwnerIdentity(makeConfig(tmpDir));
     const gateway = new Gateway(config);
 
-    await gateway.start();
-    try {
-      expect(gateway.runtimeInstance).toBeDefined();
-      expect(gateway.runtimeInstance?.workspace).toBe(config.memory.workspace);
-      expect((gateway as unknown as { getEffectiveWorkspace(): string }).getEffectiveWorkspace()).toBe(config.memory.workspace);
+    await expect(gateway.start()).rejects.toThrow(/no valid owner identity/i);
 
-      // Handle a message in legacy mode: first message enters onboarding
-      const onboardingReply = await gateway.handleTestMessage('test-chat', 'hello legacy');
-      expect(onboardingReply).toContain('personal health companion');
-
-      // Subsequent agent message after onboarding bypassed
-      (gateway.runtimeInstance!.turnCoordinator as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
-      const agentReply = await gateway.handleTestMessage('test-chat', 'hello agent');
-      expect(agentReply).toContain('ok');
-      expect(agentReply).toContain('I am an AI health companion');
-    } finally {
-      await gateway.stop();
-    }
+    // Nothing was served and nothing clinical was built.
+    expect(gateway.runtimeInstance).toBeUndefined();
+    expect(gateway.runtimeManager).toBeUndefined();
+    expect(gateway.servesPairingOnly).toBe(false);
   });
 });

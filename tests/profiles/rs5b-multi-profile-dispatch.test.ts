@@ -120,13 +120,6 @@ describe('RR-STRUCT R-S5b: live multi-profile dispatch (C-01 close)', () => {
     return new Gateway(makeConfig(), bound.gatewayDeps);
   }
 
-  function preCreateSecondaryProfile(chatId: string, label = 'father'): ProfileId {
-    const registry = new ProfileRegistry(baseDir);
-    const secondary = registry.createProfile(label);
-    registry.pairChatToProfile(chatId, secondary.profileId);
-    return secondary.profileId;
-  }
-
   function markOnboardingSkipped(workspace: string): void {
     const dir = path.join(workspace, '.redacted');
     fs.mkdirSync(dir, { recursive: true });
@@ -155,25 +148,23 @@ describe('RR-STRUCT R-S5b: live multi-profile dispatch (C-01 close)', () => {
     return hits;
   }
 
-  /** Boot with heartbeat enabled + a fake channel (survives start() while telegram is
-   *  disabled), both profiles' onboarding skipped, and deterministic mock agentLoops that
-   *  also write a profile-local ledger fact per turn (end-to-end memory-write proof). */
-  async function bootTwoProfileGateway() {
-    const secondaryId = preCreateSecondaryProfile(SECONDARY_CHAT);
-    // Pair the default chat up-front too: the secondary pairing already closed first-contact
-    // auto-pair, so an unpaired default chat would (correctly) be UNRECOGNIZED.
-    const preRegistry = new ProfileRegistry(baseDir);
-    preRegistry.getOrCreateDefaultProfile();
-    preRegistry.pairChatToProfile(DEFAULT_CHAT, 'default' as ProfileId);
+  /**
+   * Boot the real Gateway for the ONE selected owner, bound at `DEFAULT_CHAT` through the real
+   * enrollment state machine, with a deterministic agent double that also writes a ledger fact per turn
+   * (so an end-to-end memory-write proof survives).
+   *
+   * OLD -> NEW: this booted TWO real profiles through `ProfileRegistry`. S1 serves one owner and
+   * `buildRuntimeFor` now refuses any other identity, so there is no second runtime to boot. The chat
+   * that used to be the secondary's is now simply a chat the owner record does not bind — which is the
+   * same question the containment assertions were already asking after the earlier S1 pass.
+   */
+  async function bootOwnerGateway() {
     gateway = await boundGateway(baseDir);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
     await gateway.start();
-    const manager = gateway.runtimeManager!;
-    const defaultRuntime = await manager.get('default' as ProfileId);
-    const secondaryRuntime = await manager.get(secondaryId);
+    const defaultRuntime = await gateway.runtimeManager!.get('default' as ProfileId);
     markOnboardingSkipped(defaultRuntime.workspace);
-    markOnboardingSkipped(secondaryRuntime.workspace);
     const defaultAgent = mockAgentRun(`default-ack ${DEFAULT_MARKER}`, async () => {
       await defaultRuntime.ledgerStore!.recordFact({
         entity: 'default-only-med', type: 'medication',
@@ -181,64 +172,46 @@ describe('RR-STRUCT R-S5b: live multi-profile dispatch (C-01 close)', () => {
         provenance: { source: 'user', confidence: 1, anchor: 'memory/x.md#L1', capturedAt: new Date().toISOString() },
       });
     });
-    const secondaryAgent = mockAgentRun(`secondary-ack ${SECONDARY_MARKER}`, async () => {
-      await secondaryRuntime.ledgerStore!.recordFact({
-        entity: 'secondary-only-med', type: 'medication',
-        fields: { dose: '10mg' },
-        provenance: { source: 'user', confidence: 1, anchor: 'memory/x.md#L1', capturedAt: new Date().toISOString() },
-      });
-    });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (defaultRuntime as any).agentLoop = { run: defaultAgent };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (secondaryRuntime as any).agentLoop = { run: secondaryAgent };
-    return { secondaryId, defaultRuntime, secondaryRuntime, defaultAgent, secondaryAgent };
+    return { defaultRuntime, defaultAgent };
   }
 
-  it('OLD->NEW a message to the secondary paired chat is REFUSED and reaches neither runtime', async () => {
+  it('OLD->NEW a message from an UNBOUND chat is REFUSED and reaches no runtime at all', async () => {
     // OLD -> NEW (S1 containment). This asserted a message to the secondary chat is SERVED by the
     // secondary runtime. Secondary activation is parked (`BACKLOG.md:30` "Deferred, never passed… S1 must
     // prove secondary addresses/runtime/jobs unavailable without harming the owner"), so that is precisely
     // the capability S1 removes. The ISOLATION invariant is preserved and is now stronger: it is proved by
     // nothing crossing, rather than by both sides working.
-    // Per plan 15 §5, these assertions were mapped to containment, not skipped or deleted.
-    const { secondaryId, defaultRuntime, secondaryRuntime, defaultAgent, secondaryAgent } = await bootTwoProfileGateway();
+    //
+    // FURTHER S1 CHANGE: the second runtime no longer exists at all (`buildRuntimeFor` refuses any identity
+    // that is not the selected owner), so the "the two ledgers are separate stores" leg is replaced by the
+    // only meaningful form left — the ONE ledger received nothing. That is strictly stronger than
+    // "neither of two ledgers received it".
+    const { defaultRuntime, defaultAgent } = await bootOwnerGateway();
 
     const reply = await gateway!.handleTestMessage(SECONDARY_CHAT, `my bp reading ${SECONDARY_MARKER}`);
 
     // Refused by admission: the chat is not the bound owner destination.
     expect(reply).toMatch(/not connected to this assistant/i);
-    // And no model was invoked on EITHER runtime for it.
-    expect(secondaryAgent).not.toHaveBeenCalled();
+    // And no model was invoked for it.
     expect(defaultAgent).not.toHaveBeenCalled();
 
     // Nothing was captured anywhere.
-    const secondaryHistory = secondaryRuntime.sessions!.getHistory(SECONDARY_CHAT);
-    expect(secondaryHistory).toEqual([]);
     expect(defaultRuntime.sessions!.getHistory(SECONDARY_CHAT)).toEqual([]);
     expect(defaultRuntime.sessions!.getHistory(DEFAULT_CHAT)).toEqual([]);
     expect(grepTree(defaultRuntime.workspace, SECONDARY_MARKER)).toEqual([]);
     expect(grepTree(defaultRuntime.workspace, 'secondary-only-med')).toEqual([]);
-    // OLD -> NEW: previously the served turn captured a medication into the SECONDARY ledger, proving the
-    // ledgers were disjoint. With the turn refused there is nothing to capture, so disjointness is proved
-    // the only way it can be: NEITHER ledger received anything. Strictly stronger than before.
-    const secondaryMeds = await secondaryRuntime.ledgerStore!.listAllOfType('medication');
-    expect(secondaryMeds.some((f) => f.entity === 'secondary-only-med')).toBe(false);
-    const defaultMeds = await defaultRuntime.ledgerStore!.listAllOfType('medication');
-    expect(defaultMeds.some((f) => f.entity === 'secondary-only-med')).toBe(false);
-    // The ledgers are still genuinely separate stores, not one aliased store.
-    expect(secondaryRuntime.ledgerStore).not.toBe(defaultRuntime.ledgerStore);
-
-    // And the secondary runtime really is a different profile's runtime.
-    expect(secondaryRuntime.profileId).toBe(secondaryId);
-    expect(secondaryRuntime.workspace).not.toBe(defaultRuntime.workspace);
+    const meds = await defaultRuntime.ledgerStore!.listAllOfType('medication');
+    expect(meds.some((f) => f.entity === 'secondary-only-med')).toBe(false);
+    expect(meds).toEqual([]);
   });
 
-  it('OLD->NEW interleaved traffic: the owner is served, the secondary chat is refused, zero cross-contamination', async () => {
+  it('OLD->NEW interleaved traffic: the owner is served, the unbound chat is refused, zero cross-contamination', async () => {
     // OLD -> NEW: previously both profiles were served and the test proved they stayed disjoint. S1 parks
     // secondary activation, so the same disjointness is now proved the only way it can be: the owner is
-    // served and the secondary chat leaves no trace in EITHER runtime.
-    const { defaultRuntime, secondaryRuntime, defaultAgent, secondaryAgent } = await bootTwoProfileGateway();
+    // served and the unbound chat leaves no trace in the owner's runtime at all.
+    const { defaultRuntime, defaultAgent } = await bootOwnerGateway();
 
     const r1 = await gateway!.handleTestMessage(DEFAULT_CHAT, `default note ${DEFAULT_MARKER}`);
     const r2 = await gateway!.handleTestMessage(SECONDARY_CHAT, `secondary note ${SECONDARY_MARKER}`);
@@ -246,27 +219,22 @@ describe('RR-STRUCT R-S5b: live multi-profile dispatch (C-01 close)', () => {
     expect(r1).toContain(DEFAULT_MARKER);
     expect(r2).toMatch(/not connected to this assistant/i);
     expect(r3).toContain(DEFAULT_MARKER);
+    // The refused message did not consume a model call: exactly the two owner turns did.
     expect(defaultAgent).toHaveBeenCalledTimes(2);
-    // The secondary runtime is never invoked at all.
-    expect(secondaryAgent).not.toHaveBeenCalled();
 
     const defaultHistory = JSON.stringify(defaultRuntime.sessions!.getHistory(DEFAULT_CHAT));
-    const secondaryHistory = JSON.stringify(secondaryRuntime.sessions!.getHistory(SECONDARY_CHAT));
     expect(defaultHistory).toContain(DEFAULT_MARKER);
     expect(defaultHistory).not.toContain(SECONDARY_MARKER);
-    // The refused chat produced no secondary history at all.
-    expect(secondaryHistory).not.toContain(DEFAULT_MARKER);
-    expect(secondaryRuntime.sessions!.getHistory(SECONDARY_CHAT)).toEqual([]);
+    // The refused chat produced no history under its own id either.
+    expect(defaultRuntime.sessions!.getHistory(SECONDARY_CHAT)).toEqual([]);
 
-    // Ledger + on-disk workspace trees are disjoint both ways.
+    // The refused message text never reached the ledger or the on-disk workspace.
     expect(grepTree(defaultRuntime.workspace, SECONDARY_MARKER)).toEqual([]);
     expect(grepTree(defaultRuntime.workspace, 'secondary-only-med')).toEqual([]);
-    expect(grepTree(secondaryRuntime.workspace, DEFAULT_MARKER)).toEqual([]);
-    expect(grepTree(secondaryRuntime.workspace, 'default-only-med')).toEqual([]);
-    const defaultMeds = await defaultRuntime.ledgerStore!.listAllOfType('medication');
-    const secondaryMeds = await secondaryRuntime.ledgerStore!.listAllOfType('medication');
-    expect(defaultMeds.some((f) => f.entity === 'secondary-only-med')).toBe(false);
-    expect(secondaryMeds.some((f) => f.entity === 'default-only-med')).toBe(false);
+    const meds = await defaultRuntime.ledgerStore!.listAllOfType('medication');
+    expect(meds.some((f) => f.entity === 'secondary-only-med')).toBe(false);
+    // …while the owner's own turns really did write. The lane is not simply inert.
+    expect(meds.some((f) => f.entity === 'default-only-med')).toBe(true);
   });
 
   it('OLD->NEW an emergency in an UNBOUND chat is refused and persisted nowhere', async () => {
@@ -277,33 +245,44 @@ describe('RR-STRUCT R-S5b: live multi-profile dispatch (C-01 close)', () => {
     //
     // The safety property that still matters is asserted here and is unchanged: the OWNER's own emergency
     // text IS answered and recorded (covered by the owner-admission routing suite). What this test now
-    // proves is that an unauthorized chat cannot cause a persisted clinical trace in EITHER runtime.
-    const { defaultRuntime, secondaryRuntime } = await bootTwoProfileGateway();
+    // proves is that an unauthorized chat cannot cause a persisted clinical trace in the owner's runtime.
+    const { defaultRuntime } = await bootOwnerGateway();
 
     const reply = await gateway!.handleTestMessage(SECONDARY_CHAT, 'severe chest pain right now');
 
     expect(reply).toMatch(/not connected to this assistant/i);
     expect(reply).not.toBe(EMERGENCY_RESPONSE);
-    // Nothing persisted in either runtime, and no health text reached the owner's workspace.
-    expect(secondaryRuntime.sessions!.getHistory(SECONDARY_CHAT)).toEqual([]);
+    // Nothing persisted in the owner's runtime, and no health text reached the owner's workspace.
     expect(defaultRuntime.sessions!.getHistory(SECONDARY_CHAT)).toEqual([]);
     expect(defaultRuntime.sessions!.getHistory(DEFAULT_CHAT)).toEqual([]);
     expect(grepTree(defaultRuntime.workspace, 'severe chest pain')).toEqual([]);
-    expect(grepTree(secondaryRuntime.workspace, 'severe chest pain')).toEqual([]);
   });
 
-  it('staged media in the secondary chat is adopted into the SECONDARY workspace/reports (0600), never the default', async () => {
-    const { defaultRuntime, secondaryRuntime } = await bootTwoProfileGateway();
-    const staging = path.join(tmpDir, 'staging', 'media');
+  it('staged media in an UNBOUND chat is REFUSED and deleted — never adopted into any reports directory', async () => {
+    // OLD -> NEW. OLD: "staged media in the secondary chat is adopted into the SECONDARY workspace/reports
+    // (0600), never the default" — i.e. it asserted the attachment WAS adopted into the second profile's
+    // workspace with mode 0600. Adoption for a chat that is not the owner is exactly what S1 forbids, so
+    // the expectation inverts: no adoption anywhere, and the staged file is cleaned up.
+    //
+    // What is PRESERVED and is the real safety property: the bytes never land in a reports directory that
+    // the owner's index, prompt or future agent turn could read, and they do not survive as a leftover.
+    const { defaultRuntime } = await bootOwnerGateway();
+    // The REAL owner staging lane, so the cleanup path under test is the production one. `deleteStagedMedia`
+    // refuses to delete anything outside the trusted base by design, so a file planted in an unrelated
+    // directory would survive for a reason that has nothing to do with admission.
+    const staging = path.join(defaultRuntime.workspace, '.state', 'media-staging');
     fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
     const stagedPath = path.join(staging, 'lab-report.pdf');
     fs.writeFileSync(stagedPath, 'secondary lab bytes', { mode: 0o600 });
 
-    // A Router pointed at the same tmp staging lane, resolving runtimes via the real manager.
+    // A Router pointed at the same tmp staging lane, resolving runtimes via the real manager, carrying
+    // the SAME admission and owner identity the booted Gateway has.
     const router = new GatewayMessageRouter({
       config: makeConfig(),
-      profileRegistry: new ProfileRegistry(baseDir),
+      admission: (gateway as unknown as { admission: never }).admission,
+      ownerId: 'default' as ProfileId,
       stagingDir: staging,
+      stagingBaseDir: defaultRuntime.workspace,
       buildBootStatusText: () => 'status',
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       resolveRuntime: ((id: ProfileId) => gateway!.runtimeManager!.get(id)) as any,
@@ -313,118 +292,110 @@ describe('RR-STRUCT R-S5b: live multi-profile dispatch (C-01 close)', () => {
       jest.fn().mockResolvedValue(undefined),
     );
 
-    expect(reply).toContain(`secondary-ack ${SECONDARY_MARKER}`);
+    // Refused, and the staged bytes are gone rather than adopted or orphaned.
+    expect(reply).toMatch(/not connected to this assistant/i);
     expect(fs.existsSync(stagedPath)).toBe(false);
-    const adopted = path.join(secondaryRuntime.workspace, 'reports', 'lab-report.pdf');
-    expect(fs.readFileSync(adopted, 'utf8')).toBe('secondary lab bytes');
-    if (process.platform !== 'win32') {
-      expect(fs.statSync(adopted).mode & 0o777).toBe(0o600);
-    }
-    expect(fs.existsSync(path.join(defaultRuntime.workspace, 'reports', 'lab-report.pdf'))).toBe(false);
+    // Assert on CONTENTS, not on a directory being absent: `reports/` legitimately exists in a bootstrapped
+    // owner workspace, so its absence would be a false signal. What matters is that it holds no attachment
+    // and that these bytes appear nowhere under the owner's workspace at all.
+    const reportsDir = path.join(defaultRuntime.workspace, 'reports');
+    const adoptedNames = fs.existsSync(reportsDir) ? fs.readdirSync(reportsDir) : [];
+    expect(adoptedNames).toEqual([]);
     expect(grepTree(defaultRuntime.workspace, 'secondary lab bytes')).toEqual([]);
   });
 
-  it('each built profile gets its own scheduler; a secondary heartbeat job dispatches to + records in the secondary only', async () => {
-    const { secondaryId, defaultRuntime, secondaryRuntime } = await bootTwoProfileGateway();
+  it('the owner runtime carries a scheduler, and job creation for an unbound chat is refused up front', async () => {
+    // OLD -> NEW. OLD: "each built profile gets its own scheduler; a secondary heartbeat job dispatches to
+    // + records in the secondary only". There is one serving identity in S1, so the second scheduler is
+    // gone. PRESERVED: the owner's scheduler exists and is usable, and a job for any chat the owner record
+    // does not bind is REFUSED at creation rather than silently suppressed at dispatch. Asserting the
+    // refusal is the containment proof `BACKLOG.md:66` asks for: unavailable proven, not declared.
+    const { defaultRuntime } = await bootOwnerGateway();
 
-    // R-S5a left non-default runtime.scheduler undefined — R-S5b starts every built profile's.
     expect(defaultRuntime.scheduler).toBeDefined();
-    expect(secondaryRuntime.scheduler).toBeDefined();
 
-    // OLD -> NEW: previously this CREATED a heartbeat job for the secondary chat and dispatched it there.
-    // Under S1 the destination guard authorizes exactly one chat, so job CREATION for any other chat is
-    // refused up front rather than silently suppressed at dispatch. Asserting the refusal is the containment
-    // proof `BACKLOG.md:66` asks for: unavailable proven, not declared.
-    await expect(secondaryRuntime.scheduler!.createJob({
+    await expect(defaultRuntime.scheduler!.createJob({
       title: 'Father reminder', chatId: SECONDARY_CHAT, cron: '0 8 * * *',
       prompt: 'take your morning pill', source: 'user', kind: 'routine',
     })).rejects.toThrow(/does not own/i);
 
-    // And nothing was recorded in either scheduler.
-    expect(await secondaryRuntime.scheduler!.listJobs()).toEqual([]);
+    // Nothing was recorded.
     expect(await defaultRuntime.scheduler!.listJobs()).toEqual([]);
-    // The two runtimes really are distinct profiles with distinct stores.
-    expect(secondaryRuntime.profileId).toBe(secondaryId);
+
+    // …and the owner's OWN destination still works, so the owner does not lose reminders.
+    const own = await defaultRuntime.scheduler!.createJob({
+      title: 'Owner reminder', chatId: DEFAULT_CHAT, cron: '0 9 * * *',
+      prompt: 'take your morning pill', source: 'user', kind: 'routine',
+    });
+    expect(own.chatId).toBe(DEFAULT_CHAT);
+    expect(await defaultRuntime.scheduler!.listJobs()).toHaveLength(1);
   });
 
-  it('OLD->NEW a fresh secondary chat is refused: no onboarding, no agent, no store writes', async () => {
+  it('OLD->NEW a fresh unbound chat is refused: no onboarding, no agent, no store writes', async () => {
     // OLD -> NEW: previously a fresh secondary chat ran deterministic onboarding scoped to the SECONDARY
     // workspace. Secondary activation is parked, so an unbound chat is refused at admission instead. The
-    // containment is asserted directly: no onboarding file, no agent call, nothing written to either
+    // containment is asserted directly: no onboarding file, no agent call, nothing written to the owner's
     // workspace. Stronger than the original, which only proved scoping.
     const freshChat = 'father-new-chat';
-    const registry = new ProfileRegistry(baseDir);
-    const secondary = registry.createProfile('father2');
-    registry.pairChatToProfile(freshChat, secondary.profileId);
     gateway = await boundGateway(baseDir);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
     await gateway.start();
-    const manager = gateway.runtimeManager!;
-    const defaultRuntime = await manager.get('default' as ProfileId);
-    const secondaryRuntime = await manager.get(secondary.profileId);
+    const defaultRuntime = await gateway.runtimeManager!.get('default' as ProfileId);
+    const run = jest.fn().mockResolvedValue({ text: 'SHOULD-NOT-RUN', trace: [], usedTools: [], healthResponse: false });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (secondaryRuntime as any).agentLoop = { run: mockAgentRun('SHOULD-NOT-RUN') };
+    (defaultRuntime as any).agentLoop = { run };
 
     const reply = await gateway.handleTestMessage(freshChat, 'hello, I am setting up');
 
     // Refused by admission, and nothing ran or was written anywhere.
     expect(reply).toMatch(/not connected to this assistant/i);
     expect(reply).not.toBe('SHOULD-NOT-RUN');
-    expect(((secondaryRuntime as unknown as { agentLoop: { run: jest.Mock } }).agentLoop.run)).not.toHaveBeenCalled();
-    expect(fs.existsSync(path.join(secondaryRuntime.workspace, '.redacted', 'onboarding.json'))).toBe(false);
+    expect(run).not.toHaveBeenCalled();
+    expect(defaultRuntime.sessions!.getHistory(freshChat)).toEqual([]);
     expect(fs.existsSync(path.join(defaultRuntime.workspace, '.redacted', 'onboarding.json'))).toBe(false);
   });
 
-  it('OLD->NEW an unknown chat is refused and a registry-paired non-default is ALSO refused', async () => {
+  it('OLD->NEW the bound owner is served and every other chat is refused', async () => {
     // OLD -> NEW, and this test's TITLE previously documented the S1 DEFECT as intended behaviour:
     // "first-contact auto-pair intact". First contact auto-pairing is the exact defect this wave removes —
     // a stranger's first DM was auto-paired into the owner's profile and answered clinically. The owner is
     // bound here through a REAL owner record, so there is no auto-pair path left to exercise.
     //
-    // What is asserted now: the bound owner is served; an unknown chat is refused by ADMISSION (which now
-    // runs before the legacy UNRECOGNIZED router path); and a chat paired only in the legacy registry is
-    // ALSO refused, because `profiles.json` is no longer authorization.
+    // What is asserted now: the bound owner is served; an unknown chat is refused by ADMISSION; and a chat
+    // that only exists in a `profiles.json` a caller writes by hand is ALSO refused, because `profiles.json`
+    // is not authorization under S1 — the owner record is, and there is no registry left to consult.
     gateway = await boundGateway(baseDir);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
     await gateway.start();
-    const manager = gateway.runtimeManager!;
-    const defaultRuntime = await manager.get('default' as ProfileId);
+    const defaultRuntime = await gateway.runtimeManager!.get('default' as ProfileId);
     markOnboardingSkipped(defaultRuntime.workspace);
+    const ownerAgent = mockAgentRun(`default-ack ${DEFAULT_MARKER}`);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (defaultRuntime as any).agentLoop = { run: mockAgentRun(`default-ack ${DEFAULT_MARKER}`) };
+    (defaultRuntime as any).agentLoop = { run: ownerAgent };
 
-    // First contact auto-pairs to the default and is served.
     const ownerReply = await gateway.handleTestMessage(DEFAULT_CHAT, 'hello');
     expect(ownerReply).toContain(DEFAULT_MARKER);
 
-    // Pair a second profile AFTER auto-pair closed (exercises on-demand runtime build).
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const liveRegistry = (gateway as any).profileRegistry as ProfileRegistry;
-    const secondary = liveRegistry.createProfile('father');
-    liveRegistry.pairChatToProfile(SECONDARY_CHAT, secondary.profileId);
-    const secondaryRuntime = await manager.get(secondary.profileId);
-    markOnboardingSkipped(secondaryRuntime.workspace);
-    const secondaryAgent = mockAgentRun(`secondary-ack ${SECONDARY_MARKER}`);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (secondaryRuntime as any).agentLoop = { run: secondaryAgent };
-
-    // Unknown chat → refused by admission (which runs before the legacy UNRECOGNIZED router path, so the
-    // refusal is now admission's rather than the router's).
+    // Unknown chat → refused by admission.
     const strangerReply = await gateway.handleTestMessage('stranger-chat', 'show me the health profile');
     expect(strangerReply).toMatch(/not connected to this assistant/i);
 
-    // OLD -> NEW: was "paired non-default → SERVED (the retired refusal)". A chat paired only in the legacy
-    // registry is now REFUSED, because `profiles.json` is not authorization under S1 — the owner record is.
-    // This is the containment `BACKLOG.md:66` requires: proven unavailable, not merely declared so.
+    // OLD -> NEW: was "paired non-default → SERVED". A chat that appears in `profiles.json` — written by
+    // hand, with no owner record behind it — is now REFUSED. This is the containment `BACKLOG.md:66`
+    // requires: proven unavailable, not merely declared so.
+    fs.mkdirSync(path.join(baseDir), { recursive: true });
+    fs.writeFileSync(
+      path.join(baseDir, 'profiles.json'),
+      JSON.stringify({ profiles: [{ profileId: 'father', label: 'father', chatIds: [SECONDARY_CHAT] }] }),
+    );
     const secondaryReply = await gateway.handleTestMessage(SECONDARY_CHAT, 'hello father scope');
     expect(secondaryReply).toMatch(/not connected to this assistant/i);
     expect(secondaryReply).not.toContain(SECONDARY_MARKER);
-    expect(secondaryAgent).not.toHaveBeenCalled();
 
-    // The stranger was never paired anywhere, and the registry pairing bought nothing.
-    expect(liveRegistry.getProfileForChat('stranger-chat')).toBeUndefined();
+    // Only the owner's turns reached a model.
+    expect(ownerAgent).toHaveBeenCalledTimes(1);
   });
 
   it('a degraded (unresolvable) profile gets a canned genuine-failure reply — never a throw, staged media cleaned up', async () => {

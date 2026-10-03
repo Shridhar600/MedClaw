@@ -4,9 +4,12 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
-import { ProfileRegistry } from '../../src/profiles/registry';
 import type { EffectiveConfig } from '../../src/config/types';
+import type { OwnerAdmissionService } from '../../src/profiles';
 import { TEST_OWNER_ID, fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
+import { composeOwnerAuthority } from '../../src/runtime/owner-authority';
+import type { ProfileId } from '../../src/profiles/types';
 
 function makeConfig(tmpDir: string): EffectiveConfig {
 const owner = fixtureOwner(tmpDir);
@@ -67,22 +70,50 @@ describe('W-C/D fix pass — CAP: emergency + onboarding turns are losslessly ca
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  /** Bind a chat to the selected owner through the real registry before the turn. */
-  function pairOwnerChat(rootDir: string, chatId: string): void {
-    const registry = new ProfileRegistry(fixtureOwner(rootDir).baseDir);
-    registry.pairChatToProfile(chatId, TEST_OWNER_ID as never);
+  /**
+   * S1 change: binding used to be `ProfileRegistry.pairChatToProfile`, which granted a chat the default
+   * profile with no identity check. Admission is the only authority now, so this suite binds through the
+   * REAL enrollment state machine (`issue -> submit -> commit`) at the identity `handleTestMessage`
+   * presents. OLD -> NEW: registry pairing pair -> `bindOwnerFixture` bind. The assertions are unchanged.
+   */
+  let admission: OwnerAdmissionService;
+
+  async function bindOwnerChat(chatId: string): Promise<void> {
+    const bound = await bindOwnerFixture(
+      fixtureOwner(tmpDir).ownerRecord,
+      TEST_OWNER_ID,
+      chatId,
+      { channel: 'local', userId: 'local' },
+    );
+    admission = bound.admission;
   }
 
-  async function start(): Promise<void> {
+  async function start(options: { bindChatId?: string; unpairedRecord?: boolean } = {}): Promise<void> {
+    if (options.bindChatId) {
+      await bindOwnerChat(options.bindChatId);
+    } else if (options.unpairedRecord) {
+      // A record that EXISTS but holds no binding: the daemon boots pairing-only, which is exactly the
+      // state this assertion is about. OLD -> NEW: previously this suite booted with NO admission at
+      // all, so "unpaired" was not a real state — it was a missing-authority state that the legacy
+      // default grant silently turned into "owner". The refusal is now genuine.
+      const authority = composeOwnerAuthority({
+        ownerId: TEST_OWNER_ID as ProfileId,
+        ownerPaths: { ownerRecord: fixtureOwner(tmpDir).ownerRecord },
+      });
+      await authority.admission.initialize();
+      admission = authority.admission;
+    }
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), {
+      admission,
+      ownerId: TEST_OWNER_ID as ProfileId,
+    });
     await gateway.start();
     warn.mockRestore();
   }
 
   it('the OWNER chat\'s EMERGENCY turn is captured before the canned-response early-return', async () => {
-    await start();
-    pairOwnerChat(tmpDir, 'chat-1');
+    await start({ bindChatId: 'chat-1' });
 
     // Real onboarding flow is incomplete, so this hits the emergency check FIRST.
     await gateway.handleTestMessage('chat-1', 'I have severe chest pain right now');
@@ -96,7 +127,7 @@ describe('W-C/D fix pass — CAP: emergency + onboarding turns are losslessly ca
   // UNPAIRED stranger's emergency text was captured into owner memory. Refusal must prevent
   // capture side effects (charter F-5), while the canned guidance is still delivered.
   it('an UNPAIRED chat\'s emergency text gets canned guidance and is never captured', async () => {
-    await start();
+    await start({ unpairedRecord: true });
     const sent: string[] = [];
     (gateway as unknown as { channel?: unknown }).channel = undefined;
 
@@ -107,7 +138,7 @@ describe('W-C/D fix pass — CAP: emergency + onboarding turns are losslessly ca
   });
 
   it('an ONBOARDING turn is captured before its early-return', async () => {
-    await start();
+    await start({ bindChatId: 'chat-1' });
     await gateway.handleTestMessage('chat-1', 'My name is Arjun and I take metformin daily');
 
     const narrative = fs.readFileSync(path.join(workspace, 'memory', `${today()}.md`), 'utf8');
