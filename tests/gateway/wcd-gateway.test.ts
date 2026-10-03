@@ -10,6 +10,9 @@ import { TEST_OWNER_ID, fixtureOwner, ownerSelection } from '../helpers/test-con
 import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
 import { composeOwnerAuthority } from '../../src/runtime/owner-authority';
 import type { ProfileId } from '../../src/profiles/types';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+
+const CHAT_BINDING = 'chat-1';
 
 function makeConfig(tmpDir: string): EffectiveConfig {
 const owner = fixtureOwner(tmpDir);
@@ -150,6 +153,15 @@ describe('W-C/D fix pass — REC: boot-time SAFETY reconciliation', () => {
   let tmpDir: string;
   let gateway: Gateway;
   let workspace: string;
+  let admission: OwnerAdmissionService;
+
+  /** S1: admission is REQUIRED, so even a boot that only reconciles SAFETY.md holds a real bound owner. */
+  async function bindOwnerChat(chatId: string): Promise<void> {
+    const bound = await bindOwnerFixture(
+      fixtureOwner(tmpDir).ownerRecord, TEST_OWNER_ID, chatId, { channel: 'local', userId: 'local' },
+    );
+    admission = bound.admission;
+  }
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-rec-'));
@@ -180,7 +192,9 @@ describe('W-C/D fix pass — REC: boot-time SAFETY reconciliation', () => {
     );
 
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    gateway = new Gateway(makeConfig(tmpDir));
+    // S1: admission is REQUIRED, so a boot that reconciles SAFETY.md must hold a real bound owner.
+    await bindOwnerChat(CHAT_BINDING);
+    gateway = new Gateway(makeConfig(tmpDir), { admission, ownerId: TEST_OWNER_ID as ProfileId });
     await gateway.start();
     warn.mockRestore();
 
@@ -194,6 +208,14 @@ describe('W-C/D fix pass — BL: KNEE-01 back-link written on the CONFIRM path',
   let tmpDir: string;
   let gateway: Gateway;
   let workspace: string;
+  let admission: OwnerAdmissionService;
+
+  async function bindOwnerChat(chatId: string): Promise<void> {
+    const bound = await bindOwnerFixture(
+      fixtureOwner(tmpDir).ownerRecord, TEST_OWNER_ID, chatId, { channel: 'local', userId: 'local' },
+    );
+    admission = bound.admission;
+  }
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-bl-'));
@@ -209,7 +231,8 @@ describe('W-C/D fix pass — BL: KNEE-01 back-link written on the CONFIRM path',
 
   it('ledger_update confirm appends the `## Ledger writes` cross-anchor', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    gateway = new Gateway(makeConfig(tmpDir));
+    await bindOwnerChat(CHAT_BINDING);
+    gateway = new Gateway(makeConfig(tmpDir), { admission, ownerId: TEST_OWNER_ID as ProfileId });
     await gateway.start();
     warn.mockRestore();
 
@@ -230,7 +253,7 @@ describe('W-C/D fix pass — BL: KNEE-01 back-link written on the CONFIRM path',
 
   it('ledger_update dispute resolution ALSO writes the back-link', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     await gateway.start();
     warn.mockRestore();
 

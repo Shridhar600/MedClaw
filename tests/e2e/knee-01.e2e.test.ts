@@ -13,6 +13,9 @@ import { Gateway } from '../../src/gateway/gateway';
 import type { EffectiveConfig } from '../../src/config/types';
 import type { LLMProvider, LLMResponse } from '../../src/providers/types';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+
+const CHAT_BINDING = 'owner-chat';
 
 const today = (): string => new Date().toISOString().slice(0, 10);
 
@@ -94,7 +97,7 @@ describe('KNEE-01 E2E (real Gateway.handleTestMessage)', () => {
   });
 
   it('captures the injury across both lanes with cross-anchors; SAFETY excludes the transient injury', async () => {
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const errorLog = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     await gateway.start();

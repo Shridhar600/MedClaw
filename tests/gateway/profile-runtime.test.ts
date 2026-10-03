@@ -4,13 +4,15 @@ import * as os from 'os';
 import * as path from 'path';
 import type { EffectiveConfig } from '../../src/config/types';
 import type { ProfileId } from '../../src/profiles';
-import { withoutOwnerIdentity } from '../helpers/test-config';
 import type { LLMProvider } from '../../src/providers/types';
 import { LLMSemaphore } from '../../src/tools/semaphore';
 import { Gateway } from '../../src/gateway/gateway';
+import { withoutOwnerIdentity } from '../helpers/test-config';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
 import { ProfileRuntime } from '../../src/gateway/runtime';
 import { SqliteChunkStats, SqliteEventSink, SqliteFactMirror, SqliteKeywordIndex, SqliteSessionIndex, SqliteVecIndex } from '../../src/indexstore';
 import { SqliteStore } from '../../src/memory/sqlite-store';
+
 
 const mockMainProvider: LLMProvider = {
   modelName: 'runtime-test-main',
@@ -277,7 +279,10 @@ describe('ProfileRuntime Seam Tests (R-S1)', () => {
     // does not fall back to `'default'`, does not touch the workspace, and does not build a runtime.
     // A missing owner is a programming error in the caller, not a mode.
     const config = withoutOwnerIdentity(makeConfig(tmpDir));
-    const gateway = new Gateway(config);
+    // The CONFIG under test names no owner — that is the whole point. Admission is still REQUIRED on the
+    // constructor, so it is supplied from a VALID config: the refusal under test comes from the
+    // owner-less config's own path derivation, not from missing authority.
+    const gateway = new Gateway(config, await bindGatewayOwner(makeConfig(tmpDir), 'owner-chat'));
 
     await expect(gateway.start()).rejects.toThrow(/no valid owner identity/i);
 

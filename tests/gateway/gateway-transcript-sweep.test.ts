@@ -5,6 +5,9 @@ import * as cron from 'node-cron';
 import { Gateway } from '../../src/gateway/gateway';
 import type { EffectiveConfig } from '../../src/config/types';
 import {} from '../helpers/test-config';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+
+const CHAT_BINDING = 'owner-chat';
 
 jest.mock('node-cron', () => ({
   schedule: jest.fn(() => ({ stop: jest.fn() })),
@@ -52,7 +55,7 @@ describe('Gateway.runTranscriptSweep (F-6 integration, MEDIUM-6)', () => {
   const prov = (capturedAt: string) => ({ source: 'user' as const, confidence: 1, anchor: 'memory/x.md#L1', capturedAt });
 
   it('files a critical miss for an unlogged med, drops a logged one, and does NOT re-ask a same-day-superseded med', async () => {
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
     await gateway.start();
@@ -92,7 +95,7 @@ describe('Gateway.runTranscriptSweep (F-6 integration, MEDIUM-6)', () => {
   });
 
   it('joins a concurrent sweep instead of racing the dedup boundary (MEDIUM-9)', async () => {
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
     await gateway.start();
@@ -105,7 +108,7 @@ describe('Gateway.runTranscriptSweep (F-6 integration, MEDIUM-6)', () => {
   });
 
   it('restarts the nightly sweep with a live callback after stop', async () => {
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     const scheduled: Array<{
       expression: string;
       callback: ((now: Date | 'manual' | 'init') => void) | string;
@@ -133,7 +136,7 @@ describe('Gateway.runTranscriptSweep (F-6 integration, MEDIUM-6)', () => {
   });
 
   it('does not run a sweep after stop() (MEDIUM-8)', async () => {
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
     await gateway.start();

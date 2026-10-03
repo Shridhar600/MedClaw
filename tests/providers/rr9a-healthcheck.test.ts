@@ -1,12 +1,23 @@
 import type { EffectiveConfig } from '../../src/config/types';
 import { checkSystemReadiness } from '../../src/providers/healthcheck';
 import {} from '../helpers/test-config';
-import { ownerSelection, sharedFixtureOwner } from '../helpers/test-config';
+import { ownerSelection, fixtureOwner } from '../helpers/test-config';
+import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
+
+/**
+ * OLD -> NEW: was `sharedFixtureOwner()`, one hard-coded `/tmp` directory shared by every suite — outside
+ * the workspace, and (once S1 made admission bind one chat per owner record) owned by whichever suite ran
+ * first. This suite only builds a config, so a single module-scoped workspace-local root is enough; it is
+ * removed in `afterAll`.
+ */
+const moduleRoot = makeTestTemp('rr9a-healthcheck');
+const moduleOwner = (): ReturnType<typeof fixtureOwner> => fixtureOwner(moduleRoot);
+afterAll(() => removeTestTemp(moduleRoot));
 
 function config(): EffectiveConfig {
   return {
   schemaVersion: 2,
-  ...ownerSelection(sharedFixtureOwner()),
+  ...ownerSelection(moduleOwner()),
     providers: {
       main: { type: 'ollama', model: 'main-model', baseUrl: 'http://127.0.0.1:11434/v1' },
       medical: { type: 'ollama', model: 'medical-model', baseUrl: 'http://127.0.0.1:11434/v1' },

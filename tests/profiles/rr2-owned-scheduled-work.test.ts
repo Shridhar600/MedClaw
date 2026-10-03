@@ -10,7 +10,6 @@ import type { ProfileId } from '../../src/profiles/types';
 import { ProfileRuntime } from '../../src/gateway/runtime';
 import { LLMSemaphore } from '../../src/tools/semaphore';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
-import { withoutOwnerIdentity } from '../helpers/test-config';
 import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 
 // RR2-B1 (R2-10/R2-11): scheduled work retains its OWNING identity. Every production trigger
@@ -493,17 +492,21 @@ describe('RR2-B1: scheduled work retains its owning profile (R2-10/R2-11)', () =
     // profile, so `send` not being called is the faithful equivalent.
   });
 
-  it('scheduler boundary with NO admission authority, and with a throwing owner-record read: no implicit default authorization, refusal is not a crash', async () => {
-    // OLD -> NEW. OLD: "no registry / throwing registry lookup" — the guard fell back to the profile
-    // registry, so this proved that a MISSING registry and a registry that THROWS both refuse. NEW: the
-    // guard reads the owner record, so the equivalent boundary is a Gateway with NO admission authority
-    // at all, and an admission whose record read THROWS. Both must fail closed and neither may crash —
-    // this is `BACKLOG.md`'s "refusal with absent guard", and it is the guard standing between a
-    // scheduler trigger and an unauthorised send.
+  it('a throwing owner-record read fails closed: no implicit default authorization, refusal is not a crash', async () => {
+    // OLD -> NEW. OLD proved TWO boundaries: "no registry" and "throwing registry lookup". NEW proves ONE
+    // at runtime, because the other is no longer a reachable state:
+    //
+    //   - "no authority at all" is now enforced by the TYPE. `GatewayAdmissionDeps.admission` is
+    //     required, so a Gateway with no owner authority does not compile. That is stronger than a test,
+    //     and it is what plan 15 §5 asks for: "New core APIs must not have an optional admission fallback".
+    //   - "authority present but its record read THROWS" is still reachable at runtime, so it is still
+    //     tested here. This is the guard standing between a scheduler trigger and an unauthorised send,
+    //     and it must fail closed rather than crash the daemon or default to the owner.
     const config = makeConfig();
-    const legacyConfig = withoutOwnerIdentity(config);
-    gateway = new Gateway(legacyConfig);
-    const runtime = attachGatewayTestRuntime(gateway, legacyConfig, {
+    const admission = await bindOwner(DEFAULT_CHAT);
+    gateway = new Gateway(config, { admission, ownerId: asProfileId('default')! });
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const runtime = attachGatewayTestRuntime(gateway, config, {
       sessions: {
         getLastActiveAt: jest.fn().mockReturnValue(undefined),
         prepareHistory: jest.fn().mockResolvedValue([]),
@@ -537,7 +540,8 @@ describe('RR2-B1: scheduled work retains its owning profile (R2-10/R2-11)', () =
       updatedAt: new Date().toISOString(),
     };
 
-    // No admission on the gateway at all: nothing may authorize this chat by default.
+    // The gateway DOES hold a real bound owner, and `any-chat` is not that owner's destination.
+    // Nothing may authorize this chat by default.
     await (gateway as unknown as {
       handleScheduledJob(job: unknown, owner: unknown, invokedByScheduler: boolean): Promise<void>;
     }).handleScheduledJob(job, runtime, true);
@@ -546,17 +550,22 @@ describe('RR2-B1: scheduled work retains its owning profile (R2-10/R2-11)', () =
     expect((runtime.agentLoop as unknown as { run: jest.Mock }).run).not.toHaveBeenCalled();
 
     // An owner-record read that THROWS: refusal is fail-closed and sanitized, never a crash.
-    // OLD stubbed `profileRegistry.getProfileForChat` to throw; NEW stubs the admission service.
-    (gateway as unknown as { admission?: unknown }).admission = {
+    // OLD stubbed `profileRegistry.getProfileForChat` to throw; NEW replaces the admission service with
+    // one whose record read explodes. The field is private, so this reaches it the way a broken
+    // collaborator actually presents: present, and throwing.
+    (gateway as unknown as { admission: unknown }).admission = {
       ownsDestination: () => { throw new Error('owner record read exploded'); },
     };
-    (gateway as unknown as { admissionOwnerId?: string }).admissionOwnerId = 'default';
     await (gateway as unknown as {
       handleScheduledJob(job: unknown, owner: unknown, invokedByScheduler: boolean): Promise<void>;
     }).handleScheduledJob(job, runtime, true);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect(((gateway as any).channel.send as jest.Mock)).not.toHaveBeenCalled();
     expect((runtime.agentLoop as unknown as { run: jest.Mock }).run).not.toHaveBeenCalled();
+
+    // And nothing leaked: the throw was sanitized, not propagated.
+    const logged = warnSpy.mock.calls.flat().map(String).join('\n');
+    expect(logged).not.toContain('owner record read exploded');
   });
 
   it('production runtimes construct their scheduler WITH the destination guard; the direct canSchedule factory refuses activation without one', async () => {

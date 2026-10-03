@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { EffectiveConfig } from '../config/types';
 import type { AdmittedMessage, ChatType } from '../channels/types';
-import { ProfileRegistry, type ProfileId } from '../profiles';
+import type { ProfileId } from '../profiles';
 import type { OwnerAdmissionService, PairingResult } from '../profiles';
 import {
   PAIRING_COMPLETE_TEXT,
@@ -45,7 +45,6 @@ const STAGED_MEDIA_FAILURE_RESPONSE = 'Failed to store uploaded file. Please try
 export interface GatewayMessageRouterDeps {
   config: EffectiveConfig;
   runtime?: ProfileRuntime;
-  profileRegistry?: ProfileRegistry;
   /**
    * The owner-scoped staging lane, or `undefined` when this Gateway has no owner workspace to stage
    * into. `undefined` is a real, safe state: nothing can be adopted and nothing is deleted, which is
@@ -64,16 +63,20 @@ export interface GatewayMessageRouterDeps {
    */
   resolveRuntime?: (profileId: ProfileId) => Promise<ProfileRuntime | undefined>;
   /**
-   * S1 admission. When present it is the ONLY authority for "who may talk to this owner":
-   * `getProfileForChat`'s first-contact auto-pair is unreachable, because the admission decision
-   * is taken first and an unpaired chat never resolves a profile.
+   * S1 admission: the ONLY authority for "who may talk to this owner".
    *
-   * Absent only for the pre-S1 direct-Router tests that construct a Router with a single
-   * runtime and no identity. Production composition always supplies it.
+   * REQUIRED. There is no optional fallback and no legacy path around it. The Router used to resolve a
+   * chat to an identity through `ProfileRegistry`, and when no registry was attached it fell back to
+   * `config.profiles.defaultProfileId` for ANY chat — a silent grant. Plan 15 §5 requires that "New core
+   * APIs must not have an optional admission fallback", so the dependency is non-optional and every
+   * dispatch target comes from the admission decision.
    */
-  admission?: OwnerAdmissionService;
-  /** The owner identity `admission` is configured for. */
-  ownerId?: ProfileId;
+  admission: OwnerAdmissionService;
+  /**
+   * The owner identity `admission` is configured for. REQUIRED: it is the dispatch target once admission
+   * has proved the chat IS that owner. Never inferred, never defaulted.
+   */
+  ownerId: ProfileId;
 }
 
 /** Canned pairing replies. Pairing is never a health answer. */
@@ -150,37 +153,34 @@ export class GatewayMessageRouter {
     // S1 admission runs BEFORE anything else, including before the empty-message check, so a
     // request from a chat that is not the owner cannot consume a reply slot at all.
     const admission = this.deps.admission;
-    let admittedOwnerId: ProfileId | undefined;
-    if (admission) {
-      const identity = transportIdentityOf(incoming);
-      const decision = admission.inspect(identity);
-      if (decision.kind === 'refused') {
-        this.deleteStagedMedia(incoming.mediaPath);
-        return this.emitSafely(
-          egress,
-          refusalTextFor(decision.reason),
-          'Failed to send admission refusal',
-        );
-      }
-      if (decision.kind === 'pairing-only') {
-        return this.routePairing(incoming, egress, identity);
-      }
-      // Admission already proved this chat IS the bound owner, so the selected owner identity is
-      // the dispatch target. The legacy chat→profile registry is not consulted on this path.
-      admittedOwnerId = this.deps.ownerId
-        ?? ((this.deps.config.profiles?.defaultProfileId ?? 'default') as ProfileId);
+    const identity = transportIdentityOf(incoming);
+    const decision = admission.inspect(identity);
+    if (decision.kind === 'refused') {
+      this.deleteStagedMedia(incoming.mediaPath);
+      return this.emitSafely(
+        egress,
+        refusalTextFor(decision.reason),
+        'Failed to send admission refusal',
+      );
+    }
+    if (decision.kind === 'pairing-only') {
+      return this.routePairing(incoming, egress, identity);
+    }
 
-      // A REDELIVERED pairing event from the bound owner is still a pairing message, not a health
-      // question: it must answer "pairing complete" instead of becoming a clinical turn.
-      //
-      // This is deliberately narrow. It used to test `isWellFormedSubmission(text)` — that is, "is this
-      // eight characters from the pairing alphabet" — which also matched ordinary health words like
-      // `headache`, `diabetes` and `insomnia`, answered "pairing complete", and dropped them without ever
-      // answering or recording them. Only the event that actually established the binding qualifies.
-      if (admission.isRedeliveredPairingEvent(identity)) {
-        this.deleteStagedMedia(incoming.mediaPath);
-        return this.emitSafely(egress, PAIRING_COMPLETE_TEXT, 'Failed to answer redelivered pairing event');
-      }
+    // Admission has now proved this chat IS the bound owner, so the selected owner identity is the
+    // ONLY dispatch target this Router knows. There is no chat-to-identity lookup left to get wrong.
+    const admittedOwnerId = this.deps.ownerId;
+
+    // A REDELIVERED pairing event from the bound owner is still a pairing message, not a health
+    // question: it must answer "pairing complete" instead of becoming a clinical turn.
+    //
+    // This is deliberately narrow. It used to test `isWellFormedSubmission(text)` — that is, "is this
+    // eight characters from the pairing alphabet" — which also matched ordinary health words like
+    // `headache`, `diabetes` and `insomnia`, answered "pairing complete", and dropped them without ever
+    // answering or recording them. Only the event that actually established the binding qualifies.
+    if (admission.isRedeliveredPairingEvent(identity)) {
+      this.deleteStagedMedia(incoming.mediaPath);
+      return this.emitSafely(egress, PAIRING_COMPLETE_TEXT, 'Failed to answer redelivered pairing event');
     }
 
     if (text.trim().length === 0 && !incoming.mediaPath && !incoming.mediaError) {
@@ -192,21 +192,12 @@ export class GatewayMessageRouter {
       return this.routeEmergency(incoming, egress, emergency, admittedOwnerId);
     }
 
-    // Owner chat: the only path that may reach a clinical runtime. The legacy first-contact
-    // grant below still exists for the pre-S1 direct-Router tests, but production composition
-    // always supplies `admission`, which has already resolved this decision.
-    const profileId = admittedOwnerId ?? this.getProfileForChat(chatId);
-    if (profileId === null) {
-      this.deleteStagedMedia(incoming.mediaPath);
-      return this.emitSafely(
-        egress,
-        UNRECOGNIZED_CHAT_RESPONSE,
-        'Failed to respond to unrecognized chat',
-      );
-    }
-    // RR-STRUCT R-S5b: the RR-4 interim refusal (`!isDefaultRuntimeProfile`) is RETIRED — a
-    // paired non-default chat is dispatched to its OWN runtime below. The `profileId === null`
-    // refusal above is untouched: an unpaired chat can never reach the resolved-runtime path.
+    // Owner chat: the only path that may reach a clinical runtime. Admission has already proved this
+    // chat is the bound owner, so the dispatch target is the owner identity — the sole value this
+    // Router knows. There is no chat-to-identity lookup left to get wrong.
+    const profileId = admittedOwnerId ?? this.deps.ownerId;
+    // A chat that admission admitted is dispatched to the owner runtime. A chat it refused was already
+    // answered above and never reaches this line.
     const runtime = await this.resolveRuntimeFor(profileId);
     if (!runtime) {
       this.deleteStagedMedia(incoming.mediaPath);
@@ -240,10 +231,6 @@ export class GatewayMessageRouter {
     }
   }
 
-  resolveProfileForChat(chatId: string): ProfileId | null {
-    return this.getProfileForChat(chatId);
-  }
-
   /**
    * An unpaired owner: pairing and emergency guidance only.
    *
@@ -263,51 +250,10 @@ export class GatewayMessageRouter {
       return this.emitSafely(egress, emergency, 'Failed to send emergency response');
     }
 
-    const admission = this.deps.admission;
-    if (!admission) {
-      return this.emitSafely(egress, PAIRING_UNAVAILABLE_TEXT, 'Failed to answer unpaired chat');
-    }
-
     // A message that is not a well-formed code gets the generic prompt; it still consumes the
     // same daily allowance, so there is no free unlimited prompt channel.
-    const result = await admission.handlePairing(identity, incoming.text);
+    const result = await this.deps.admission.handlePairing(identity, incoming.text);
     return this.emitSafely(egress, PAIRING_RESULT_TEXT[result.kind], 'Failed to send pairing response');
-  }
-
-  isDefaultProfile(profileId: ProfileId): boolean {
-    return this.isDefaultRuntimeProfile(profileId);
-  }
-
-  private getProfileForChat(chatId: string): ProfileId | null {
-    const registry = this.deps.profileRegistry;
-    if (!registry) {
-      return (this.deps.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
-    }
-    const existing = registry.getProfileForChat(chatId);
-    if (existing) return existing.profileId;
-
-    const anyChatPaired = registry.getAllProfiles().some((profile) => profile.chatIds.length > 0);
-    if (anyChatPaired) {
-      console.warn(`[gateway] Refused unrecognized chat ${chatId} (auto-pair closed after first pairing)`);
-      return null;
-    }
-
-    const defaultProfile = registry.getOrCreateDefaultProfile();
-    registry.pairChatToProfile(chatId, defaultProfile.profileId);
-    console.log(`[gateway] Paired chat ${chatId} to profile "${defaultProfile.profileId}" (first-contact auto-pair)`);
-    return defaultProfile.profileId;
-  }
-
-  private getExistingProfileForChat(chatId: string): ProfileId | null {
-    const registry = this.deps.profileRegistry;
-    if (!registry) {
-      return (this.deps.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
-    }
-    return registry.getProfileForChat(chatId)?.profileId ?? null;
-  }
-
-  private isDefaultRuntimeProfile(profileId: ProfileId): boolean {
-    return profileId === (this.deps.config.profiles?.defaultProfileId ?? 'default');
   }
 
   private emergencyResponse(input: string): string | undefined {
@@ -321,11 +267,22 @@ export class GatewayMessageRouter {
       : undefined;
   }
 
+  /**
+   * M9 (closed). This used to append `User id: <transport sender id>` to the model input.
+   *
+   * The sender id is a chat-shaped identifier: it was being sent to the provider on every turn and
+   * persisted in the session window, while being needed only for AUTHORIZATION — which admission has
+   * already decided before this string exists. Nothing downstream reads it, so it bought nothing and cost
+   * a re-identification channel into a third party. The authz decision still reads the full transport
+   * identity; only the prompt payload changed.
+   *
+   * `mediaPath` and `replyToMessageId` stay: the first is how the owner refers to their own attachment,
+   * and the second is thread structure, not identity.
+   */
   private buildAgentInput(incoming: AdmittedMessage): string {
     const parts: string[] = [incoming.text];
     if (incoming.mediaPath) parts.push('', `Uploaded media path (relative to workspace): ${incoming.mediaPath}`);
     if (incoming.replyToMessageId) parts.push('', `Reply to message id: ${incoming.replyToMessageId}`);
-    if (incoming.userId) parts.push('', `User id: ${incoming.userId}`);
     return parts.join('\n');
   }
 
@@ -368,13 +325,14 @@ export class GatewayMessageRouter {
     emergency: string,
     admittedOwnerId?: ProfileId,
   ): Promise<string> {
-    // NOTE: deliberately `getExistingProfileForChat` (no auto-pair) — an emergency from an
-    // unknown chat must NEVER consume the one-time first-contact pairing, and stays
-    // unpersisted guidance. Only a chat already paired to a profile resolves a runtime.
-    // Under S1 the caller passes the admitted owner id, so an admitted emergency records into
-    // the owner runtime without consulting the legacy registry at all.
-    const profileId = admittedOwnerId ?? this.getExistingProfileForChat(incoming.chatId);
-    const runtime = profileId !== null ? await this.resolveRuntimeFor(profileId) : undefined;
+    // An emergency from an ADMITTED owner records into the owner runtime. An emergency from an
+    // unadmitted chat never reaches here: `route()` refuses it at admission, before the emergency
+    // detector runs, so it stays unpersisted canned guidance.
+    //
+    // OLD -> NEW: this used to fall back to `getExistingProfileForChat(chatId)`, i.e. it consulted the
+    // registry to decide whether an emergency belonged to a profile. There is no registry and no
+    // lookup: no admitted owner id means no runtime.
+    const runtime = admittedOwnerId ? await this.resolveRuntimeFor(admittedOwnerId) : undefined;
     const emergencyIncoming = { ...incoming };
     if (path.isAbsolute(emergencyIncoming.mediaPath ?? '')) {
       this.deleteStagedMedia(emergencyIncoming.mediaPath);

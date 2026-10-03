@@ -5,10 +5,37 @@ import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import type { EffectiveConfig } from '../../src/config/types';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
-import {} from '../helpers/test-config';
-import { ownerSelection, sharedFixtureOwner } from '../helpers/test-config';
+import { ownerSelection, fixtureOwner } from '../helpers/test-config';
+import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+
+/**
+ * Per-suite owner root, INSIDE the workspace (`gitignored .test-tmp/`).
+ *
+ * OLD -> NEW: this used `sharedFixtureOwner()`, one hard-coded `/tmp` directory shared by every suite.
+ * That was outside the workspace, and once S1 made admission bind exactly one chat per owner record, the
+ * first suite to bind there owned it for all later callers — so this suite's chats were silently refused.
+ * Each suite now derives and removes its own owner workspace.
+ */
+let suiteRoot = '';
+const suiteOwner = (): ReturnType<typeof fixtureOwner> => fixtureOwner(suiteRoot);
+
+const CHAT_BINDING = 'chat-1';
 
 describe('Gateway media flow', () => {
+  beforeEach(() => {
+    suiteRoot = makeTestTemp('gateway-media-flow');
+  });
+
+  afterEach(() => {
+    removeTestTemp(suiteRoot);
+    suiteRoot = '';
+  });
+
+  afterEach(() => {
+    removeTestTemp(suiteRoot);
+    suiteRoot = '';
+  });
   afterEach(() => {
     jest.restoreAllMocks();
   });
@@ -16,7 +43,7 @@ describe('Gateway media flow', () => {
   function makeConfig(): EffectiveConfig {
     return {
     schemaVersion: 2,
-    ...ownerSelection(sharedFixtureOwner()),
+    ...ownerSelection(suiteOwner()),
       providers: {
         main: { type: 'ollama', model: 'qwen3.5:9b', baseUrl: 'http://localhost:11434/v1' },
         medical: { type: 'ollama', model: 'qwen3.5:9b', baseUrl: 'http://localhost:11434/v1' },
@@ -30,7 +57,7 @@ describe('Gateway media flow', () => {
         deny: [],
       },
       memory: {
-        workspace: sharedFixtureOwner().workspace,
+        workspace: suiteOwner().workspace,
         search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
         bootstrapMaxChars: 20000,
       },
@@ -42,11 +69,11 @@ describe('Gateway media flow', () => {
       heartbeat: {
         enabled: false,
         timezone: 'Asia/Kolkata',
-        storePath: sharedFixtureOwner().storePath,
+        storePath: suiteOwner().storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 3, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-        audit: { path: sharedFixtureOwner().auditLogPath },
+        audit: { path: suiteOwner().auditLogPath },
         policy: {
           quietHours: { enabled: true, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,
@@ -64,7 +91,7 @@ describe('Gateway media flow', () => {
   }
 
   it('forwards mediaPath and reply metadata into agent execution input', async () => {
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-1', { channel: 'local', userId: 'user-1' }));
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn().mockResolvedValue({
       text: 'processed',
@@ -85,6 +112,9 @@ describe('Gateway media flow', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:chat-1:1',
       chatId: 'chat-1',
       userId: 'user-1',
       text: 'Please analyze this uploaded report',
@@ -101,7 +131,7 @@ describe('Gateway media flow', () => {
   });
 
   it('does not log user message text when handling incoming messages', async () => {
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-1', { channel: 'local', userId: 'user-1' }));
     const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn().mockResolvedValue({
@@ -124,6 +154,9 @@ describe('Gateway media flow', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:chat-1:2',
       chatId: 'chat-1',
       userId: 'user-1',
       text: 'My private glucose reading is 240 after lunch',
@@ -134,7 +167,7 @@ describe('Gateway media flow', () => {
   });
 
   it('logs agent error name+location but never the sensitive message body', async () => {
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-1', { channel: 'local', userId: 'user-1' }));
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     const send = jest.fn().mockResolvedValue(undefined);
 
@@ -151,6 +184,9 @@ describe('Gateway media flow', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:chat-1:3',
       chatId: 'chat-1',
       userId: 'user-1',
       text: 'Please analyze my report',
@@ -161,7 +197,7 @@ describe('Gateway media flow', () => {
   });
 
   it('sends generic fallback and never logs sensitive session context when prepareHistory fails', async () => {
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-1', { channel: 'local', userId: 'user-1' }));
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn();
@@ -179,6 +215,9 @@ describe('Gateway media flow', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await expect((gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:chat-1:4',
       chatId: 'chat-1',
       userId: 'user-1',
       text: 'Can I eat rice?',
@@ -193,7 +232,7 @@ describe('Gateway media flow', () => {
   });
 
   it('does not send fallback nor log sensitive context when recordTurn fails after successful send', async () => {
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-1', { channel: 'local', userId: 'user-1' }));
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn().mockResolvedValue({
@@ -218,6 +257,9 @@ describe('Gateway media flow', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await expect((gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:chat-1:5',
       chatId: 'chat-1',
       userId: 'user-1',
       text: 'Please analyze my report',
@@ -229,7 +271,7 @@ describe('Gateway media flow', () => {
   });
 
   it('closes the search store on stop', async () => {
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), CHAT_BINDING, { channel: 'local', userId: 'user-1' }));
     const close = jest.fn();
     attachGatewayTestRuntime(gateway, makeConfig(), { store: { close } });
 
@@ -239,7 +281,7 @@ describe('Gateway media flow', () => {
   });
 
   it('still closes the search store when channel disconnect fails during stop', async () => {
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), CHAT_BINDING, { channel: 'local', userId: 'user-1' }));
     const close = jest.fn();
     attachGatewayTestRuntime(gateway, makeConfig(), { store: { close } });
     (gateway as any).channel = { disconnect: jest.fn().mockRejectedValue(new Error('disconnect failed')) };
@@ -249,10 +291,11 @@ describe('Gateway media flow', () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 
-  it('fails startup bootstrap instead of silently continuing with an unusable workspace path', () => {
+  it('fails startup bootstrap instead of silently continuing with an unusable workspace path', async () => {
     const tmpFile = path.join(os.tmpdir(), `redacted-bootstrap-file-${Date.now()}`);
     fs.writeFileSync(tmpFile, 'not a directory', 'utf8');
-    const gateway = new Gateway(makeConfig());
+    const config = makeConfig();
+    const gateway = new Gateway(config, await bindGatewayOwner(config, CHAT_BINDING, { channel: 'local', userId: 'user-1' }));
 
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -263,7 +306,7 @@ describe('Gateway media flow', () => {
   });
 
   it('surfaces explicit error to user when media download fails', async () => {
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-1', { channel: 'local', userId: 'user-1' }));
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn();
 
@@ -275,6 +318,9 @@ describe('Gateway media flow', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:chat-1:6',
       chatId: 'chat-1',
       userId: 'user-1',
       text: 'Uploaded report',
@@ -288,7 +334,7 @@ describe('Gateway media flow', () => {
   });
 
   it('preserves failed-upload message text in session history', async () => {
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-media', { channel: 'local', userId: 'user-1' }));
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn();
     const recordTurn = jest.fn().mockResolvedValue(undefined);
@@ -302,6 +348,9 @@ describe('Gateway media flow', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:chat-media:7',
       chatId: 'chat-media',
       userId: 'user-1',
       text: 'Here is my blood test report',
@@ -321,7 +370,7 @@ describe('Gateway media flow', () => {
   });
 
   it('preserves reply metadata when media download fails', async () => {
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-reply', { channel: 'local', userId: 'user-1' }));
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn();
     const recordTurn = jest.fn().mockResolvedValue(undefined);
@@ -335,6 +384,9 @@ describe('Gateway media flow', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:chat-reply:8',
       chatId: 'chat-reply',
       userId: 'user-1',
       text: 'What do you think of this report?',
@@ -356,7 +408,7 @@ describe('Gateway media flow', () => {
   });
 
   it('handles recordTurn failure in mediaError path without throwing out of the gateway handler', async () => {
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-error', { channel: 'local', userId: 'user-1' }));
     const send = jest.fn()
       .mockResolvedValueOnce(undefined)
       .mockResolvedValueOnce(undefined);
@@ -372,6 +424,9 @@ describe('Gateway media flow', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await expect((gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:chat-error:9',
       chatId: 'chat-error',
       userId: 'user-1',
       text: 'Uploaded report',
@@ -385,7 +440,7 @@ describe('Gateway media flow', () => {
   });
 
   it('does not log raw send errors when mediaError response delivery fails', async () => {
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-send-fail', { channel: 'local', userId: 'user-1' }));
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     const send = jest.fn().mockRejectedValue(new Error('telegram response included private glucose context'));
     const run = jest.fn();
@@ -400,6 +455,9 @@ describe('Gateway media flow', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await expect((gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:chat-send-fail:10',
       chatId: 'chat-send-fail',
       userId: 'user-1',
       text: 'Uploaded report',
@@ -414,7 +472,7 @@ describe('Gateway media flow', () => {
   });
 
   it('still surfaces upload failure when prepareHistory fails', async () => {
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-session-fail', { channel: 'local', userId: 'user-1' }));
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn();
     const recordTurn = jest.fn().mockResolvedValue(undefined);
@@ -428,6 +486,9 @@ describe('Gateway media flow', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await expect((gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:chat-session-fail:11',
       chatId: 'chat-session-fail',
       userId: 'user-1',
       text: 'Uploaded report',
@@ -443,10 +504,19 @@ describe('Gateway media flow', () => {
 
 // ── RES-P0-4: persist-before-send ordering (main agent path) ───────────────
 describe('Gateway persist-before-send (RES-P0-4)', () => {
+  beforeEach(() => {
+    suiteRoot = makeTestTemp('gateway-media-flow');
+  });
+
+  afterEach(() => {
+    removeTestTemp(suiteRoot);
+    suiteRoot = '';
+  });
+
   function makeConfig(): EffectiveConfig {
     return {
     schemaVersion: 2,
-    ...ownerSelection(sharedFixtureOwner()),
+    ...ownerSelection(suiteOwner()),
       providers: {
         main: { type: 'ollama', model: 'qwen3.5:9b', baseUrl: 'http://localhost:11434/v1' },
         medical: { type: 'ollama', model: 'qwen3.5:9b', baseUrl: 'http://localhost:11434/v1' },
@@ -455,7 +525,7 @@ describe('Gateway persist-before-send (RES-P0-4)', () => {
       channels: { telegram: { enabled: false, botToken: '' } },
       tools: { allow: ['*'], deny: [] },
       memory: {
-        workspace: sharedFixtureOwner().workspace,
+        workspace: suiteOwner().workspace,
         search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
         bootstrapMaxChars: 20000,
       },
@@ -467,11 +537,11 @@ describe('Gateway persist-before-send (RES-P0-4)', () => {
       heartbeat: {
         enabled: false,
         timezone: 'Asia/Kolkata',
-        storePath: sharedFixtureOwner().storePath,
+        storePath: suiteOwner().storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 3, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-        audit: { path: sharedFixtureOwner().auditLogPath },
+        audit: { path: suiteOwner().auditLogPath },
         policy: {
           quietHours: { enabled: true, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,
@@ -490,7 +560,7 @@ describe('Gateway persist-before-send (RES-P0-4)', () => {
   });
 
   it('records the turn BEFORE sending the agent response (happy path)', async () => {
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-order', { channel: 'local', userId: 'user-1' }));
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn().mockResolvedValue({
       text: 'processed',
@@ -510,6 +580,9 @@ describe('Gateway persist-before-send (RES-P0-4)', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:chat-order:12',
       chatId: 'chat-order',
       userId: 'user-1',
       text: 'Please analyze my report',
@@ -524,7 +597,7 @@ describe('Gateway persist-before-send (RES-P0-4)', () => {
 
   it('still sends the real response when recordTurn fails pre-send, logs divergence sanitized (no fallback)', async () => {
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-persist-fail', { channel: 'local', userId: 'user-1' }));
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn().mockResolvedValue({
       text: 'processed',
@@ -546,6 +619,9 @@ describe('Gateway persist-before-send (RES-P0-4)', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:chat-persist-fail:13',
       chatId: 'chat-persist-fail',
       userId: 'user-1',
       text: 'Please analyze my report',
@@ -563,7 +639,7 @@ describe('Gateway persist-before-send (RES-P0-4)', () => {
   });
 
   it('persists the emergency turn BEFORE sending emergency guidance', async () => {
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-emerg', { channel: 'local', userId: 'user-1' }));
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn();
     const recordTurn = jest.fn().mockResolvedValue(undefined);
@@ -578,6 +654,9 @@ describe('Gateway persist-before-send (RES-P0-4)', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:chat-emerg:14',
       chatId: 'chat-emerg',
       userId: 'user-1',
       text: 'I have severe chest pain and cannot breathe',

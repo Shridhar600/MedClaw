@@ -48,8 +48,19 @@ const MEDIA_REFUSAL_TEXT: Record<string, string> = {
 };
 
 export interface GatewayAdmissionDeps {
-  admission?: OwnerAdmissionService;
-  ownerId?: ProfileId;
+  /**
+   * The owner's enrollment authority. REQUIRED.
+   *
+   * It used to be optional so pre-S1 tests could construct a Gateway with no identity at all. That
+   * optionality was load-bearing in the worst way: `if (this.admission)` in `start()` skipped the
+   * entire refusal policy, and `admitAndStage` passed media and text straight through, so a Gateway
+   * built without it served as though every chat were the owner. Plan 15 §5 requires that "New core APIs
+   * must not have an optional admission fallback". It is now non-optional, and `ownerPaths()` refuses a
+   * config that names no valid owner.
+   */
+  admission: OwnerAdmissionService;
+  /** The owner identity `admission` is configured for. REQUIRED; never inferred, never defaulted. */
+  ownerId: ProfileId;
   /**
    * How providers are constructed for this daemon (plan 15 §3 `GatewayBindings`).
    *
@@ -144,7 +155,7 @@ export class Gateway {
    * and its boot answer decides whether one may be built at all. Absent only for pre-S1 tests that
    * construct a Gateway directly with a hand-built runtime.
    */
-  private admission?: OwnerAdmissionService;
+  private admission: OwnerAdmissionService;
   /**
    * Set when the owner record is not yet bound. While true the daemon serves pairing and canned
    * emergency guidance only: no provider, no workspace bootstrap, no runtime, no index, no
@@ -152,7 +163,7 @@ export class Gateway {
    */
   private unpairedOnly = false;
   /** The owner identity admission is configured for, used as the dispatch target when admitted. */
-  private admissionOwnerId?: ProfileId;
+  private admissionOwnerId: ProfileId;
   /**
    * The ONE derivation of this owner's resources, memoised from the validated config.
    *
@@ -175,7 +186,7 @@ export class Gateway {
    */
   private mediaStagerCache?: FsMediaStager;
 
-  constructor(config: EffectiveConfig, deps: GatewayAdmissionDeps = {}) {
+  constructor(config: EffectiveConfig, deps: GatewayAdmissionDeps) {
     this.config = config;
     this.admission = deps.admission;
     this.admissionOwnerId = deps.ownerId;
@@ -279,19 +290,17 @@ export class Gateway {
     // and an unpaired record must NOT build anything clinical. Both decisions are taken before a
     // provider is created, before the workspace is touched, and before any index or scheduler
     // exists, so "unpaired" cannot degrade into "serving on a default identity".
-    if (this.admission) {
-      const admissionState = this.admission.inspectInstallation();
-      if (admissionState.kind === 'refused') {
-        throw new Error(
-          `Refusing to serve: the owner record is ${admissionState.reason}. `
-          + 'Re-run setup on this computer, then start the daemon again.',
-        );
-      }
-      if (admissionState.kind === 'unpaired') {
-        this.unpairedOnly = true;
-        await this.startUnpaired(config);
-        return;
-      }
+    const admissionState = this.admission.inspectInstallation();
+    if (admissionState.kind === 'refused') {
+      throw new Error(
+        `Refusing to serve: the owner record is ${admissionState.reason}. `
+        + 'Re-run setup on this computer, then start the daemon again.',
+      );
+    }
+    if (admissionState.kind === 'unpaired') {
+      this.unpairedOnly = true;
+      await this.startUnpaired(config);
+      return;
     }
 
     await this.serveOwner({ connectChannel: true, runHealthchecks: true });
@@ -576,17 +585,11 @@ export class Gateway {
   }
 
   private async admitAndStage(incoming: IncomingMessage): Promise<AdmittedMessage | undefined> {
-    const admission = this.admission;
-    if (!admission) {
-      // Fail CLOSED, never open. Without an admission policy there is no authority to have fetched
-      // anything, so a message carrying media is refused outright rather than being passed through as
-      // if it had been admitted. This used to `return incoming as AdmittedMessage`, which handed an
-      // unadmitted sender a clinical turn whenever a Gateway was composed without admission.
-      if (incoming.media) return undefined;
-      return incoming as AdmittedMessage;
-    }
-
-    const decision = admission.inspect(transportIdentityOf(incoming));
+    // Admission is REQUIRED, so there is no "no authority" branch left to fail closed in: the policy
+    // always exists. This used to read `if (!admission) { if (incoming.media) return undefined; return
+    // incoming as AdmittedMessage; }` — which handed an unadmitted sender a clinical turn whenever a
+    // Gateway was composed without admission, and silently dropped the owner's media.
+    const decision = this.admission.inspect(transportIdentityOf(incoming));
     const admitted: AdmittedMessage = { ...incoming };
 
     if (decision.kind !== 'owner') {
@@ -621,7 +624,7 @@ export class Gateway {
     }
 
     // Re-check authority AFTER the retrieval. A binding revoked mid-download must not adopt a file.
-    const recheck = admission.inspect(transportIdentityOf(incoming));
+    const recheck = this.admission.inspect(transportIdentityOf(incoming));
     if (recheck.kind !== 'owner') {
       this.deleteStagedFile(staged.absolutePath);
       return undefined;
@@ -790,10 +793,8 @@ export class Gateway {
     // Work dispatched as some OTHER identity may not address this daemon's single owner destination.
     // Multi-profile activation is parked, so there is exactly one dispatching identity that can pass.
     if (this.admissionOwnerId !== profileId) return false;
-    const admission = this.admission;
-    if (!admission) return false;
     try {
-      return admission.ownsDestination(chatId);
+      return this.admission.ownsDestination(chatId);
     } catch (error) {
       console.warn('[gateway] Scheduled-work destination lookup failed; refusing:', summarizeErrorForLog(error));
       return false;
@@ -1398,7 +1399,7 @@ export class Gateway {
       config: this.config,
       runtime: this.runtime,
       admission: this.admission,
-      ownerId: this.admissionOwnerId ?? ((this.config.profiles?.defaultProfileId ?? 'default') as ProfileId),
+      ownerId: this.admissionOwnerId,
       stagingDir: this.mediaStagingDir(),
       // The trusted base is the owner's own workspace, never `$HOME`: a home-wide base let one
       // installation adopt or delete another installation's staged file.

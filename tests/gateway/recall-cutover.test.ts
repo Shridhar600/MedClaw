@@ -6,6 +6,9 @@ import { SafetyView } from '../../src/memcore';
 import type { EffectiveConfig } from '../../src/config/types';
 import type { LLMProvider, LLMResponse, Message } from '../../src/providers/types';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+
+const CHAT_BINDING = 'chat-1';
 
 // C3 — the prompt cutover: the live chat path builds its system prompt per turn through the v2
 // assembler with recall injected and SAFETY re-rendered EVERY turn (D9). These are gateway-level
@@ -70,7 +73,7 @@ function captureProvider(gateway: Gateway): Message[][] {
 }
 
 async function startGateway(tmpDir: string): Promise<Gateway> {
-  const gateway = new Gateway(makeConfig(tmpDir));
+  const gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
   const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
   const log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
   await gateway.start();

@@ -88,17 +88,14 @@ export function withoutOwnerIdentity(config: EffectiveConfig): EffectiveConfig {
   return copy as unknown as EffectiveConfig;
 }
 
-/**
- * Stable synthetic owner root for suites whose factory takes no per-test directory.
- *
- * These fixtures previously hard-coded `/tmp/redacted-test` as their workspace. Declaring an
- * owner identity now makes the Gateway resolve the selected owner through
- * `<baseDir>/profiles/<ownerId>`, so the declared identity and the declared workspace have to
- * agree. Rooting them here keeps them coherent and moves their writes out of a bare
- * `/tmp/redacted-test` that several unrelated suites shared.
- */
-export const FIXTURE_OWNER_ROOT = '/tmp/redacted-socs-s1-fixture-owner';
-
-export function sharedFixtureOwner(): FixtureOwner {
-  return fixtureOwner(FIXTURE_OWNER_ROOT);
-}
+// NOTE: `FIXTURE_OWNER_ROOT` / `sharedFixtureOwner()` are DELETED, not relocated.
+//
+// They pointed every caller at one hard-coded `/tmp/redacted-socs-s1-fixture-owner` directory, which was
+// wrong twice over. It was outside the workspace, which the founder rule forbids. And because S1 makes
+// admission bind exactly ONE chat per owner record, the first suite to bind a chat there owned it for
+// every later caller: `bindOwnerFixture` finds an existing record, issues no challenge, and returns
+// without binding, so every subsequent suite's chat was silently refused. That cascade was the single
+// largest cause of test failures after admission became mandatory.
+//
+// Callers now pass their own `makeTestTemp(...)` root to `fixtureOwner(root)`, so each suite owns and
+// removes its own owner workspace.

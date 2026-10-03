@@ -10,13 +10,25 @@
 import { Gateway } from '../../src/gateway/gateway';
 import type { EffectiveConfig } from '../../src/config/types';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
-import {} from '../helpers/test-config';
-import { ownerSelection, sharedFixtureOwner } from '../helpers/test-config';
+import { ownerSelection, fixtureOwner } from '../helpers/test-config';
+import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+
+/**
+ * Per-suite owner root, INSIDE the workspace (`gitignored .test-tmp/`).
+ *
+ * OLD -> NEW: this used `sharedFixtureOwner()`, one hard-coded `/tmp` directory shared by every suite.
+ * That was outside the workspace, and once S1 made admission bind exactly one chat per owner record, the
+ * first suite to bind there owned it for all later callers — so this suite's chats were silently refused.
+ * Each suite now derives and removes its own owner workspace.
+ */
+let suiteRoot = '';
+const suiteOwner = (): ReturnType<typeof fixtureOwner> => fixtureOwner(suiteRoot);
 
 function makeConfig(): EffectiveConfig {
   return {
   schemaVersion: 2,
-  ...ownerSelection(sharedFixtureOwner()),
+  ...ownerSelection(suiteOwner()),
     providers: {
       main: { type: 'ollama', model: 'qwen3.5:9b', baseUrl: 'http://localhost:11434/v1' },
       medical: { type: 'ollama', model: 'qwen3.5:9b', baseUrl: 'http://localhost:11434/v1' },
@@ -25,7 +37,7 @@ function makeConfig(): EffectiveConfig {
     channels: { telegram: { enabled: false, botToken: '' } },
     tools: { allow: ['*'], deny: [] },
     memory: {
-      workspace: sharedFixtureOwner().workspace,
+      workspace: suiteOwner().workspace,
       search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
       bootstrapMaxChars: 20000,
     },
@@ -37,11 +49,11 @@ function makeConfig(): EffectiveConfig {
     heartbeat: {
       enabled: false,
       timezone: 'Asia/Kolkata',
-      storePath: sharedFixtureOwner().storePath,
+      storePath: suiteOwner().storePath,
       recovery: { enabled: false, windowMinutes: 60 },
       retry: { maxRetries: 3, backoffMinutes: 5 },
       rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-      audit: { path: sharedFixtureOwner().auditLogPath },
+      audit: { path: suiteOwner().auditLogPath },
       policy: {
         quietHours: { enabled: true, start: '22:00', end: '07:00' },
         skipIfChatActiveWithinMinutes: 60,
@@ -56,7 +68,14 @@ function makeConfig(): EffectiveConfig {
 }
 
 describe('PROD-P1-6 empty/whitespace message guard', () => {
-  afterEach(() => jest.restoreAllMocks());
+  beforeEach(() => {
+    suiteRoot = makeTestTemp('empty-message-guard');
+  });
+
+  afterEach(() => {
+    removeTestTemp(suiteRoot);
+    suiteRoot = '';
+  });
 
   describe('handleMessage (channel path)', () => {
     function wire(gateway: Gateway) {
@@ -79,11 +98,14 @@ describe('PROD-P1-6 empty/whitespace message guard', () => {
     }
 
     it('an empty-text message (no media) returns a canned reply, never runs the agent, never writes a session', async () => {
-      const gateway = new Gateway(makeConfig());
+      const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'test-chat', { channel: 'local', userId: 'u' }));
       const { run, send, prepareHistory, recordTurn } = wire(gateway);
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await (gateway as any).handleMessage({ chatId: 'c1', userId: 'u', text: '' });
+      await (gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:c1:1', chatId: 'c1', userId: 'u', text: '' });
 
       expect(run).not.toHaveBeenCalled();
       expect(prepareHistory).not.toHaveBeenCalled();
@@ -94,11 +116,14 @@ describe('PROD-P1-6 empty/whitespace message guard', () => {
     });
 
     it('a whitespace-only-text message (no media) returns a canned reply and runs nothing', async () => {
-      const gateway = new Gateway(makeConfig());
+      const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'c1', { channel: 'local', userId: 'u' }));
       const { run, send, prepareHistory, recordTurn } = wire(gateway);
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await (gateway as any).handleMessage({ chatId: 'c1', userId: 'u', text: '   \n\t  ' });
+      await (gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:c1:2', chatId: 'c1', userId: 'u', text: '   \n\t  ' });
 
       expect(run).not.toHaveBeenCalled();
       expect(prepareHistory).not.toHaveBeenCalled();
@@ -107,11 +132,14 @@ describe('PROD-P1-6 empty/whitespace message guard', () => {
     });
 
     it('still processes a media upload when text is empty (canned reply NOT fired)', async () => {
-      const gateway = new Gateway(makeConfig());
+      const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'c1', { channel: 'local', userId: 'u' }));
       const { run, send, recordTurn } = wire(gateway);
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await (gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:c1:3',
         chatId: 'c1',
         userId: 'u',
         text: '',
@@ -145,7 +173,7 @@ describe('PROD-P1-6 empty/whitespace message guard', () => {
     }
 
     it('an empty-text message returns a canned reply, never runs the agent, never writes a session', async () => {
-      const gateway = new Gateway(makeConfig());
+      const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'test-chat'));
       const { run, prepareHistory, recordTurn } = wire(gateway);
 
       const reply = await gateway.handleTestMessage('test-chat', '');
@@ -157,7 +185,7 @@ describe('PROD-P1-6 empty/whitespace message guard', () => {
     });
 
     it('a whitespace-only-text message returns a canned reply and runs nothing', async () => {
-      const gateway = new Gateway(makeConfig());
+      const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'test-chat'));
       const { run, prepareHistory, recordTurn } = wire(gateway);
 
       const reply = await gateway.handleTestMessage('test-chat', '   \n  ');
@@ -169,7 +197,7 @@ describe('PROD-P1-6 empty/whitespace message guard', () => {
     });
 
     it('still runs the agent for a non-empty message', async () => {
-      const gateway = new Gateway(makeConfig());
+      const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'test-chat'));
       const { run } = wire(gateway);
 
       const reply = await gateway.handleTestMessage('test-chat', 'How are my labs?');

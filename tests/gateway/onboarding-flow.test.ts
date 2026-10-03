@@ -1,21 +1,27 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import type { EffectiveConfig } from '../../src/config/types';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 import {} from '../helpers/test-config';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+import { resolveOwnerPaths } from '../../src/profiles';
+import type { ProfileId } from '../../src/profiles/types';
+import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
+
 
 describe('Gateway onboarding integration', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-gateway-onboarding-'));
+    // OLD -> NEW: was `os.tmpdir()`. R-14 / the founder's no-outside-workspace rule: synthetic data
+    // belongs in the gitignored `.test-tmp/` root.
+    tmpDir = makeTestTemp('gateway-onboarding');
   });
 
   afterEach(() => {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    removeTestTemp(tmpDir);
   });
 
   function makeConfig(): EffectiveConfig {
@@ -65,7 +71,7 @@ describe('Gateway onboarding integration', () => {
     fs.mkdirSync(config.memory.workspace, { recursive: true });
     fs.writeFileSync(path.join(config.memory.workspace, 'USER.md'), '# User Preferences\n', 'utf8');
     fs.writeFileSync(path.join(config.memory.workspace, 'HEALTH_PROFILE.md'), '# Health Profile\n', 'utf8');
-    const gateway = new Gateway(config);
+    const gateway = new Gateway(config, await bindGatewayOwner(config, 'chat-1', { channel: 'local', userId: 'local' }));
     const run = jest.fn().mockResolvedValue({ text: 'normal agent', trace: [{ role: 'assistant', content: 'normal agent' }] });
     const recordTurn = jest.fn().mockResolvedValue(undefined);
     attachGatewayTestRuntime(gateway, config, {
@@ -85,7 +91,7 @@ describe('Gateway onboarding integration', () => {
     fs.mkdirSync(config.memory.workspace, { recursive: true });
     fs.writeFileSync(path.join(config.memory.workspace, 'USER.md'), '# User Preferences\n', 'utf8');
     fs.writeFileSync(path.join(config.memory.workspace, 'HEALTH_PROFILE.md'), '# Health Profile\n', 'utf8');
-    const gateway = new Gateway(config);
+    const gateway = new Gateway(config, await bindGatewayOwner(config, 'chat-1', { channel: 'local', userId: 'local' }));
     const run = jest.fn().mockResolvedValue({ text: 'normal agent', trace: [{ role: 'assistant', content: 'normal agent' }] });
     attachGatewayTestRuntime(gateway, config, {
       agentLoop: { run },
@@ -118,10 +124,14 @@ describe('Gateway onboarding integration', () => {
     // S1 change (old -> new): `handleTestMessage` now presents an explicit local transport identity
     // instead of an empty one, because S1 admission refuses a message with no transport identity
     // and omitting it made this path untestable and its refusals meaningless. The extra
-    // `User id: local` line is that honest identity appearing in the captured agent input; the
+    // M9 (closed): the transport sender id is no longer appended to the prompt. It is a chat-shaped
+    // identifier needed only for authorization — which admission has already decided — and appending it
+    // shipped it to the provider on every turn and into the persisted session window. The authz decision
+    // still reads the whole transport identity; only the prompt payload changed. This assertion is the
+    // regression proof that the identifier does NOT reappear.earing in the captured agent input; the
     // clinical text, the history and the turn options are unchanged.
     expect(run).toHaveBeenCalledWith(
-      'Can I eat daal chawal?\n\nUser id: local',
+      'Can I eat daal chawal?',
       [],
       { chatId: 'chat-1', mode: 'chat', turnId: undefined },
     );
@@ -132,7 +142,7 @@ describe('Gateway onboarding integration', () => {
     fs.mkdirSync(config.memory.workspace, { recursive: true });
     fs.writeFileSync(path.join(config.memory.workspace, 'USER.md'), '# User Preferences\n', 'utf8');
     fs.writeFileSync(path.join(config.memory.workspace, 'HEALTH_PROFILE.md'), '# Health Profile\n', 'utf8');
-    const gateway = new Gateway(config);
+    const gateway = new Gateway(config, await bindGatewayOwner(config, 'chat-1', { channel: 'local', userId: 'local' }));
     const run = jest.fn();
     attachGatewayTestRuntime(gateway, config, {
       agentLoop: { run },
@@ -150,7 +160,7 @@ describe('Gateway onboarding integration', () => {
     fs.mkdirSync(config.memory.workspace, { recursive: true });
     fs.writeFileSync(path.join(config.memory.workspace, 'USER.md'), '# User Preferences\n', 'utf8');
     fs.writeFileSync(path.join(config.memory.workspace, 'HEALTH_PROFILE.md'), '# Health Profile\n', 'utf8');
-    const gateway = new Gateway(config);
+    const gateway = new Gateway(config, await bindGatewayOwner(config, 'chat-1', { channel: 'local', userId: 'local' }));
     const run = jest.fn();
     attachGatewayTestRuntime(gateway, config, {
       agentLoop: { run },
@@ -170,7 +180,7 @@ describe('Gateway onboarding integration', () => {
     fs.mkdirSync(config.memory.workspace, { recursive: true });
     fs.writeFileSync(path.join(config.memory.workspace, 'USER.md'), '# User Preferences\n', 'utf8');
     fs.writeFileSync(path.join(config.memory.workspace, 'HEALTH_PROFILE.md'), '# Health Profile\n', 'utf8');
-    const gateway = new Gateway(config);
+    const gateway = new Gateway(config, await bindGatewayOwner(config, 'chat-1', { channel: 'local', userId: 'local' }));
     const run = jest.fn();
     attachGatewayTestRuntime(gateway, config, {
       agentLoop: { run },
@@ -193,7 +203,7 @@ describe('Gateway onboarding integration', () => {
       JSON.stringify({ status: 'complete', updatedAt: new Date().toISOString(), answers: {} }),
       'utf8',
     );
-    const gateway = new Gateway(config);
+    const gateway = new Gateway(config, await bindGatewayOwner(config, 'chat-1', { channel: 'local', userId: 'local' }));
     const run = jest.fn().mockResolvedValue({ text: 'normal agent', trace: [{ role: 'assistant', content: 'normal agent' }] });
     const recordTurn = jest.fn().mockResolvedValue(undefined);
     attachGatewayTestRuntime(gateway, config, {
@@ -220,7 +230,7 @@ describe('Gateway onboarding integration', () => {
     fs.writeFileSync(path.join(config.memory.workspace, 'USER.md'), '# User Preferences\n', 'utf8');
     fs.writeFileSync(path.join(config.memory.workspace, 'HEALTH_PROFILE.md'), '# Health Profile\n', 'utf8');
     fs.writeFileSync(path.join(config.memory.workspace, '.redacted', 'onboarding.json'), '{bad-json', 'utf8');
-    const gateway = new Gateway(config);
+    const gateway = new Gateway(config, await bindGatewayOwner(config, 'chat-1', { channel: 'local', userId: 'local' }));
     const run = jest.fn();
     attachGatewayTestRuntime(gateway, config, {
       agentLoop: { run },
@@ -243,7 +253,7 @@ describe('Gateway onboarding integration', () => {
     fs.mkdirSync(config.memory.workspace, { recursive: true });
     fs.writeFileSync(path.join(config.memory.workspace, 'USER.md'), '# User Preferences\n', 'utf8');
     fs.writeFileSync(path.join(config.memory.workspace, 'HEALTH_PROFILE.md'), '# Health Profile\n', 'utf8');
-    const gateway = new Gateway(config);
+    const gateway = new Gateway(config, await bindGatewayOwner(config, 'chat-1', { channel: 'local', userId: 'user-1' }));
     const sent: string[] = [];
     attachGatewayTestRuntime(gateway, config, {
       agentLoop: { run: jest.fn() },
@@ -253,12 +263,18 @@ describe('Gateway onboarding integration', () => {
     (gateway as any).channel = { send: jest.fn(async (_chatId: string, message: { text: string }) => sent.push(message.text)) };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (gateway as any).handleMessage({ chatId: 'chat-1', text: 'hello', userId: 'user-1' });
+    await (gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:chat-1:1', chatId: 'chat-1', text: 'hello', userId: 'user-1' });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (gateway as any).handleMessage({ chatId: 'chat-1', text: 'Arjun', userId: 'user-1' });
+    await (gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:chat-1:2', chatId: 'chat-1', text: 'Arjun', userId: 'user-1' });
 
     const state = JSON.parse(
-      fs.readFileSync(path.join(config.memory.workspace, '.redacted', 'onboarding.json'), 'utf8'),
+      fs.readFileSync(path.join(resolveOwnerPaths(config.profiles.baseDir, 'default' as ProfileId).workspace, '.redacted', 'onboarding.json'), 'utf8'),
     );
     expect(state.answers.name).toBe('Arjun');
     expect(state.answers.name).not.toContain('User id');
@@ -270,7 +286,7 @@ describe('Gateway onboarding integration', () => {
     fs.mkdirSync(config.memory.workspace, { recursive: true });
     fs.writeFileSync(path.join(config.memory.workspace, 'USER.md'), '# User Preferences\n', 'utf8');
     fs.writeFileSync(path.join(config.memory.workspace, 'HEALTH_PROFILE.md'), '# Health Profile\n', 'utf8');
-    const gateway = new Gateway(config);
+    const gateway = new Gateway(config, await bindGatewayOwner(config, 'chat-1', { channel: 'local', userId: 'user-1' }));
     const run = jest.fn();
     const sent: string[] = [];
     attachGatewayTestRuntime(gateway, config, {
@@ -282,6 +298,9 @@ describe('Gateway onboarding integration', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleMessage({
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:chat-1:3',
       chatId: 'chat-1',
       text: '',
       mediaPath: 'reports/scan.png',

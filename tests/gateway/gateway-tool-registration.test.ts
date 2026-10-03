@@ -5,6 +5,9 @@ import { Gateway } from '../../src/gateway/gateway';
 import type { EffectiveConfig } from '../../src/config/types';
 import {} from '../helpers/test-config';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+
+const CHAT_BINDING = 'owner-chat';
 
 // RES-P2-1: one tool-group factory failure must NOT crash boot — remaining
 // groups still register.
@@ -71,7 +74,7 @@ describe('Gateway boot tool-group degradation (RES-P2-1)', () => {
   it('memory-tools factory failure does not crash boot; medical tools still register, failure warned sanitized', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const error = jest.spyOn(console, 'error').mockImplementation(() => undefined);
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), CHAT_BINDING));
 
     await expect(gateway.start()).resolves.toBeUndefined();
 

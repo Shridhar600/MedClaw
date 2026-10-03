@@ -422,9 +422,10 @@ export class TurnCoordinator {
     if (incoming.replyToMessageId) {
       parts.push('', `Reply to message id: ${incoming.replyToMessageId}`);
     }
-    if (incoming.userId) {
-      parts.push('', `User id: ${incoming.userId}`);
-    }
+    // M9: the transport sender id is deliberately NOT appended. It is a chat-shaped identifier needed
+    // only for authorization, which admission has already decided, and appending it shipped it to the
+    // provider on every turn and into the persisted session window. This is the second of the two
+    // `buildAgentInput` twins; see the same note in `router.ts`.
     return parts.join('\n');
   }
 

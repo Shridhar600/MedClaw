@@ -6,6 +6,9 @@ import { MemoryIndexer } from '../../src/memory/indexer';
 import type { EffectiveConfig } from '../../src/config/types';
 import type { FactRecord } from '../../src/ports';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+
+const CHAT_BINDING = 'owner-chat';
 
 // P2 Wave A — the recall substrate wired behind the live Gateway: every ledger write live-populates
 // the FactMirror (recall Stage 1 source) and reindexes the changed file (M-2 closed), and the mirror
@@ -82,7 +85,7 @@ describe('Gateway recall substrate wiring (P2 Wave A)', () => {
 
   it('live-populates the FactMirror on a ledger write and reindexes the changed files (M-2)', async () => {
     const indexFileSpy = jest.spyOn(MemoryIndexer.prototype, 'indexFile');
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     await gateway.start();
     indexFileSpy.mockClear(); // ignore the boot indexAll's calls; assert only the post-write ones
 
@@ -111,7 +114,7 @@ describe('Gateway recall substrate wiring (P2 Wave A)', () => {
 
   it('rebuilds the FactMirror from ledger Markdown at boot (A4 self-heal)', async () => {
     // First daemon writes a fact, then stops.
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     await gateway.start();
     await registryOf(gateway).execute('ledger_record', {
       entity: 'lisinopril', type: 'medication', fields: { dose: '10mg' }, note: 'started lisinopril',
@@ -120,7 +123,7 @@ describe('Gateway recall substrate wiring (P2 Wave A)', () => {
 
     // A fresh daemon over the SAME workspace rebuilds the mirror from Markdown at boot — the fact
     // is queryable without any new write (proves the mirror is derived state, not the source).
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     await gateway.start();
     const meds = await collectActive(gateway, 'medication');
     expect(meds.map(f => f.entity)).toContain('lisinopril');

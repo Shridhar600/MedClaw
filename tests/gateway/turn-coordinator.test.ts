@@ -170,7 +170,8 @@ describe('TurnCoordinator whole-turn serialization', () => {
 
     expect(runtime.sessions.prepareHistory).toHaveBeenCalledTimes(2);
     expect(runtime.sessions.prepareHistory.mock.results[1].value).toBeDefined();
-    expect(runtime.agentLoop.run.mock.calls[1][1]).toEqual([{ role: 'user', content: 'first\n\nUser id: user-1' }]);
+    // M9: the transport sender id is not part of the prompt payload (see `buildAgentInput`).
+    expect(runtime.agentLoop.run.mock.calls[1][1]).toEqual([{ role: 'user', content: 'first' }]);
   });
 
   it('allows independent chats to enter their agents concurrently', async () => {
@@ -189,7 +190,8 @@ describe('TurnCoordinator whole-turn serialization', () => {
     const chatA = coordinator.runUser(message('A', 'chat-a'), egress, noEmergency);
     const chatB = coordinator.runUser(message('B', 'chat-b'), egress, noEmergency);
     await bothEntered.promise;
-    expect(entered).toEqual(new Set(['A\n\nUser id: user-1', 'B\n\nUser id: user-1']));
+    // M9: same — the prompt carries the turn text, not the sender identifier.
+    expect(entered).toEqual(new Set(['A', 'B']));
 
     release.resolve();
     await Promise.all([chatA, chatB]);

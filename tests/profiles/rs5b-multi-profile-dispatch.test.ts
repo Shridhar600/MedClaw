@@ -3,7 +3,6 @@ import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { GatewayMessageRouter } from '../../src/gateway/router';
-import { ProfileRegistry } from '../../src/profiles/registry';
 import type { EffectiveConfig } from '../../src/config/types';
 import type { ProfileId } from '../../src/profiles/types';
 import { EMERGENCY_RESPONSE } from '../../src/safety/emergency-detector';
@@ -399,19 +398,15 @@ describe('RR-STRUCT R-S5b: live multi-profile dispatch (C-01 close)', () => {
   });
 
   it('a degraded (unresolvable) profile gets a canned genuine-failure reply — never a throw, staged media cleaned up', async () => {
-    const staging = path.join(tmpDir, 'staging-degraded', 'media');
+    // Inside the OWNER workspace: `deleteStagedMedia` refuses anything outside its trusted base, so a
+    // file planted in an unrelated directory would survive for a reason unrelated to admission.
+    const staging = path.join(baseDir, 'profiles', 'default', '.state', 'media-staging');
     fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
     const mkStaged = (name: string): string => {
       const p = path.join(staging, name);
       fs.writeFileSync(p, 'degraded bytes', { mode: 0o600 });
       return p;
     };
-    const registry = new ProfileRegistry(baseDir);
-    registry.getOrCreateDefaultProfile();
-    registry.pairChatToProfile('owner-chat', 'default' as ProfileId);
-    const other = registry.createProfile('other');
-    registry.pairChatToProfile('other-chat', other.profileId);
-
     for (const resolveRuntime of [
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (() => Promise.resolve(undefined)) as any,
@@ -419,15 +414,36 @@ describe('RR-STRUCT R-S5b: live multi-profile dispatch (C-01 close)', () => {
       (() => Promise.reject(new Error('simulated corrupt profile build'))) as any,
     ]) {
       const stagedPath = mkStaged(`upload-${Math.random().toString(36).slice(2)}.pdf`);
+      // S1: admission is REQUIRED. OLD passed `profileRegistry` and routed from `other-chat`, a chat the
+      // registry paired to a second profile. NEW there is no second identity, so the only way to reach the
+      // DEGRADED-runtime path is as the BOUND OWNER whose runtime cannot resolve — which is exactly the
+      // failure this test is about: a resolver that returns nothing or rejects must yield the canned
+      // genuine-failure reply, never a throw, and the staged media must be cleaned up either way.
+      const bound = await bindOwnerFixture(
+        path.join(baseDir, 'profiles', 'default', '.state', 'owner-access.json'),
+        'default',
+        DEFAULT_CHAT,
+        { channel: 'telegram', userId: 'owner-user' },
+      );
       const router = new GatewayMessageRouter({
         config: makeConfig(),
-        profileRegistry: registry,
+        admission: bound.admission,
+        ownerId: bound.ownerId,
         stagingDir: staging,
+        stagingBaseDir: path.join(baseDir, 'profiles', 'default'),
         buildBootStatusText: () => 'status',
         resolveRuntime,
       } as never);
       const reply = await router.route(
-        { chatId: 'other-chat', userId: '', text: 'hello', mediaPath: stagedPath },
+        {
+          channel: 'telegram',
+          chatId: DEFAULT_CHAT,
+          userId: 'owner-user',
+          chatType: 'private',
+          eventId: 'telegram:degraded:1',
+          text: 'hello',
+          mediaPath: stagedPath,
+        },
         jest.fn().mockResolvedValue(undefined),
       );
       expect(reply).toContain('temporarily unavailable');

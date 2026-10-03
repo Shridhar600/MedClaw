@@ -310,7 +310,11 @@ describe('the Gateway structurally refuses to serve a second identity', () => {
     const { readConfigDocument, effectiveConfigFor } = await import('../../src/runtime/installation');
     const config = effectiveConfigFor(readConfigDocument(fixture.configPath, tmpDir).stored);
 
-    const gateway = new Gateway(config);
+    // Admission is REQUIRED on the constructor. It is supplied here because this test is about which
+    // IDENTITY `buildRuntimeFor` will build for, not about admission: the authority is a real bound
+    // owner, and the refusal under test is the identity check.
+    const { bindGatewayOwner } = await import('../helpers/gateway-owner-deps');
+    const gateway = new Gateway(config, await bindGatewayOwner(config, 'owner-chat'));
     const build = (gateway as unknown as {
       buildRuntimeFor(id: ProfileId): Promise<ProfileRuntime>;
     }).buildRuntimeFor.bind(gateway);

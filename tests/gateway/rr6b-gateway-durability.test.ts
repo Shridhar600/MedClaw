@@ -26,7 +26,7 @@ describe('RR-6b gateway delivery durability', () => {
   });
 
   /**
-   * OLD -> NEW: built `new Gateway({} as EffectiveConfig)` with no admission. Under S1 the destination
+   * OLD -> NEW: built `new Gateway({} as EffectiveConfig, await bindGatewayOwner({} as EffectiveConfig, CHAT_BINDING))` with no admission. Under S1 the destination
    * guard fails closed, so a heartbeat that must NOT be delivered before a failed persistence would look
    * delivered for the wrong reason. A real bound owner keeps the assertion about persistence, not about a
    * dead default.

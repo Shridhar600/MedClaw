@@ -7,6 +7,9 @@ import type { EffectiveConfig } from '../../src/config/types';
 import type { LLMProvider } from '../../src/providers/types';
 import type { ToolRegistry } from '../../src/tools/registry';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+
+const CHAT_BINDING = 'owner-chat';
 
 const mockProvider: LLMProvider = {
   modelName: 'rr9b-gateway',
@@ -88,7 +91,7 @@ describe('RR-9b Gateway delta wiring', () => {
     fs.mkdirSync(path.dirname(dayPath), { recursive: true });
     fs.writeFileSync(dayPath, Array.from({ length: 900 }, (_, index) => `history-${index} ${'stable '.repeat(8)}`).join('\n') + '\n');
 
-    gateway = new Gateway(makeConfig(workspace));
+    gateway = new Gateway(makeConfig(workspace), await bindGatewayOwner(makeConfig(workspace), CHAT_BINDING));
     await gateway.start();
     (mockProvider.embed as jest.Mock).mockClear();
 
@@ -114,7 +117,7 @@ describe('RR-9b Gateway delta wiring', () => {
 
   it('replaces only the changed FactMirror type/entity scope after a ledger capture', async () => {
     const workspace = path.join(tmpDir, 'workspace');
-    gateway = new Gateway(makeConfig(workspace));
+    gateway = new Gateway(makeConfig(workspace), await bindGatewayOwner(makeConfig(workspace), CHAT_BINDING));
     await gateway.start();
 
     const mirror = (gateway as unknown as {

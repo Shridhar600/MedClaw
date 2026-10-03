@@ -6,7 +6,13 @@ import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 
 describe('RR-6b transcript sweep completeness', () => {
   it('reports an incomplete ledger read and skips missing-data conclusions', async () => {
-    const gateway = new Gateway({} as EffectiveConfig);
+    // A structural double, never started: this suite tests `runTranscriptSweep` directly. S1 makes
+    // admission REQUIRED on the constructor, so the minimal real authority is supplied here rather
+    // than weakening the type back to optional.
+    const gateway = new Gateway({} as EffectiveConfig, {
+      admission: {} as never,
+      ownerId: 'default' as never,
+    });
     const added: unknown[] = [];
     const runtime = attachGatewayTestRuntime(gateway, {} as EffectiveConfig, {
       sessions: {

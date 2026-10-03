@@ -9,6 +9,8 @@ jest.mock('../../src/providers/healthcheck', () => ({
 
 import { Gateway } from '../../src/gateway/gateway';
 
+const CHAT_BINDING = 'owner-chat';
+
 describe('RR-9a R6-23 Gateway boot health budget', () => {
   afterEach(() => {
     jest.useRealTimers();
@@ -19,7 +21,10 @@ describe('RR-9a R6-23 Gateway boot health budget', () => {
     jest.useFakeTimers();
     mockCheckSystemReadiness.mockImplementation(() => new Promise(() => undefined));
     mockProbeChatCompletion.mockImplementation(() => new Promise(() => undefined));
-    const gateway = new Gateway({} as EffectiveConfig);
+    // A purely structural double: this suite exercises `runBootHealthchecks` on a Gateway that is never
+    // started and never serves. S1 makes admission REQUIRED on the constructor, so a minimal structural
+    // authority is supplied rather than weakening the type back to optional.
+    const gateway = new Gateway({} as EffectiveConfig, { admission: {} as never, ownerId: CHAT_BINDING as never });
     const internals = gateway as unknown as {
       runBootHealthchecks(): Promise<void>;
       bootHealth?: { providers: Array<{ reasonCode?: string }> };

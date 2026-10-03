@@ -5,6 +5,9 @@ import { Gateway } from '../../src/gateway/gateway';
 import type { EffectiveConfig } from '../../src/config/types';
 import {} from '../helpers/test-config';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+
+const CHAT_BINDING = 'owner-chat';
 
 jest.mock('../../src/memory/indexer', () => ({
   MemoryIndexer: jest.fn().mockImplementation(() => ({
@@ -68,7 +71,7 @@ describe('Gateway startup resilience', () => {
 
   it('continues startup when the initial memory index build fails', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), CHAT_BINDING));
 
     await expect(gateway.start()).resolves.toBeUndefined();
     await gateway.stop();

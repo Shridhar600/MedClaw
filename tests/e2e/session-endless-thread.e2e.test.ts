@@ -18,6 +18,9 @@ import { PRUNED_TOOL_MARKER } from '../../src/gateway/session';
 import type { EffectiveConfig } from '../../src/config/types';
 import type { LLMProvider, LLMResponse, Message } from '../../src/providers/types';
 import {} from '../helpers/test-config';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+
+const CHAT_BINDING = 'owner-chat';
 
 const COMPACT_MARKER = 'Summarize the conversation turns below';
 const SUMMARY = '- Patient is allergic to penicillin\n- Blood pressure 150/95 logged\n- Following up next week';
@@ -81,7 +84,7 @@ function makeConfig(tmpDir: string): EffectiveConfig {
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 async function startGateway(tmpDir: string): Promise<Gateway> {
-  const gw = new Gateway(makeConfig(tmpDir));
+  const gw = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
   const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
   const log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
   const err = jest.spyOn(console, 'error').mockImplementation(() => undefined);

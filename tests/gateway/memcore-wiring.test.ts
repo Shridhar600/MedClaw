@@ -6,6 +6,9 @@ import { ContextAssembler } from '../../src/agent/context';
 import { InvariantViolationError } from '../../src/shared/errors';
 import type { EffectiveConfig } from '../../src/config/types';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+
+const CHAT_BINDING = 'chat-1';
 
 // Task 13 — the v2 memory core wired behind the live Gateway: ledger/episode/safety tool
 // groups registered per profile, the ledger tools driving both lanes + SAFETY.md, the
@@ -74,7 +77,7 @@ describe('Gateway memory-core wiring (Task 13)', () => {
   const registryOf = (): any => (gateway as any).agentLoop.registry;
 
   it('registers the ledger, episode, and safety tool groups', async () => {
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     await gateway.start();
     warn.mockRestore();
@@ -84,7 +87,7 @@ describe('Gateway memory-core wiring (Task 13)', () => {
   });
 
   it('ledger_record via the registry writes the ledger, SAFETY.md, and the narrative cross-anchor', async () => {
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     await gateway.start();
     warn.mockRestore();
@@ -102,7 +105,7 @@ describe('Gateway memory-core wiring (Task 13)', () => {
   });
 
   it('captures raw user text into the narrative lane every turn (F4/CHAT-06)', async () => {
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     await gateway.start();
     warn.mockRestore();
@@ -127,7 +130,7 @@ describe('Gateway memory-core wiring (Task 13)', () => {
     const spy = jest.spyOn(ContextAssembler.prototype, 'buildSystemMessages')
       .mockRejectedValue(new InvariantViolationError('SAFETY.md was not injected in full'));
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
 
     await expect(gateway.start()).rejects.toBeInstanceOf(InvariantViolationError);
 

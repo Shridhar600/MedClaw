@@ -392,7 +392,11 @@ describe('ownership release requires quiescence', () => {
   async function buildRealGateway(fixture: ReturnType<typeof writeConfigFixture>): Promise<import('../../src/gateway/gateway').Gateway> {
     const { Gateway } = await import('../../src/gateway/gateway');
     const { effectiveConfigFor, readConfigDocument } = await import('../../src/runtime/installation');
-    return new Gateway(effectiveConfigFor(readConfigDocument(fixture.configPath, tmpDir).stored));
+    const config = effectiveConfigFor(readConfigDocument(fixture.configPath, tmpDir).stored);
+    // S1: admission is REQUIRED. This suite drives real boots, so it binds the owner for real rather than
+    // stubbing the authority that decides who may serve.
+    const { bindGatewayOwner } = await import('../helpers/gateway-owner-deps');
+    return new Gateway(config, await bindGatewayOwner(config, 'owner-chat'));
   }
 
   async function bootRealGateway(fixture: ReturnType<typeof writeConfigFixture>): Promise<import('../../src/gateway/gateway').Gateway> {

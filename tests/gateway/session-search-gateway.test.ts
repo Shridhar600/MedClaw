@@ -4,6 +4,9 @@ import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import type { EffectiveConfig } from '../../src/config/types';
 import {} from '../helpers/test-config';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+
+const CHAT_BINDING = 'chat-c';
 
 // Wave D-2 — session_search (PLAT-20) wired behind the live Gateway: the SqliteSessionIndex is built on
 // the profile search.db, injected into the SessionManager for incremental indexing, and exposed as the
@@ -68,7 +71,7 @@ describe('Gateway session_search wiring (Wave D-2)', () => {
   const registryOf = (): any => (gateway as any).agentLoop.registry;
 
   it('registers the session_search tool group', async () => {
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     await gateway.start();
     warn.mockRestore();
@@ -78,7 +81,7 @@ describe('Gateway session_search wiring (Wave D-2)', () => {
   });
 
   it('session_search returns a turn recorded through the SessionManager verbatim', async () => {
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     await gateway.start();
     warn.mockRestore();
@@ -96,7 +99,7 @@ describe('Gateway session_search wiring (Wave D-2)', () => {
   });
 
   it('the /compact command forces a compaction and confirms (DD9)', async () => {
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     await gateway.start();
     warn.mockRestore();
