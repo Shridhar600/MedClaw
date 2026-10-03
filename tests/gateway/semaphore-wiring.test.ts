@@ -11,8 +11,6 @@ import type { LLMProvider, LLMResponse } from '../../src/providers/types';
 import type { EffectiveConfig } from '../../src/config/types';
 import { HeartbeatStore } from '../../src/scheduler/store';
 import { HeartbeatScheduler } from '../../src/scheduler/runtime';
-import { ProfileRegistry } from '../../src/profiles/registry';
-import type { ProfileId } from '../../src/profiles/types';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 import {} from '../helpers/test-config';
 import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
@@ -189,12 +187,10 @@ describe('LLM semaphore wiring', () => {
     (gateway as any).channel = { send };
     // RR2-B1 setup migration: pair the job's chat to the attached runtime's profile so the
     // queue-overflow assertions keep their original meaning under the destination guard.
-    const baseDir = path.join(tmpDir, 'profiles-base');
-    fs.mkdirSync(baseDir, { recursive: true });
-    const pairingRegistry = new ProfileRegistry(baseDir);
-    pairingRegistry.getOrCreateDefaultProfile();
-    pairingRegistry.pairChatToProfile('chat-1', 'default' as ProfileId);
-    (gateway as any).profileRegistry = pairingRegistry;
+    // S1: this used to build a `ProfileRegistry`, pair 'chat-1' to the default profile and assign it to
+    // `gateway.profileRegistry`. That field no longer exists — admission replaced it — so the block was
+    // write-only scaffolding that granted nothing. The real authority is the bound owner record supplied
+    // through `bindGatewayOwner` at construction.
 
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
@@ -275,12 +271,10 @@ describe('LLM semaphore wiring', () => {
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
     // RR2-B1 setup migration: pair the job's chat to the attached runtime's profile.
     {
-      const baseDir = path.join(tmpDir, 'profiles-base');
-      fs.mkdirSync(baseDir, { recursive: true });
-      const pairingRegistry = new ProfileRegistry(baseDir);
-      pairingRegistry.getOrCreateDefaultProfile();
-      pairingRegistry.pairChatToProfile('chat-1', 'default' as ProfileId);
-      (gateway as any).profileRegistry = pairingRegistry;
+      // S1: this used to build a `ProfileRegistry`, pair 'chat-1' to the default profile and assign it to
+    // `gateway.profileRegistry`. That field no longer exists — admission replaced it — so the block was
+    // write-only scaffolding that granted nothing. The real authority is the bound owner record supplied
+    // through `bindGatewayOwner` at construction.
     }
 
     const job = {

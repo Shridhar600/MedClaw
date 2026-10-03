@@ -17,7 +17,6 @@ import type { HeartbeatJob } from '../../src/scheduler/types';
 import { ensureWorkspaceBootstrap } from '../../src/workspace/bootstrap';
 import { OnboardingStore } from '../../src/onboarding/store';
 import { writeOnboardingProfile } from '../../src/onboarding/profile-writer';
-import { ProfileRegistry } from '../../src/profiles/registry';
 import {
   secureMkdir,
   secureWrite,
@@ -360,68 +359,61 @@ describe('PHI file modes', () => {
     });
   });
 
-  // ── profile registry ────────────────────────────────────────────
+  // ── owner enrollment record ──────────────────────────────────────
 
-  describe('ProfileRegistry', () => {
-    it('profiles root dir and profiles.json are 0o700 / 0o600', () => {
-      const registry = new ProfileRegistry(root);
-      // Constructing the registry creates the base dir; an explicit write
-      // includes a quarantine-triggerable profiles.json too.
-      const profile = registry.createProfile('default', 'chat-1');
-      expectDirMode(root);
-      expectFileMode(path.join(root, 'profiles.json'));
-      expect(profile.profileId).toBe('default');
-    });
+  /**
+   * OLD -> NEW. This block held three `ProfileRegistry` tests: the mode of `profiles.json`, the mode of
+   * files copied by the deleted workspace migration, and the mode of a `.trash` subtree produced by
+   * `deleteProfile`. All three exercised a class that no longer exists, so they protected nothing and were
+   * removed rather than kept.
+   *
+   * What replaces them is the invariant that actually mattered underneath: the durable owner record holds
+   * the owner's chat identifier, so it must be owner-only (0600) inside an owner-only state directory
+   * (0700). That was previously only ever asserted as a WRITE mode in passing fixtures — never as an
+   * expectation — so a writer that dropped the mode would have passed the whole suite. This asserts it
+   * through the REAL enrollment state machine and the REAL file port, not a hand-written record.
+   */
+  describe('owner enrollment record', () => {
+    it('is written 0600 inside a 0700 owner workspace, and stays that way through a binding', async () => {
+      const { composeOwnerAuthority } = await import('../../src/runtime/owner-authority');
+      const { resolveOwnerPaths } = await import('../../src/profiles');
 
-    it('migrates a legacy workspace with copied files at 0o600', () => {
-      const legacy = path.join(root, 'legacy');
-      fs.mkdirSync(path.join(legacy, 'medications'), { recursive: true });
-      fs.writeFileSync(path.join(legacy, 'USER.md'), 'u', { mode: 0o644 });
-      fs.writeFileSync(path.join(legacy, 'medications', 'aspirin.md'), 'm', { mode: 0o644 });
+      const baseDir = path.join(root, 'owner-base');
+      const ownerId = 'default' as never;
+      const paths = resolveOwnerPaths(baseDir, ownerId);
+      fs.mkdirSync(path.dirname(paths.ownerRecord), { recursive: true, mode: 0o700 });
 
-      const registryDir = path.join(root, 'profiles-reg');
-      const registry = new ProfileRegistry(registryDir);
-      const result = registry.migrateLegacyWorkspace(legacy);
+      const authority = composeOwnerAuthority({ ownerId, ownerPaths: { ownerRecord: paths.ownerRecord } });
+      await authority.admission.initialize();
 
-      expect(result.errors).toHaveLength(0);
-      expect(result.migrated).toBeGreaterThan(0);
-      const targetDir = path.join(registryDir, 'profiles', 'default');
-      expectFileMode(path.join(targetDir, 'USER.md'));
-      expectFileMode(path.join(targetDir, 'medications', 'aspirin.md'));
-      expectDirMode(targetDir);
-    });
+      // Written by the real store, on the real path.
+      expect(fs.existsSync(paths.ownerRecord)).toBe(true);
+      expectFileMode(paths.ownerRecord);
+      expectDirMode(paths.workspace);
+      expectDirMode(path.dirname(paths.ownerRecord));
 
-    it('deleteProfile moves the subtree to .trash with tightened modes', () => {
-      const registryDir = path.join(root, 'profiles-del');
-      const registry = new ProfileRegistry(registryDir);
-      const profile = registry.createProfile('alice', 'chat-2');
-      const profileDir = registry.profileDir(profile.profileId);
-      // Populate the profile dir with PHI artifacts (mkdir parents since the
-      // dir is only path-derived until the daemon's memory/session mkdir it).
-      fs.mkdirSync(path.join(profileDir, 'medications'), { recursive: true });
-      fs.writeFileSync(path.join(profileDir, 'medications', 'lisinopril.md'), 'm', { mode: 0o644 });
-      fs.writeFileSync(path.join(profileDir, 'HEALTH_PROFILE.md'), 'h', { mode: 0o644 });
-
-      registry.deleteProfile(profile.profileId);
-
-      expect(fs.existsSync(profileDir)).toBe(false);
-      const trashDir = path.join(registryDir, 'profiles', '.trash');
-      expectDirMode(trashDir);
-      const trashed = listFiles(trashDir);
-      expect(trashed.length).toBeGreaterThan(0);
-      for (const f of trashed) {
-        expectFileMode(f);
+      // Issue and consume a code, so the record also holds a BINDING (the chat identifier) — the
+      // sensitive field whose exposure this mode exists to prevent. A pre-commit write must not weaken it.
+      const issued = await authority.admission.issueChallenge();
+      if (issued.kind === 'issued') {
+        await authority.admission.handlePairing(
+          {
+            channel: 'telegram', chatId: 'owner-chat', userId: 'owner-user',
+            chatType: 'private', eventId: 'telegram:owner-chat:bind',
+          },
+          issued.plaintext,
+        );
       }
-      // trashed directories are 0o700
-      const trashRoots = fs.readdirSync(trashDir, { withFileTypes: true })
-        .filter((e) => e.isDirectory());
-      for (const e of trashRoots) {
-        expectDirMode(path.join(trashDir, e.name));
+      expectFileMode(paths.ownerRecord);
+
+      // And the plaintext code is never persisted: only a salted verifier is.
+      const raw = fs.readFileSync(paths.ownerRecord, 'utf8');
+      if (issued.kind === 'issued') {
+        expect(raw).not.toContain(issued.plaintext);
       }
+      expect(raw).toContain('owner-chat');
     });
   });
-
-  // ── config (secrets-bearing parent dir) ─────────────────────────
 
   describe('writeConfigDocument', () => {
     it('creates the config parent dir at 0o700 and file at 0o600', () => {

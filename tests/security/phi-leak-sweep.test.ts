@@ -20,6 +20,8 @@ import { createMemoryTools } from '../../src/tools/memory-tools';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import type { LLMProvider } from '../../src/providers/types';
 import type { Tool } from '../../src/tools/types';
+import { sweepStagedMedia } from '../../src/gateway/router';
+import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 
 const PHI = 'glucose-PHI-marker-142857';
 
@@ -172,46 +174,46 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
     expect(errorText).toContain('Error');
   });
 
-  // ── profiles/registry.ts: deleteProfile rename failure logs sanitized frame.
-  it('profiles deleteProfile quarantine failure logs a sanitized frame, never the PHI-bearing fs error', async () => {
-    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+  // ── destructive fs op on owner data logs a sanitized frame, never the PHI-bearing error.
+  it('staged-media sweep unlink failure logs a sanitized frame, never the PHI-bearing fs error', () => {
+    // OLD -> NEW. This drove `ProfileRegistry.deleteProfile`, which renamed a PHI subtree to `.trash` and
+    // logged through `summarizeErrorForLog` when the rename failed. The registry is deleted. The INVARIANT
+    // is not: a destructive filesystem operation on owner data must never put the underlying error — which
+    // carries a path and whatever the OS appended — into a log line.
+    //
+    // The surviving analogue is the boot sweep of the owner's staging lane (`sweepStagedMedia`), which
+    // unlinks owner-scoped files and logs the same sanitized frame on failure. Same boundary, same
+    // `summarizeErrorForLog`, and it is the one that actually runs on a real boot.
+    const errorSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const fsReal = jest.requireActual<typeof import('fs')>('fs');
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phi-profs-'));
+    // Workspace-local (gitignored `.test-tmp/`), never `os.tmpdir()` — `os.tmpdir()` is a symlink on
+    // macOS, which routes the sweep down its symlink branch instead of the unlink path under test.
+    const staging = makeTestTemp('phi-staging');
     try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { ProfileRegistry } = require('../../src/profiles/registry');
-      const registry = new ProfileRegistry(tmpDir);
-      const profile = registry.createProfile('test-profile');
-      fs.mkdirSync(path.join(tmpDir, 'profiles', profile.profileId), { recursive: true });
-      fs.writeFileSync(path.join(tmpDir, 'profiles', profile.profileId, 'note.md'), 'data');
-
-      const originalRename = fsReal.renameSync;
-      const renameSpy = jest.spyOn(fsReal, 'renameSync').mockImplementation((src, dest) => {
-        const destStr = typeof dest === 'string' ? dest : dest.toString();
-        if (destStr.includes('.trash')) {
-          throw new Error(`rename fs failure: ${PHI}`);
-        }
-        return originalRename.call(fsReal, src, dest);
+      fs.writeFileSync(path.join(staging, 'orphan.pdf'), 'data');
+      const unlinkSpy = jest.spyOn(fsReal, 'unlinkSync').mockImplementation(() => {
+        throw new Error(`unlink fs failure: ${PHI}`);
       });
-      registry.deleteProfile(profile.profileId);
-      renameSpy.mockRestore();
 
-      const errorText = errorSpy.mock.calls.flat().map(String).join('\n');
-      expect(errorText).not.toContain(PHI);
-      expect(errorText).not.toContain('rename fs failure');
-      expect(errorText).toContain('profiles');
-      expect(errorText).toContain('Error');
+      // One-argument form: the sweep resolves the lane itself, which is how production calls it.
+      sweepStagedMedia(staging);
+      unlinkSpy.mockRestore();
+
+      const warnText = errorSpy.mock.calls.flat().map(String).join('\n');
+      // The PHI marker and the raw message never appear…
+      expect(warnText).not.toContain(PHI);
+      expect(warnText).not.toContain('unlink fs failure');
+      // …but the operator still learns what failed and where, which is the point of a sanitized frame.
+      expect(warnText).toContain('sweep');
+      expect(warnText).toContain('Error');
+      // …and no filesystem path leaked either: the frame names the code location, not the owner's tree.
+      expect(warnText).not.toContain(staging);
     } finally {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
+      removeTestTemp(staging);
+      errorSpy.mockRestore();
     }
   });
-});
 
-// ── Sweep additions the review MISSED — each driven with a PHI marker.
-describe('SEC-M1 extra sweep — review-missed raw-error logs', () => {
-  afterEach(() => jest.restoreAllMocks());
-
-  // memory-tools.ts:88 reindex catch logs sanitized frame.
   it('memory_write append reindex failure logs a sanitized frame, never the PHI-bearing reindex error', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phi-reindex-'));

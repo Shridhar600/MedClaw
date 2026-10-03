@@ -6,8 +6,6 @@ import { Gateway } from '../../src/gateway/gateway';
 import { SessionManager } from '../../src/gateway/session';
 import type { EffectiveConfig } from '../../src/config/types';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
-import { ProfileRegistry } from '../../src/profiles/registry';
-import type { ProfileId } from '../../src/profiles/types';
 import {} from '../helpers/test-config';
 import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
@@ -135,14 +133,10 @@ describe('Gateway reconciler debounce', () => {
     (gateway as any).resolvedMemoryWorkspace = config.memory.workspace;
     // RR2-B1 setup migration: the policy-reconcile path refuses chats the resolving profile
     // does not own; pair the fixture chats so the debounce/timer assertions keep their meaning.
-    const baseDir = path.join(tmpDir, 'profiles-base');
-    fs.mkdirSync(baseDir, { recursive: true });
-    const pairingRegistry = new ProfileRegistry(baseDir);
-    pairingRegistry.getOrCreateDefaultProfile();
-    for (const chatId of ['chat-1', 'chat-A', 'chat-B']) {
-      pairingRegistry.pairChatToProfile(chatId, 'default' as ProfileId);
-    }
-    (gateway as any).profileRegistry = pairingRegistry;
+    // S1: this used to build a `ProfileRegistry`, pair 'chat-1' to the default profile and assign it to
+    // `gateway.profileRegistry`. That field no longer exists — admission replaced it — so the block was
+    // write-only scaffolding that granted nothing. The real authority is the bound owner record supplied
+    // through `bindGatewayOwner` at construction.
     return { gateway, config };
   }
 
@@ -234,12 +228,10 @@ describe('Gateway reconciler debounce', () => {
     (runtime as any).sessions = sessions;
     // RR2-B1 setup migration: pair the startup chat so the guarded policy reconcile runs.
     {
-      const baseDir = path.join(tmpDir, 'profiles-base');
-      fs.mkdirSync(baseDir, { recursive: true });
-      const pairingRegistry = new ProfileRegistry(baseDir);
-      pairingRegistry.getOrCreateDefaultProfile();
-      pairingRegistry.pairChatToProfile('chat-1', 'default' as ProfileId);
-      (gateway as any).profileRegistry = pairingRegistry;
+      // S1: this used to build a `ProfileRegistry`, pair 'chat-1' to the default profile and assign it to
+    // `gateway.profileRegistry`. That field no longer exists — admission replaced it — so the block was
+    // write-only scaffolding that granted nothing. The real authority is the bound owner record supplied
+    // through `bindGatewayOwner` at construction.
     }
 
     await (gateway as any).initializeScheduler();

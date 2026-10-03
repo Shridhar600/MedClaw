@@ -4,11 +4,9 @@ import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { SessionManager } from '../../src/gateway/session';
 import type { EffectiveConfig } from '../../src/config/types';
-import type { ProfileId } from '../../src/profiles/types';
 import type { HeartbeatJob } from '../../src/scheduler/types';
 import { HeartbeatStore } from '../../src/scheduler/store';
 import { HeartbeatScheduler } from '../../src/scheduler/runtime';
-import { ProfileRegistry } from '../../src/profiles/registry';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 import {} from '../helpers/test-config';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
@@ -24,21 +22,6 @@ describe('Gateway heartbeat integration', () => {
   afterEach(() => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
-
-  /**
-   * RR2-B1 setup migration: the dispatch handler requires an explicit owner runtime, and the
-   * destination guard reads the gateway's profile registry. Fixture: pair the job's chat to
-   * the attached runtime's profile so the valid-job assertions keep their original meaning.
-   */
-  function pairChatToDefaultRuntime(gateway: Gateway, chatId: string): void {
-    const baseDir = path.join(tmpDir, 'profiles-base');
-    fs.mkdirSync(baseDir, { recursive: true });
-    const registry = new ProfileRegistry(baseDir);
-    registry.getOrCreateDefaultProfile();
-    registry.pairChatToProfile(chatId, 'default' as ProfileId);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).profileRegistry = registry;
-  }
 
   /**
    * OLD -> NEW: these tests built `await boundGateway(config)` with no admission, which under S1 means the
@@ -152,7 +135,10 @@ describe('Gateway heartbeat integration', () => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
-    pairChatToDefaultRuntime(gateway, job.chatId);
+    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
+    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
+    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
+    // The call was therefore write-only and granted nothing.
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleScheduledJob(job, runtime);
@@ -221,7 +207,10 @@ describe('Gateway heartbeat integration', () => {
     (gateway as any).sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
     // RR2-B1 setup migration: the guarded policy reconcile refuses unpaired chats; pair
     // the persisted job's chat so the HEARTBEAT.md sync assertions keep their meaning.
-    pairChatToDefaultRuntime(gateway, 'chat-1');
+    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
+    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
+    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
+    // The call was therefore write-only and granted nothing.
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).initializeScheduler();
@@ -260,7 +249,10 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
-    pairChatToDefaultRuntime(gateway, 'chat-1');
+    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
+    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
+    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
+    // The call was therefore write-only and granted nothing.
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send };
@@ -335,7 +327,10 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
-    pairChatToDefaultRuntime(gateway, 'chat-1');
+    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
+    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
+    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
+    // The call was therefore write-only and granted nothing.
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send };
@@ -380,7 +375,10 @@ describe('Gateway heartbeat integration', () => {
     (gateway as any).sessions = sessions;
     // RR2-B1 setup migration: the guarded policy reconcile refuses unpaired chats; pair
     // the startup chat so the policy-job creation assertions keep their meaning.
-    pairChatToDefaultRuntime(gateway, 'chat-1');
+    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
+    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
+    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
+    // The call was therefore write-only and granted nothing.
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).initializeScheduler();
@@ -444,7 +442,10 @@ describe('Gateway heartbeat integration', () => {
     await sessions.recordTurn('chat-1', [{ role: 'user', content: 'Seed policy chat.' }]);
     const sessionState = sessions.getOrCreateSessionState('chat-1');
     sessionState.lastActiveAt = new Date(Date.now() - (2 * 60 * 60 * 1000));
-    pairChatToDefaultRuntime(gateway, 'chat-1');
+    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
+    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
+    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
+    // The call was therefore write-only and granted nothing.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).initializeScheduler();
 
@@ -516,7 +517,10 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
-    pairChatToDefaultRuntime(gateway, 'chat-1');
+    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
+    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
+    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
+    // The call was therefore write-only and granted nothing.
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockRejectedValue(new Error('send failed')) };
@@ -588,7 +592,10 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
-    pairChatToDefaultRuntime(gateway, 'chat-1');
+    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
+    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
+    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
+    // The call was therefore write-only and granted nothing.
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockRejectedValue(new Error('send failed')) };
@@ -665,7 +672,10 @@ describe('Gateway heartbeat integration', () => {
       source: 'system',
       kind: 'routine',
     });
-    pairChatToDefaultRuntime(gateway, 'chat-1');
+    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
+    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
+    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
+    // The call was therefore write-only and granted nothing.
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockRejectedValue(new Error('send failed')) };
@@ -737,7 +747,10 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
-    pairChatToDefaultRuntime(gateway, 'chat-1');
+    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
+    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
+    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
+    // The call was therefore write-only and granted nothing.
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockRejectedValue(new Error('send failed')) };
@@ -895,7 +908,10 @@ describe('Gateway heartbeat integration', () => {
       };
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (gateway as any).sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
-      pairChatToDefaultRuntime(gateway, 'chat-1');
+    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
+    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
+    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
+    // The call was therefore write-only and granted nothing.
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await (gateway as any).initializeScheduler();
@@ -986,7 +1002,10 @@ describe('Gateway heartbeat integration', () => {
     (gateway as any).sessions = sessions;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).scheduler = scheduler;
-    pairChatToDefaultRuntime(gateway, 'chat-1');
+    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
+    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
+    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
+    // The call was therefore write-only and granted nothing.
 
     await scheduler.runNow(firstJob.id);
     await scheduler.runNow(secondJob.id);

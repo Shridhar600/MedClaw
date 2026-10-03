@@ -8,8 +8,6 @@ import type { HeartbeatJob } from '../../src/scheduler/types';
 import { Gateway } from '../../src/gateway/gateway';
 import { SqliteChunkStats, SqliteKeywordIndex, SqliteVecIndex } from '../../src/indexstore';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
-import { ProfileRegistry } from '../../src/profiles/registry';
-import type { ProfileId } from '../../src/profiles/types';
 import {} from '../helpers/test-config';
 import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
 
@@ -294,12 +292,10 @@ describe('Gateway RR-7 concurrency and lifecycle', () => {
     (gateway as unknown as { reconcileHeartbeatPoliciesOnRuntime: jest.Mock }).reconcileHeartbeatPoliciesOnRuntime = reconcile;
     // Destination guard fixture: pair the job's chat to the owning profile.
     {
-      const baseDir = path.join(tmpDir, 'profiles-base');
-      fs.mkdirSync(baseDir, { recursive: true });
-      const pairingRegistry = new ProfileRegistry(baseDir);
-      pairingRegistry.getOrCreateDefaultProfile();
-      pairingRegistry.pairChatToProfile('chat-1', 'default' as ProfileId);
-      (gateway as unknown as { profileRegistry: unknown }).profileRegistry = pairingRegistry;
+      // S1: this used to build a `ProfileRegistry`, pair 'chat-1' to the default profile and assign it to
+    // `gateway.profileRegistry`. That field no longer exists — admission replaced it — so the block was
+    // write-only scaffolding that granted nothing. The real authority is the bound owner record supplied
+    // through `bindGatewayOwner` at construction.
     }
 
     await expect(

@@ -8,8 +8,6 @@ import { SqliteSessionIndex } from '../../src/indexstore/session-index';
 import type { EffectiveConfig } from '../../src/config/types';
 import type { HeartbeatJob } from '../../src/scheduler/types';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
-import { ProfileRegistry } from '../../src/profiles/registry';
-import type { ProfileId } from '../../src/profiles/types';
 import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
 
 const FALLBACK = "I'm having trouble right now. Please try again in a moment.";
@@ -152,12 +150,10 @@ describe('RR-6b gateway delivery durability', () => {
 
     // RR2-B1 setup migration: dispatch requires an explicit owner runtime; pair the job's
     // chat to the attached runtime's profile so the delivery assertions keep their meaning.
-    const baseDir = path.join(tmpDir, 'profiles-base');
-    fs.mkdirSync(baseDir, { recursive: true });
-    const pairingRegistry = new ProfileRegistry(baseDir);
-    pairingRegistry.getOrCreateDefaultProfile();
-    pairingRegistry.pairChatToProfile('chat-1', 'default' as ProfileId);
-    state.profileRegistry = pairingRegistry;
+    // S1: this used to build a `ProfileRegistry`, pair 'chat-1' to the default profile and assign it to
+    // `gateway.profileRegistry`. That field no longer exists — admission replaced it — so the block was
+    // write-only scaffolding that granted nothing. The real authority is the bound owner record supplied
+    // through `bindGatewayOwner` at construction.
 
     await expect((gateway as unknown as { handleScheduledJob(job: HeartbeatJob, owner: unknown, schedulerOwned: boolean): Promise<void> })
       .handleScheduledJob(job, runtime, true)).rejects.toThrow('session persistence unavailable');
