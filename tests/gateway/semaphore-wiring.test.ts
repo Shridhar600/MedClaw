@@ -8,12 +8,15 @@ import { SessionManager } from '../../src/gateway/session';
 import { Gateway } from '../../src/gateway/gateway';
 import { ToolRegistry } from '../../src/tools/registry';
 import type { LLMProvider, LLMResponse } from '../../src/providers/types';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import { HeartbeatStore } from '../../src/scheduler/store';
 import { HeartbeatScheduler } from '../../src/scheduler/runtime';
 import { ProfileRegistry } from '../../src/profiles/registry';
 import type { ProfileId } from '../../src/profiles/types';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
+import {} from '../helpers/test-config';
+import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -46,8 +49,21 @@ describe('LLM semaphore wiring', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  function makeConfig(overrides?: Partial<AppConfig>): AppConfig {
+  /**
+   * OLD -> NEW: built `await boundGateway(config)` with no admission. Under S1 that makes the destination guard
+   * fail closed, so scheduled work is suppressed. Binding a real owner keeps these tests on the same
+   * authority production uses.
+   */
+  async function boundGateway(config: EffectiveConfig): Promise<Gateway> {
+    const owner = fixtureOwner(tmpDir);
+    const bound = await bindOwnerFixture(owner.ownerRecord, owner.ownerId, 'chat-1');
+    return new Gateway(config, bound.gatewayDeps);
+  }
+
+  function makeConfig(overrides?: Partial<EffectiveConfig>): EffectiveConfig {
     return {
+    schemaVersion: 2,
+    ...ownerSelection(fixtureOwner(tmpDir)),
       providers: {
         main: { type: 'ollama', model: 'qwen3.5:9b', baseUrl: 'http://localhost:11434/v1' },
         medical: { type: 'ollama', model: 'qwen3.5:9b', baseUrl: 'http://localhost:11434/v1' },
@@ -56,7 +72,7 @@ describe('LLM semaphore wiring', () => {
       channels: { telegram: { enabled: false, botToken: '' } },
       tools: { allow: ['*'], deny: [] },
       memory: {
-        workspace: path.join(tmpDir, 'workspace'),
+        workspace: fixtureOwner(tmpDir).workspace,
         search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
         bootstrapMaxChars: 20000,
       },
@@ -68,11 +84,11 @@ describe('LLM semaphore wiring', () => {
       heartbeat: {
         enabled: true,
         timezone: 'Asia/Kolkata',
-        storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+        storePath: fixtureOwner(tmpDir).storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 3, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-        audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+        audit: { path: fixtureOwner(tmpDir).auditLogPath },
         policy: {
           quietHours: { enabled: false, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,
@@ -161,7 +177,7 @@ describe('LLM semaphore wiring', () => {
     await Promise.resolve();
 
     const config = makeConfig();
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     const send = jest.fn().mockResolvedValue(undefined);
     const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
 
@@ -246,7 +262,7 @@ describe('LLM semaphore wiring', () => {
 
   it('queue-full recordFailure storage failure does not escape handleScheduledJob', async () => {
     const config = makeConfig();
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
 
     const runtime = attachGatewayTestRuntime(gateway, config, {

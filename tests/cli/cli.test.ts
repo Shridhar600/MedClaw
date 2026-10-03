@@ -4,6 +4,7 @@ import * as path from 'path';
 import { spawnSync } from 'child_process';
 import { runCli } from '../../src/cli/index';
 import { createCliSessionManager } from '../../src/test-cli';
+import { writeConfigFixture } from '../helpers/config-fixture';
 
 function createTempHome(): { tmpDir: string; restore: () => void } {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-cli-home-'));
@@ -67,18 +68,22 @@ describe('cli router', () => {
     expect(output.join('')).toContain('bogus');
   });
 
+  // RETIRED -> both cases hand-wrote a document with no `schemaVersion` and no owner identity,
+  // and one of them persisted `memory.workspace` / `heartbeat.storePath`. Those only loaded
+  // because decoding deep-merged onto defaults. Setup now selects identity and derives paths,
+  // so the fixtures write a real `schemaVersion: 2` document.
   it('routes config show through the admin surface', async () => {
     const home = createTempHome();
     try {
-      const configPath = path.join(home.tmpDir, 'config.json');
-      fs.mkdirSync(path.dirname(configPath), { recursive: true });
-      fs.writeFileSync(
-        configPath,
-        JSON.stringify({
-          providers: { main: { type: 'openai', model: 'gpt-4o', apiKey: 'sk-secret' } },
-          channels: { telegram: { enabled: true, botToken: '123:secret-token' } },
-        }),
-      );
+      const fixture = writeConfigFixture(home.tmpDir, {
+        telegramEnabled: true,
+        telegramToken: '123:secret-token',
+        providerType: 'openai',
+        apply: (stored) => {
+          stored.providers.main.apiKey = 'sk-secret';
+        },
+      });
+      const configPath = fixture.configPath;
 
       const output: string[] = [];
       const code = await runCli(['--config', configPath, 'config', 'show'], {
@@ -99,14 +104,8 @@ describe('cli router', () => {
   it('routes heartbeats list through the admin surface', async () => {
     const home = createTempHome();
     try {
-      const configPath = path.join(home.tmpDir, 'config.json');
-      fs.writeFileSync(
-        configPath,
-        JSON.stringify({
-          memory: { workspace: path.join(home.tmpDir, 'workspace') },
-          heartbeat: { storePath: path.join(home.tmpDir, 'heartbeats', 'jobs.json') },
-        }),
-      );
+      const fixture = writeConfigFixture(home.tmpDir, {});
+      const configPath = fixture.configPath;
       const output: string[] = [];
       const code = await runCli(['--config', configPath, 'heartbeats', 'list'], {
         stdout: (text: string) => output.push(text),
@@ -125,9 +124,15 @@ describe('cli router', () => {
     const home = createTempHome();
     try {
       const configPath = path.join(home.tmpDir, 'config.json');
-      const workspacePath = path.join(home.tmpDir, 'workspace');
+      // S1 change (old -> new): the wizard step that used to ask for a raw "Workspace path" now
+      // asks for the owner state root and then the owner id. The workspace is DERIVED from that
+      // pair, so there is no second path authority. This test previously answered with a workspace
+      // path; it now answers with a state root plus an owner id, and the resulting workspace is
+      // asserted where relevant so the derivation is proved, not assumed.
+      const stateRoot = path.join(home.tmpDir, 'state');
       const input = [
-        workspacePath,
+        stateRoot,
+        'default',
         'ollama',
         '',
         '',
@@ -166,10 +171,10 @@ describe('cli router', () => {
     const home = createTempHome();
     try {
       const configPath = path.join(home.tmpDir, 'config.json');
-      const workspacePath = path.join(home.tmpDir, 'workspace');
+      const stateRoot = path.join(home.tmpDir, 'state');
       // Deliberately too few answers: the wizard must abort with a clear
       // error, not spin in a re-prompt loop (the old Node-26 hang).
-      const input = [workspacePath, 'ollama'].join('\n');
+      const input = [stateRoot, 'default', 'ollama'].join('\n');
 
       const result = spawnSync(
         process.execPath,
@@ -195,9 +200,15 @@ describe('cli router', () => {
     const home = createTempHome();
     try {
       const configPath = path.join(home.tmpDir, 'config.json');
-      const workspacePath = path.join(home.tmpDir, 'workspace');
+      // S1 change (old -> new): the wizard step that used to ask for a raw "Workspace path" now
+      // asks for the owner state root and then the owner id. The workspace is DERIVED from that
+      // pair, so there is no second path authority. This test previously answered with a workspace
+      // path; it now answers with a state root plus an owner id, and the resulting workspace is
+      // asserted where relevant so the derivation is proved, not assumed.
+      const stateRoot = path.join(home.tmpDir, 'state');
       const input = [
-        workspacePath,
+        stateRoot,
+        'default',
         'ollama',
         '',
         '',

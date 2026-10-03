@@ -1,14 +1,14 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { Gateway } from '../../src/gateway/gateway';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import { ProfileRuntime } from '../../src/gateway/runtime';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 
 describe('RR-6b transcript sweep completeness', () => {
   it('reports an incomplete ledger read and skips missing-data conclusions', async () => {
-    const gateway = new Gateway({} as AppConfig);
+    const gateway = new Gateway({} as EffectiveConfig);
     const added: unknown[] = [];
-    const runtime = attachGatewayTestRuntime(gateway, {} as AppConfig, {
+    const runtime = attachGatewayTestRuntime(gateway, {} as EffectiveConfig, {
       sessions: {
         readDayFileLines: jest.fn().mockReturnValue([
           JSON.stringify({

@@ -1,4 +1,19 @@
 // src/config/types.ts
+//
+// Two distinct types by design (specs/16 §1 "config values arrive as typed params";
+// plan 15 §2.1 "the source schema and effective configuration are distinct types"):
+//
+//   StoredConfig   — the persisted document (schemaVersion 2). Carries owner IDENTITY
+//                    and the owner-scoped base directory. It never carries derived
+//                    paths, so there is no second path authority to disagree with.
+//   EffectiveConfig— the runtime shape existing consumers already read. It is
+//                    `StoredConfig` plus the owner paths resolved once from
+//                    `resolveOwnerPaths`, so stores stay path-agnostic and no module
+//                    re-derives a path.
+//
+// Nothing here reads a file. Disk IO lives in `src/runtime/adapters/config-file.ts`.
+
+export const CONFIG_SCHEMA_VERSION = 2 as const;
 
 export interface ProviderConfig {
   type: 'ollama' | 'openai' | 'anthropic' | 'google' | 'openrouter';
@@ -33,20 +48,32 @@ export interface ToolsConfig {
   deny: string[];
 }
 
-export interface MemoryConfig {
-  workspace: string;
+export interface SearchWeights {
+  vector: number;
+  keyword: number;
+}
+
+export interface BudgetRatios {
+  health: number;
+  life: number;
+  agent: number;
+}
+
+/** Stored memory settings. `workspace` is derived, never persisted (plan 15 §2.1). */
+export interface StoredMemoryConfig {
   search: {
-    hybridWeights: { vector: number; keyword: number };
+    hybridWeights: SearchWeights;
   };
   bootstrapMaxChars: number;
   /** MEMORY.md per-section budget shares (E1.4); defaults 0.6 / 0.2 / 0.2. */
-  budgetRatios?: { health: number; life: number; agent: number };
+  budgetRatios?: BudgetRatios;
 }
 
 /**
  * P2b spec 14 §3 — real-token window triggers. Percentages of the effective context window
- * (`providers.main.contextWindow` else the per-model table). Optional in the type so pre-P2b config
- * literals still compile; `DEFAULT_CONFIG` supplies it and `deepMerge` fills it into partial configs.
+ * (`providers.main.contextWindow` else the per-model table). `src/gateway/session.ts` reads
+ * these through `windowThresholds()`; the defaults live only in `defaults.ts` so there is a
+ * single authority for them.
  */
 export interface SessionWindowConfig {
   pruneAtPercent: number;
@@ -56,9 +83,13 @@ export interface SessionWindowConfig {
 }
 
 export interface SessionsConfig {
-  /** @deprecated P2b: idle resets are retired (DD10). Read for one release; warns; triggers nothing. */
+  /**
+   * Retired by P2b DD10 (idle resets). Not persisted meaning: the values are still threaded
+   * into SessionManager construction, so the key stays in the stored schema and `config set`
+   * still refuses to change it. See implementation decision D4 in the S1 report.
+   */
   softResetAfterMinutes: number;
-  /** @deprecated P2b: idle resets are retired (DD10). Read for one release; warns; triggers nothing. */
+  /** @see softResetAfterMinutes */
   hardResetAfterMinutes: number;
   compaction: {
     enabled: boolean;
@@ -66,7 +97,6 @@ export interface SessionsConfig {
     memoryFlush: boolean;
     keepRecentTurns: number;
   };
-  /** P2b spec 14 §3 window triggers (defaults 35/50/80/10). */
   window?: SessionWindowConfig;
 }
 
@@ -106,19 +136,14 @@ export interface HeartbeatRateLimitConfig {
   maxPerChatTriggersPerMinute: number;
 }
 
-export interface HeartbeatAuditConfig {
-  path: string;
-}
-
-export interface HeartbeatConfig {
+/** Stored heartbeat settings. `storePath` and `audit.path` are derived, never persisted. */
+export interface StoredHeartbeatConfig {
   enabled: boolean;
   timezone: string;
-  storePath: string;
   policy: HeartbeatPolicyConfig;
   recovery: HeartbeatRecoveryConfig;
   retry: HeartbeatRetryConfig;
   rateLimit: HeartbeatRateLimitConfig;
-  audit: HeartbeatAuditConfig;
 }
 
 export interface AgentConfig {
@@ -127,16 +152,23 @@ export interface AgentConfig {
 }
 
 export interface EmergencyConfig {
-  /** Literal phrases that extend the built-in emergency detector. */
+  /** Literal phrases that extend the built-in emergency detector. Built-ins are always kept. */
   keywords: string[];
 }
 
-export interface ProfileConfig {
+/**
+ * The selected owner's identity and owner-scoped base directory. Mandatory in
+ * `schemaVersion: 2`: a document without it cannot serve, because identity must never
+ * be inferred from defaults.
+ */
+export interface ProfilesConfig {
   baseDir: string;
   defaultProfileId: string;
 }
 
-export interface AppConfig {
+/** The persisted document. Unknown keys, prototype keys and legacy path aliases are refused. */
+export interface StoredConfig {
+  schemaVersion: typeof CONFIG_SCHEMA_VERSION;
   providers: {
     main: ProviderConfig;
     medical: ProviderConfig;
@@ -144,10 +176,43 @@ export interface AppConfig {
   };
   channels: ChannelConfig;
   tools: ToolsConfig;
-  memory: MemoryConfig;
+  memory: StoredMemoryConfig;
   sessions: SessionsConfig;
-  heartbeat: HeartbeatConfig;
+  heartbeat: StoredHeartbeatConfig;
   agent: AgentConfig;
   emergency?: EmergencyConfig;
-  profiles?: ProfileConfig;
+  profiles: ProfilesConfig;
 }
+
+/**
+ * The owner paths the effective config needs. Structurally satisfied by `OwnerPaths` from
+ * `src/profiles/paths.ts` without this module importing the profiles module.
+ */
+export interface DerivedOwnerPaths {
+  workspace: string;
+  schedulerStorePath: string;
+  auditLogPath: string;
+}
+
+export interface EffectiveMemoryConfig extends StoredMemoryConfig {
+  /** `<baseDir>/profiles/<ownerId>` — resolved once, injected, never re-derived. */
+  workspace: string;
+}
+
+export interface EffectiveHeartbeatConfig extends StoredHeartbeatConfig {
+  storePath: string;
+  audit: { path: string };
+}
+
+/**
+ * What every runtime consumer receives. Same shape the gateway/scheduler/admin code already
+ * reads (`config.memory.workspace`, `config.heartbeat.storePath`, `config.heartbeat.audit.path`),
+ * with those three values now supplied by derivation instead of by a second persisted authority.
+ */
+export interface EffectiveConfig extends Omit<StoredConfig, 'memory' | 'heartbeat'> {
+  memory: EffectiveMemoryConfig;
+  heartbeat: EffectiveHeartbeatConfig;
+}
+
+/** Provider env-var name for a provider type. `ollama` is local and needs no key. */
+export type ProviderType = ProviderConfig['type'];

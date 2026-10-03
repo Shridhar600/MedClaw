@@ -15,8 +15,9 @@ import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { dateKey, countDayFileLines } from '../../src/gateway/session-window';
 import { PRUNED_TOOL_MARKER } from '../../src/gateway/session';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { LLMProvider, LLMResponse, Message } from '../../src/providers/types';
+import {} from '../helpers/test-config';
 
 const COMPACT_MARKER = 'Summarize the conversation turns below';
 const SUMMARY = '- Patient is allergic to penicillin\n- Blood pressure 150/95 logged\n- Following up next week';
@@ -35,8 +36,9 @@ function journeyProvider(): LLMProvider {
   };
 }
 
-function makeConfig(tmpDir: string): AppConfig {
+function makeConfig(tmpDir: string): EffectiveConfig {
   return {
+  schemaVersion: 2,
     providers: {
       main: { type: 'ollama', model: 'unused', baseUrl: 'http://127.0.0.1:9/v1' },
       medical: { type: 'ollama', model: 'unused', baseUrl: 'http://127.0.0.1:9/v1' },

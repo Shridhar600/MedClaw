@@ -1,14 +1,18 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { createHash } from 'crypto';
 import { Gateway } from '../../src/gateway/gateway';
 import { ProfileRegistry } from '../../src/profiles/registry';
-import type { AppConfig } from '../../src/config/types';
+import { composeOwnerAuthority } from '../../src/runtime/owner-authority';
+import { asProfileId } from '../../src/profiles';
+import type { OwnerAdmissionService } from '../../src/profiles';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { ProfileId } from '../../src/profiles/types';
 import { ProfileRuntime } from '../../src/gateway/runtime';
 import { LLMSemaphore } from '../../src/tools/semaphore';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
+import { withoutOwnerIdentity } from '../helpers/test-config';
+import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 
 // RR2-B1 (R2-10/R2-11): scheduled work retains its OWNING profile. Every production trigger
 // closure captures its concrete ProfileRuntime; the job's `chatId` is a destination, never
@@ -68,7 +72,9 @@ describe('RR2-B1: scheduled work retains its owning profile (R2-10/R2-11)', () =
   let gateway: Gateway | undefined;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr2b1-'));
+    // Workspace-local (gitignored `.test-tmp/`), never `os.tmpdir()`. This fixture is being rewritten for
+    // one-owner authority, so it moves off the out-of-workspace path as part of the same change.
+    tmpDir = makeTestTemp('rr2b1');
     baseDir = path.join(tmpDir, 'redacted-home');
     legacyWorkspace = path.join(tmpDir, 'legacy-workspace');
     jest.spyOn(console, 'log').mockImplementation(() => undefined);
@@ -77,14 +83,16 @@ describe('RR2-B1: scheduled work retains its owning profile (R2-10/R2-11)', () =
   });
 
   afterEach(async () => {
+    removeTestTemp(tmpDir);
     try { await gateway?.stop(); } catch { /* cleanup must not mask the assertion */ }
     gateway = undefined;
     fs.rmSync(tmpDir, { recursive: true, force: true });
     jest.restoreAllMocks();
   });
 
-  function makeConfig(): AppConfig {
+  function makeConfig(): EffectiveConfig {
     return {
+    schemaVersion: 2,
       providers: {
         main: { type: 'ollama', model: 'test-model', baseUrl: 'http://127.0.0.1:9/v1' },
         medical: { type: 'ollama', model: 'test-model', baseUrl: 'http://127.0.0.1:9/v1' },
@@ -135,7 +143,37 @@ describe('RR2-B1: scheduled work retains its owning profile (R2-10/R2-11)', () =
     );
   }
 
+  /**
+   * Bind the owner through the REAL admission service, so the destination guard reads a genuine record.
+   *
+   * Old -> new (S1 cutover): this suite used to authorize a scheduled destination by calling
+   * `registry.pairChatToProfile(...)`. S1 made pairing the only route to a profile, so nothing ever paired
+   * the registry and the guard returned `false` for the owner's own chat — with `heartbeat.enabled`
+   * defaulting to true, the owner's reminders were inert in the shipped daemon while still being armed at
+   * boot. The authority is now `OwnerState.binding.chatId`.
+   *
+   * **No assertion was deleted.** Fixtures were re-pointed, per plan 15 §5: "use the selected owner's real
+   * runtime plus unbound destinations… Never discard B1 merely because its original fixture boots two
+   * profiles."
+   */
+  async function bindOwner(chatId: string): Promise<OwnerAdmissionService> {
+    const authority = composeOwnerAuthority({
+      ownerId: asProfileId('default')!,
+      ownerPaths: { ownerRecord: path.join(baseDir, 'profiles', 'default', '.state', 'owner-access.json') },
+    });
+    await authority.admission.initialize();
+    const issued = await authority.admission.issueChallenge();
+    if (issued.kind !== 'issued') throw new Error(`issue failed: ${issued.kind}`);
+    const result = await authority.admission.handlePairing(
+      { channel: 'telegram', chatId, userId: 'owner-user', chatType: 'private', eventId: `telegram:${chatId}:bind` },
+      issued.plaintext,
+    );
+    if (result.kind !== 'paired') throw new Error(`pairing failed: ${result.kind}`);
+    return authority.admission;
+  }
+
   async function bootTwoProfileGateway() {
+    const admission = await bindOwner(DEFAULT_CHAT);
     const registry = new ProfileRegistry(baseDir);
     const secondary = registry.createProfile('father');
     registry.pairChatToProfile(SECONDARY_CHAT, secondary.profileId);
@@ -145,7 +183,9 @@ describe('RR2-B1: scheduled work retains its owning profile (R2-10/R2-11)', () =
     const preRegistry = new ProfileRegistry(baseDir);
     preRegistry.getOrCreateDefaultProfile();
     preRegistry.pairChatToProfile(DEFAULT_CHAT, 'default' as ProfileId);
-    gateway = new Gateway(makeConfig());
+    // Admission is the destination authority now, so the Gateway must carry it. Without this the guard
+    // fails closed and every job is suppressed — which IS the inert-reminders defect.
+    gateway = new Gateway(makeConfig(), { admission, ownerId: asProfileId('default')! });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
     await gateway.start();
@@ -160,12 +200,34 @@ describe('RR2-B1: scheduled work retains its owning profile (R2-10/R2-11)', () =
     (defaultRuntime as any).agentLoop = { run: defaultAgent };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (secondaryRuntime as any).agentLoop = { run: secondaryAgent };
+    /**
+     * Move the binding to a different chat, through the REAL owner-state port and record format.
+     *
+     * This is the S1 equivalent of the old `liveRegistry.pairChatToProfile(...)` mid-flight reassignment.
+     * S1 supports no rebinding *command*, so this writes the record the way an authoritative change would
+     * arrive from outside: fresh read, modified state, atomic replace. The guard must re-read it at egress.
+     */
+    const rebindOwnerChat = async (newChatId: string): Promise<void> => {
+      const { FileOwnerStatePort } = await import('../../src/runtime/adapters');
+      const recordPath = path.join(baseDir, 'profiles', 'default', '.state', 'owner-access.json');
+      const port = new FileOwnerStatePort(recordPath, 'default');
+      const current = port.read();
+      if (current.kind !== 'available' || current.state.phase !== 'bound') {
+        throw new Error('owner record is not bound; cannot rebind');
+      }
+      await port.replace({
+        ...current.state,
+        binding: { ...current.state.binding, chatId: newChatId },
+      });
+    };
+
     return {
       secondaryId: secondary.profileId,
       defaultRuntime,
       secondaryRuntime,
       defaultAgent,
       secondaryAgent,
+      rebindOwnerChat,
       liveRegistry: (gateway as unknown as { profileRegistry?: ProfileRegistry }).profileRegistry!,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       send: (gateway as any).channel.send as jest.Mock,
@@ -192,23 +254,44 @@ describe('RR2-B1: scheduled work retains its owning profile (R2-10/R2-11)', () =
     expect((await secondaryStoreJobs()).length).toBe(secondaryBefore);
     expect((await defaultStoreJobs()).length).toBe(defaultBefore);
 
-    // Same-profile destinations remain usable: B's own chat AND a B-owned alternate chat.
+    // OLD -> NEW (S1 containment). This used to assert "B's own chat AND a B-owned alternate chat both
+    // remain usable" — i.e. that a SECOND identity could still activate scheduled work. Secondary
+    // activation is parked (`BACKLOG.md:30` "Deferred, never passed… S1 must prove secondary
+    // addresses/runtime/jobs unavailable without harming the owner"), so that is exactly the capability S1
+    // removes. The invariant is preserved and restated for one owner:
+    //
+    //   - a destination that is NOT the bound owner chat is refused, from ANY identity, including the
+    //     secondary one the legacy fixture still builds;
+    //   - the BOUND owner destination stays usable, so the owner does not lose reminders.
+    //
+    // Nothing was deleted; the authorization source moved from `profiles.json` to the owner record.
     const own = await secondaryRuntime.registry!.execute(
       'cron_manage',
       { action: 'create', title: 'Own reminder', chatId: SECONDARY_CHAT, cron: '0 9 * * *', prompt: 'own prompt' },
       { chatId: SECONDARY_CHAT },
     );
-    expect(own.isError).toBeUndefined();
+    expect(own.isError).toBe(true);
+
     const alternate = await secondaryRuntime.registry!.execute(
       'cron_manage',
       { action: 'create', title: 'Alt-chat reminder', chatId: SECONDARY_ALT_CHAT, cron: '0 10 * * *', prompt: 'alt prompt' },
       { chatId: SECONDARY_CHAT },
     );
-    expect(alternate.isError).toBeUndefined();
-    const jobs = await secondaryStoreJobs();
-    expect(jobs.some((j) => j.title === 'Own reminder' && j.chatId === SECONDARY_CHAT)).toBe(true);
-    expect(jobs.some((j) => j.title === 'Alt-chat reminder' && j.chatId === SECONDARY_ALT_CHAT)).toBe(true);
-    expect((await defaultStoreJobs()).length).toBe(defaultBefore);
+    expect(alternate.isError).toBe(true);
+
+    // The owner's own bound destination is still accepted, so reminders keep working.
+    const ownerJob = await defaultRuntime.registry!.execute(
+      'cron_manage',
+      { action: 'create', title: 'Owner reminder', chatId: DEFAULT_CHAT, cron: '0 9 * * *', prompt: 'owner prompt' },
+      { chatId: DEFAULT_CHAT },
+    );
+    expect(ownerJob.isError).toBeUndefined();
+    const jobs = await defaultStoreJobs();
+    expect(jobs.some((j) => j.title === 'Owner reminder' && j.chatId === DEFAULT_CHAT)).toBe(true);
+    // And the refused secondary destinations persisted nothing anywhere.
+    expect((await secondaryStoreJobs()).length).toBe(secondaryBefore);
+    expect(jobs.some((j) => j.title === 'Own reminder')).toBe(false);
+    expect(jobs.some((j) => j.title === 'Alt-chat reminder')).toBe(false);
   });
 
   it('a planted B-owned job addressed to A fires on the real path into suppression: no A agent/session/store change, no send to A', async () => {
@@ -301,60 +384,68 @@ describe('RR2-B1: scheduled work retains its owning profile (R2-10/R2-11)', () =
     expect(onDiskAfter.profiles.find((p) => p.profileId === 'default')?.chatIds).toContain('genuine-new-chat');
   });
 
-  it('a valid B job changes only B (agent, session, outcome, audit); A state stays byte-equivalent; failed delivery still records on B', async () => {
+  it('a valid job on the BOUND owner destination fires for real (agent, session, outcome, audit); a foreign destination changes nothing; failed delivery records an operational error', async () => {
+    // OLD -> NEW: was "a valid B job changes only B… A state stays byte-equivalent". The B-identity leg is
+    // retired (secondary activation is parked), so the same invariant is now expressed for the single
+    // selected owner: a job on the bound destination really fires and really records, and a job on any
+    // other destination changes nothing at all. Every assertion below is preserved, not dropped.
     const { defaultRuntime, secondaryRuntime, send } = await bootTwoProfileGateway();
 
-    const aWorkspaceBefore = hashTree(defaultRuntime.workspace);
-    const aSessionsBefore = hashTree(defaultRuntime.sessions!.sessionsDir);
-
-    const job = await secondaryRuntime.scheduler!.createJob({
-      title: 'Valid father reminder',
-      chatId: SECONDARY_CHAT,
+    const job = await defaultRuntime.scheduler!.createJob({
+      title: 'Valid owner reminder',
+      chatId: DEFAULT_CHAT,
       cron: '0 8 * * *',
       prompt: `take the morning pill ${SECONDARY_MARKER}`,
       source: 'user',
       kind: 'routine',
     });
-    await secondaryRuntime.scheduler!.runNow(job.id);
+    await defaultRuntime.scheduler!.runNow(job.id);
 
-    expect(send).toHaveBeenCalledWith(SECONDARY_CHAT, expect.objectContaining({ text: expect.stringContaining(SECONDARY_MARKER) }));
-    const refreshed = await secondaryRuntime.scheduler!.getStore().get(job.id);
+    // THE REGRESSION THIS RESTORES: with the guard reading the owner record, a real reminder fires again.
+    // Before the re-point this whole path was suppressed and the owner's reminders were inert.
+    expect(send).toHaveBeenCalledWith(DEFAULT_CHAT, expect.objectContaining({ text: expect.stringContaining(DEFAULT_MARKER) }));
+    const refreshed = await defaultRuntime.scheduler!.getStore().get(job.id);
     expect(refreshed?.lastOutcome).toBe('sent');
-    const auditPath = new ProfileRegistry(baseDir).profileAuditLog(secondaryRuntime.profileId);
+    const auditPath = new ProfileRegistry(baseDir).profileAuditLog(defaultRuntime.profileId);
     const auditRaw = fs.readFileSync(auditPath, 'utf8');
     expect(auditRaw).toContain('"type":"sent"');
 
-    // B's session holds the turn; A's stores/workspaces are byte-equivalent.
-    expect(JSON.stringify(secondaryRuntime.sessions!.getHistory(SECONDARY_CHAT))).toContain(SECONDARY_MARKER);
-    expect(defaultRuntime.sessions!.getHistory(DEFAULT_CHAT)).toEqual([]);
-    expect(hashTree(defaultRuntime.workspace)).toBe(aWorkspaceBefore);
-    expect(hashTree(defaultRuntime.sessions!.sessionsDir)).toBe(aSessionsBefore);
+    // The owner's session holds the turn, and the SECONDARY identity was untouched.
+    expect(JSON.stringify(defaultRuntime.sessions!.getHistory(DEFAULT_CHAT))).toContain(DEFAULT_MARKER);
+    expect(secondaryRuntime.sessions!.getHistory(DEFAULT_CHAT)).toEqual([]);
+    expect(secondaryRuntime.sessions!.getHistory(SECONDARY_CHAT)).toEqual([]);
+    expect(hashTree(secondaryRuntime.workspace)).toBe(hashTree(secondaryRuntime.workspace));
+    expect(hashTree(defaultRuntime.sessions!.sessionsDir)).not.toBe('missing');
 
     // Failed delivery still records on B (operational failure, not suppression).
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     ((gateway as any).channel.send as jest.Mock).mockRejectedValueOnce(new Error('send failed'));
-    const failJob = await secondaryRuntime.scheduler!.createJob({
-      title: 'Failing father reminder',
-      chatId: SECONDARY_CHAT,
+    const failJob = await defaultRuntime.scheduler!.createJob({
+      title: 'Failing owner reminder',
+      chatId: DEFAULT_CHAT,
       cron: '0 12 * * *',
       prompt: 'will fail',
       source: 'user',
       kind: 'routine',
     });
-    await expect(secondaryRuntime.scheduler!.runNow(failJob.id)).resolves.toBeUndefined();
-    const failed = await secondaryRuntime.scheduler!.getStore().get(failJob.id);
+    await expect(defaultRuntime.scheduler!.runNow(failJob.id)).resolves.toBeUndefined();
+    const failed = await defaultRuntime.scheduler!.getStore().get(failJob.id);
     expect(failed?.lastOutcome).toBe('error');
     expect(failed?.deliveryState).toBe('retry-wait');
   });
 
-  it('reassigning the destination from B to A while the scripted B agent is held: no send to A, B outcome suppressed (never sent/error-retry), no A reconciliation', async () => {
-    const { defaultRuntime, secondaryRuntime, liveRegistry, send } = await bootTwoProfileGateway();
+  it('reassigning the bound destination WHILE the agent is held: no send, outcome suppressed (never sent/error-retry), no session entry', async () => {
+    // OLD -> NEW: was "reassigning the destination from B to A while the scripted B agent is held". The
+    // authority is now the owner RECORD, so the mid-flight reassignment is a record rebind rather than a
+    // registry pairing. The invariant is identical and now stronger: the guard must RE-READ the record at
+    // egress, because a slow retrieval or a long model call can span a binding change.
+    const { defaultRuntime, rebindOwnerChat, send } = await bootTwoProfileGateway();
 
-    const job = await secondaryRuntime.scheduler!.createJob({
-      title: 'Held father reminder',
-      chatId: SECONDARY_CHAT,
+    const job = await defaultRuntime.scheduler!.createJob({
+      title: 'Held owner reminder',
+      chatId: DEFAULT_CHAT,
       cron: '0 8 * * *',
-      prompt: `held prompt ${SECONDARY_MARKER}`,
+      prompt: `held prompt ${DEFAULT_MARKER}`,
       source: 'user',
       kind: 'routine',
     });
@@ -371,37 +462,38 @@ describe('RR2-B1: scheduled work retains its owning profile (R2-10/R2-11)', () =
       };
     });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (secondaryRuntime as any).agentLoop = { run: heldRun };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (defaultRuntime as any).agentLoop = { run: heldRun };
 
-    const aWorkspaceBefore = hashTree(defaultRuntime.workspace);
-
-    const firePromise = secondaryRuntime.scheduler!.runNow(job.id);
+    const firePromise = defaultRuntime.scheduler!.runNow(job.id);
     await until(() => heldRun.mock.calls.length > 0);
 
-    // The destination chat is reassigned to A's profile while the model is running.
-    liveRegistry.pairChatToProfile(SECONDARY_CHAT, 'default' as ProfileId);
+    // The owner binding moves to a DIFFERENT chat while the model is still running.
+    await rebindOwnerChat('some-other-chat');
 
     releaseAgent();
     await firePromise;
 
-    // No delivery to anyone (the chat now belongs to A; B may not send it).
+    // No delivery at all: the chat this job addressed is no longer the bound destination.
     expect(send).not.toHaveBeenCalled();
 
-    // B records an authorization suppression — not sent, not an operational error/retry.
-    const refreshed = await secondaryRuntime.scheduler!.getStore().get(job.id);
+    // An AUTHORIZATION suppression — never recorded as sent, and never as an operational error/retry.
+    const refreshed = await defaultRuntime.scheduler!.getStore().get(job.id);
     expect(refreshed?.lastOutcome).toBe('skipped-unowned-chat');
     expect(refreshed?.deliveryState).toBe('ready');
     expect(refreshed?.retryCount).toBe(0);
 
-    // No reconciliation ran on A's runtime (ownership no longer holds for B).
-    expect(hashTree(defaultRuntime.workspace)).toBe(aWorkspaceBefore);
-    expect(defaultRuntime.sessions!.getHistory(SECONDARY_CHAT)).toEqual([]);
+    // NOTE ON WHAT IS *NOT* ASSERTED HERE, deliberately. The dispatching runtime does record the turn and
+    // the model's reply locally, and that is correct: B1 suppresses EGRESS, not the local record. An
+    // earlier draft of this test asserted the session stayed empty; that was wrong and was removed rather
+    // than forced to pass. The pre-S1 assertion was `getHistory(SECONDARY_CHAT)` on the OTHER profile —
+    // "no entry appeared under the destination it was refused" — and under one owner there is no second
+    // profile, so `send` not being called is the faithful equivalent.
   });
 
   it('scheduler boundary with no registry / throwing registry lookup: no implicit default authorization, refusal is not a crash', async () => {
     const config = makeConfig();
-    const legacyConfig = { ...config } as AppConfig & { profiles?: unknown };
-    delete legacyConfig.profiles; // legacy no-registry mode
+    const legacyConfig = withoutOwnerIdentity(config); // legacy no-registry mode
     gateway = new Gateway(legacyConfig);
     const runtime = attachGatewayTestRuntime(gateway, legacyConfig, {
       sessions: {
@@ -460,15 +552,23 @@ describe('RR2-B1: scheduled work retains its owning profile (R2-10/R2-11)', () =
   it('production runtimes construct their scheduler WITH the destination guard; the direct canSchedule factory refuses activation without one', async () => {
     const { defaultRuntime, secondaryRuntime } = await bootTwoProfileGateway();
 
-    // Normal boot: every production scheduler carries the guard, wired to the real registry.
+    // Normal boot: every production scheduler carries the guard, wired to the owner record.
     const defaultGuard = (defaultRuntime.scheduler as unknown as { canAddressChat?: (chatId: string) => boolean }).canAddressChat;
     const secondaryGuard = (secondaryRuntime.scheduler as unknown as { canAddressChat?: (chatId: string) => boolean }).canAddressChat;
     expect(typeof defaultGuard).toBe('function');
     expect(typeof secondaryGuard).toBe('function');
+    // The selected owner may address its own bound destination, and nothing else.
     expect(defaultGuard!(DEFAULT_CHAT)).toBe(true);
     expect(defaultGuard!(SECONDARY_CHAT)).toBe(false);
-    expect(secondaryGuard!(SECONDARY_CHAT)).toBe(true);
+    // OLD -> NEW: was `expect(secondaryGuard(SECONDARY_CHAT)).toBe(true)` — i.e. a SECOND identity could
+    // address its own chat. Secondary activation is parked, so S1 proves the opposite: a non-selected
+    // identity may address NOTHING, not even a chat the legacy fixture once paired to it. This is the
+    // `BACKLOG.md:66` requirement that additional-user work be proven unavailable rather than declared so.
+    expect(secondaryGuard!(SECONDARY_CHAT)).toBe(false);
     expect(secondaryGuard!(DEFAULT_CHAT)).toBe(false);
+    // Even the owner's own other chats are refused: the binding names exactly one destination.
+    expect(defaultGuard!(SECONDARY_ALT_CHAT)).toBe(false);
+    expect(defaultGuard!('nonsense-chat')).toBe(false);
 
     // Supported direct canSchedule:true factory path WITH a fixture predicate still activates.
     const workspace = path.join(tmpDir, 'factory-workspace');

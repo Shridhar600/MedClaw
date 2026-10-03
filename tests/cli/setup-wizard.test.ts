@@ -2,8 +2,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { SpawnOptions } from 'child_process';
-import { getDefaultConfig } from '../../src/config/config';
-import { loadConfig } from '../../src/config/config';
+import { loadRuntimeConfig } from '../../src/runtime/startup';
+import { writeConfigFixture } from '../helpers/config-fixture';
 import { maskSecret, renderStepHeader, renderStatus, renderWizardBanner } from '../../src/cli/wizard-render';
 import { askChoice, askSecret, askValue } from '../../src/cli/wizard-prompts';
 import {
@@ -16,11 +16,17 @@ import {
 describe('setup wizard', () => {
   let tmpDir: string;
   let workspacePath: string;
+  let stateRoot: string;
   let configPath: string;
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-setup-wizard-'));
     workspacePath = path.join(tmpDir, 'workspace');
+    // S1 change (old -> new): the wizard now asks for the owner STATE ROOT and the OWNER ID
+    // instead of a raw workspace path. Everything about the owner workspace is derived from that
+    // pair, so an answer stream that used to start with a workspace path must now start with a
+    // state root followed by an owner id.
+    stateRoot = path.join(tmpDir, 'state');
     configPath = path.join(tmpDir, 'config.json');
   });
 
@@ -125,7 +131,8 @@ describe('setup wizard', () => {
   it('runs the staged interactive wizard, saves config, and exits cleanly', async () => {
     const output: string[] = [];
     const answers = [
-      workspacePath,
+      stateRoot,
+      'default',
       'ollama',
       '',
       '',
@@ -152,14 +159,15 @@ describe('setup wizard', () => {
     expect(output.join('')).not.toContain('123456:test-token');
     expect(fs.existsSync(configPath)).toBe(true);
 
-    const config = await loadConfig({ configPath, requireFile: true });
+    const config = await loadRuntimeConfig({ configPath });
     expect(config.channels.telegram.botToken).toBe('123456:test-token');
   });
 
   it('shows readiness and validation summary during completion, not just review', async () => {
     const output: string[] = [];
     const answers = [
-      workspacePath,
+      stateRoot,
+      'default',
       'ollama',
       '',
       '',
@@ -219,7 +227,7 @@ describe('setup wizard', () => {
     expect(code).toBe(0);
     expect(output.join('')).not.toContain('123456:prefilled-token');
 
-    const config = await loadConfig({ configPath, requireFile: true });
+    const config = await loadRuntimeConfig({ configPath });
     expect(config.channels.telegram.enabled).toBe(true);
     expect(config.channels.telegram.botToken).toBe('123456:prefilled-token');
   });
@@ -227,7 +235,8 @@ describe('setup wizard', () => {
   it('allows editing from review before persisting config', async () => {
     const output: string[] = [];
     const answers = [
-      workspacePath,
+      stateRoot,
+      'default',
       'ollama',
       '',
       '',
@@ -253,7 +262,7 @@ describe('setup wizard', () => {
     expect(output.join('')).toContain('Telegram');
     expect(output.join('')).toContain('[REDACTED]');
 
-    const config = await loadConfig({ configPath, requireFile: true });
+    const config = await loadRuntimeConfig({ configPath });
     expect(config.channels.telegram.enabled).toBe(true);
     expect(config.channels.telegram.botToken).toBe('123456:updated-token');
   });
@@ -261,7 +270,8 @@ describe('setup wizard', () => {
   it('re-prompts immediately when telegram is enabled without a token', async () => {
     const output: string[] = [];
     const answers = [
-      workspacePath,
+      stateRoot,
+      'default',
       'ollama',
       '',
       '',
@@ -285,14 +295,15 @@ describe('setup wizard', () => {
     expect(code).toBe(0);
     expect(output.join('')).toContain('Telegram bot token is required when Telegram is enabled.');
 
-    const config = await loadConfig({ configPath, requireFile: true });
+    const config = await loadRuntimeConfig({ configPath });
     expect(config.channels.telegram.botToken).toBe('123456:retried-token');
   });
 
   it('can cancel from review without persisting config', async () => {
     const output: string[] = [];
     const answers = [
-      workspacePath,
+      stateRoot,
+      'default',
       'ollama',
       '',
       '',
@@ -321,6 +332,7 @@ describe('setup wizard', () => {
     const output: string[] = [];
     const answers = [
       nestedWorkspacePath,
+      'default',
       'ollama',
       '',
       '',
@@ -346,22 +358,20 @@ describe('setup wizard', () => {
   });
 
   it('prints the redacted config when review-config is selected from completion', async () => {
-    fs.mkdirSync(path.dirname(configPath), { recursive: true });
-    fs.writeFileSync(
-      configPath,
-      JSON.stringify({
-        providers: {
-          main: { type: 'openai', model: 'gpt-4o-mini', apiKey: 'sk-secret' },
-        },
-        channels: {
-          telegram: { enabled: true, botToken: '123456:test-token' },
-        },
-      }),
-      'utf8',
-    );
+    // RETIRED -> this hand-wrote a document with no `schemaVersion` and no owner identity,
+    // which only loaded because decoding used to deep-merge onto defaults. Setup now selects
+    // identity, so a servable document must carry it.
+    const fixture = writeConfigFixture(path.dirname(configPath), {
+      telegramEnabled: true,
+      telegramToken: '123456:test-token',
+      providerType: 'openai',
+      apply: (stored) => {
+        stored.providers.main.apiKey = 'sk-secret';
+      },
+    });
 
     const output: string[] = [];
-    const code = await handleCompletionAction('review-config', configPath, {
+    const code = await handleCompletionAction('review-config', fixture.configPath, {
       stdout: (text: string) => output.push(text),
       stderr: (text: string) => output.push(text),
     });
@@ -392,19 +402,26 @@ describe('setup wizard', () => {
       args: string[];
       options: { cwd?: string | URL; env?: NodeJS.ProcessEnv; stdio?: string; detached?: boolean };
     }> = [];
-    const config = getDefaultConfig();
-    config.memory.workspace = workspacePath;
-    config.channels.telegram.enabled = false;
-    config.heartbeat.enabled = true;
-    config.providers.main = { type: 'openai', model: 'gpt-4o-mini', apiKey: 'sk-test' };
-    config.providers.medical = { type: 'openai', model: 'gpt-4o-mini', apiKey: 'sk-test' };
-    config.providers.embeddings = { type: 'openai', model: 'text-embedding-3-small', apiKey: 'sk-test' };
+    // RETIRED -> the test persisted a hand-built effective config, including the derived
+    // owner paths, and expected the preflight to read it. Setup now persists only the stored
+    // document, and the preflight re-derives the owner paths from the selected identity.
+    const fixture = writeConfigFixture(path.dirname(configPath), {
+      providerType: 'openai',
+      apply: (stored) => {
+        stored.providers.main.model = 'gpt-4o-mini';
+        stored.providers.main.apiKey = 'sk-test';
+        stored.providers.medical = { type: 'openai', model: 'gpt-4o-mini', apiKey: 'sk-test' };
+        stored.providers.embeddings = { type: 'openai', model: 'text-embedding-3-small', apiKey: 'sk-test' };
+        stored.heartbeat.enabled = true;
+      },
+    });
+    // The preflight checks the DERIVED owner workspace exists, not the old `--workspace` path.
+    fs.mkdirSync(fixture.workspace, { recursive: true });
     fs.mkdirSync(workspacePath, { recursive: true });
-    fs.writeFileSync(configPath, JSON.stringify(config), 'utf8');
 
     const code = await handleCompletionAction(
       'start',
-      configPath,
+      fixture.configPath,
       {
         stdout: () => undefined,
         stderr: () => undefined,
@@ -440,7 +457,7 @@ describe('setup wizard', () => {
         detached: true,
       },
     });
-    expect(spawnCalls[0].options.env?.REDACTED_CONFIG_PATH).toBe(configPath);
+    expect(spawnCalls[0].options.env?.REDACTED_CONFIG_PATH).toBe(fixture.configPath);
   });
 
   it('reports daemon startup spawn errors', async () => {

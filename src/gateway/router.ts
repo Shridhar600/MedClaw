@@ -1,8 +1,19 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import type { AppConfig } from '../config/types';
-import type { IncomingMessage } from '../channels/types';
+import type { EffectiveConfig } from '../config/types';
+import type { AdmittedMessage, ChatType } from '../channels/types';
 import { ProfileRegistry, type ProfileId } from '../profiles';
+import type { OwnerAdmissionService, PairingResult } from '../profiles';
+import {
+  PAIRING_COMPLETE_TEXT,
+  PAIRING_EXPIRED_TEXT,
+  PAIRING_INVALID_TEXT,
+  PAIRING_LIMITED_TEXT,
+  PAIRING_PROMPT_TEXT,
+  PAIRING_UNAVAILABLE_TEXT,
+  refusalTextFor,
+} from '../profiles';
+import type { TransportIdentity } from '../ports/owner-state';
 import { EMERGENCY_RESPONSE, isEmergencyInput } from '../safety/emergency-detector';
 import {
   PathContainmentError,
@@ -32,10 +43,15 @@ const TURN_QUEUE_FULL_RESPONSE = "I'm still processing your previous message. Pl
 const STAGED_MEDIA_FAILURE_RESPONSE = 'Failed to store uploaded file. Please try uploading it again.';
 
 export interface GatewayMessageRouterDeps {
-  config: AppConfig;
+  config: EffectiveConfig;
   runtime?: ProfileRuntime;
   profileRegistry?: ProfileRegistry;
-  stagingDir: string;
+  /**
+   * The owner-scoped staging lane, or `undefined` when this Gateway has no owner workspace to stage
+   * into. `undefined` is a real, safe state: nothing can be adopted and nothing is deleted, which is
+   * the correct outcome for a configuration that names no owner.
+   */
+  stagingDir: string | undefined;
   stagingBaseDir?: string;
   buildBootStatusText: () => string;
   /**
@@ -47,7 +63,30 @@ export interface GatewayMessageRouterDeps {
    * cannot crash the daemon either.
    */
   resolveRuntime?: (profileId: ProfileId) => Promise<ProfileRuntime | undefined>;
+  /**
+   * S1 admission. When present it is the ONLY authority for "who may talk to this owner":
+   * `getProfileForChat`'s first-contact auto-pair is unreachable, because the admission decision
+   * is taken first and an unpaired chat never resolves a profile.
+   *
+   * Absent only for the pre-S1 direct-Router tests that construct a Router with a single
+   * runtime and no identity. Production composition always supplies it.
+   */
+  admission?: OwnerAdmissionService;
+  /** The owner identity `admission` is configured for. */
+  ownerId?: ProfileId;
 }
+
+/** Canned pairing replies. Pairing is never a health answer. */
+const PAIRING_RESULT_TEXT: Record<PairingResult['kind'], string> = {
+  paired: PAIRING_COMPLETE_TEXT,
+  'already-paired': PAIRING_COMPLETE_TEXT,
+  prompt: PAIRING_PROMPT_TEXT,
+  invalid: PAIRING_INVALID_TEXT,
+  expired: PAIRING_EXPIRED_TEXT,
+  limited: PAIRING_LIMITED_TEXT,
+  refused: UNRECOGNIZED_CHAT_RESPONSE,
+  unavailable: PAIRING_UNAVAILABLE_TEXT,
+};
 
 interface StagedMedia {
   sourcePath: string;
@@ -100,12 +139,48 @@ export function sweepStagedMedia(stagingDir: string, stagingBaseDir?: string): v
 export class GatewayMessageRouter {
   constructor(private readonly deps: GatewayMessageRouterDeps) {}
 
-  async route(incoming: IncomingMessage, egress: TurnEgress, logIncoming = true): Promise<string | undefined> {
+  async route(incoming: AdmittedMessage, egress: TurnEgress, logIncoming = true): Promise<string | undefined> {
     const { chatId, text } = incoming;
     if (logIncoming) {
       console.log(
         `[gateway] Message from ${chatId}: ${text.length} chars${incoming.mediaPath ? ', media attached' : ''}`,
       );
+    }
+
+    // S1 admission runs BEFORE anything else, including before the empty-message check, so a
+    // request from a chat that is not the owner cannot consume a reply slot at all.
+    const admission = this.deps.admission;
+    let admittedOwnerId: ProfileId | undefined;
+    if (admission) {
+      const identity = transportIdentityOf(incoming);
+      const decision = admission.inspect(identity);
+      if (decision.kind === 'refused') {
+        this.deleteStagedMedia(incoming.mediaPath);
+        return this.emitSafely(
+          egress,
+          refusalTextFor(decision.reason),
+          'Failed to send admission refusal',
+        );
+      }
+      if (decision.kind === 'pairing-only') {
+        return this.routePairing(incoming, egress, identity);
+      }
+      // Admission already proved this chat IS the bound owner, so the selected owner identity is
+      // the dispatch target. The legacy chat→profile registry is not consulted on this path.
+      admittedOwnerId = this.deps.ownerId
+        ?? ((this.deps.config.profiles?.defaultProfileId ?? 'default') as ProfileId);
+
+      // A REDELIVERED pairing event from the bound owner is still a pairing message, not a health
+      // question: it must answer "pairing complete" instead of becoming a clinical turn.
+      //
+      // This is deliberately narrow. It used to test `isWellFormedSubmission(text)` — that is, "is this
+      // eight characters from the pairing alphabet" — which also matched ordinary health words like
+      // `headache`, `diabetes` and `insomnia`, answered "pairing complete", and dropped them without ever
+      // answering or recording them. Only the event that actually established the binding qualifies.
+      if (admission.isRedeliveredPairingEvent(identity)) {
+        this.deleteStagedMedia(incoming.mediaPath);
+        return this.emitSafely(egress, PAIRING_COMPLETE_TEXT, 'Failed to answer redelivered pairing event');
+      }
     }
 
     if (text.trim().length === 0 && !incoming.mediaPath && !incoming.mediaError) {
@@ -114,10 +189,13 @@ export class GatewayMessageRouter {
 
     const emergency = this.emergencyResponse(text);
     if (emergency) {
-      return this.routeEmergency(incoming, egress, emergency);
+      return this.routeEmergency(incoming, egress, emergency, admittedOwnerId);
     }
 
-    const profileId = this.getProfileForChat(chatId);
+    // Owner chat: the only path that may reach a clinical runtime. The legacy first-contact
+    // grant below still exists for the pre-S1 direct-Router tests, but production composition
+    // always supplies `admission`, which has already resolved this decision.
+    const profileId = admittedOwnerId ?? this.getProfileForChat(chatId);
     if (profileId === null) {
       this.deleteStagedMedia(incoming.mediaPath);
       return this.emitSafely(
@@ -164,6 +242,36 @@ export class GatewayMessageRouter {
 
   resolveProfileForChat(chatId: string): ProfileId | null {
     return this.getProfileForChat(chatId);
+  }
+
+  /**
+   * An unpaired owner: pairing and emergency guidance only.
+   *
+   * Emergency text from a chat that is not yet bound stays canned, provider-free and
+   * UNPERSISTED — there is no owner runtime to record it into, and writing it would recreate the
+   * capture defect. Pairing text is never treated as clinical content.
+   */
+  private async routePairing(
+    incoming: AdmittedMessage,
+    egress: TurnEgress,
+    identity: TransportIdentity,
+  ): Promise<string> {
+    this.deleteStagedMedia(incoming.mediaPath);
+
+    const emergency = this.emergencyResponse(incoming.text);
+    if (emergency) {
+      return this.emitSafely(egress, emergency, 'Failed to send emergency response');
+    }
+
+    const admission = this.deps.admission;
+    if (!admission) {
+      return this.emitSafely(egress, PAIRING_UNAVAILABLE_TEXT, 'Failed to answer unpaired chat');
+    }
+
+    // A message that is not a well-formed code gets the generic prompt; it still consumes the
+    // same daily allowance, so there is no free unlimited prompt channel.
+    const result = await admission.handlePairing(identity, incoming.text);
+    return this.emitSafely(egress, PAIRING_RESULT_TEXT[result.kind], 'Failed to send pairing response');
   }
 
   isDefaultProfile(profileId: ProfileId): boolean {
@@ -213,7 +321,7 @@ export class GatewayMessageRouter {
       : undefined;
   }
 
-  private buildAgentInput(incoming: IncomingMessage): string {
+  private buildAgentInput(incoming: AdmittedMessage): string {
     const parts: string[] = [incoming.text];
     if (incoming.mediaPath) parts.push('', `Uploaded media path (relative to workspace): ${incoming.mediaPath}`);
     if (incoming.replyToMessageId) parts.push('', `Reply to message id: ${incoming.replyToMessageId}`);
@@ -240,7 +348,7 @@ export class GatewayMessageRouter {
   }
 
   private async persistEmergencyTurn(
-    incoming: IncomingMessage,
+    incoming: AdmittedMessage,
     emergency: string,
     runtime: ProfileRuntime,
   ): Promise<void> {
@@ -254,11 +362,18 @@ export class GatewayMessageRouter {
     }
   }
 
-  private async routeEmergency(incoming: IncomingMessage, egress: TurnEgress, emergency: string): Promise<string> {
+  private async routeEmergency(
+    incoming: AdmittedMessage,
+    egress: TurnEgress,
+    emergency: string,
+    admittedOwnerId?: ProfileId,
+  ): Promise<string> {
     // NOTE: deliberately `getExistingProfileForChat` (no auto-pair) — an emergency from an
     // unknown chat must NEVER consume the one-time first-contact pairing, and stays
     // unpersisted guidance. Only a chat already paired to a profile resolves a runtime.
-    const profileId = this.getExistingProfileForChat(incoming.chatId);
+    // Under S1 the caller passes the admitted owner id, so an admitted emergency records into
+    // the owner runtime without consulting the legacy registry at all.
+    const profileId = admittedOwnerId ?? this.getExistingProfileForChat(incoming.chatId);
     const runtime = profileId !== null ? await this.resolveRuntimeFor(profileId) : undefined;
     const emergencyIncoming = { ...incoming };
     if (path.isAbsolute(emergencyIncoming.mediaPath ?? '')) {
@@ -276,11 +391,11 @@ export class GatewayMessageRouter {
     return emergency;
   }
 
-  private scheduleBackgroundCapture(incoming: IncomingMessage, runtime: ProfileRuntime): void {
+  private scheduleBackgroundCapture(incoming: AdmittedMessage, runtime: ProfileRuntime): void {
     scheduleBackgroundCapture(runtime, incoming);
   }
 
-  private adoptStagedMedia(incoming: IncomingMessage, runtime: ProfileRuntime): void {
+  private adoptStagedMedia(incoming: AdmittedMessage, runtime: ProfileRuntime): void {
     if (!incoming.mediaPath || !path.isAbsolute(incoming.mediaPath)) return;
     const staged = this.inspectStagedMedia(incoming.mediaPath);
     if (!staged) {
@@ -423,7 +538,31 @@ export class GatewayMessageRouter {
   }
 }
 
-function trustedDirectory(directory: string, trustedBaseDir?: string): TrustedDirectory | undefined {
+export type IncomingMessageLike = {
+  channel?: string;
+  chatId: string;
+  userId: string;
+  chatType?: ChatType;
+  eventId?: string;
+};
+
+/**
+ * Normalize an inbound message into the transport identity admission requires. A missing or
+ * over-long field is carried through as-is so the admission service — not this adapter — decides it
+ * is missing identity.
+ */
+export function transportIdentityOf(incoming: IncomingMessageLike): TransportIdentity {
+  return {
+    channel: incoming.channel ?? '',
+    chatId: incoming.chatId,
+    userId: incoming.userId,
+    chatType: incoming.chatType ?? 'private',
+    eventId: incoming.eventId ?? '',
+  };
+}
+
+function trustedDirectory(directory: string | undefined, trustedBaseDir?: string): TrustedDirectory | undefined {
+  if (!directory) return undefined;
   const absolute = path.resolve(directory);
   try {
     const stat = fs.lstatSync(absolute);

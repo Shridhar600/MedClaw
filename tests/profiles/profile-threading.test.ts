@@ -1,6 +1,5 @@
 import * as path from 'path';
 import * as os from 'os';
-import * as fs from 'fs';
 import type { LLMProvider } from '../../src/providers/types';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import { SqliteStore } from '../../src/memory/sqlite-store';
@@ -9,8 +8,9 @@ import { MemorySearch } from '../../src/memory/search';
 import { ContextAssembler } from '../../src/agent/context';
 import { HeartbeatStore } from '../../src/scheduler/store';
 import { SchedulerAuditLog } from '../../src/scheduler/audit-log';
-import { DEFAULT_CONFIG, cloneDefaultConfig } from '../../src/config/defaults';
-import { loadConfig } from '../../src/config/config';
+import { DEFAULT_STORED_CONFIG, cloneStoredDefaults } from '../../src/config/defaults';
+import { loadRuntimeConfig } from '../../src/runtime/startup';
+import { writeConfigFixture } from '../helpers/config-fixture';
 
 jest.mock('../../src/providers/types', () => ({}));
 
@@ -134,39 +134,44 @@ describe('profileId threading', () => {
   });
 });
 
-describe('ProfileConfig defaults', () => {
-  it('DEFAULT_CONFIG includes profiles section', () => {
-    expect(DEFAULT_CONFIG.profiles).toBeDefined();
-    expect(DEFAULT_CONFIG.profiles!.baseDir).toContain('.redacted');
-    expect(DEFAULT_CONFIG.profiles!.defaultProfileId).toBe('default');
+describe('selected owner identity', () => {
+  it('the stored defaults name an owner base directory and a default owner ID', () => {
+    expect(DEFAULT_STORED_CONFIG.profiles).toBeDefined();
+    expect(DEFAULT_STORED_CONFIG.profiles.baseDir).toBe('~/.redacted');
+    expect(DEFAULT_STORED_CONFIG.profiles.defaultProfileId).toBe('default');
   });
 
-  it('cloneDefaultConfig includes profiles section', () => {
-    const config = cloneDefaultConfig();
-    expect(config.profiles).toBeDefined();
-    expect(config.profiles!.defaultProfileId).toBe('default');
+  it('a cloned default carries no shared reference to the defaults', () => {
+    const first = cloneStoredDefaults();
+    first.profiles.defaultProfileId = 'mutated';
+    expect(cloneStoredDefaults().profiles.defaultProfileId).toBe('default');
   });
 
-  it('loadConfig with no config file uses defaults including profiles', async () => {
-    const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
-    const config = await loadConfig({ configPath: '/nonexistent/config.json' });
-    expect(config.profiles).toBeDefined();
-    expect(config.profiles!.baseDir).toContain('.redacted');
-    expect(config.profiles!.defaultProfileId).toBe('default');
-    consoleWarnSpy.mockRestore();
+  // RETIRED -> `loadConfig` on an absent file returned full defaults, so a machine that had
+  // never been set up resolved to an owner. Serving now refuses instead; the default owner
+  // name exists only as a setup value.
+  it('refuses to serve when no configuration document is selected', async () => {
+    await expect(
+      loadRuntimeConfig({ configPath: '/nonexistent/config.json', homeDir: tmpDir }),
+    ).rejects.toThrow(/Config file not found/);
   });
 
-  it('merged config preserves user profiles section', async () => {
-    const testConfigPath = path.join(tmpDir, 'test-config.json');
-    const userConfig = {
-      profiles: { baseDir: '/custom/path', defaultProfileId: 'work' },
-    };
-    fs.mkdirSync(path.dirname(testConfigPath), { recursive: true });
-    fs.writeFileSync(testConfigPath, JSON.stringify(userConfig), 'utf8');
+  it('derives the owner workspace from the selected identity', async () => {
+    const fixture = writeConfigFixture(tmpDir, { baseDir: '/custom/path', ownerId: 'work' });
 
-    const config = await loadConfig({ configPath: testConfigPath });
-    expect(config.profiles).toBeDefined();
-    expect(config.profiles!.baseDir).toBe('/custom/path');
-    expect(config.profiles!.defaultProfileId).toBe('work');
+    const config = await loadRuntimeConfig({ configPath: fixture.configPath, homeDir: tmpDir });
+
+    expect(config.profiles.baseDir).toBe('/custom/path');
+    expect(config.profiles.defaultProfileId).toBe('work');
+    expect(config.memory.workspace).toBe('/custom/path/profiles/work');
+    expect(config.heartbeat.storePath).toBe('/custom/path/profiles/work/.state/heartbeat-jobs.json');
+  });
+
+  it('refuses an owner ID that is not a valid identity', async () => {
+    const fixture = writeConfigFixture(tmpDir, { raw: '{ "schemaVersion": 2, "profiles": { "baseDir": "/custom/path", "defaultProfileId": "Work Owner" } }' });
+
+    await expect(
+      loadRuntimeConfig({ configPath: fixture.configPath, homeDir: tmpDir }),
+    ).rejects.toThrow(/profiles.defaultProfileId/);
   });
 });

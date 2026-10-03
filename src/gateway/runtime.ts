@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
 import * as cron from 'node-cron';
-import type { AppConfig } from '../config/types';
+import type { EffectiveConfig } from '../config/types';
 import type { ProfileId } from '../profiles';
 import { WriteQueue, replayJournal } from '../profiles';
 import {
@@ -56,7 +56,7 @@ import { ContextAssembler } from '../agent/context';
 import { ContextAssembler as ContextAssemblerV2 } from '../context2';
 import type { SafetyReader } from '../context2';
 import { RecallEngine, DEFAULT_RECALL_CONFIG } from '../recall';
-import { createProvider } from '../providers/factory';
+import { createProvider, type ProviderFactory } from '../providers/factory';
 import type { LLMProvider } from '../providers/types';
 import type { LLMSemaphore } from '../tools/semaphore';
 import { SessionManager } from './session';
@@ -82,7 +82,7 @@ const HEARTBEAT_CURIOSITY_LIMIT = 5;
  * running and proceeding to `closeStore()` anyway, so a single hung op (e.g. an ACTIVE provider
  * call with no timeout) can never stall shutdown forever. Not yet config-exposed — a named
  * constant (per the brief's "config or a named constant" choice) to keep this slice's diff
- * surgical; promoting it to `AppConfig` (schema + onboarding + validation) is a reasonable, small
+ * surgical; promoting it to `EffectiveConfig` (schema + onboarding + validation) is a reasonable, small
  * follow-up but out of R-S4's touched-files lane.
  */
 const SHUTDOWN_DRAIN_BUDGET_MS = 10_000;
@@ -190,7 +190,7 @@ export interface ProfileRuntimeDeps {
   dbPath: string;
   sessionsPath?: string;
   schedulerPaths: { storePath: string; auditLogPath: string };
-  config: AppConfig;
+  config: EffectiveConfig;
   mainProvider: LLMProvider;
   semaphore: LLMSemaphore;
   canSchedule?: boolean;
@@ -204,12 +204,18 @@ export interface ProfileRuntimeDeps {
   canAddressChat?: (chatId: string) => boolean;
   sideEffectLookup?: (entity: string) => Promise<string[]>;
   reconcile?: (chatId: string) => Promise<void>;
+  /**
+   * How the embedding and medical providers are constructed. Supplied by whoever owns the
+   * lifecycle; defaults to the real factory. Absent it, `create` builds real providers — the
+   * seam exists so a real runtime can be built with controlled providers, NOT to avoid them.
+   */
+  createProvider?: ProviderFactory;
 }
 
 export class ProfileRuntime {
   readonly profileId: ProfileId;
   readonly workspace: string;
-  config: AppConfig;
+  config: EffectiveConfig;
 
   store?: SqliteStore;
   factMirror?: SqliteFactMirror;
@@ -273,10 +279,10 @@ export class ProfileRuntime {
   readonly dirtyIndexPaths: Set<string> = new Set();
   dirtyIndexMarkerPath?: string;
 
-  private constructor(profileId: ProfileId = 'default' as ProfileId, workspace = '', config?: AppConfig) {
+  private constructor(profileId: ProfileId = 'default' as ProfileId, workspace = '', config?: EffectiveConfig) {
     this.profileId = profileId;
     this.workspace = workspace;
-    this.config = config ?? ({} as AppConfig);
+    this.config = config ?? ({} as EffectiveConfig);
   }
 
   isStopping(): boolean {
@@ -305,6 +311,7 @@ export class ProfileRuntime {
       semaphore,
       sideEffectLookup,
       reconcile,
+      createProvider: buildProvider = createProvider,
     } = deps;
 
     const runtime = new ProfileRuntime(profileId, memoryWorkspace, config);
@@ -319,7 +326,7 @@ export class ProfileRuntime {
     const store = new SqliteStore(dbPath, profileId);
     runtime.store = store;
 
-    const embeddingProvider = createProvider(config.providers.embeddings);
+    const embeddingProvider = buildProvider(config.providers.embeddings);
     const boundedEmbeddingProvider = makeBoundedEmbeddingProvider(embeddingProvider);
     const { MemoryIndexer } = await import('../memory/indexer');
     const indexer = new MemoryIndexer(
@@ -364,7 +371,7 @@ export class ProfileRuntime {
     }
 
     try {
-      const medicalProvider = createProvider(config.providers.medical);
+      const medicalProvider = buildProvider(config.providers.medical);
       for (const tool of createMedicalTools(
         memory,
         (query) => medicalContextProvider ? medicalContextProvider(query) : Promise.resolve(''),

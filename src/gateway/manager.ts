@@ -31,6 +31,11 @@ export class ProfileRuntimeManager {
   /** Successfully resolved runtimes only — the synchronous "currently-built" snapshot `all()`
    *  reads from (a Promise cannot be introspected synchronously, so this is tracked separately). */
   private readonly resolvedRuntimes = new Map<ProfileId, ProfileRuntime>();
+  /**
+   * Settlement state per profile, tracked alongside `builds` because a Promise cannot be
+   * introspected synchronously. Drives `pendingBuildCount()` for the shutdown disposition.
+   */
+  private readonly buildStatus = new Map<ProfileId, 'pending' | 'settled'>();
   private stopping = false;
   private drainPromise?: Promise<void>;
 
@@ -54,13 +59,16 @@ export class ProfileRuntimeManager {
       );
     }
 
+    this.buildStatus.set(profileId, 'pending');
     const build = this.buildRuntimeFor(profileId).then(
       (runtime) => {
         this.resolvedRuntimes.set(profileId, runtime);
+        this.buildStatus.set(profileId, 'settled');
         return runtime;
       },
       (error: unknown) => {
         this.builds.delete(profileId);
+        this.buildStatus.set(profileId, 'settled');
         throw error;
       },
     );
@@ -92,6 +100,26 @@ export class ProfileRuntimeManager {
    *  as the nightly sweep (Part C). Excludes in-flight and failed builds. */
   all(): ProfileRuntime[] {
     return [...this.resolvedRuntimes.values()];
+  }
+
+  /**
+   * How many build attempts have not settled yet.
+   *
+   * Ownership release must not happen while a construction continuation can still use owner
+   * resources, so the shutdown disposition reads this. A rejected build that has not yet been
+   * evicted still counts, because its continuation has not finished running.
+   */
+  pendingBuildCount(): number {
+    let pending = 0;
+    for (const record of this.buildStatus.values()) {
+      if (record === 'pending') pending += 1;
+    }
+    return pending;
+  }
+
+  /** Whether a drain has begun. After this, no new build is accepted. */
+  get isStopping(): boolean {
+    return this.stopping;
   }
 
   /**

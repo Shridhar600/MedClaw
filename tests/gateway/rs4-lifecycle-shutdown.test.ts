@@ -2,7 +2,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { ProfileId } from '../../src/profiles';
 import type { LLMProvider } from '../../src/providers/types';
 import { LLMSemaphore } from '../../src/tools/semaphore';
@@ -41,9 +41,10 @@ jest.mock('../../src/memory/indexer', () => ({
   })),
 }));
 
-function makeConfig(tmpDir: string): AppConfig {
+function makeConfig(tmpDir: string): EffectiveConfig {
   const workspace = path.join(tmpDir, 'workspace');
   return {
+  schemaVersion: 2,
     providers: {
       main: { type: 'ollama', model: 'rs4-main', baseUrl: 'http://127.0.0.1:9/v1' },
       medical: { type: 'ollama', model: 'rs4-main', baseUrl: 'http://127.0.0.1:9/v1' },

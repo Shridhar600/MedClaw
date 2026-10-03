@@ -5,8 +5,9 @@ import { Gateway } from '../../src/gateway/gateway';
 import { ProfileRegistry } from '../../src/profiles/registry';
 import { HeartbeatStore } from '../../src/scheduler/store';
 import { SchedulerAuditLog } from '../../src/scheduler/audit-log';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { ProfileId } from '../../src/profiles/types';
+import { withoutOwnerIdentity } from '../helpers/test-config';
 
 // Deterministic, network-free memory index (mirrors tests/gateway/gateway-startup.test.ts).
 jest.mock('../../src/memory/indexer', () => ({
@@ -31,8 +32,9 @@ describe('Gateway profile migration + path derivation on startup', () => {
     jest.restoreAllMocks();
   });
 
-  function makeConfig(overrides?: Partial<AppConfig>): AppConfig {
+  function makeConfig(overrides?: Partial<EffectiveConfig>): EffectiveConfig {
     return {
+    schemaVersion: 2,
       providers: {
         main: { type: 'ollama', model: 'test-model', baseUrl: 'http://localhost:11434/v1' },
         medical: { type: 'ollama', model: 'test-model', baseUrl: 'http://localhost:11434/v1' },
@@ -487,9 +489,9 @@ describe('Gateway profile migration + path derivation on startup', () => {
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
 
     const config = makeConfig();
-    delete config.profiles;
+    const legacyConfig = withoutOwnerIdentity(config);
 
-    const gateway = new Gateway(config);
+    const gateway = new Gateway(legacyConfig);
     await gateway.start();
     await gateway.stop();
 

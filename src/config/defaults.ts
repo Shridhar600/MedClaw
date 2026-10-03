@@ -1,9 +1,19 @@
-import * as os from 'os';
-import * as path from 'path';
-import type { AppConfig } from './types';
 import { BUILT_IN_EMERGENCY_KEYWORDS } from '../safety/emergency-detector';
+import { CONFIG_SCHEMA_VERSION, type StoredConfig } from './types';
 
-export const DEFAULT_CONFIG: AppConfig = {
+/**
+ * Stored defaults for `schemaVersion: 2`.
+ *
+ * Two properties matter here:
+ *  - No derived owner path appears. `memory.workspace`, `heartbeat.storePath` and
+ *    `heartbeat.audit.path` are derived by `resolveOwnerPaths` and injected by
+ *    `resolveEffectiveConfig`, so the persisted document has exactly one path authority.
+ *  - `profiles.baseDir` is stored in `~/` form rather than frozen against `os.homedir()`
+ *    at import time, so a test or a changed HOME cannot silently receive a stale root.
+ *    The decoder expands it with an explicit home directory.
+ */
+export const DEFAULT_STORED_CONFIG: StoredConfig = Object.freeze({
+  schemaVersion: CONFIG_SCHEMA_VERSION,
   providers: {
     main: {
       type: 'ollama',
@@ -23,7 +33,10 @@ export const DEFAULT_CONFIG: AppConfig = {
   },
   channels: {
     telegram: {
-      enabled: true,
+      // Disabled by default so the shipped defaults are themselves a decodable document.
+      // Setup enables it together with a bot token; a disabled channel is the truthful
+      // "configured, pairing-pending" state, not a working owner conversation.
+      enabled: false,
       botToken: '',
     },
   },
@@ -32,7 +45,6 @@ export const DEFAULT_CONFIG: AppConfig = {
     deny: ['exec'],
   },
   memory: {
-    workspace: path.join(os.homedir(), '.redacted', 'workspace'),
     search: {
       hybridWeights: { vector: 0.7, keyword: 0.3 },
     },
@@ -58,7 +70,6 @@ export const DEFAULT_CONFIG: AppConfig = {
   heartbeat: {
     enabled: true,
     timezone: 'Asia/Kolkata',
-    storePath: path.join(os.homedir(), '.redacted', 'heartbeats', 'jobs.json'),
     policy: {
       quietHours: {
         enabled: true,
@@ -93,9 +104,6 @@ export const DEFAULT_CONFIG: AppConfig = {
       maxGlobalTriggersPerMinute: 10,
       maxPerChatTriggersPerMinute: 3,
     },
-    audit: {
-      path: path.join(os.homedir(), '.redacted', 'heartbeats', 'audit.jsonl'),
-    },
   },
   agent: {
     maxIterations: 15,
@@ -105,11 +113,21 @@ export const DEFAULT_CONFIG: AppConfig = {
     keywords: [...BUILT_IN_EMERGENCY_KEYWORDS],
   },
   profiles: {
-    baseDir: path.join(os.homedir(), '.redacted'),
+    baseDir: '~/.redacted',
     defaultProfileId: 'default',
   },
-};
+}) as StoredConfig;
 
-export function cloneDefaultConfig(): AppConfig {
-  return structuredClone(DEFAULT_CONFIG);
+/** Deep copy so a caller can never mutate the shared defaults. */
+export function cloneStoredDefaults(): StoredConfig {
+  return structuredClone(DEFAULT_STORED_CONFIG);
 }
+
+/**
+ * Single authority for the session-window triggers. `src/gateway/session.ts` reads these
+ * instead of repeating `?? 35/50/80/10` inline, which used to be a second authority that
+ * could disagree with the config module.
+ */
+export const DEFAULT_SESSION_WINDOW = DEFAULT_STORED_CONFIG.sessions.window as NonNullable<
+  StoredConfig['sessions']['window']
+>;

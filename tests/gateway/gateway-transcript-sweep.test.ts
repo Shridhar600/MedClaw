@@ -3,7 +3,8 @@ import * as os from 'os';
 import * as path from 'path';
 import * as cron from 'node-cron';
 import { Gateway } from '../../src/gateway/gateway';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
+import {} from '../helpers/test-config';
 
 jest.mock('node-cron', () => ({
   schedule: jest.fn(() => ({ stop: jest.fn() })),
@@ -14,8 +15,9 @@ jest.mock('node-cron', () => ({
 // and the real CuriosityQueue. Proves the feature is wired (not inert) and that an entity logged yesterday
 // then superseded today is still recognized as logged yesterday (no spurious critical re-ask).
 
-function makeConfig(tmpDir: string): AppConfig {
+function makeConfig(tmpDir: string): EffectiveConfig {
   return {
+  schemaVersion: 2,
     providers: {
       main: { type: 'ollama', model: 'unused', baseUrl: 'http://127.0.0.1:9/v1' },
       medical: { type: 'ollama', model: 'unused', baseUrl: 'http://127.0.0.1:9/v1' },

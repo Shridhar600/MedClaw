@@ -9,3 +9,46 @@ export type { KVCache } from './kv-cache';
 export type { Clock } from './clock';
 export type { IdGen } from './id-gen';
 export { SystemClock, CryptoIdGen, systemClock, uuidIdGen } from './defaults';
+export type {
+  AdmissionDecision,
+  AdmissionReason,
+  OwnerBinding,
+  OwnerChallenge,
+  OwnerReadReason,
+  OwnerState,
+  OwnerStatePort,
+  OwnerStateRead,
+  PairingAttempts,
+  PairingCandidateChat,
+  PairingCodePort,
+  PairingResult,
+  PairingResultKind,
+  TransportIdentity,
+} from './owner-state';
+export { isBoundOwnerState, isUnpairedOwnerState } from './owner-state';
+export type {
+  MediaReference,
+  MediaSourcePort,
+  MediaStageResult,
+  MediaStageReason,
+  MediaLimits,
+  OpenedMedia,
+  MediaStageDiagnostics,
+} from './media-source';
+export {
+  DEFAULT_MEDIA_LIMITS,
+  MEDIA_INTAKE_TIMEOUT_MS,
+  MEDIA_MAX_ACTIVE,
+  MEDIA_MAX_FILE_BYTES,
+  MEDIA_MAX_WAITING,
+} from './media-source';
+export {
+  PAIRING_ATTEMPTS_PER_CHAT_PER_DAY,
+  PAIRING_CODE_EXPIRY_MS,
+  PAIRING_CODE_LENGTH,
+  PAIRING_CODE_SYMBOLS,
+  PAIRING_MAX_CANDIDATE_CHATS,
+  PAIRING_MAX_EVENT_ID_LENGTH,
+  PAIRING_MAX_EVENT_IDS_PER_CHAT,
+  PAIRING_MAX_ID_LENGTH,
+} from './owner-state';

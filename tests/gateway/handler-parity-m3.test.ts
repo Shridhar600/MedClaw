@@ -2,9 +2,11 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import { EMERGENCY_RESPONSE } from '../../src/safety/emergency-detector';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
+import {} from '../helpers/test-config';
+import { ownerSelection, sharedFixtureOwner } from '../helpers/test-config';
 
 // E1.5 (M-3) — handleTestMessage↔handleMessage reconcile (CLAUDE.md mirror-sync law).
 // Two provable divergences on current code:
@@ -18,8 +20,10 @@ import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 
 const FALLBACK = "I'm having trouble right now. Please try again in a moment.";
 
-function makeConfig(): AppConfig {
+function makeConfig(): EffectiveConfig {
   return {
+  schemaVersion: 2,
+  ...ownerSelection(sharedFixtureOwner()),
     providers: {
       main: { type: 'ollama', model: 'qwen3.5:9b', baseUrl: 'http://localhost:11434/v1' },
       medical: { type: 'ollama', model: 'qwen3.5:9b', baseUrl: 'http://localhost:11434/v1' },
@@ -28,7 +32,7 @@ function makeConfig(): AppConfig {
     channels: { telegram: { enabled: false, botToken: '' } },
     tools: { allow: ['*'], deny: [] },
     memory: {
-      workspace: '/tmp/redacted-test',
+      workspace: sharedFixtureOwner().workspace,
       search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
       bootstrapMaxChars: 20000,
     },
@@ -40,11 +44,11 @@ function makeConfig(): AppConfig {
     heartbeat: {
       enabled: false,
       timezone: 'Asia/Kolkata',
-      storePath: '/tmp/redacted-test/heartbeats/jobs.json',
+      storePath: sharedFixtureOwner().storePath,
       recovery: { enabled: false, windowMinutes: 60 },
       retry: { maxRetries: 3, backoffMinutes: 5 },
       rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-      audit: { path: '/tmp/redacted-test/heartbeats/audit.jsonl' },
+      audit: { path: sharedFixtureOwner().auditLogPath },
       policy: {
         quietHours: { enabled: true, start: '22:00', end: '07:00' },
         skipIfChatActiveWithinMinutes: 60,

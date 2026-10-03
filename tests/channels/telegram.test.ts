@@ -1,7 +1,10 @@
 import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import { TelegramChannel } from '../../src/channels/telegram';
+import type { IncomingMessage } from '../../src/channels/types';
+import { makeTestTemp } from '../helpers/test-temp';
+
+/** Synthetic PHI marker. Must never appear in any log the channel emits. */
+const PHI = 'patient-12345-diabetes';
 
 const mockGetFile = jest.fn();
 const mockSendMessage = jest.fn();
@@ -40,7 +43,7 @@ describe('TelegramChannel', () => {
 
   describe('constructor', () => {
     it('accepts stagingPath as second parameter', () => {
-      const channel = new TelegramChannel('test-token', '/workspace/path/.staging/media');
+      const channel = new TelegramChannel('test-token');
       expect(channel).toBeInstanceOf(TelegramChannel);
     });
   });
@@ -55,7 +58,7 @@ describe('TelegramChannel', () => {
         if (event === 'message:text') handler = cb;
       });
 
-      const channel = new TelegramChannel('test-token', '/tmp/test-workspace');
+      const channel = new TelegramChannel('test-token');
       const receivedMessages: { messageId?: string }[] = [];
       channel.onMessage(async (msg) => {
         receivedMessages.push(msg);
@@ -66,400 +69,127 @@ describe('TelegramChannel', () => {
       expect(receivedMessages[0].messageId).toBe('77');
     });
 
-    it('document handler sets mediaPath on incoming message', async () => {
+    // ── METADATA-FIRST (S1 T4) ────────────────────────────────────────────────────────
+    // S1 change (old -> new): the tests in this block used to assert that the document and photo
+    // handlers called `getFile`, fetched the bytes over HTTP and wrote a local staging file BEFORE
+    // any admission decision — and that a symlinked staging root was rejected at write time. That
+    // eager path is the defect: an unauthenticated stranger could make the process download and
+    // store arbitrary bytes. It has moved behind the core's admission boundary.
+    //
+    // What replaces it here: the transport emits an OPAQUE reference and does no I/O at all. The
+    // staging-path containment, the byte cap, the stream abort and the PHI-safe failure logging all
+    // now belong to `FsMediaStager` and are proved in `tests/runtime/media-stager.test.ts`.
+
+    it('document handler emits an opaque media reference and performs no retrieval or write', async () => {
       let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
 
       mockBotOn.mockImplementation((event: string, cb: (ctx: MockCtx) => Promise<void>) => {
-        if (event === 'message:document') {
-          handler = cb;
-        }
+        if (event === 'message:document') handler = cb;
       });
 
-      mockGetFile.mockResolvedValue({ file_path: 'documents/test.pdf' });
-      const mockFetch = jest.fn().mockResolvedValue({
-        ok: true,
-        status: 200,
-        arrayBuffer: () => Promise.resolve(new ArrayBuffer(10)),
-      });
+      const mockFetch = jest.fn();
       global.fetch = mockFetch;
 
-      const channel = new TelegramChannel('test-token', '/tmp/test-workspace');
-      const receivedMessages: { mediaPath?: string; text?: string }[] = [];
+      // A real directory to prove nothing was written into it. Workspace-local via `makeTestTemp`, never
+      // `os.tmpdir()`. The channel no longer takes a staging path, so this stands in for the owner's lane.
+      const stagingDir = makeTestTemp('socs-s1-tg-nothing-written');
+      const channel = new TelegramChannel('test-token');
+      const received: IncomingMessage[] = [];
       await channel.onMessage(async (msg) => {
-        receivedMessages.push(msg);
+        received.push(msg);
       });
 
-      const mockCtx: MockCtx = {
+      await handler?.({
         message: {
-          document: { file_id: 'doc123', file_name: 'report.pdf' },
+          document: { file_id: 'doc123', file_name: 'report.pdf', mime_type: 'application/pdf', file_size: 4096 },
           caption: 'My report',
           reply_to_message: { message_id: 42 },
         },
-        chat: { id: 123 },
+        chat: { id: 123, type: 'private' },
         from: { id: 456 },
-      };
+      } as unknown as MockCtx);
 
-      if (handler) {
-        await handler(mockCtx);
-      }
+      expect(received).toHaveLength(1);
+      const message = received[0];
+      // The caption survives verbatim; the reference is an identity, not bytes or a path.
+      expect(message.text).toBe('My report');
+      expect(message.media).toEqual({
+        channel: 'telegram',
+        fileId: 'doc123',
+        kind: 'document',
+        displayName: 'report.pdf',
+        mime: 'application/pdf',
+        advertisedBytes: 4096,
+      });
 
-      expect(receivedMessages).toHaveLength(1);
-      expect(receivedMessages[0].mediaPath).toBeDefined();
-      expect(receivedMessages[0].mediaPath).toMatch(/^\/tmp\/test-workspace\/\d+-[0-9a-f-]+-report\.pdf$/);
-      expect(receivedMessages[0].text).toBe('My report');
+      // The load-bearing assertions: no Bot API call, no HTTP fetch, and nothing written.
+      expect(mockGetFile).not.toHaveBeenCalled();
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(fs.readdirSync(stagingDir)).toEqual([]);
+      // And the wire type cannot carry a local path at all.
+      expect((message as { mediaPath?: string }).mediaPath).toBeUndefined();
     });
 
-
-    it('document handler surfaces explicit mediaError on download failure', async () => {
+    it('photo handler emits an opaque reference for the highest resolution photo, doing no I/O', async () => {
       let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
 
       mockBotOn.mockImplementation((event: string, cb: (ctx: MockCtx) => Promise<void>) => {
-        if (event === 'message:document') {
-          handler = cb;
-        }
+        if (event === 'message:photo') handler = cb;
       });
 
-      mockGetFile.mockRejectedValue(new Error('File not found'));
-
-      const channel = new TelegramChannel('test-token', '/tmp/test-workspace');
-      const receivedMessages: { mediaPath?: string; mediaError?: string }[] = [];
-      await channel.onMessage(async (msg) => {
-        receivedMessages.push(msg);
-      });
-
-      const mockCtx: MockCtx = {
-        message: {
-          document: { file_id: 'doc123', file_name: 'report.pdf' },
-          caption: 'My report',
-        },
-        chat: { id: 123 },
-        from: { id: 456 },
-      };
-
-      if (handler) {
-        await handler(mockCtx);
-      }
-
-      expect(receivedMessages).toHaveLength(1);
-      expect(receivedMessages[0].mediaPath).toBeUndefined();
-      expect(receivedMessages[0].mediaError).toContain('Failed to download');
-    });
-
-    it('rejects a symlinked staging root without writing through it', async () => {
-      let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
-      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-telegram-staging-link-'));
-      const realStaging = path.join(root, 'real-media');
-      const stagingPath = path.join(root, 'media');
-      fs.mkdirSync(realStaging, { recursive: true, mode: 0o700 });
-      fs.symlinkSync(realStaging, stagingPath, 'dir');
-      mockBotOn.mockImplementation((event: string, cb: (ctx: MockCtx) => Promise<void>) => {
-        if (event === 'message:document') handler = cb;
-      });
-      mockGetFile.mockResolvedValue({ file_path: 'documents/test.pdf' });
-      global.fetch = jest.fn().mockResolvedValue({
-        ok: true,
-        status: 200,
-        arrayBuffer: () => Promise.resolve(new ArrayBuffer(2)),
-      });
-      const channel = new TelegramChannel('test-token', stagingPath);
-      const receivedMessages: { mediaPath?: string; mediaError?: string }[] = [];
-      channel.onMessage(async (msg) => { receivedMessages.push(msg); });
-
-      try {
-        await handler?.({
-          message: { document: { file_id: 'doc123', file_name: 'report.pdf' } },
-          chat: { id: 123 },
-          from: { id: 456 },
-        });
-        expect(receivedMessages[0].mediaPath).toBeUndefined();
-        expect(receivedMessages[0].mediaError).toContain('Failed to download');
-        expect(fs.readdirSync(realStaging)).toEqual([]);
-      } finally {
-        fs.rmSync(root, { recursive: true, force: true });
-      }
-    });
-
-    it('rejects a symlinked staging ancestor when a trusted base is provided', async () => {
-      let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
-      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-telegram-staging-ancestor-'));
-      const realParent = path.join(root, 'real-staging');
-      const stagingParent = path.join(root, 'staging');
-      const stagingPath = path.join(stagingParent, 'media');
-      fs.mkdirSync(path.join(realParent, 'media'), { recursive: true, mode: 0o700 });
-      fs.symlinkSync(realParent, stagingParent, 'dir');
-      mockBotOn.mockImplementation((event: string, cb: (ctx: MockCtx) => Promise<void>) => {
-        if (event === 'message:document') handler = cb;
-      });
-      mockGetFile.mockResolvedValue({ file_path: 'documents/test.pdf' });
-      global.fetch = jest.fn().mockResolvedValue({
-        ok: true,
-        status: 200,
-        arrayBuffer: () => Promise.resolve(new ArrayBuffer(2)),
-      });
-      const channel = new TelegramChannel('test-token', stagingPath, root);
-      const receivedMessages: { mediaPath?: string; mediaError?: string }[] = [];
-      channel.onMessage(async (msg) => { receivedMessages.push(msg); });
-
-      try {
-        await handler?.({
-          message: { document: { file_id: 'doc123', file_name: 'report.pdf' } },
-          chat: { id: 123 },
-          from: { id: 456 },
-        });
-        expect(receivedMessages[0].mediaPath).toBeUndefined();
-        expect(receivedMessages[0].mediaError).toContain('Failed to download');
-        expect(fs.readdirSync(path.join(realParent, 'media'))).toEqual([]);
-      } finally {
-        fs.rmSync(root, { recursive: true, force: true });
-      }
-    });
-
-    it('document download failure logs only the sanitized error identity', async () => {
-      let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
-      const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
-
-      mockBotOn.mockImplementation((event: string, cb: (ctx: MockCtx) => Promise<void>) => {
-        if (event === 'message:document') {
-          handler = cb;
-        }
-      });
-
-      mockGetFile.mockRejectedValue(
-        new Error('failed https://api.telegram.org/file/bottest-token/documents/report.pdf')
-      );
-
-      const channel = new TelegramChannel('test-token', '/tmp/test-workspace');
-      const receivedMessages: { mediaPath?: string; mediaError?: string }[] = [];
-      await channel.onMessage(async (msg) => {
-        receivedMessages.push(msg);
-      });
-
-      const mockCtx: MockCtx = {
-        message: {
-          document: { file_id: 'doc123', file_name: 'report.pdf' },
-          caption: 'My report',
-        },
-        chat: { id: 123 },
-        from: { id: 456 },
-      };
-
-      if (handler) {
-        await handler(mockCtx);
-      }
-
-      const logged = consoleError.mock.calls.flat().map(String).join('\n');
-      consoleError.mockRestore();
-      expect(logged).not.toContain('test-token');
-      expect(logged).not.toContain('https://api.telegram.org');
-      expect(logged).not.toContain('failed ');
-      expect(logged).toContain('Error');
-      expect(receivedMessages).toHaveLength(1);
-      expect(receivedMessages[0].mediaPath).toBeUndefined();
-      expect(receivedMessages[0].mediaError).toContain('Failed to download');
-    });
-
-    it('document download failure does not log the Bot API error message', async () => {
-      let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
-      const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
-
-      mockBotOn.mockImplementation((event: string, cb: (ctx: MockCtx) => Promise<void>) => {
-        if (event === 'message:document') {
-          handler = cb;
-        }
-      });
-
-      mockGetFile.mockRejectedValue(
-        new Error('failed https://api.telegram.org/bottest-token/getFile')
-      );
-
-      const channel = new TelegramChannel('test-token', '/tmp/test-workspace');
-      await channel.onMessage(async () => undefined);
-
-      const mockCtx: MockCtx = {
-        message: {
-          document: { file_id: 'doc123', file_name: 'report.pdf' },
-          caption: 'My report',
-        },
-        chat: { id: 123 },
-        from: { id: 456 },
-      };
-
-      if (handler) {
-        await handler(mockCtx);
-      }
-
-      const logged = consoleError.mock.calls.flat().map(String).join('\n');
-      consoleError.mockRestore();
-      expect(logged).not.toContain('test-token');
-      expect(logged).not.toContain('https://api.telegram.org');
-      expect(logged).not.toContain('failed ');
-      expect(logged).toContain('Error');
-    });
-
-    it('document download failure never logs a PHI-bearing filename', async () => {
-      let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
-      const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
-      const marker = 'MEDICALSECRET12345';
-
-      mockBotOn.mockImplementation((event: string, cb: (ctx: MockCtx) => Promise<void>) => {
-        if (event === 'message:document') handler = cb;
-      });
-      mockGetFile.mockResolvedValue({ file_path: 'documents/test.pdf' });
-      global.fetch = jest.fn().mockResolvedValue({
-        ok: true,
-        status: 200,
-        arrayBuffer: () => Promise.resolve(new ArrayBuffer(1)),
-      });
-
-      const channel = new TelegramChannel('test-token', '/tmp/test-workspace');
-      await channel.onMessage(async () => undefined);
-      await handler?.({
-        message: { document: { file_id: 'doc123', file_name: `${marker}${'x'.repeat(300)}.pdf` } },
-        chat: { id: 123 },
-        from: { id: 456 },
-      });
-
-      const logged = consoleError.mock.calls.flat().map(String).join('\n');
-      consoleError.mockRestore();
-      expect(logged).not.toContain(marker);
-      expect(logged).not.toContain('ENAMETOOLONG');
-    });
-
-    it('photo handler sets mediaPath for highest resolution photo', async () => {
-      let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
-
-      mockBotOn.mockImplementation((event: string, cb: (ctx: MockCtx) => Promise<void>) => {
-        if (event === 'message:photo') {
-          handler = cb;
-        }
-      });
-
-      mockGetFile.mockResolvedValue({ file_path: 'photos/photo_123.jpg' });
-      const mockFetch = jest.fn().mockResolvedValue({
-        ok: true,
-        status: 200,
-        arrayBuffer: () => Promise.resolve(new ArrayBuffer(10)),
-      });
+      const mockFetch = jest.fn();
       global.fetch = mockFetch;
 
-      const channel = new TelegramChannel('test-token', '/tmp/test-workspace');
-      const receivedMessages: { mediaPath?: string }[] = [];
+      const channel = new TelegramChannel('test-token');
+      const received: IncomingMessage[] = [];
       await channel.onMessage(async (msg) => {
-        receivedMessages.push(msg);
+        received.push(msg);
       });
 
-      const mockCtx: MockCtx = {
+      const stagingDir = makeTestTemp('socs-s1-tg-photo-nothing-written');
+      await handler?.({
         message: {
           photo: [
-            { file_id: 'small', width: 100, height: 100 },
-            { file_id: 'medium', width: 400, height: 400 },
-            { file_id: 'large', width: 800, height: 800 },
+            { file_id: 'small', file_size: 100 },
+            { file_id: 'large', file_size: 9000 },
           ],
-          caption: 'Check this out',
         },
-        chat: { id: 123 },
+        chat: { id: 123, type: 'private' },
         from: { id: 456 },
-      };
+      } as unknown as MockCtx);
 
-      if (handler) {
-        await handler(mockCtx);
-      }
-
-      expect(receivedMessages).toHaveLength(1);
-      expect(receivedMessages[0].mediaPath).toBeDefined();
-      expect(receivedMessages[0].mediaPath).toMatch(/^\/tmp\/test-workspace\/\d+-[0-9a-f-]+-photo-large\.jpg$/);
-      expect(mockGetFile).toHaveBeenCalledWith('large');
+      expect(received).toHaveLength(1);
+      expect(received[0].media?.fileId).toBe('large');
+      expect(received[0].media?.kind).toBe('photo');
+      expect(received[0].media?.advertisedBytes).toBe(9000);
+      expect(received[0].text).toBe('Sent a photo');
+      expect(mockGetFile).not.toHaveBeenCalled();
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(fs.readdirSync(stagingDir)).toEqual([]);
     });
 
-    it('does not save file when HTTP fetch returns non-OK status', async () => {
+    it('a caption-bearing document never reaches a fetch even when the sender is a stranger', async () => {
+      // The transport cannot know who the sender is — that is the core's job — so this asserts the
+      // property that matters here: the transport does no work regardless of who is talking.
       let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
-
       mockBotOn.mockImplementation((event: string, cb: (ctx: MockCtx) => Promise<void>) => {
-        if (event === 'message:document') {
-          handler = cb;
-        }
+        if (event === 'message:document') handler = cb;
       });
-
-      mockGetFile.mockResolvedValue({ file_path: 'documents/test.pdf' });
-      const mockFetch = jest.fn().mockResolvedValue({
-        ok: false,
-        status: 404,
-        arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
-      });
+      const mockFetch = jest.fn();
       global.fetch = mockFetch;
 
-      const channel = new TelegramChannel('test-token', '/tmp/test-workspace2');
-      const receivedMessages: { mediaPath?: string; mediaError?: string }[] = [];
-      await channel.onMessage(async (msg) => {
-        receivedMessages.push(msg);
-      });
+      const channel = new TelegramChannel('test-token');
+      await channel.onMessage(async () => undefined);
 
-      const mockCtx: MockCtx = {
-        message: {
-          document: { file_id: 'doc123', file_name: 'report.pdf' },
-          caption: 'My report',
-        },
-        chat: { id: 123 },
-        from: { id: 456 },
-      };
+      await handler?.({
+        message: { document: { file_id: 'stranger-doc', file_name: 'x.pdf' } },
+        chat: { id: 999, type: 'private' },
+        from: { id: 888 },
+      } as unknown as MockCtx);
 
-      if (handler) {
-        await handler(mockCtx);
-      }
-
-      expect(receivedMessages).toHaveLength(1);
-      expect(receivedMessages[0].mediaPath).toBeUndefined();
-      expect(receivedMessages[0].mediaError).toContain('Failed to download');
+      expect(mockGetFile).not.toHaveBeenCalled();
+      expect(mockFetch).not.toHaveBeenCalled();
     });
-
-    it('photo download failure logs only the sanitized error identity', async () => {
-      let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
-      const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
-
-      mockBotOn.mockImplementation((event: string, cb: (ctx: MockCtx) => Promise<void>) => {
-        if (event === 'message:photo') {
-          handler = cb;
-        }
-      });
-
-      mockGetFile.mockRejectedValue(
-        new Error('failed https://api.telegram.org/file/bottest-token/photos/photo.jpg')
-      );
-
-      const channel = new TelegramChannel('test-token', '/tmp/test-workspace');
-      const receivedMessages: { mediaPath?: string; mediaError?: string }[] = [];
-      await channel.onMessage(async (msg) => {
-        receivedMessages.push(msg);
-      });
-
-      const mockCtx: MockCtx = {
-        message: {
-          photo: [{ file_id: 'large', width: 800, height: 800 }],
-          caption: 'Check this out',
-        },
-        chat: { id: 123 },
-        from: { id: 456 },
-      };
-
-      if (handler) {
-        await handler(mockCtx);
-      }
-
-      const logged = consoleError.mock.calls.flat().map(String).join('\n');
-      consoleError.mockRestore();
-      expect(logged).not.toContain('test-token');
-      expect(logged).not.toContain('https://api.telegram.org');
-      expect(logged).not.toContain('failed ');
-      expect(logged).toContain('Error');
-      expect(receivedMessages).toHaveLength(1);
-      expect(receivedMessages[0].mediaPath).toBeUndefined();
-      expect(receivedMessages[0].mediaError).toContain('Failed to download');
-    });
-  });
-
-  // ── SEC-M1: handler errors must log a sanitized frame, never the raw PHI.
-  describe('SEC-M1 handler error PHI leak guard', () => {
-    const PHI = 'glucose-PHI-marker-telegram-142857';
 
     it('text handler error logs a sanitized frame, never the PHI-bearing handler error', async () => {
       const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
@@ -469,7 +199,7 @@ describe('TelegramChannel', () => {
           handler = cb;
         }
       });
-      const channel = new TelegramChannel('test-token', '/tmp/test-workspace');
+      const channel = new TelegramChannel('test-token');
       await channel.onMessage(async () => {
         throw new Error(`telegram handler failed: ${PHI}`);
       });
@@ -503,7 +233,7 @@ describe('TelegramChannel', () => {
         arrayBuffer: () => Promise.resolve(new ArrayBuffer(10)),
       });
       global.fetch = mockFetch;
-      const channel = new TelegramChannel('test-token', '/tmp/test-workspace');
+      const channel = new TelegramChannel('test-token');
       await channel.onMessage(async () => {
         throw new Error(`telegram handler failed: ${PHI}`);
       });
@@ -537,7 +267,7 @@ describe('TelegramChannel', () => {
         arrayBuffer: () => Promise.resolve(new ArrayBuffer(10)),
       });
       global.fetch = mockFetch;
-      const channel = new TelegramChannel('test-token', '/tmp/test-workspace');
+      const channel = new TelegramChannel('test-token');
       await channel.onMessage(async () => {
         throw new Error(`telegram handler failed: ${PHI}`);
       });
@@ -561,7 +291,7 @@ describe('TelegramChannel', () => {
   describe('grammY error boundary (RES-P0-1)', () => {
     it('installs bot.catch handler during construction', () => {
       mockBotCatch.mockClear();
-      new TelegramChannel('test-token', '/tmp/test-workspace');
+      new TelegramChannel('test-token');
       expect(mockBotCatch).toHaveBeenCalledTimes(1);
       expect(typeof mockBotCatch.mock.calls[0][0]).toBe('function');
     });
@@ -583,7 +313,7 @@ describe('TelegramChannel', () => {
         mockBotStart.mockClear();
         mockBotStart.mockRejectedValue(new Error('getUpdates request failed: 401 Unauthorized PHI marker glucose'));
 
-        const channel = new TelegramChannel('test-token', '/tmp/test-workspace');
+        const channel = new TelegramChannel('test-token');
         await channel.connect();
 
         // Let the rejected promise's .then rejection handler run.
@@ -622,7 +352,7 @@ describe('TelegramChannel', () => {
       const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
       try {
         mockBotStart.mockRejectedValue(new Error('startup blip'));
-        const channel = new TelegramChannel('test-token', '/tmp/test-workspace');
+        const channel = new TelegramChannel('test-token');
         await channel.connect();
         await Promise.resolve();
         await Promise.resolve();

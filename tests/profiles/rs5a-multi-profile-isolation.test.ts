@@ -4,8 +4,9 @@ import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { ProfileRegistry } from '../../src/profiles/registry';
 import { ProfileRuntime } from '../../src/gateway/runtime';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { ProfileId } from '../../src/profiles/types';
+import { withoutOwnerIdentity } from '../helpers/test-config';
 
 // RR-STRUCT R-S5a (mini-plan v3 §3.3 + §3.8): ProfileRuntimeManager + entry-path isolation.
 // Dispatch STAYS default-only this slice (RR-4 refusal intact) — these tests prove the multi-
@@ -42,8 +43,9 @@ describe('RR-STRUCT R-S5a: ProfileRuntimeManager entry-path isolation', () => {
     jest.restoreAllMocks();
   });
 
-  function makeConfig(overrides?: Partial<AppConfig>): AppConfig {
+  function makeConfig(overrides?: Partial<EffectiveConfig>): EffectiveConfig {
     return {
+    schemaVersion: 2,
       providers: {
         main: { type: 'ollama', model: 'test-model', baseUrl: 'http://127.0.0.1:9/v1' },
         medical: { type: 'ollama', model: 'test-model', baseUrl: 'http://127.0.0.1:9/v1' },
@@ -213,8 +215,8 @@ describe('RR-STRUCT R-S5a: ProfileRuntimeManager entry-path isolation', () => {
 
   it('legacy no-registry mode still builds exactly ONE (default) profile via the manager (A-F11)', async () => {
     const config = makeConfig();
-    delete config.profiles;
-    gateway = new Gateway(config);
+    const legacyConfig = withoutOwnerIdentity(config);
+    gateway = new Gateway(legacyConfig);
 
     await gateway.start();
 
@@ -346,7 +348,7 @@ describe('RR-STRUCT R-S5a: ProfileRuntimeManager entry-path isolation', () => {
     // migration-sentinel state (no `hasBeenMigrated` gate, no legacy fallback for a secondary).
     const registry = new ProfileRegistry(baseDir);
     const expectedStore = registry.profileSchedulerStore(secondaryId);
-    expect(expectedStore).not.toBe((gateway as unknown as { config: AppConfig }).config.heartbeat.storePath);
+    expect(expectedStore).not.toBe((gateway as unknown as { config: EffectiveConfig }).config.heartbeat.storePath);
   });
 
   // ── Extra hunt: N>2 profiles build in parallel without serializing/deadlocking ───────────────

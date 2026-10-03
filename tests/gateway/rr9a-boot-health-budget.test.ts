@@ -1,4 +1,4 @@
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 
 const mockCheckSystemReadiness = jest.fn();
 const mockProbeChatCompletion = jest.fn();
@@ -19,7 +19,7 @@ describe('RR-9a R6-23 Gateway boot health budget', () => {
     jest.useFakeTimers();
     mockCheckSystemReadiness.mockImplementation(() => new Promise(() => undefined));
     mockProbeChatCompletion.mockImplementation(() => new Promise(() => undefined));
-    const gateway = new Gateway({} as AppConfig);
+    const gateway = new Gateway({} as EffectiveConfig);
     const internals = gateway as unknown as {
       runBootHealthchecks(): Promise<void>;
       bootHealth?: { providers: Array<{ reasonCode?: string }> };

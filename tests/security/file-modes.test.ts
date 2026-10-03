@@ -26,8 +26,8 @@ import {
   secureCopyFile,
   secureChmodTree,
 } from '../../src/security/secure-fs';
-import { saveConfig } from '../../src/config/config';
-import { cloneDefaultConfig } from '../../src/config/defaults';
+import { writeConfigDocument } from '../../src/runtime/installation';
+import { cloneStoredDefaults } from '../../src/config/defaults';
 import { LedgerStore } from '../../src/memcore/ledger-store';
 
 const DIR = 0o700;
@@ -423,11 +423,15 @@ describe('PHI file modes', () => {
 
   // ── config (secrets-bearing parent dir) ─────────────────────────
 
-  describe('saveConfig', () => {
-    it('creates the config parent dir at 0o700 and file at 0o600', async () => {
+  describe('writeConfigDocument', () => {
+    it('creates the config parent dir at 0o700 and file at 0o600', () => {
       const configPath = path.join(root, '.redacted', 'config.json');
-      const config = cloneDefaultConfig();
-      await saveConfig(configPath, config);
+      const stored = cloneStoredDefaults();
+      stored.profiles = { baseDir: root, defaultProfileId: 'default' };
+
+      const outcome = writeConfigDocument(configPath, stored);
+
+      expect(outcome.status).toBe('committed');
       expectDirMode(path.join(root, '.redacted'));
       expectFileMode(configPath);
     });

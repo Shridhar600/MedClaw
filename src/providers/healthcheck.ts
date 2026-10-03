@@ -1,4 +1,4 @@
-import type { AppConfig, ProviderConfig } from '../config/types';
+import type { EffectiveConfig, ProviderConfig } from '../config/types';
 import { providerEnvVar } from '../config/provider-env';
 import type { LLMProvider, LLMResponse, Message, ToolSchema } from './types';
 
@@ -444,7 +444,7 @@ export async function checkProviderReadiness(
 }
 
 export async function checkTelegramReadiness(
-  config: AppConfig,
+  config: EffectiveConfig,
   options: HealthcheckOptions = {},
 ): Promise<ReadinessResult> {
   if (!config.channels.telegram.enabled) {
@@ -563,7 +563,7 @@ export async function probeChatCompletion(
 }
 
 export async function checkSystemReadiness(
-  config: AppConfig,
+  config: EffectiveConfig,
   options: HealthcheckOptions = {},
 ): Promise<{ providers: ReadinessResult[]; telegram: ReadinessResult }> {
   const controller = new AbortController();

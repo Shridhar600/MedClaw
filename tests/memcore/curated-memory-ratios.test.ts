@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { CuratedMemory } from '../../src/memcore';
 import { BudgetExceededError } from '../../src/shared/errors';
-import { DEFAULT_CONFIG } from '../../src/config/defaults';
+import { DEFAULT_STORED_CONFIG } from '../../src/config/defaults';
 
 // E1.4 — the 60/20/20 MEMORY.md split becomes configurable (config.memory.budgetRatios), while the
 // no-cross-category + health-never-evicted invariants stay code-enforced (CHAT-02/05 unchanged).
@@ -59,7 +59,7 @@ describe('CuratedMemory configurable budget ratios (E1.4)', () => {
 });
 
 describe('config default budget ratios (E1.4)', () => {
-  it('DEFAULT_CONFIG.memory.budgetRatios is 60/20/20', () => {
-    expect(DEFAULT_CONFIG.memory.budgetRatios).toEqual({ health: 0.6, life: 0.2, agent: 0.2 });
+  it('DEFAULT_STORED_CONFIG.memory.budgetRatios is 60/20/20', () => {
+    expect(DEFAULT_STORED_CONFIG.memory.budgetRatios).toEqual({ health: 0.6, life: 0.2, agent: 0.2 });
   });
 });

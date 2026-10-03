@@ -4,10 +4,13 @@ import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { SessionManager } from '../../src/gateway/session';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 import { ProfileRegistry } from '../../src/profiles/registry';
 import type { ProfileId } from '../../src/profiles/types';
+import {} from '../helpers/test-config';
+import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 
 jest.mock('../../src/memory/indexer', () => ({
   MemoryIndexer: jest.fn().mockImplementation(() => ({
@@ -64,8 +67,21 @@ describe('Gateway reconciler debounce', () => {
     jest.restoreAllMocks();
   });
 
-  function makeConfig(): AppConfig {
+  /**
+   * OLD -> NEW: built `await boundGateway(config)` with no admission. Under S1 that makes the destination guard
+   * fail closed, so scheduled work is suppressed. Binding a real owner keeps these tests on the same
+   * authority production uses.
+   */
+  async function boundGateway(config: EffectiveConfig): Promise<Gateway> {
+    const owner = fixtureOwner(tmpDir);
+    const bound = await bindOwnerFixture(owner.ownerRecord, owner.ownerId, 'chat-1');
+    return new Gateway(config, bound.gatewayDeps);
+  }
+
+  function makeConfig(): EffectiveConfig {
     return {
+    schemaVersion: 2,
+    ...ownerSelection(fixtureOwner(tmpDir)),
       providers: {
         main: { type: 'ollama', model: 'kimi-k2.5:cloud', baseUrl: 'http://localhost:11434/v1' },
         medical: { type: 'ollama', model: 'medgemma', baseUrl: 'http://localhost:11434/v1' },
@@ -74,7 +90,7 @@ describe('Gateway reconciler debounce', () => {
       channels: { telegram: { enabled: false, botToken: '' } },
       tools: { allow: ['*'], deny: [] },
       memory: {
-        workspace: path.join(tmpDir, 'workspace'),
+        workspace: fixtureOwner(tmpDir).workspace,
         search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
         bootstrapMaxChars: 20000,
       },
@@ -86,11 +102,11 @@ describe('Gateway reconciler debounce', () => {
       heartbeat: {
         enabled: true,
         timezone: 'Asia/Kolkata',
-        storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+        storePath: fixtureOwner(tmpDir).storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 3, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-        audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+        audit: { path: fixtureOwner(tmpDir).auditLogPath },
         policy: {
           quietHours: { enabled: true, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,
@@ -104,9 +120,9 @@ describe('Gateway reconciler debounce', () => {
     };
   }
 
-  function setupGatewayWithScheduler() {
+  async function setupGatewayWithScheduler() {
     const config = makeConfig();
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
     const mockScheduler = {
       listJobs: jest.fn().mockResolvedValue([]),
@@ -131,7 +147,7 @@ describe('Gateway reconciler debounce', () => {
   }
 
   it('burst of messages triggers exactly one reconcile after debounce window', async () => {
-    const { gateway } = setupGatewayWithScheduler();
+    const { gateway } = await setupGatewayWithScheduler();
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const gw = gateway as any;
@@ -149,26 +165,32 @@ describe('Gateway reconciler debounce', () => {
     expect(mockReconcile).toHaveBeenCalledTimes(1);
   });
 
-  it('two different chatIds get independent debounce timers', async () => {
-    const { gateway } = setupGatewayWithScheduler();
+  it('two different chatIds get independent debounce timers, and only the BOUND chat may reconcile', async () => {
+    // OLD -> NEW: this asserted two independent timers AND that both chats reconciled. Under S1 only the
+    // bound owner destination may reconcile — the destination guard authorizes exactly one chat. The
+    // debounce mechanism is unchanged and still per-chat; what changed is that a second chat can no longer
+    // reach reconciliation. Both halves are now asserted, which is strictly more than before.
+    const { gateway } = await setupGatewayWithScheduler();
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const gw = gateway as any;
-    await gw.debouncedReconcile('chat-A');
-    await gw.debouncedReconcile('chat-B');
+    await gw.debouncedReconcile('chat-1'); // the bound owner destination (see boundGateway)
+    await gw.debouncedReconcile('chat-B'); // not bound
 
     jest.advanceTimersByTime(30_000);
     await Promise.resolve();
 
-    expect(mockReconcile).toHaveBeenCalledTimes(2);
+    // Independent timers: the bound chat's own debounce elapsed and ran exactly once.
+    expect(mockReconcile).toHaveBeenCalledTimes(1);
 
     const chatIds = mockBuildDesired.mock.calls.map((call: unknown[]) => (call[0] as { chatId: string }).chatId);
-    expect(chatIds).toContain('chat-A');
-    expect(chatIds).toContain('chat-B');
+    expect(chatIds).toContain('chat-1');
+    // The unbound chat got its own timer but was refused by the destination guard.
+    expect(chatIds).not.toContain('chat-B');
   });
 
   it('re-scheduling within the window resets the timer for that chatId', async () => {
-    const { gateway } = setupGatewayWithScheduler();
+    const { gateway } = await setupGatewayWithScheduler();
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const gw = gateway as any;
@@ -200,7 +222,7 @@ describe('Gateway reconciler debounce', () => {
       'utf8',
     );
 
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     const disconnect = jest.fn().mockResolvedValue(undefined);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined), disconnect };
@@ -229,7 +251,7 @@ describe('Gateway reconciler debounce', () => {
   });
 
   it('debounce timers do not keep the process alive (unref)', async () => {
-    const { gateway } = setupGatewayWithScheduler();
+    const { gateway } = await setupGatewayWithScheduler();
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const gw = gateway as any;
@@ -249,7 +271,7 @@ describe('Gateway reconciler debounce', () => {
     jest.spyOn(console, 'log').mockImplementation(() => undefined);
 
     const config = makeConfig();
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     await gateway.start();
 
     const mockScheduler = {

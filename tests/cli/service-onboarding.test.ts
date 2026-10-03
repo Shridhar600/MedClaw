@@ -1,9 +1,11 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { loadConfig } from '../../src/config/config';
 import { validateConfig } from '../../src/config/validation';
-import { buildConfigFromArgs, modelDefaultsForProvider, runServiceOnboarding, startDaemon, SUPPORTED_ONBOARDING_PROVIDERS } from '../../src/cli/service-onboarding';
+import { loadRuntimeConfig } from '../../src/runtime/startup';
+import { buildConfigFromArgs, modelDefaultsForProvider, SUPPORTED_ONBOARDING_PROVIDERS } from '../../src/cli/setup-config';
+import { runServiceOnboarding, startDaemon } from '../../src/cli/service-onboarding';
+import { fixtureOwner } from '../helpers/test-config';
 
 describe('service onboarding init', () => {
   let tmpDir: string;
@@ -29,8 +31,7 @@ describe('service onboarding init', () => {
       [
         '--yes',
         '--config', configPath,
-        '--workspace', workspacePath,
-        '--provider', 'ollama',
+                '--provider', 'ollama',
         '--main-model', 'kimi-k2.5:cloud',
         '--medical-model', 'aadide/medgemma-1.5-4b-it-Q4_K_S:latest',
         '--embedding-model', 'embeddinggemma:latest',
@@ -48,16 +49,94 @@ describe('service onboarding init', () => {
       },
     );
 
+    // RETIRED -> these asserted that setup bootstrapped `--workspace` and created sibling
+    // `<config parent>/sessions` and `<config parent>/heartbeats` directories. Setup now
+    // selects owner identity and DERIVES one workspace inside the state root, so the owner's
+    // workspace is bootstrapped and the scheduler store/audit log live under its `.state`.
+    const owner = fixtureOwner(path.dirname(configPath));
     expect(code).toBe(0);
-    expect(fs.readFileSync(path.join(workspacePath, 'SOUL.md'), 'utf8')).toBe('existing soul');
-    expect(fs.existsSync(path.join(workspacePath, 'HEALTH_PROFILE.md'))).toBe(true);
-    expect(fs.existsSync(path.join(workspacePath, 'conditions'))).toBe(true);
-    expect(fs.existsSync(path.join(workspacePath, 'medications'))).toBe(true);
-    expect(fs.existsSync(path.join(workspacePath, 'reports'))).toBe(true);
-    expect(fs.existsSync(path.join(workspacePath, 'goals'))).toBe(true);
-    expect(fs.existsSync(path.join(tmpDir, 'sessions'))).toBe(true);
-    expect(fs.existsSync(path.join(tmpDir, 'heartbeats'))).toBe(true);
+    expect(fs.existsSync(path.join(owner.workspace, 'HEALTH_PROFILE.md'))).toBe(true);
+    expect(fs.existsSync(path.join(owner.workspace, 'conditions'))).toBe(true);
+    expect(fs.existsSync(path.join(owner.workspace, 'medications'))).toBe(true);
+    expect(fs.existsSync(path.join(owner.workspace, 'reports'))).toBe(true);
+    expect(fs.existsSync(path.join(owner.workspace, 'goals'))).toBe(true);
+    expect(fs.existsSync(path.dirname(owner.storePath))).toBe(true);
     expect(output.join('')).not.toContain('prompt should not be called');
+  });
+
+  it('refuses a non-empty owner workspace instead of bootstrapping over existing files', async () => {
+    // S1 change (old -> new): this used to pre-create the workspace, assert templates were written
+    // around an existing SOUL.md, and prove nothing was overwritten. Setup now REFUSES a non-empty
+    // owner workspace outright, so the guarantee is stronger and simpler: nothing is written at all.
+    const owner = fixtureOwner(path.dirname(configPath));
+    fs.mkdirSync(owner.workspace, { recursive: true });
+    fs.writeFileSync(path.join(owner.workspace, 'SOUL.md'), 'existing soul', 'utf8');
+
+    const output: string[] = [];
+    const code = await runServiceOnboarding(
+      ['--yes', '--config', configPath, '--provider', 'ollama', '--telegram-enabled', 'false'],
+      {
+        stdout: (text: string) => output.push(text),
+        stderr: (text: string) => output.push(text),
+        input: async () => {
+          throw new Error('prompt should not be called');
+        },
+      },
+    );
+
+    expect(code).toBe(1);
+    expect(output.join('')).toContain('not empty');
+    expect(output.join('')).toContain('never removed');
+    expect(fs.readFileSync(path.join(owner.workspace, 'SOUL.md'), 'utf8')).toBe('existing soul');
+    expect(fs.existsSync(path.join(owner.workspace, 'HEALTH_PROFILE.md'))).toBe(false);
+    expect(fs.existsSync(configPath)).toBe(false);
+  });
+
+  it('creates the unpaired owner record before the config document, for the selected owner id', async () => {
+    const output: string[] = [];
+    const code = await runServiceOnboarding(
+      ['--yes', '--config', configPath, '--owner-id', 'kiran', '--provider', 'ollama', '--telegram-enabled', 'false'],
+      {
+        stdout: (text: string) => output.push(text),
+        stderr: (text: string) => output.push(text),
+        input: async () => {
+          throw new Error('prompt should not be called');
+        },
+      },
+    );
+
+    expect(code).toBe(0);
+    const owner = fixtureOwner(path.dirname(configPath), 'kiran');
+    // The record exists, is owner-only, and is unpaired — not a default profile.
+    expect(JSON.parse(fs.readFileSync(owner.ownerRecord, 'utf8'))).toMatchObject({
+      version: 1,
+      ownerId: 'kiran',
+      phase: 'unpaired',
+    });
+    expect(fs.statSync(owner.ownerRecord).mode & 0o777).toBe(0o600);
+    // The document selects the SAME identity, so a record can never sit behind a config that
+    // disagrees about who the owner is.
+    expect(await loadRuntimeConfig({ configPath })).toMatchObject({
+      profiles: { baseDir: path.dirname(configPath), defaultProfileId: 'kiran' },
+    });
+  });
+
+  it('refuses an owner id that the config decoder would later reject', async () => {
+    const output: string[] = [];
+    const code = await runServiceOnboarding(
+      ['--yes', '--config', configPath, '--owner-id', 'Not A Valid Id', '--provider', 'ollama'],
+      {
+        stdout: (text: string) => output.push(text),
+        stderr: (text: string) => output.push(text),
+        input: async () => {
+          throw new Error('prompt should not be called');
+        },
+      },
+    );
+
+    expect(code).toBe(1);
+    expect(output.join('')).toContain('Invalid --owner-id');
+    expect(fs.existsSync(configPath)).toBe(false);
   });
 
   it('fails when telegram is enabled without a token', async () => {
@@ -66,8 +145,7 @@ describe('service onboarding init', () => {
       [
         '--yes',
         '--config', configPath,
-        '--workspace', workspacePath,
-        '--provider', 'ollama',
+                '--provider', 'ollama',
         '--main-model', 'kimi-k2.5:cloud',
         '--medical-model', 'aadide/medgemma-1.5-4b-it-Q4_K_S:latest',
         '--embedding-model', 'embeddinggemma:latest',
@@ -98,8 +176,7 @@ describe('service onboarding init', () => {
         [
           '--yes',
           '--config', configPath,
-          '--workspace', workspacePath,
-          '--provider', 'ollama',
+                    '--provider', 'ollama',
           '--telegram-enabled', 'true',
           '--timezone', 'Asia/Kolkata',
           '--heartbeats-enabled', 'true',
@@ -115,7 +192,7 @@ describe('service onboarding init', () => {
 
       expect(code).toBe(0);
       expect(output.join('')).not.toContain('secret-token');
-      expect((await loadConfig({ configPath, requireFile: true })).channels.telegram.botToken).toBe(
+      expect((await loadRuntimeConfig({ configPath })).channels.telegram.botToken).toBe(
         '123456:secret-token',
       );
     } finally {
@@ -132,8 +209,7 @@ describe('service onboarding init', () => {
       [
         '--yes',
         '--config', configPath,
-        '--workspace', workspacePath,
-        '--provider', 'ollama',
+                '--provider', 'ollama',
         '--main-model', 'kimi-k2.5:cloud',
         '--medical-model', 'aadide/medgemma-1.5-4b-it-Q4_K_S:latest',
         '--embedding-model', 'embeddinggemma:latest',
@@ -150,7 +226,7 @@ describe('service onboarding init', () => {
     );
 
     expect(code).toBe(0);
-    const config = await loadConfig({ configPath, requireFile: true });
+    const config = await loadRuntimeConfig({ configPath });
     const result = validateConfig(config);
 
     expect(config.channels.telegram.enabled).toBe(false);
@@ -162,8 +238,7 @@ describe('service onboarding init', () => {
       [
         '--yes',
         '--config', configPath,
-        '--workspace', workspacePath,
-        '--provider', 'ollama',
+                '--provider', 'ollama',
         '--telegram-enabled', 'false',
         '--timezone', 'Asia/Kolkata',
         '--heartbeats-enabled', 'true',
@@ -180,8 +255,11 @@ describe('service onboarding init', () => {
     expect(code).toBe(0);
     expect(fs.existsSync(configPath)).toBe(true);
 
-    const config = await loadConfig({ configPath, requireFile: true });
-    expect(config.memory.workspace).toBe(workspacePath);
+    // S1 change (old -> new): the workspace used to be whatever `--workspace` said. It is now
+    // DERIVED from the state root plus the owner id, so a retired `--workspace` value can no longer
+    // silently become the serving workspace.
+    const config = await loadRuntimeConfig({ configPath });
+    expect(config.memory.workspace).toBe(fixtureOwner(path.dirname(configPath)).workspace);
     expect(config.channels.telegram.enabled).toBe(false);
     expect(config.heartbeat.timezone).toBe('Asia/Kolkata');
     expect(config.heartbeat.enabled).toBe(true);
@@ -196,8 +274,7 @@ describe('service onboarding init', () => {
       [
         '--yes',
         '--config', configPath,
-        '--workspace', workspacePath,
-        '--provider', 'ollama',
+                '--provider', 'ollama',
         '--telegram-enabled', 'false',
         '--timezone', 'Asia/Kolkata',
         '--heartbeats-enabled', 'true',
@@ -212,41 +289,64 @@ describe('service onboarding init', () => {
     );
 
     expect(code).toBe(1);
+    // S1 change (old -> new): this used to point the operator at `--force`. There is no overwrite
+    // path any more, so the refusal names the real remedy — a fresh target.
     expect(output.join('')).toContain('already exists');
-    expect(output.join('')).toContain('--force');
+    expect(output.join('')).toContain('never overwrites');
+    expect(output.join('')).toContain('--state-root');
     expect(fs.readFileSync(configPath, 'utf8')).toBe('{"existing":true}\n');
   });
 
-  it('overwrites an existing config during non-interactive init when force is provided', async () => {
+  it('refuses the retired --force flag with guidance instead of overwriting', async () => {
     fs.mkdirSync(path.dirname(configPath), { recursive: true });
     fs.writeFileSync(configPath, '{"existing":true}\n', 'utf8');
 
+    const output: string[] = [];
     const code = await runServiceOnboarding(
       [
         '--yes',
         '--force',
         '--config', configPath,
-        '--workspace', workspacePath,
         '--provider', 'ollama',
         '--telegram-enabled', 'false',
-        '--timezone', 'Asia/Kolkata',
-        '--heartbeats-enabled', 'true',
       ],
       {
-        stdout: () => undefined,
-        stderr: () => undefined,
+        stdout: (text: string) => output.push(text),
+        stderr: (text: string) => output.push(text),
         input: async () => {
           throw new Error('prompt should not be called');
         },
       },
     );
 
-    expect(code).toBe(0);
-    const config = await loadConfig({ configPath, requireFile: true });
-    expect(config.memory.workspace).toBe(workspacePath);
-    expect(config.channels.telegram.enabled).toBe(false);
+    // S1 change (old -> new): this test asserted `--force` OVERWROTE an existing config. Setup is
+    // now additive only — there is no overwrite, no resume and no unsolicited wipe.
+    expect(code).toBe(1);
+    expect(output.join('')).toContain('--force is retired');
+    expect(output.join('')).toContain('never removed');
+    expect(fs.readFileSync(configPath, 'utf8')).toBe('{"existing":true}\n');
   });
 
+  it('refuses the retired --workspace flag instead of silently ignoring it', async () => {
+    const output: string[] = [];
+    const code = await runServiceOnboarding(
+      ['--yes', '--config', configPath, '--workspace', workspacePath, '--provider', 'ollama'],
+      {
+        stdout: (text: string) => output.push(text),
+        stderr: (text: string) => output.push(text),
+        input: async () => {
+          throw new Error('prompt should not be called');
+        },
+      },
+    );
+
+    // S1 change (old -> new): `--workspace` used to be accepted and then overridden by the derived
+    // owner path. An old invocation now fails loudly rather than quietly writing somewhere else.
+    expect(code).toBe(1);
+    expect(output.join('')).toContain('--workspace is retired');
+    expect(output.join('')).toContain('--state-root');
+    expect(fs.existsSync(configPath)).toBe(false);
+  });
   it('fails clearly for OpenAI provider without an API key', async () => {
     const original = process.env.OPENAI_API_KEY;
     delete process.env.OPENAI_API_KEY;
@@ -256,8 +356,7 @@ describe('service onboarding init', () => {
         [
           '--yes',
           '--config', configPath,
-          '--workspace', workspacePath,
-          '--provider', 'openai',
+                    '--provider', 'openai',
           '--telegram-enabled', 'false',
           '--timezone', 'Asia/Kolkata',
           '--heartbeats-enabled', 'false',
@@ -287,8 +386,7 @@ describe('service onboarding init', () => {
       [
         '--yes',
         '--config', configPath,
-        '--workspace', workspacePath,
-        '--provider', 'openai',
+                '--provider', 'openai',
         '--telegram-enabled', 'false',
         '--timezone', 'Asia/Kolkata',
         '--heartbeats-enabled', 'false',
@@ -303,7 +401,7 @@ describe('service onboarding init', () => {
 
     expect(code).toBe(0);
     expect(output.join('')).not.toContain('sk-test-secret');
-    const config = await loadConfig({ configPath, requireFile: true });
+    const config = await loadRuntimeConfig({ configPath });
     expect(config.providers.main.type).toBe('openai');
     expect(config.providers.main.model).toBe('gpt-4o-mini');
     expect(config.providers.main.apiKey).toBe('sk-test-secret');
@@ -416,8 +514,12 @@ describe('service onboarding init', () => {
     delete process.env.OPENAI_API_KEY;
     try {
       const output: string[] = [];
+      // S1 change (old -> new): the wizard's workspace prompt became a state-root prompt plus an
+      // owner-id prompt, because every owner path is now derived from that pair. The answer stream
+      // gains the owner id and the former workspace path becomes the state root.
       const answers = [
-        workspacePath,
+        path.dirname(configPath),
+        'default',
         'openai',
         'sk-interactive-secret',
         '',
@@ -442,7 +544,7 @@ describe('service onboarding init', () => {
       expect(code).toBe(0);
       expect(prompts).toContain('• OpenAI API key\n  › ');
       expect(output.join('')).not.toContain('sk-interactive-secret');
-      const config = await loadConfig({ configPath, requireFile: true });
+      const config = await loadRuntimeConfig({ configPath });
       expect(config.providers.main).toEqual({
         type: 'openai',
         model: 'gpt-4o-mini',
@@ -474,7 +576,8 @@ describe('service onboarding init', () => {
     try {
       const output: string[] = [];
       const answers = [
-        workspacePath,
+        path.dirname(configPath),
+        'default',
         '',
         '',
         '',
@@ -506,7 +609,7 @@ describe('service onboarding init', () => {
       expect(code).toBe(0);
       expect(output.join('')).not.toContain('sk-prefilled-secret');
 
-      const config = await loadConfig({ configPath, requireFile: true });
+      const config = await loadRuntimeConfig({ configPath });
       expect(config.providers.main).toEqual({
         type: 'openai',
         model: 'gpt-4o-mini',

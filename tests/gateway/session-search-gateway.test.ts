@@ -2,14 +2,16 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
+import {} from '../helpers/test-config';
 
 // Wave D-2 — session_search (PLAT-20) wired behind the live Gateway: the SqliteSessionIndex is built on
 // the profile search.db, injected into the SessionManager for incremental indexing, and exposed as the
 // `session_search` tool group. A turn recorded through the manager is retrievable verbatim via the tool.
 
-function makeConfig(tmpDir: string): AppConfig {
+function makeConfig(tmpDir: string): EffectiveConfig {
   return {
+  schemaVersion: 2,
     providers: {
       main: { type: 'ollama', model: 'kimi-k2.5:cloud', baseUrl: 'http://localhost:11434/v1' },
       medical: { type: 'ollama', model: 'medgemma', baseUrl: 'http://localhost:11434/v1' },

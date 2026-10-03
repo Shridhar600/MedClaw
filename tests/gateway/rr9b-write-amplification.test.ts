@@ -3,9 +3,10 @@ import * as os from 'os';
 import * as path from 'path';
 
 import { Gateway } from '../../src/gateway/gateway';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { LLMProvider } from '../../src/providers/types';
 import type { ToolRegistry } from '../../src/tools/registry';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 
 const mockProvider: LLMProvider = {
   modelName: 'rr9b-gateway',
@@ -17,8 +18,11 @@ jest.mock('../../src/providers/factory', () => ({
   createProvider: jest.fn(() => mockProvider),
 }));
 
-function makeConfig(workspace: string): AppConfig {
+function makeConfig(workspace: string): EffectiveConfig {
+const owner = fixtureOwner(workspace);
   return {
+  schemaVersion: 2,
+  ...ownerSelection(owner),
     providers: {
       main: { type: 'ollama', model: 'rr9b-main', baseUrl: 'http://127.0.0.1:9/v1' },
       medical: { type: 'ollama', model: 'rr9b-medical', baseUrl: 'http://127.0.0.1:9/v1' },

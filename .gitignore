@@ -150,3 +150,6 @@ AGENTS.md
 CLAUDE.md
 readmedraft/
 505/
+
+# Synthetic test data created inside the workspace (never in /tmp or $HOME)
+.test-tmp/

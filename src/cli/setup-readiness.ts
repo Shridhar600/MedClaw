@@ -1,6 +1,6 @@
 import { spawn, type SpawnOptions } from 'child_process';
 import * as fs from 'fs';
-import type { AppConfig } from '../config/types';
+import type { EffectiveConfig } from '../config/types';
 import { validateConfig } from '../config/validation';
 import { providerEnvVar } from '../config/provider-env';
 import { probeOllamaCatalog, verifyTelegramToken, type HealthcheckOptions } from '../providers/healthcheck';
@@ -42,9 +42,9 @@ function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function configuredProviders(config: AppConfig): Array<{
+function configuredProviders(config: EffectiveConfig): Array<{
   label: 'providers.main' | 'providers.medical' | 'providers.embeddings';
-  provider: AppConfig['providers']['main'];
+  provider: EffectiveConfig['providers']['main'];
 }> {
   return [
     { label: 'providers.main', provider: config.providers.main },
@@ -53,12 +53,12 @@ function configuredProviders(config: AppConfig): Array<{
   ];
 }
 
-function hasProviderApiKey(provider: AppConfig['providers']['main']): boolean {
+function hasProviderApiKey(provider: EffectiveConfig['providers']['main']): boolean {
   const envVar = providerEnvVar(provider.type);
   return Boolean(provider.apiKey?.trim() || (envVar && process.env[envVar]?.trim()));
 }
 
-function providerDisplayName(provider: AppConfig['providers']['main']): string {
+function providerDisplayName(provider: EffectiveConfig['providers']['main']): string {
   switch (provider.type) {
     case 'openai':
       return 'OpenAI';
@@ -137,7 +137,7 @@ export async function ensureOllamaRuntime(
   };
 }
 
-export function getRequiredOllamaModels(config: AppConfig): string[] {
+export function getRequiredOllamaModels(config: EffectiveConfig): string[] {
   return [config.providers.main, config.providers.medical, config.providers.embeddings]
     .filter((provider) => provider.type === 'ollama')
     .map((provider) => provider.model.trim())
@@ -150,7 +150,7 @@ export function getMissingOllamaModels(requiredModels: string[], availableModels
 }
 
 export async function verifyTelegramRuntime(
-  config: AppConfig,
+  config: EffectiveConfig,
   dependencies: SetupReadinessDependencies = {},
 ): Promise<TelegramRuntimeCheck> {
   if (!config.channels.telegram.enabled) {
@@ -179,7 +179,7 @@ export async function verifyTelegramRuntime(
 }
 
 export async function preflightStartCheck(
-  config: AppConfig,
+  config: EffectiveConfig,
   configPath: string,
   dependencies: SetupReadinessDependencies = {},
 ): Promise<StartPreflightReport> {

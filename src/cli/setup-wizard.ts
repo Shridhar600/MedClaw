@@ -10,10 +10,11 @@ import {
   persistSetupArtifacts,
   providerLabel,
   SUPPORTED_ONBOARDING_PROVIDERS,
+  requireOwnerId,
   resolveNonInteractiveArgs,
   resolveSetupPath,
   requiredCloudEnv,
-} from './service-onboarding';
+} from './setup-config';
 import {
   getMissingOllamaModels,
   verifyTelegramRuntime,
@@ -33,8 +34,9 @@ import type { SetupWizardState, CompletionAction, ReviewAction } from './wizard-
 import { checkSystemReadiness } from '../providers/healthcheck';
 import { probeOllamaCatalog } from '../providers/healthcheck';
 import { validateConfig } from '../config/validation';
-import type { AppConfig, ProviderConfig } from '../config/types';
+import type { EffectiveConfig, ProviderConfig } from '../config/types';
 import { listWorkspaceTemplateFiles } from '../workspace/bootstrap';
+import { resolveOwnerPaths } from '../profiles';
 
 const TOTAL_STEPS = 5;
 
@@ -51,10 +53,10 @@ function shouldRunLiveChecks(io: CliIO, options?: SetupReadinessDependencies): b
   return process.stdin.isTTY === true;
 }
 
-function validateWritablePath(targetPath: string, kind: 'workspace' | 'config'): string[] {
+function validateWritablePath(targetPath: string, kind: 'state' | 'config'): string[] {
   const errors: string[] = [];
   try {
-    const directory = kind === 'workspace' ? targetPath : path.dirname(targetPath);
+    const directory = kind === 'state' ? targetPath : path.dirname(targetPath);
     let probeDirectory = directory;
     while (!fs.existsSync(probeDirectory)) {
       const parent = path.dirname(probeDirectory);
@@ -70,7 +72,7 @@ function validateWritablePath(targetPath: string, kind: 'workspace' | 'config'):
     fs.accessSync(probeDirectory, fs.constants.W_OK);
   } catch (error) {
     errors.push(
-      `${kind === 'workspace' ? 'Workspace' : 'Config directory'} is not writable: ${
+      `${kind === 'state' ? 'Owner state' : 'Config directory'} is not writable: ${
         error instanceof Error ? error.message : String(error)
       }`,
     );
@@ -81,7 +83,8 @@ function validateWritablePath(targetPath: string, kind: 'workspace' | 'config'):
 function stateToArgs(state: SetupWizardState) {
   return resolveNonInteractiveArgs({
     configPath: state.configPath,
-    workspace: state.workspace,
+    stateRoot: state.stateRoot,
+    ownerId: state.ownerId,
     provider: state.provider,
     mainModel: state.mainModel,
     medicalModel: state.medicalModel,
@@ -101,7 +104,7 @@ async function buildReviewStateWithOptions(
   options: SetupReadinessDependencies = {},
 ): Promise<{
   args: ReturnType<typeof stateToArgs>;
-  config: AppConfig;
+  config: EffectiveConfig;
   validation: ReturnType<typeof validateConfig>;
   readiness: Awaited<ReturnType<typeof checkSystemReadiness>>;
   errors: string[];
@@ -128,17 +131,33 @@ async function runEnvironmentStep(io: CliIO, state: SetupWizardState): Promise<v
   renderStatus(io, 'OK', 'Setup wizard is ready');
 }
 
-async function runWorkspaceStep(io: CliIO, state: SetupWizardState): Promise<void> {
-  renderStepHeader(io, 2, TOTAL_STEPS, 'Workspace');
-  state.workspace = resolveSetupPath(await askValue(io, 'Workspace path', state.workspace));
-  const pathErrors = validateWritablePath(state.workspace, 'workspace');
+/**
+ * The owner chooses the STATE ROOT and the OWNER ID. Everything else about their location is
+ * derived, so there is no second path authority that can disagree with the first.
+ */
+async function runStateStep(io: CliIO, state: SetupWizardState): Promise<void> {
+  renderStepHeader(io, 2, TOTAL_STEPS, 'Owner state');
+
+  state.stateRoot = resolveSetupPath(await askValue(io, 'Owner state root', state.stateRoot));
+  state.ownerId = (await askValue(io, 'Owner ID', state.ownerId)).trim();
+
+  try {
+    requireOwnerId(state.ownerId);
+    state.ownerId = state.ownerId.trim();
+  } catch (error) {
+    renderStatus(io, 'WARN', error instanceof Error ? error.message : String(error));
+  }
+
+  const ownerPaths = resolveOwnerPaths(state.stateRoot, requireOwnerId(state.ownerId));
+  const pathErrors = validateWritablePath(state.stateRoot, 'state');
   if (pathErrors.length === 0) {
-    renderStatus(io, 'OK', 'Workspace directory is writable.');
+    renderStatus(io, 'OK', 'Owner state directory is writable.');
   } else {
     for (const error of pathErrors) {
       renderStatus(io, 'WARN', error);
     }
   }
+  renderStatus(io, 'INFO', `Derived owner workspace: ${ownerPaths.workspace}`);
   renderStatus(io, 'INFO', `Template files: ${listWorkspaceTemplateFiles().join(', ')}`);
 }
 
@@ -332,8 +351,8 @@ async function runReviewStep(
 
 async function rerunSelectedStep(io: CliIO, state: SetupWizardState, action: ReviewAction): Promise<void> {
   switch (action) {
-    case 'workspace':
-      await runWorkspaceStep(io, state);
+    case 'state':
+      await runStateStep(io, state);
       return;
     case 'provider':
       await runProviderStep(io, state);
@@ -358,7 +377,7 @@ async function ensureReviewCanContinue(
 ): Promise<boolean> {
   const review = await buildReviewStateWithOptions(state, shouldRunLiveChecks(io, options), options);
   const pathErrors = [
-    ...validateWritablePath(state.workspace, 'workspace'),
+    ...validateWritablePath(state.stateRoot, 'state'),
     ...validateWritablePath(state.configPath, 'config'),
   ];
   const readinessFailures = [...review.readiness.providers, review.readiness.telegram]
@@ -388,7 +407,7 @@ async function ensureReviewCanContinue(
 
 async function runCompletionStep(
   io: CliIO,
-  config: AppConfig,
+  config: EffectiveConfig,
   configPath: string,
   options: SetupReadinessDependencies = {},
 ): Promise<CompletionAction> {
@@ -430,23 +449,23 @@ export async function runSetupWizard(
   io: CliIO,
   initial: SetupWizardState,
   options: SetupReadinessDependencies = {},
-): Promise<{ config?: AppConfig; action: CompletionAction; cancelled: boolean }> {
+): Promise<{ config?: EffectiveConfig; action: CompletionAction; cancelled: boolean }> {
   const state: SetupWizardState = {
     ...initial,
     configPath: resolveSetupPath(initial.configPath),
-    workspace: resolveSetupPath(initial.workspace),
+    stateRoot: resolveSetupPath(initial.stateRoot),
   };
 
   renderWizardBanner(io);
   await runEnvironmentStep(io, state);
-  await runWorkspaceStep(io, state);
+  await runStateStep(io, state);
   await runProviderStep(io, state);
   await runProviderChecks(io, state, options);
   await runTelegramStep(io, state);
   await runTelegramChecks(io, state, options);
   await runPreferencesStep(io, state);
 
-  let config: AppConfig | undefined;
+  let config: EffectiveConfig | undefined;
   let configPath: string | undefined;
   for (;;) {
     const action = await runReviewStep(io, state, options);

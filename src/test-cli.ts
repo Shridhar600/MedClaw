@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import express, { Request, Response } from 'express';
-import { loadConfig } from './config/config';
+import { loadRuntimeConfig } from './runtime/startup';
 import { AgentLoop } from './agent/agent-loop';
 import { ContextAssembler } from './agent/context';
 import { MemoryEngine } from './memory/memory-engine';
@@ -149,7 +149,7 @@ function countSessionFiles(dir: string): number {
 }
 
 async function main(): Promise<void> {
-  const config = await loadConfig();
+  const config = await loadRuntimeConfig();
 
   process.stdout.write('[cli] Starting Redacted...\n');
 

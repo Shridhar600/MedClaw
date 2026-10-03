@@ -12,11 +12,15 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { LLMProvider, LLMResponse, Message } from '../../src/providers/types';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 
-function makeConfig(tmpDir: string): AppConfig {
+function makeConfig(tmpDir: string): EffectiveConfig {
+const owner = fixtureOwner(tmpDir);
   return {
+  schemaVersion: 2,
+  ...ownerSelection(owner),
     providers: {
       main: { type: 'ollama', model: 'unused', baseUrl: 'http://127.0.0.1:9/v1' },
       medical: { type: 'ollama', model: 'unused', baseUrl: 'http://127.0.0.1:9/v1' },
@@ -25,7 +29,7 @@ function makeConfig(tmpDir: string): AppConfig {
     channels: { telegram: { enabled: false, botToken: '' } },
     tools: { allow: ['*'], deny: [] },
     memory: {
-      workspace: path.join(tmpDir, 'workspace'),
+      workspace: owner.workspace,
       search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
       bootstrapMaxChars: 20000,
     },
@@ -37,11 +41,11 @@ function makeConfig(tmpDir: string): AppConfig {
     heartbeat: {
       enabled: false,
       timezone: 'Asia/Kolkata',
-      storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+      storePath: owner.storePath,
       recovery: { enabled: false, windowMinutes: 60 },
       retry: { maxRetries: 3, backoffMinutes: 5 },
       rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-      audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+      audit: { path: owner.auditLogPath },
       policy: {
         quietHours: { enabled: true, start: '22:00', end: '07:00' },
         skipIfChatActiveWithinMinutes: 60,

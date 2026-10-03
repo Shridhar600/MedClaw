@@ -3,8 +3,9 @@ import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { ProfileRegistry } from '../../src/profiles/registry';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { ProfileId } from '../../src/profiles/types';
+import {} from '../helpers/test-config';
 
 // Deterministic, network-free memory index (mirrors migration-startup.test.ts).
 jest.mock('../../src/memory/indexer', () => ({
@@ -35,8 +36,9 @@ describe('Gateway boot with profiles config (Task 2.5)', () => {
     jest.restoreAllMocks();
   });
 
-  function makeConfig(): AppConfig {
+  function makeConfig(): EffectiveConfig {
     return {
+    schemaVersion: 2,
       providers: {
         main: { type: 'ollama', model: 'test-model', baseUrl: 'http://localhost:11434/v1' },
         medical: { type: 'ollama', model: 'test-model', baseUrl: 'http://localhost:11434/v1' },

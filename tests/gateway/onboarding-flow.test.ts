@@ -2,8 +2,10 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
+import {} from '../helpers/test-config';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 
 describe('Gateway onboarding integration', () => {
   let tmpDir: string;
@@ -16,8 +18,10 @@ describe('Gateway onboarding integration', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  function makeConfig(): AppConfig {
+  function makeConfig(): EffectiveConfig {
     return {
+    schemaVersion: 2,
+    ...ownerSelection(fixtureOwner(tmpDir)),
       providers: {
         main: { type: 'ollama', model: 'kimi-k2.5:cloud', baseUrl: 'http://localhost:11434/v1' },
         medical: { type: 'ollama', model: 'medgemma', baseUrl: 'http://localhost:11434/v1' },
@@ -26,7 +30,7 @@ describe('Gateway onboarding integration', () => {
       channels: { telegram: { enabled: false, botToken: '' } },
       tools: { allow: ['*'], deny: [] },
       memory: {
-        workspace: path.join(tmpDir, 'workspace'),
+        workspace: fixtureOwner(tmpDir).workspace,
         search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
         bootstrapMaxChars: 20000,
       },
@@ -38,11 +42,11 @@ describe('Gateway onboarding integration', () => {
       heartbeat: {
         enabled: false,
         timezone: 'Asia/Kolkata',
-        storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+        storePath: fixtureOwner(tmpDir).storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 3, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-        audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+        audit: { path: fixtureOwner(tmpDir).auditLogPath },
         policy: {
           quietHours: { enabled: true, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,
@@ -111,7 +115,16 @@ describe('Gateway onboarding integration', () => {
     const response = await gateway.handleTestMessage('chat-1', 'Can I eat daal chawal?');
 
     expect(response).toBe('normal agent');
-    expect(run).toHaveBeenCalledWith('Can I eat daal chawal?', [], { chatId: 'chat-1', mode: 'chat' });
+    // S1 change (old -> new): `handleTestMessage` now presents an explicit local transport identity
+    // instead of an empty one, because S1 admission refuses a message with no transport identity
+    // and omitting it made this path untestable and its refusals meaningless. The extra
+    // `User id: local` line is that honest identity appearing in the captured agent input; the
+    // clinical text, the history and the turn options are unchanged.
+    expect(run).toHaveBeenCalledWith(
+      'Can I eat daal chawal?\n\nUser id: local',
+      [],
+      { chatId: 'chat-1', mode: 'chat', turnId: undefined },
+    );
   });
 
   it('bypasses onboarding for urgent health messages without calling the agent loop', async () => {

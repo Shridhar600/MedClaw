@@ -12,7 +12,7 @@ interface MenuOption<TValue extends string> {
 
 const REVIEW_MENU_OPTIONS: readonly MenuOption<ReviewAction>[] = [
   { value: 'apply', label: 'Apply setup' },
-  { value: 'workspace', label: 'Edit workspace' },
+  { value: 'state', label: 'Edit workspace' },
   { value: 'provider', label: 'Edit provider' },
   { value: 'telegram', label: 'Edit Telegram' },
   { value: 'preferences', label: 'Edit preferences' },

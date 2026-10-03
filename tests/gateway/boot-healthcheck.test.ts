@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { ReadinessResult } from '../../src/providers/healthcheck';
 
 jest.mock('../../src/memory/indexer', () => ({
@@ -35,6 +35,8 @@ jest.mock('../../src/onboarding/flow', () => ({
 }));
 
 import { Gateway } from '../../src/gateway/gateway';
+import {} from '../helpers/test-config';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 
 function allReadyResult(): { providers: ReadinessResult[]; telegram: ReadinessResult } {
   return {
@@ -82,8 +84,10 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     jest.restoreAllMocks();
   });
 
-  function makeConfig(): AppConfig {
+  function makeConfig(): EffectiveConfig {
     return {
+    schemaVersion: 2,
+    ...ownerSelection(fixtureOwner(tmpDir)),
       providers: {
         main: { type: 'ollama', model: 'kimi-k2.5:cloud', baseUrl: 'http://localhost:11434/v1' },
         medical: { type: 'ollama', model: 'medgemma', baseUrl: 'http://localhost:11434/v1' },
@@ -92,7 +96,7 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
       channels: { telegram: { enabled: false, botToken: '' } },
       tools: { allow: ['*'], deny: [] },
       memory: {
-        workspace: path.join(tmpDir, 'workspace'),
+        workspace: fixtureOwner(tmpDir).workspace,
         search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
         bootstrapMaxChars: 20000,
       },
@@ -104,11 +108,11 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
       heartbeat: {
         enabled: false,
         timezone: 'Asia/Kolkata',
-        storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+        storePath: fixtureOwner(tmpDir).storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 3, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-        audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+        audit: { path: fixtureOwner(tmpDir).auditLogPath },
         policy: {
           quietHours: { enabled: true, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,

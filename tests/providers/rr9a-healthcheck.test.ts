@@ -1,8 +1,12 @@
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import { checkSystemReadiness } from '../../src/providers/healthcheck';
+import {} from '../helpers/test-config';
+import { ownerSelection, sharedFixtureOwner } from '../helpers/test-config';
 
-function config(): AppConfig {
+function config(): EffectiveConfig {
   return {
+  schemaVersion: 2,
+  ...ownerSelection(sharedFixtureOwner()),
     providers: {
       main: { type: 'ollama', model: 'main-model', baseUrl: 'http://127.0.0.1:11434/v1' },
       medical: { type: 'ollama', model: 'medical-model', baseUrl: 'http://127.0.0.1:11434/v1' },
@@ -22,7 +26,7 @@ function config(): AppConfig {
     },
     heartbeat: { enabled: false, timezone: 'Asia/Kolkata' },
     agent: { maxIterations: 5, disclaimerEnabled: true },
-  } as unknown as AppConfig;
+  } as unknown as EffectiveConfig;
 }
 
 describe('RR-9a R6-23 bounded readiness probes', () => {

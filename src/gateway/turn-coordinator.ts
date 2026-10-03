@@ -1,4 +1,4 @@
-import type { IncomingMessage } from '../channels/types';
+import type { AdmittedMessage } from '../channels/types';
 import type { AgentRunResult, Message } from '../providers/types';
 import { OnboardingFlow } from '../onboarding/flow';
 import { OnboardingStore } from '../onboarding/store';
@@ -23,7 +23,7 @@ export const MAX_QUEUED_TURNS_WAITING = 2;
 export type TurnEgress = (text: string) => Promise<void>;
 export type EmergencyResponse = (input: string) => string | undefined;
 
-export async function captureUserTurn(runtime: ProfileRuntime, incoming: IncomingMessage): Promise<void> {
+export async function captureUserTurn(runtime: ProfileRuntime, incoming: AdmittedMessage): Promise<void> {
   const pipeline = runtime.capturePipeline;
   if (!pipeline || incoming.text.trim().length === 0) return;
   try {
@@ -39,7 +39,7 @@ export async function captureUserTurn(runtime: ProfileRuntime, incoming: Incomin
   }
 }
 
-export function scheduleBackgroundCapture(runtime: ProfileRuntime, incoming: IncomingMessage): void {
+export function scheduleBackgroundCapture(runtime: ProfileRuntime, incoming: AdmittedMessage): void {
   runtime.trackBackgroundOperation('emergency capture', () => captureUserTurn(runtime, incoming));
 }
 
@@ -119,7 +119,7 @@ export class TurnCoordinator {
   ) {}
 
   runUser(
-    incoming: IncomingMessage,
+    incoming: AdmittedMessage,
     egress: TurnEgress,
     emergencyResponse: EmergencyResponse,
   ): Promise<string> {
@@ -208,7 +208,7 @@ export class TurnCoordinator {
   }
 
   private async executeUser(
-    incoming: IncomingMessage,
+    incoming: AdmittedMessage,
     egress: TurnEgress,
     emergencyResponse: EmergencyResponse,
   ): Promise<string> {
@@ -414,7 +414,7 @@ export class TurnCoordinator {
     return result.response;
   }
 
-  private buildAgentInput(incoming: IncomingMessage): string {
+  private buildAgentInput(incoming: AdmittedMessage): string {
     const parts: string[] = [incoming.text];
     if (incoming.mediaPath) {
       parts.push('', `Uploaded media path (relative to workspace): ${incoming.mediaPath}`);

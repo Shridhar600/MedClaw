@@ -1,9 +1,10 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import type { AppConfig } from '../../src/config/types';
-import type { ProfileId } from '../../src/profiles/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { HeartbeatJob } from '../../src/scheduler/types';
+import {} from '../helpers/test-config';
+import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
 
 const mockSendMessage = jest.fn();
 const mockBotOn = jest.fn();
@@ -72,8 +73,9 @@ describe('Gateway scheduler recovery wiring', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  function makeConfig(): AppConfig {
+  function makeConfig(): EffectiveConfig {
     return {
+    schemaVersion: 2,
       providers: {
         main: { type: 'ollama', model: 'test-main' },
         medical: { type: 'ollama', model: 'test-medical' },
@@ -135,7 +137,7 @@ describe('Gateway scheduler recovery wiring', () => {
     };
   }
 
-  function installRuntime(config: AppConfig): void {
+  function installRuntime(config: EffectiveConfig): void {
     const job = recoveryJob();
     const runtime: Record<string, unknown> = {
       profileId: 'default',
@@ -182,15 +184,15 @@ describe('Gateway scheduler recovery wiring', () => {
 
   it('does not drop a recovered heartbeat while ProfileRuntime.create is in progress', async () => {
     const { Gateway } = await import('../../src/gateway/gateway');
-    const { ProfileRegistry } = await import('../../src/profiles/registry');
     const config = makeConfig();
-    // Persist the pairing fixture BEFORE boot: the destination guard refuses unpaired chats.
-    fs.mkdirSync(path.join(tmpDir, 'profiles-base'), { recursive: true });
-    const fixtureRegistry = new ProfileRegistry(path.join(tmpDir, 'profiles-base'));
-    fixtureRegistry.getOrCreateDefaultProfile();
-    fixtureRegistry.pairChatToProfile('chat-1', 'default' as ProfileId);
+    // OLD -> NEW: persisted a REGISTRY pairing before boot. S1's destination guard authorizes the
+    // `OwnerState.binding.chatId`, not `profiles.json`, so a registry pairing authorizes nothing and this
+    // recovered heartbeat would be suppressed. Bind a real owner record instead — through the same
+    // composition production uses.
+    const ownerRecord = path.join(tmpDir, 'owner-workspace', '.state', 'owner-access.json');
+    const bound = await bindOwnerFixture(ownerRecord, 'default', 'chat-1');
     installRuntime(config);
-    const gateway = new Gateway(config);
+    const gateway = new Gateway(config, bound.gatewayDeps);
 
     await gateway.start();
     try {

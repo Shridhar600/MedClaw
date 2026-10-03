@@ -5,11 +5,12 @@ import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { SessionManager } from '../../src/gateway/session';
 import { SqliteSessionIndex } from '../../src/indexstore/session-index';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { HeartbeatJob } from '../../src/scheduler/types';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 import { ProfileRegistry } from '../../src/profiles/registry';
 import type { ProfileId } from '../../src/profiles/types';
+import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
 
 const FALLBACK = "I'm having trouble right now. Please try again in a moment.";
 
@@ -24,13 +25,25 @@ describe('RR-6b gateway delivery durability', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  function makeGateway(): Gateway {
-    return new Gateway({} as AppConfig);
+  /**
+   * OLD -> NEW: built `new Gateway({} as EffectiveConfig)` with no admission. Under S1 the destination
+   * guard fails closed, so a heartbeat that must NOT be delivered before a failed persistence would look
+   * delivered for the wrong reason. A real bound owner keeps the assertion about persistence, not about a
+   * dead default.
+   */
+  async function makeGateway(): Promise<Gateway> {
+    const bound = await bindOwnerFixture(
+      path.join(tmpDir, 'owner-workspace', '.state', 'owner-access.json'),
+      'default',
+      'chat-1',
+      { channel: 'local', userId: 'local' },
+    );
+    return new Gateway({} as EffectiveConfig, bound.gatewayDeps);
   }
 
-  function prepareFailureGateway(sessions: SessionManager): Gateway {
-    const gateway = makeGateway();
-    attachGatewayTestRuntime(gateway, {} as AppConfig, {
+  async function prepareFailureGateway(sessions: SessionManager): Promise<Gateway> {
+    const gateway = await makeGateway();
+    attachGatewayTestRuntime(gateway, {} as EffectiveConfig, {
       capturePipeline: { ingest: jest.fn().mockResolvedValue(undefined) },
       agentLoop: { run: jest.fn().mockRejectedValue(new Error('provider failed')) },
       sessions,
@@ -47,7 +60,7 @@ describe('RR-6b gateway delivery durability', () => {
       sessionsDir: sessions.sessionsDir,
     });
     sessions.setTurnIndex(index);
-    const gateway = prepareFailureGateway(sessions);
+    const gateway = await prepareFailureGateway(sessions);
 
     await expect(gateway.handleTestMessage('chat-1', 'private glucose 240')).resolves.toBe(FALLBACK);
 
@@ -63,15 +76,21 @@ describe('RR-6b gateway delivery durability', () => {
       sessionsDir: sessions.sessionsDir,
     });
     sessions.setTurnIndex(index);
-    const gateway = prepareFailureGateway(sessions);
+    const gateway = await prepareFailureGateway(sessions);
     const state = gateway as unknown as Record<string, unknown>;
     const send = jest.fn().mockResolvedValue(undefined);
     state.channel = { send };
 
+    // OLD -> NEW: this drove the transport callback with NO channel/chatType/eventId, which S1 admission
+    // refuses as `missing-transport-identity` — correctly, since a real inbound message always carries them.
+    // The test is about handler/session sync, so it now sends a genuine bound-owner identity.
     await (gateway as unknown as { handleMessage(message: unknown): Promise<void> }).handleMessage({
       chatId: 'chat-1',
-      userId: 'user-1',
+      userId: 'local',
       text: 'private blood pressure 180',
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:chat-1:bp',
     });
 
     expect(send).toHaveBeenCalledWith('chat-1', { text: FALLBACK });
@@ -81,8 +100,8 @@ describe('RR-6b gateway delivery durability', () => {
   });
 
   it('does not deliver a heartbeat before a failed persistence attempt, so retry sends once', async () => {
-    const gateway = makeGateway();
-    const runtime = attachGatewayTestRuntime(gateway, {} as AppConfig);
+    const gateway = await makeGateway();
+    const runtime = attachGatewayTestRuntime(gateway, {} as EffectiveConfig);
     const state = gateway as unknown as Record<string, unknown>;
     const send = jest.fn().mockResolvedValue(undefined);
     let recordCalls = 0;
@@ -150,8 +169,8 @@ describe('RR-6b gateway delivery durability', () => {
   });
 
   it('does not report /new success or reject the test handler when the replacement window write fails', async () => {
-    const gateway = makeGateway();
-    attachGatewayTestRuntime(gateway, {} as AppConfig);
+    const gateway = await makeGateway();
+    attachGatewayTestRuntime(gateway, {} as EffectiveConfig);
     const state = gateway as unknown as Record<string, unknown>;
     state.sessions = {
       resetSession: jest.fn().mockRejectedValue(new Error('window write failed')),
@@ -161,8 +180,8 @@ describe('RR-6b gateway delivery durability', () => {
   });
 
   it('does not reject the channel handler when the replacement window write fails', async () => {
-    const gateway = makeGateway();
-    attachGatewayTestRuntime(gateway, {} as AppConfig);
+    const gateway = await makeGateway();
+    attachGatewayTestRuntime(gateway, {} as EffectiveConfig);
     const state = gateway as unknown as Record<string, unknown>;
     const send = jest.fn().mockResolvedValue(undefined);
     state.channel = { send };
@@ -170,10 +189,15 @@ describe('RR-6b gateway delivery durability', () => {
       resetSession: jest.fn().mockRejectedValue(new Error('window write failed')),
     };
 
+    // OLD -> NEW: as above — a real inbound message carries a transport identity, and admission refuses
+    // one that does not.
     await (gateway as unknown as { handleMessage(message: unknown): Promise<void> }).handleMessage({
       chatId: 'chat-1',
-      userId: 'user-1',
+      userId: 'local',
       text: '/new',
+      channel: 'local',
+      chatType: 'private',
+      eventId: 'local:chat-1:new',
     });
 
     expect(send).toHaveBeenCalledWith('chat-1', expect.objectContaining({ text: expect.stringMatching(/unable|try again/i) }));

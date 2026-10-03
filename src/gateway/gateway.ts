@@ -1,14 +1,13 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
-import type { AppConfig } from '../config/types';
+import type { EffectiveConfig } from '../config/types';
 import { ProfileRegistry } from '../profiles';
-import type { ProfileId } from '../profiles';
-import type { Channel, IncomingMessage } from '../channels/types';
+import type { OwnerAdmissionService, ProfileId } from '../profiles';
+import type { AdmittedMessage, Channel, IncomingMessage } from '../channels/types';
 import { TelegramChannel } from '../channels/telegram';
 import { LLMSemaphore, HeartbeatQueueFullError } from '../tools/semaphore';
 import { deprecatedSessionWarnings } from '../config/deprecations';
-import { createProvider } from '../providers/factory';
+import { createProvider, type ProviderFactory } from '../providers/factory';
 import { SessionManager } from './session';
 import { syncHeartbeatMarkdown } from '../scheduler/heartbeat-markdown';
 import type { NightlySweepResult } from '../scheduler/transcript-sweep-job';
@@ -27,8 +26,49 @@ import {
 } from '../security';
 import { ProfileRuntime } from './runtime';
 import { ProfileRuntimeManager } from './manager';
-import { GatewayMessageRouter, sweepStagedMedia } from './router';
+import { GatewayMessageRouter, sweepStagedMedia, transportIdentityOf } from './router';
+import { FsMediaStager } from '../runtime/adapters/media-stager';
+import type { MediaSourcePort, MediaStageDiagnostics } from '../ports/media-source';
 import { TurnQueueFullError, heartbeatTurnId } from './turn-coordinator';
+
+/**
+ * Required collaborators for a production Gateway. S1 makes admission non-optional in
+ * composition; it stays optional on the constructor only so the pre-S1 direct-construction tests
+ * can still describe a single-runtime world. A Gateway booted WITHOUT admission has no enrollment
+ * authority at all and must not be used to serve a real owner.
+ */
+/** Canned, non-clinical explanations for a refused attachment. Never leaks a reason detail. */
+const MEDIA_REFUSAL_TEXT: Record<string, string> = {
+  unsupported: 'That attachment type cannot be accepted.',
+  'advertised-too-large': 'That file is larger than the 10 MB limit.',
+  'too-large': 'That file is larger than the 10 MB limit.',
+  timeout: 'That upload took too long and was cancelled. Please try again.',
+  'queue-full': 'Too many uploads are already being processed. Please try again in a moment.',
+  aborted: 'That upload was cancelled.',
+  'source-failed': 'Failed to retrieve that attachment. Please try uploading it again.',
+};
+
+export interface GatewayAdmissionDeps {
+  admission?: OwnerAdmissionService;
+  ownerId?: ProfileId;
+  /**
+   * How providers are constructed for this daemon (plan 15 §3 `GatewayBindings`).
+   *
+   * Production composition supplies the real factory explicitly rather than letting the Gateway and
+   * `ProfileRuntime.create` each reach for one internally — that hidden creation is what made a
+   * real owner spine untestable without live providers. Defaults to the real factory, so a caller
+   * that omits it gets exactly the previous production behaviour.
+   */
+  createProvider?: ProviderFactory;
+  /**
+   * How attached media bytes are retrieved (plan 15 §2.5). Supplied by production composition.
+   * Absent it, media is refused rather than silently dropped — a transport that cannot retrieve
+   * bytes must not appear to succeed.
+   */
+  mediaSource?: MediaSourcePort;
+  /** Diagnostics for bounded media outcomes. One event per attempt, no identifiers. */
+  mediaDiagnostics?: MediaStageDiagnostics;
+}
 
 const SHUTDOWN_RESPONSE = 'The health assistant is shutting down. Please try again in a moment.';
 const BOOT_HEALTHCHECK_BUDGET_MS = 3_000;
@@ -74,7 +114,7 @@ function readinessLabel(result: ReadinessResult): 'OK' | 'FAIL' | 'PENDING' {
 }
 
 export class Gateway {
-  private config: AppConfig;
+  private config: EffectiveConfig;
   private channel?: Channel;
   private profileRegistry?: ProfileRegistry;
   private resolvedMemoryWorkspace?: string;
@@ -89,6 +129,8 @@ export class Gateway {
   private semaphore?: LLMSemaphore;
   private stopping = false;
   private stopped = false;
+  /** Inbound turns that have started and not settled. Drives `getShutdownDisposition()`. */
+  private inboundTurnsInFlight = 0;
   private stopPromise?: Promise<void>;
   private runtime?: ProfileRuntime;
   /** RR-STRUCT R-S5a (mini-plan v3 §3.3): owns one ProfileRuntime per paired profile. `this.runtime`
@@ -97,9 +139,47 @@ export class Gateway {
    *  (the RR-4 refusal is untouched — R-S5b routes by profile and retires it). */
   private manager?: ProfileRuntimeManager;
   private router?: GatewayMessageRouter;
+  /** Overrides the legacy paired-profile enumeration while serving pairing only. */
+  private pairedProfileIdsCache?: ProfileId[];
 
-  constructor(config: AppConfig) {
+  /**
+   * S1 admission. When supplied, it is the sole authority for who may reach a clinical runtime,
+   * and its boot answer decides whether one may be built at all. Absent only for pre-S1 tests that
+   * construct a Gateway directly with a hand-built runtime.
+   */
+  private admission?: OwnerAdmissionService;
+  /**
+   * Set when the owner record is not yet bound. While true the daemon serves pairing and canned
+   * emergency guidance only: no provider, no workspace bootstrap, no runtime, no index, no
+   * scheduler. This is what keeps "unpaired" from quietly meaning "serving on a default identity".
+   */
+  private unpairedOnly = false;
+  /** The owner identity admission is configured for, used as the dispatch target when admitted. */
+  private admissionOwnerId?: ProfileId;
+  private readonly buildProvider: ProviderFactory;
+  private readonly mediaSource?: MediaSourcePort;
+  private readonly mediaDiagnostics?: MediaStageDiagnostics;
+  private mediaIntake?: AbortController;
+  /** In-flight unpaired -> bound promotion, so concurrent messages cannot both build a runtime. */
+  private pairingTransition?: Promise<void>;
+  /**
+   * One media stager per Gateway. Its active/waiting counters implement the intake concurrency bound,
+   * so it must NOT be rebuilt per message — see `mediaStager()`.
+   */
+  private mediaStagerCache?: FsMediaStager;
+
+  constructor(config: EffectiveConfig, deps: GatewayAdmissionDeps = {}) {
     this.config = config;
+    this.admission = deps.admission;
+    this.admissionOwnerId = deps.ownerId;
+    this.buildProvider = deps.createProvider ?? createProvider;
+    this.mediaSource = deps.mediaSource;
+    this.mediaDiagnostics = deps.mediaDiagnostics;
+  }
+
+  /** True when the daemon is serving pairing only, with no clinical runtime built. */
+  get servesPairingOnly(): boolean {
+    return this.unpairedOnly;
   }
 
   get runtimeInstance(): ProfileRuntime | undefined {
@@ -176,8 +256,6 @@ export class Gateway {
 
   async start(): Promise<void> {
     const { config } = this;
-    const profilesConfig = config.profiles;
-    const profileId = (profilesConfig?.defaultProfileId ?? 'default') as ProfileId;
     this.stopping = false;
     this.stopped = false;
 
@@ -189,17 +267,67 @@ export class Gateway {
       console.warn(`[gateway] Deprecated config: ${warning}`);
     }
 
+    // ── S1 admission comes first ──────────────────────────────────────────────────────────
+    // A missing, unreadable, corrupt or wrong-owner record must NOT boot into a serving state,
+    // and an unpaired record must NOT build anything clinical. Both decisions are taken before a
+    // provider is created, before the workspace is touched, and before any index or scheduler
+    // exists, so "unpaired" cannot degrade into "serving on a default identity".
+    if (this.admission) {
+      const admissionState = this.admission.inspectInstallation();
+      if (admissionState.kind === 'refused') {
+        throw new Error(
+          `Refusing to serve: the owner record is ${admissionState.reason}. `
+          + 'Re-run setup on this computer, then start the daemon again.',
+        );
+      }
+      if (admissionState.kind === 'unpaired') {
+        this.unpairedOnly = true;
+        this.pairedProfileIdsCache = [];
+        await this.startUnpaired(config);
+        return;
+      }
+    }
+
+    await this.serveOwner({ connectChannel: true, runHealthchecks: true });
+
+    console.log('[gateway] Redacted is running.');
+  }
+
+  /**
+   * Build everything that only the BOUND owner may have: workspace, providers, the runtime, the
+   * router and the scheduler.
+   *
+   * This is the single implementation of "serve the owner", shared by two callers:
+   *
+   * - `start()` on a boot whose record is already bound, and
+   * - the unpaired -> bound transition in `ensureOwnerServing`, which fires on the first admitted
+   *   owner message after the owner sends their pairing code.
+   *
+   * It used to be inline in `start()`, which meant a daemon that booted unpaired could never serve
+   * the owner: pairing bound the record, but nothing rebuilt a runtime, so every later message was
+   * answered with the canned "profile temporarily unavailable" until the operator restarted. The
+   * restart was never documented anywhere.
+   */
+  private async serveOwner(options: { connectChannel: boolean; runHealthchecks: boolean }): Promise<void> {
+    const { config } = this;
+    const profilesConfig = config.profiles;
+    const profileId = (profilesConfig?.defaultProfileId ?? 'default') as ProfileId;
+
     // Bootstrap workspace with template files on first run
     this.bootstrapWorkspace(config.memory.workspace);
-    const stagingDir = this.mediaStagingDir();
-    sweepStagedMedia(stagingDir, os.homedir());
+    // Sweep ONLY this owner's staging lane, and only now that this process owns the owner's
+    // resources — so a crash-left orphan cannot be cleaned up by, or clean up over, another owner.
+    // Intake is aborted on stop, so a staged file in flight is accounted for in the disposition.
+    this.mediaIntake ??= new AbortController();
+    const ownerStaging = this.mediaStagingDir();
+    if (ownerStaging) sweepStagedMedia(ownerStaging, this.ownerStagingBase());
 
     // Profiles: construct the registry. Legacy migration (idempotent) happens per-profile inside
     // buildRuntimeFor below, restricted to the DEFAULT profile only (RR-STRUCT R-S5a Part B,
     // mini-plan v3 §3.8 A-F04 — SAFETY-CRITICAL: a secondary profile must never see it).
     this.profileRegistry = profilesConfig ? this.tryCreateProfileRegistry(profilesConfig.baseDir) : undefined;
 
-    const mainProvider = createProvider(config.providers.main);
+    const mainProvider = this.buildProvider(config.providers.main);
     this.mainProvider = mainProvider;
 
     const semaphore = new LLMSemaphore();
@@ -207,19 +335,24 @@ export class Gateway {
 
     let sideEffectProvider: LLMProvider = mainProvider;
     try {
-      sideEffectProvider = createProvider(config.providers.medical);
+      sideEffectProvider = this.buildProvider(config.providers.medical);
     } catch (error) {
       console.warn('[gateway] Medical provider for side-effect lookup unavailable; using main:', summarizeErrorForLog(error));
     }
     this.sideEffectProvider = sideEffectProvider;
 
-    // Channel
-    if (config.channels.telegram.enabled) {
+    // Channel. On the pairing transition the pairing-only channel is already constructed and
+    // connected, so it is reused rather than replaced — replacing it would drop the very connection
+    // that delivered the pairing code.
+    if (!this.channel && config.channels.telegram.enabled) {
       const token = config.channels.telegram.botToken || process.env.TELEGRAM_BOT_TOKEN;
       if (!token) {
         throw new Error('TELEGRAM_BOT_TOKEN not set. Set it in config or environment.');
       }
-      this.channel = new TelegramChannel(token, stagingDir, os.homedir());
+      // The channel emits media references only — it never downloads, writes or names a file, so it
+      // takes no staging path. Containment is `FsMediaStager`'s, bound to the owner's lane at
+      // composition. `deliverMessage` -> `admitAndStage` is what decides whether bytes are fetched.
+      this.channel = new TelegramChannel(token);
       this.channel.onMessage((msg) => this.handleMessage(msg));
     }
 
@@ -235,15 +368,26 @@ export class Gateway {
     await this.manager.buildAll(this.pairedProfileIds(profileId));
 
     this.router = this.createRouter();
-    if (this.channel && typeof this.channel.connect === 'function') {
+    if (options.connectChannel && this.channel && typeof this.channel.connect === 'function') {
       await this.channel.connect();
     }
+
+    // `stop()` may have begun while this build was in flight. Everything above is drainable through
+    // `this.manager`, but a scheduler started now would have no owner left to stop it and would never be
+    // drained. Bail out instead: the daemon is shutting down, so leaving `unpairedOnly` set is correct.
+    if (this.stopping) {
+      console.log('[gateway] Shutdown began while building the owner runtime; not starting the scheduler.');
+      return;
+    }
+
     await this.initializeScheduler();
 
-    await this.runBootHealthchecks();
-    this.runSecurityChecks();
+    if (options.runHealthchecks) {
+      await this.runBootHealthchecks();
+      this.runSecurityChecks();
+    }
 
-    console.log('[gateway] Redacted is running.');
+    this.unpairedOnly = false;
   }
 
   /**
@@ -308,25 +452,229 @@ export class Gateway {
     }
   }
 
+  /**
+   * Development/diagnostic entry point.
+   *
+   * It presents an explicit `local` transport identity rather than none, because admission refuses
+   * a message with no transport identity — and silently omitting it would make this path
+   * untestable and its refusals meaningless. A local conversation is NOT the bound Telegram chat,
+   * so once an owner is paired this path is refused as a stranger. That is correct: a local REPL
+   * must not become a serving bypass around enrollment.
+   */
   async handleTestMessage(chatId: string, text: string, sourceMessageId?: string): Promise<string> {
     if (this.stopping) return SHUTDOWN_RESPONSE;
-    return this.trackOperation(() => this.requireRouter().route(
-      { chatId, userId: '', text, ...(sourceMessageId ? { messageId: sourceMessageId } : {}) },
+    const eventId = `local:${chatId}:${sourceMessageId ?? 'adhoc'}`;
+    return this.trackInboundTurn(() => this.requireRouter().route(
+      {
+        chatId,
+        userId: 'local',
+        text,
+        channel: 'local',
+        chatType: 'private',
+        eventId,
+        ...(sourceMessageId ? { messageId: sourceMessageId } : {}),
+      },
       async () => undefined,
       false,
     ).then((response) => response ?? ''));
   }
 
+  /**
+   * The Telegram channel's inbound callback. A thin edge adapter over `deliverMessage` — it supplies
+   * the channel's egress and nothing else.
+   *
+   * It used to call `route()` directly, which meant the channel's messages never passed through
+   * admission-staged media: an attachment arrived as a `MediaReference` that nothing ever retrieved,
+   * and the placeholder text the channel substitutes ("Sent a photo") reached the model as if it were
+   * the whole message. There is now exactly one inbound path.
+   */
   private async handleMessage(incoming: IncomingMessage): Promise<void> {
-    if (this.stopping) return;
     try {
-      await this.trackOperation(() => this.requireRouter().route(
-        incoming,
-        (text) => this.channel!.send(incoming.chatId, { text }),
-      ));
+      await this.deliverMessage(incoming, (text) => this.channel!.send(incoming.chatId, { text }));
     } catch (error) {
       console.error('[gateway] Handler error:', summarizeErrorForLog(error));
     }
+  }
+
+  /**
+   * The one inbound path every transport shares.
+   *
+   * `handleMessage` delegates here with the Telegram channel's egress. A non-Telegram edge adapter
+   * calls the same method with its OWN egress (plan 15 §3: "Future CLI normalizes identity/media
+   * through its own edge adapter and calls the same admission/turn/action seams; it does not
+   * pretend a CLI conversation has Telegram identity").
+   *
+   * This is the seam that lets the acceptance spine exercise the REAL admission, router and runtime
+   * with a genuine `telegram` transport identity without standing up a polling bot. It is not a
+   * bypass: admission sees exactly the identity the transport supplied, so a caller cannot use it
+   * to claim an identity it does not have.
+   */
+  async deliverMessage(incoming: IncomingMessage, egress: (text: string) => Promise<void>): Promise<void> {
+    if (this.stopping) return;
+    // A daemon that booted unpaired has no runtime. If the owner has since paired, THIS is the moment
+    // to build one — see `ensureOwnerServing`. Checked before staging so the transition never races a
+    // retrieval it would then have to discard.
+    // TRACKED. The promotion builds a provider, a runtime and a scheduler — real work touching owner
+    // resources. Untracked, `getShutdownDisposition()` reported `quiescent` while it was still running
+    // (this.manager is not assigned until the build finishes), so `startDaemon`'s shutdown released the
+    // installation lease and a second daemon could enter the workspace we were still writing to.
+    await this.trackInboundTurn(() => this.ensureOwnerServing(incoming));
+    if (this.stopping) return;
+    const admitted = await this.admitAndStage(incoming);
+    if (!admitted) return;
+    await this.trackInboundTurn(() => this.requireRouter().route(admitted, egress));
+  }
+
+  /**
+   * Run the SAME admission policy used by text and scheduling, then stage any media, then re-check
+   * authority before the turn begins.
+   *
+   * Order is the whole point (plan 15 §2.5): a denied identity never causes a fetch, a fetch never
+   * happens for an unadmitted sender, and authority is re-read after the (slow) retrieval so a
+   * binding that changed mid-download cannot be raced into a clinical turn.
+   */
+  /**
+   * Promote a pairing-only daemon to a serving one, on the first admitted owner message.
+   *
+   * Boot decides admission ONCE, and an unpaired boot deliberately builds no provider, workspace,
+   * runtime or scheduler. That is correct — but it left no path back. Pairing bound the record, and
+   * every subsequent message resolved to a runtime that did not exist, so the owner was answered
+   * "this chat's profile is temporarily unavailable" until they restarted a daemon nobody had told
+   * them to restart. Requiring a restart is also wrong on its own terms: `pairing issue` refuses
+   * while the daemon holds the installation lease, so the documented sequence already had the owner
+   * stop and start the process by hand.
+   *
+   * Single-flight: two messages arriving together must not both build a runtime.
+   */
+  private async ensureOwnerServing(incoming: IncomingMessage): Promise<void> {
+    if (!this.unpairedOnly) return;
+    if (!this.admission) return;
+
+    this.pairingTransition ??= (async () => {
+      try {
+        // Fresh read, same authority the router will use. Only a genuine owner identity promotes.
+        if (this.admission!.inspect(transportIdentityOf(incoming)).kind !== 'owner') return;
+        if (this.stopping) return;
+        console.log('[gateway] Owner paired. Building the owner runtime.');
+        await this.serveOwner({ connectChannel: false, runHealthchecks: false });
+      } catch (error) {
+        // A failed promotion must not take the daemon down, and must not leave `unpairedOnly`
+        // cleared: the next owner message retries rather than silently serving nothing.
+        console.error('[gateway] Could not start serving after pairing:', summarizeErrorForLog(error));
+      }
+    })();
+
+    try {
+      await this.pairingTransition;
+    } finally {
+      this.pairingTransition = undefined;
+    }
+  }
+
+  private async admitAndStage(incoming: IncomingMessage): Promise<AdmittedMessage | undefined> {
+    const admission = this.admission;
+    if (!admission) {
+      // Fail CLOSED, never open. Without an admission policy there is no authority to have fetched
+      // anything, so a message carrying media is refused outright rather than being passed through as
+      // if it had been admitted. This used to `return incoming as AdmittedMessage`, which handed an
+      // unadmitted sender a clinical turn whenever a Gateway was composed without admission.
+      if (incoming.media) return undefined;
+      return incoming as AdmittedMessage;
+    }
+
+    const decision = admission.inspect(transportIdentityOf(incoming));
+    const admitted: AdmittedMessage = { ...incoming };
+
+    if (decision.kind !== 'owner') {
+      // Not the owner, so NO media is fetched, staged or buffered — that is the whole security value of
+      // this seam, and it holds equally for an unpaired owner, a stranger and a group.
+      //
+      // The message itself is still handed to the Router, which owns every refusal and pairing reply.
+      // Dropping it here was wrong twice over:
+      //   - it made pairing over a real transport unreachable, because the only caller of
+      //     `handlePairing` lives inside `route()`, so the owner's code was discarded before it could
+      //     bind and the promotion transition could never fire; and
+      //   - it made a stranger's DM SILENT instead of answered with the canned refusal, because the
+      //     Router is what sends that reply.
+      if (incoming.media) admitted.mediaError = MEDIA_REFUSAL_TEXT.unsupported;
+      return admitted;
+    }
+
+    if (!incoming.media) return admitted;
+
+    const stager = this.mediaStager();
+    if (!stager) {
+      // No source bound: say the upload could not be taken rather than pretending it succeeded.
+      admitted.mediaError = 'Attachments cannot be accepted by this installation right now.';
+      return admitted;
+    }
+
+    const signal = this.mediaIntake?.signal ?? new AbortController().signal;
+    const staged = await this.trackInboundTurn(() => stager.stage(incoming.media, signal));
+    if (staged.kind === 'refused') {
+      admitted.mediaError = MEDIA_REFUSAL_TEXT[staged.reason];
+      return admitted;
+    }
+
+    // Re-check authority AFTER the retrieval. A binding revoked mid-download must not adopt a file.
+    const recheck = admission.inspect(transportIdentityOf(incoming));
+    if (recheck.kind !== 'owner') {
+      this.deleteStagedFile(staged.absolutePath);
+      return undefined;
+    }
+
+    admitted.mediaPath = staged.absolutePath;
+    return admitted;
+  }
+
+  /** Remove one staged file this operation created. Scoped: it never sweeps a directory. */
+  private deleteStagedFile(target: string): void {
+    try {
+      fs.unlinkSync(target);
+    } catch {
+      // best effort: a leftover staged file is swept on the next owned boot
+    }
+  }
+
+  /**
+   * Run one inbound turn while it is visible to the shutdown disposition.
+   *
+   * A turn that has started and not yet settled may still read or write owner resources, so it is
+   * counted. Admission-state replacement, media staging and their cleanup ride inside this same
+   * window; S5 owns cancelling them, not deciding whether ownership may be released. Both entry
+   * points go through here so the count cannot be bypassed by the test/dev path.
+   */
+  private async trackInboundTurn<T>(operation: () => Promise<T>): Promise<T> {
+    this.inboundTurnsInFlight += 1;
+    try {
+      return await this.trackOperation(operation);
+    } finally {
+      this.inboundTurnsInFlight -= 1;
+    }
+  }
+
+  /**
+   * Whether anything that can still touch owner resources has settled.
+   *
+   * `pending` covers in-flight runtime construction, in-flight inbound turns (which include
+   * admission-state replacement, media staging and their cleanup) and an unfinished drain. Only
+   * `quiescent` authorises releasing the installation's resource ownership. A stop that returns
+   * after a timeout is NOT quiescence; S5 owns bounded cancellation and the shared stop deadline.
+   */
+  getShutdownDisposition(): 'quiescent' | 'pending' {
+    if (this.stopPromise) return 'pending';
+    if (this.inboundTurnsInFlight > 0) return 'pending';
+    if (this.manager?.pendingBuildCount() ?? 0 > 0) return 'pending';
+    return 'quiescent';
+  }
+
+  /** Counters behind the disposition, for honest local reporting and tests. */
+  shutdownWorkInFlight(): { turns: number; builds: number; stopping: boolean } {
+    return {
+      turns: this.inboundTurnsInFlight,
+      builds: this.manager?.pendingBuildCount() ?? 0,
+      stopping: this.stopping,
+    };
   }
 
   async stop(): Promise<void> {
@@ -429,19 +777,28 @@ export class Gateway {
   }
 
   /**
-   * RR2-B1 (R2-10/11) destination-ownership predicate: `chatId` may be addressed by work
-   * running as `profileId` ONLY when the (optional) profile registry currently pairs that
-   * chat to that profile. Side-effect-free: it READS `registry.getProfileForChat` only —
-   * never Router.resolveProfileForChat / getOrCreateDefaultProfile / pairChatToProfile, and
-   * it never builds or initializes another runtime. A missing/unreadable registry is FALSE
-   * (no implicit default authorization), and lookup failures are logged sanitized and
-   * refused. `job.chatId` is a destination, never authority.
+   * RR2-B1 (R2-10/11) destination-ownership predicate: `chatId` may be addressed by work running as
+   * `profileId` ONLY when the CURRENT owner record binds that chat to that owner identity.
+   *
+   * Side-effect-free and fail-closed. It reads exactly one thing — the owner record — and never
+   * Router.resolveProfileForChat / getOrCreateDefaultProfile / pairChatToProfile, never the legacy
+   * registry, and never builds or initializes a runtime. No admission authority means FALSE: there is no
+   * implicit default authorization. Lookup failures are logged sanitized and refused.
+   * `job.chatId` is a destination, never authority.
+   *
+   * It previously read `ProfileRegistry.getProfileForChat`. S1 made pairing the only route to a profile,
+   * so nothing ever paired the registry and this returned `false` for the owner's own chat — with
+   * `heartbeat.enabled` defaulting to true, the owner's reminders were inert in the shipped daemon while
+   * still being armed at boot. See `OwnerAdmissionService.ownsDestination`.
    */
   private canChatIdAddressProfile(chatId: string, profileId: ProfileId): boolean {
+    // Work dispatched as some OTHER identity may not address this daemon's single owner destination.
+    // Multi-profile activation is parked, so there is exactly one dispatching identity that can pass.
+    if (this.admissionOwnerId !== profileId) return false;
+    const admission = this.admission;
+    if (!admission) return false;
     try {
-      const resolved = this.profileRegistry?.getProfileForChat(chatId);
-      if (!resolved) return false;
-      return resolved.profileId === profileId;
+      return admission.ownsDestination(chatId);
     } catch (error) {
       console.warn('[gateway] Scheduled-work destination lookup failed; refusing:', summarizeErrorForLog(error));
       return false;
@@ -890,6 +1247,7 @@ export class Gateway {
       schedulerPaths,
       config,
       mainProvider: this.mainProvider!,
+      createProvider: this.buildProvider,
       semaphore: this.semaphore!,
       // RR-STRUCT R-S5a: scheduler recovery must not invoke a callback before
       // ProfileRuntime.create returns. Gateway explicitly initializes every runtime's
@@ -1063,17 +1421,94 @@ export class Gateway {
     return this.runtime?.workspace || this.resolvedMemoryWorkspace || this.config.memory?.workspace || '';
   }
 
-  private mediaStagingDir(): string {
-    return path.join(os.homedir(), '.redacted', '.staging', 'media');
+  /**
+   * Owner-scoped incoming media staging.
+   *
+   * S1 change (old -> new): this used to be `~/.redacted/.staging/media` — a HOME-wide location, so
+   * two daemons sharing a home account swept and wrote into the same directory, and the boot sweep
+   * deleted whatever it found there. It is now derived from the selected owner's paths, so staging
+   * cannot exist without the owner whose lease this process holds.
+   */
+  private mediaStagingDir(): string | undefined {
+    const base = this.getEffectiveWorkspace();
+    return base ? path.join(base, '.state', 'media-staging') : undefined;
+  }
+
+  /**
+   * The stager, or `undefined` when no media source was injected. Media is only ever staged through
+   * this, and only after admission.
+   */
+  /**
+   * The trusted ancestor for the staging sweep and adoption: the owner's own workspace.
+   *
+   * Uses the same effective-workspace resolution as the rest of the Gateway, so a configuration
+   * that names no owner workspace yields `undefined` and staging is simply unavailable — rather than
+   * throwing while routing a message.
+   */
+  private ownerStagingBase(): string | undefined {
+    const base = this.getEffectiveWorkspace();
+    return base === '' ? undefined : base;
+  }
+
+  /**
+   * ONE stager for this Gateway, memoised.
+   *
+   * This used to construct `new FsMediaStager(...)` per inbound message. `FsMediaStager` keeps its
+   * `active` / `waiting` / `slotWaiters` counters as INSTANCE fields, and those counters are what gate
+   * the `MEDIA_MAX_ACTIVE = 1` / `MEDIA_MAX_WAITING = 4` module constants. A fresh instance per message
+   * therefore always saw `0 >= 1`, so the concurrency queue never engaged, `wakeSlot()` was a no-op and
+   * the `'queue-full'` refusal was unreachable in production: N simultaneous attachments meant N
+   * simultaneous 10 MB streams against a disk and a network. `media-stager.ts` documented a bound it did
+   * not enforce.
+   *
+   * The bound only bites when concurrent attachments actually happen, so this stayed invisible for as
+   * long as no media source was wired — and would have detonated the moment one was.
+   */
+  private mediaStager(): FsMediaStager | undefined {
+    const stagingDir = this.mediaStagingDir();
+    if (!this.mediaSource || !stagingDir) return undefined;
+    this.mediaStagerCache ??= new FsMediaStager(this.mediaSource, stagingDir, {
+      diagnostics: this.mediaDiagnostics,
+    });
+    return this.mediaStagerCache;
+  }
+
+  /**
+   * An unpaired installation: connect the channel so a code can be sent, and route every message
+   * through pairing/canned-emergency policy. Deliberately builds NO provider, workspace, runtime,
+   * manager or scheduler — there is nothing to serve yet.
+   */
+  private async startUnpaired(config: EffectiveConfig): Promise<void> {
+    this.stopping = false;
+    this.stopped = false;
+    if (config.channels.telegram.enabled) {
+      const token = config.channels.telegram.botToken || process.env.TELEGRAM_BOT_TOKEN;
+      if (!token) {
+        throw new Error('TELEGRAM_BOT_TOKEN not set. Set it in config or environment.');
+      }
+      this.channel = new TelegramChannel(token);
+      this.channel.onMessage((msg) => this.handleMessage(msg));
+    }
+
+    this.router = this.createRouter();
+    console.log('[gateway] Owner is not paired yet: serving pairing only. Run `medclaw pairing issue`, then send the code from the owner chat.');
+
+    if (this.channel && typeof this.channel.connect === 'function') {
+      await this.channel.connect();
+    }
   }
 
   private createRouter(): GatewayMessageRouter {
     return new GatewayMessageRouter({
       config: this.config,
       runtime: this.runtime,
+      admission: this.admission,
+      ownerId: this.admissionOwnerId ?? ((this.config.profiles?.defaultProfileId ?? 'default') as ProfileId),
       profileRegistry: this.profileRegistry,
       stagingDir: this.mediaStagingDir(),
-      stagingBaseDir: os.homedir(),
+      // The trusted base is the owner's own workspace, never `$HOME`: a home-wide base let one
+      // installation adopt or delete another installation's staged file.
+      stagingBaseDir: this.ownerStagingBase(),
       buildBootStatusText: () => this.buildBootStatusText(),
       // RR-STRUCT R-S5b (mini-plan v3 §3.2): the Router dispatches every turn to the runtime
       // OWNING the resolved profile. Manager-backed in production; when no manager exists

@@ -4,10 +4,15 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
-import type { AppConfig } from '../../src/config/types';
+import { ProfileRegistry } from '../../src/profiles/registry';
+import type { EffectiveConfig } from '../../src/config/types';
+import { TEST_OWNER_ID, fixtureOwner, ownerSelection } from '../helpers/test-config';
 
-function makeConfig(tmpDir: string): AppConfig {
+function makeConfig(tmpDir: string): EffectiveConfig {
+const owner = fixtureOwner(tmpDir);
   return {
+  schemaVersion: 2,
+  ...ownerSelection(owner),
     providers: {
       main: { type: 'ollama', model: 'kimi-k2.5:cloud', baseUrl: 'http://localhost:11434/v1' },
       medical: { type: 'ollama', model: 'medgemma', baseUrl: 'http://localhost:11434/v1' },
@@ -16,7 +21,7 @@ function makeConfig(tmpDir: string): AppConfig {
     channels: { telegram: { enabled: false, botToken: '' } },
     tools: { allow: ['*'], deny: [] },
     memory: {
-      workspace: path.join(tmpDir, 'workspace'),
+      workspace: owner.workspace,
       search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
       bootstrapMaxChars: 20000,
     },
@@ -28,11 +33,11 @@ function makeConfig(tmpDir: string): AppConfig {
     heartbeat: {
       enabled: false,
       timezone: 'Asia/Kolkata',
-      storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+      storePath: owner.storePath,
       recovery: { enabled: false, windowMinutes: 60 },
       retry: { maxRetries: 3, backoffMinutes: 5 },
       rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-      audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+      audit: { path: owner.auditLogPath },
       policy: {
         quietHours: { enabled: true, start: '22:00', end: '07:00' },
         skipIfChatActiveWithinMinutes: 60,
@@ -55,12 +60,18 @@ describe('W-C/D fix pass — CAP: emergency + onboarding turns are losslessly ca
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-gw-'));
-    workspace = path.join(tmpDir, 'workspace');
+    workspace = fixtureOwner(tmpDir).workspace;
   });
   afterEach(async () => {
     try { await gateway?.stop(); } catch { /* ignore */ }
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
+
+  /** Bind a chat to the selected owner through the real registry before the turn. */
+  function pairOwnerChat(rootDir: string, chatId: string): void {
+    const registry = new ProfileRegistry(fixtureOwner(rootDir).baseDir);
+    registry.pairChatToProfile(chatId, TEST_OWNER_ID as never);
+  }
 
   async function start(): Promise<void> {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
@@ -69,13 +80,30 @@ describe('W-C/D fix pass — CAP: emergency + onboarding turns are losslessly ca
     warn.mockRestore();
   }
 
-  it('an EMERGENCY turn is captured before the canned-response early-return', async () => {
+  it('the OWNER chat\'s EMERGENCY turn is captured before the canned-response early-return', async () => {
     await start();
+    pairOwnerChat(tmpDir, 'chat-1');
+
     // Real onboarding flow is incomplete, so this hits the emergency check FIRST.
     await gateway.handleTestMessage('chat-1', 'I have severe chest pain right now');
 
     const narrative = fs.readFileSync(path.join(workspace, 'memory', `${today()}.md`), 'utf8');
     expect(narrative).toContain('I have severe chest pain right now');
+  });
+
+  // New companion to the assertion above, and the S1 rule the old fixture shape hid:
+  // with no owner registry the chat was silently granted the default profile, so an
+  // UNPAIRED stranger's emergency text was captured into owner memory. Refusal must prevent
+  // capture side effects (charter F-5), while the canned guidance is still delivered.
+  it('an UNPAIRED chat\'s emergency text gets canned guidance and is never captured', async () => {
+    await start();
+    const sent: string[] = [];
+    (gateway as unknown as { channel?: unknown }).channel = undefined;
+
+    await gateway.handleTestMessage('stranger-chat', 'I have severe chest pain right now');
+
+    expect(fs.existsSync(path.join(workspace, 'memory', `${today()}.md`))).toBe(false);
+    expect(sent).toEqual([]);
   });
 
   it('an ONBOARDING turn is captured before its early-return', async () => {
@@ -94,7 +122,7 @@ describe('W-C/D fix pass — REC: boot-time SAFETY reconciliation', () => {
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-rec-'));
-    workspace = path.join(tmpDir, 'workspace');
+    workspace = fixtureOwner(tmpDir).workspace;
   });
   afterEach(async () => {
     try { await gateway?.stop(); } catch { /* ignore */ }
@@ -138,7 +166,7 @@ describe('W-C/D fix pass — BL: KNEE-01 back-link written on the CONFIRM path',
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-bl-'));
-    workspace = path.join(tmpDir, 'workspace');
+    workspace = fixtureOwner(tmpDir).workspace;
   });
   afterEach(async () => {
     try { await gateway?.stop(); } catch { /* ignore */ }

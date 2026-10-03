@@ -3,15 +3,19 @@ import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { MemoryIndexer } from '../../src/memory/indexer';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { FactRecord } from '../../src/ports';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 
 // P2 Wave A — the recall substrate wired behind the live Gateway: every ledger write live-populates
 // the FactMirror (recall Stage 1 source) and reindexes the changed file (M-2 closed), and the mirror
 // is rebuilt from Markdown at boot (A4 self-heal). Re-derivation runs OUTSIDE the write-queue op (B2).
 
-function makeConfig(tmpDir: string): AppConfig {
+function makeConfig(tmpDir: string): EffectiveConfig {
+const owner = fixtureOwner(tmpDir);
   return {
+  schemaVersion: 2,
+  ...ownerSelection(owner),
     providers: {
       main: { type: 'ollama', model: 'kimi-k2.5:cloud', baseUrl: 'http://localhost:11434/v1' },
       medical: { type: 'ollama', model: 'medgemma', baseUrl: 'http://localhost:11434/v1' },
@@ -20,7 +24,7 @@ function makeConfig(tmpDir: string): AppConfig {
     channels: { telegram: { enabled: false, botToken: '' } },
     tools: { allow: ['*'], deny: [] },
     memory: {
-      workspace: path.join(tmpDir, 'workspace'),
+      workspace: owner.workspace,
       search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
       bootstrapMaxChars: 20000,
     },
@@ -32,11 +36,11 @@ function makeConfig(tmpDir: string): AppConfig {
     heartbeat: {
       enabled: false,
       timezone: 'Asia/Kolkata',
-      storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+      storePath: owner.storePath,
       recovery: { enabled: false, windowMinutes: 60 },
       retry: { maxRetries: 3, backoffMinutes: 5 },
       rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-      audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+      audit: { path: owner.auditLogPath },
       policy: {
         quietHours: { enabled: true, start: '22:00', end: '07:00' },
         skipIfChatActiveWithinMinutes: 60,

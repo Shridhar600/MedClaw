@@ -1,16 +1,37 @@
 import { Bot, type PollingOptions } from 'grammy';
-import * as fs from 'fs';
-import * as path from 'path';
-import * as crypto from 'crypto';
-import { secureMkdir, secureWrite, summarizeErrorForLog } from '../security';
-import type { Channel, IncomingMessage, OutgoingMessage } from './types';
+import { summarizeErrorForLog } from '../security';
+import type { Channel, ChatType, IncomingMessage, OutgoingMessage } from './types';
+
+export const TELEGRAM_CHANNEL_NAME = 'telegram';
+
+/** Stable across a Telegram redelivery, so a retry cannot spend a second pairing attempt. */
+export function telegramEventId(chatId: number | string, messageId: number | string): string {
+  return `${TELEGRAM_CHANNEL_NAME}:${chatId}:${messageId}`;
+}
+
+/**
+ * grammY reports the chat kind; anything it does not recognise is treated as a non-private chat,
+ * because the safe failure for admission is "not one-to-one".
+ */
+export function telegramChatType(raw: string): ChatType {
+  switch (raw) {
+    case 'private':
+      return 'private';
+    case 'group':
+      return 'group';
+    case 'supergroup':
+      return 'supergroup';
+    case 'channel':
+      return 'channel';
+    default:
+      return 'group';
+  }
+}
 
 export class TelegramChannel implements Channel {
   readonly name = 'telegram';
   private bot: Bot;
   private messageHandler?: (msg: IncomingMessage) => Promise<void>;
-  private stagingPath: string;
-  private trustedStagingBase?: string;
   // Reconnect state for the polling long-poll lifecycle. Network blips or a
   // bad/expired token make bot.start() reject; without an explicit .catch the
   // rejected promise becomes an unhandledRejection and the daemon dies (RES-P0-2).
@@ -20,82 +41,23 @@ export class TelegramChannel implements Channel {
   private readonly maxReconnectMs = 60_000;
   private startOptions?: PollingOptions;
 
-  constructor(botToken: string, stagingPath: string, trustedStagingBase?: string) {
+  /**
+   * @param botToken Bot token. Used for polling only.
+   *
+   * There is deliberately no staging path and no trusted-base argument any more. The channel emits an
+   * opaque `MediaReference` and never fetches, writes or names a file, so it has no filesystem
+   * authority to contain. Containment belongs to `FsMediaStager`, which is constructed once by the
+   * Gateway against the selected owner's lane. The old `stagingPath`/`trustedStagingBase` pair existed
+   * solely for `downloadFile`, which buffered the whole body with `arrayBuffer()` and was dead code.
+   */
+  constructor(botToken: string) {
     this.bot = new Bot(botToken);
-    this.stagingPath = stagingPath;
-    this.trustedStagingBase = trustedStagingBase;
     // grammY's error boundary: any error thrown by handlers/middleware that is
     // not caught inside the handler lands here. Without it, such errors crash
     // the polling loop (RES-P0-1). Sanitized via summarizeErrorForLog (PHI bind).
     this.bot.catch((botError) => {
       console.error('[telegram] Bot error boundary:', summarizeErrorForLog(botError));
     });
-  }
-
-  private sanitizeFileName(fileName: string): string {
-    return fileName.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/\.\./g, '');
-  }
-
-  private async downloadFile(fileId: string, fileName: string): Promise<string> {
-    const file = await this.bot.api.getFile(fileId);
-    const fileUrl = `https://api.telegram.org/file/bot${this.bot.token}/${file.file_path}`;
-    const response = await fetch(fileUrl);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-    const buffer = Buffer.from(await response.arrayBuffer());
-
-    if (!this.hasTrustedStagingPath()) throw new Error('media staging path is not a trusted directory');
-    try {
-      fs.lstatSync(this.stagingPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      secureMkdir(this.stagingPath);
-    }
-    const safeFileName = this.sanitizeFileName(fileName);
-    const savePath = path.join(this.stagingPath, `${Date.now()}-${crypto.randomUUID()}-${safeFileName}`);
-    secureWrite(savePath, buffer);
-    return savePath;
-  }
-
-  private hasTrustedStagingPath(): boolean {
-    const staging = path.resolve(this.stagingPath);
-    if (!this.trustedStagingBase) {
-      try {
-        const stat = fs.lstatSync(staging);
-        return stat.isDirectory() && !stat.isSymbolicLink();
-      } catch (error) {
-        return (error as NodeJS.ErrnoException).code === 'ENOENT';
-      }
-    }
-
-    const base = path.resolve(this.trustedStagingBase);
-    const relative = path.relative(base, staging);
-    if (
-      relative.length === 0
-      || relative === '..'
-      || relative.startsWith(`..${path.sep}`)
-      || path.isAbsolute(relative)
-    ) return false;
-    try {
-      const baseStat = fs.lstatSync(base);
-      if (!baseStat.isDirectory() || baseStat.isSymbolicLink()) return false;
-      let current = base;
-      for (const component of relative.split(path.sep)) {
-        current = path.join(current, component);
-        let stat: fs.Stats;
-        try {
-          stat = fs.lstatSync(current);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
-          return false;
-        }
-        if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
-      }
-      return isContained(fs.realpathSync(base), fs.realpathSync(staging));
-    } catch {
-      return false;
-    }
   }
 
   onMessage(handler: (msg: IncomingMessage) => Promise<void>): void {
@@ -108,6 +70,9 @@ export class TelegramChannel implements Channel {
           chatId: String(ctx.chat.id),
           userId: String(ctx.from?.id ?? ''),
           text: ctx.message.text,
+          channel: TELEGRAM_CHANNEL_NAME,
+          chatType: telegramChatType(ctx.chat.type),
+          eventId: telegramEventId(ctx.chat.id, ctx.message.message_id),
           messageId: String(ctx.message.message_id),
           replyToMessageId: ctx.message.reply_to_message?.message_id
             ? String(ctx.message.reply_to_message.message_id)
@@ -130,23 +95,27 @@ export class TelegramChannel implements Channel {
       const fileId = document.file_id;
       const fileName = document.file_name ?? 'document';
 
-      let mediaPath: string | undefined;
-      let mediaError: string | undefined;
-      try {
-        mediaPath = await this.downloadFile(fileId, fileName);
-      } catch (e) {
-        console.error('[telegram] Failed to download document:', summarizeErrorForLog(e));
-        mediaError = `Failed to download uploaded file ${fileName}. Please try uploading it again.`;
-      }
-
+      // METADATA ONLY. No `getFile`, no remote fetch, no local write happens here: an unauthenticated
+      // sender must not be able to make this process download or store anything. The core asks the
+      // injected media source for bytes only after admission.
       try {
         await this.messageHandler({
           chatId: String(ctx.chat.id),
           userId: String(ctx.from?.id ?? ''),
           text: ctx.message.caption ?? `Uploaded: ${fileName}`,
+          channel: TELEGRAM_CHANNEL_NAME,
+          chatType: telegramChatType(ctx.chat.type),
+          eventId: telegramEventId(ctx.chat.id, ctx.message.message_id),
           messageId: String(ctx.message.message_id),
-          mediaPath,
-          mediaError,
+          media: {
+            channel: TELEGRAM_CHANNEL_NAME,
+            fileId,
+            kind: 'document',
+            displayName: fileName,
+            mime: document.mime_type ?? undefined,
+            // `file_size` is the transport's claim. It is inspected, never trusted as the cap.
+            advertisedBytes: typeof document.file_size === 'number' ? document.file_size : undefined,
+          },
           replyToMessageId: ctx.message.reply_to_message?.message_id
             ? String(ctx.message.reply_to_message.message_id)
             : undefined,
@@ -163,23 +132,23 @@ export class TelegramChannel implements Channel {
       const fileId = photo.file_id;
       const fileName = `photo-${fileId}.jpg`;
 
-      let mediaPath: string | undefined;
-      let mediaError: string | undefined;
-      try {
-        mediaPath = await this.downloadFile(fileId, fileName);
-      } catch (e) {
-        console.error('[telegram] Failed to download photo:', summarizeErrorForLog(e));
-        mediaError = 'Failed to download uploaded photo. Please try sending it again.';
-      }
-
+      // METADATA ONLY, same reason as the document handler above.
       try {
         await this.messageHandler({
           chatId: String(ctx.chat.id),
           userId: String(ctx.from?.id ?? ''),
           text: ctx.message.caption ?? 'Sent a photo',
+          channel: TELEGRAM_CHANNEL_NAME,
+          chatType: telegramChatType(ctx.chat.type),
+          eventId: telegramEventId(ctx.chat.id, ctx.message.message_id),
           messageId: String(ctx.message.message_id),
-          mediaPath,
-          mediaError,
+          media: {
+            channel: TELEGRAM_CHANNEL_NAME,
+            fileId,
+            kind: 'photo',
+            displayName: fileName,
+            advertisedBytes: typeof photo.file_size === 'number' ? photo.file_size : undefined,
+          },
           replyToMessageId: ctx.message.reply_to_message?.message_id
             ? String(ctx.message.reply_to_message.message_id)
             : undefined,
@@ -254,14 +223,4 @@ export class TelegramChannel implements Channel {
     }
     await this.bot.stop();
   }
-}
-
-function isContained(base: string, candidate: string): boolean {
-  const relative = path.relative(base, candidate);
-  return relative.length === 0
-    || (
-      relative !== '..'
-      && !relative.startsWith(`..${path.sep}`)
-      && !path.isAbsolute(relative)
-    );
 }

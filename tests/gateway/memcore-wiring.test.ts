@@ -4,14 +4,18 @@ import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { ContextAssembler } from '../../src/agent/context';
 import { InvariantViolationError } from '../../src/shared/errors';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 
 // Task 13 — the v2 memory core wired behind the live Gateway: ledger/episode/safety tool
 // groups registered per profile, the ledger tools driving both lanes + SAFETY.md, the
 // per-turn narrative capture hook (F4/CHAT-06), and the boot-time SAFETY invariant (D9).
 
-function makeConfig(tmpDir: string): AppConfig {
+function makeConfig(tmpDir: string): EffectiveConfig {
+const owner = fixtureOwner(tmpDir);
   return {
+  schemaVersion: 2,
+  ...ownerSelection(owner),
     providers: {
       main: { type: 'ollama', model: 'kimi-k2.5:cloud', baseUrl: 'http://localhost:11434/v1' },
       medical: { type: 'ollama', model: 'medgemma', baseUrl: 'http://localhost:11434/v1' },
@@ -20,7 +24,7 @@ function makeConfig(tmpDir: string): AppConfig {
     channels: { telegram: { enabled: false, botToken: '' } },
     tools: { allow: ['*'], deny: [] },
     memory: {
-      workspace: path.join(tmpDir, 'workspace'),
+      workspace: owner.workspace,
       search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
       bootstrapMaxChars: 20000,
     },
@@ -32,11 +36,11 @@ function makeConfig(tmpDir: string): AppConfig {
     heartbeat: {
       enabled: false,
       timezone: 'Asia/Kolkata',
-      storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+      storePath: owner.storePath,
       recovery: { enabled: false, windowMinutes: 60 },
       retry: { maxRetries: 3, backoffMinutes: 5 },
       rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-      audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+      audit: { path: owner.auditLogPath },
       policy: {
         quietHours: { enabled: true, start: '22:00', end: '07:00' },
         skipIfChatActiveWithinMinutes: 60,
@@ -59,7 +63,7 @@ describe('Gateway memory-core wiring (Task 13)', () => {
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-memcore-wire-'));
-    workspace = path.join(tmpDir, 'workspace');
+    workspace = fixtureOwner(tmpDir).workspace;
   });
   afterEach(async () => {
     try { await gateway?.stop(); } catch { /* ignore */ }

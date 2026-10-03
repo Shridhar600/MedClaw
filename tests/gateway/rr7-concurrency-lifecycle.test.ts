@@ -3,13 +3,15 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { LLMProvider } from '../../src/providers/types';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { HeartbeatJob } from '../../src/scheduler/types';
 import { Gateway } from '../../src/gateway/gateway';
 import { SqliteChunkStats, SqliteKeywordIndex, SqliteVecIndex } from '../../src/indexstore';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 import { ProfileRegistry } from '../../src/profiles/registry';
 import type { ProfileId } from '../../src/profiles/types';
+import {} from '../helpers/test-config';
+import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
 
 const mockMainProvider: LLMProvider = {
   modelName: 'rr7-main',
@@ -44,8 +46,24 @@ function nextEventLoopTurn(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-function makeConfig(tmpDir: string): AppConfig {
+/**
+ * OLD -> NEW: built `await boundGateway(tmpDir)` with no admission, so under S1 the destination guard
+ * failed closed and every scheduled job was suppressed. Binding a real owner keeps these tests on the
+ * authority production actually uses.
+ */
+async function boundGateway(root: string): Promise<Gateway> {
+  const { fixtureOwner } = await import('../helpers/test-config');
+  const owner = fixtureOwner(root);
+  // These tests drive the Gateway through `handleTestMessage`, which presents `channel: 'local'`,
+  // `userId: 'local'`. Admission compares the whole identity, so the owner must be bound over the same
+  // transport or the messages are correctly refused.
+  const bound = await bindOwnerFixture(owner.ownerRecord, owner.ownerId, 'chat-1', { channel: 'local', userId: 'local' });
+  return new Gateway(makeConfig(root), bound.gatewayDeps);
+}
+
+function makeConfig(tmpDir: string): EffectiveConfig {
   return {
+  schemaVersion: 2,
     providers: {
       main: { type: 'ollama', model: 'rr7-main', baseUrl: 'http://127.0.0.1:9/v1' },
       medical: { type: 'ollama', model: 'rr7-main', baseUrl: 'http://127.0.0.1:9/v1' },
@@ -125,7 +143,7 @@ describe('Gateway RR-7 concurrency and lifecycle', () => {
   });
 
   it('does not hold a turn on a hung post-capture index and records a durable dirty watermark', async () => {
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = await boundGateway(tmpDir);
     await gateway.start();
     const indexer = latestIndexer();
     const indexEntered = deferred();
@@ -172,7 +190,7 @@ describe('Gateway RR-7 concurrency and lifecycle', () => {
   });
 
   it('bounds and aborts the embedding adapter supplied to the indexer', async () => {
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = await boundGateway(tmpDir);
     await gateway.start();
     jest.useFakeTimers();
     let aborted = false;
@@ -198,7 +216,7 @@ describe('Gateway RR-7 concurrency and lifecycle', () => {
   });
 
   it('sends emergency guidance before starting capture and does not wait for capture', async () => {
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = await boundGateway(tmpDir);
     const captureStarted = deferred();
     const releaseCapture = deferred();
     const order: string[] = [];
@@ -220,9 +238,20 @@ describe('Gateway RR-7 concurrency and lifecycle', () => {
 
     let turn: Promise<string> | undefined;
     try {
+      // OLD -> NEW: drove the transport callback with no channel/chatType/eventId and a `user-1` sender.
+      // S1 admission compares the WHOLE transport identity against the binding and refuses a message with
+      // none, so this correctly never reached a turn. The test is about emergency guidance being sent
+      // BEFORE capture starts, so it now sends a genuine bound-owner identity.
       turn = (gateway as unknown as {
-        handleMessage(message: { chatId: string; userId: string; text: string }): Promise<void>;
-      }).handleMessage({ chatId: 'chat-1', userId: 'user-1', text: 'I have chest pain right now' })
+        handleMessage(message: Record<string, unknown>): Promise<void>;
+      }).handleMessage({
+        chatId: 'chat-1',
+        userId: 'local',
+        text: 'I have chest pain right now',
+        channel: 'local',
+        chatType: 'private',
+        eventId: 'local:chat-1:chest',
+      })
         .then(() => 'completed');
       await captureStarted.promise;
       const completion = await Promise.race([
@@ -238,7 +267,7 @@ describe('Gateway RR-7 concurrency and lifecycle', () => {
   });
 
   it('does not turn a post-delivery reconcile failure into a scheduled delivery failure', async () => {
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = await boundGateway(tmpDir);
     const send = jest.fn().mockResolvedValue(undefined);
     const recordOutcome = jest.fn().mockResolvedValue(undefined);
     const reconcile = jest.fn().mockRejectedValue(new Error('private health reconciliation detail'));
@@ -286,7 +315,7 @@ describe('Gateway RR-7 concurrency and lifecycle', () => {
     const vecClose = jest.spyOn(SqliteVecIndex.prototype, 'close');
     const keywordClose = jest.spyOn(SqliteKeywordIndex.prototype, 'close');
     const statsClose = jest.spyOn(SqliteChunkStats.prototype, 'close');
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = await boundGateway(tmpDir);
     await gateway.start();
 
     const state = gateway as unknown as Record<string, unknown>;
@@ -303,7 +332,7 @@ describe('Gateway RR-7 concurrency and lifecycle', () => {
   });
 
   it('refuses a scheduled heartbeat after shutdown begins, before the compaction drain', async () => {
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = await boundGateway(tmpDir);
     const compactionStarted = deferred();
     const releaseCompaction = deferred();
     const schedulerStopStarted = deferred();

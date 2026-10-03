@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../src/gateway/gateway';
 import { SessionManager } from '../src/gateway/session';
-import type { AppConfig } from '../src/config/types';
+import type { EffectiveConfig } from '../src/config/types';
 import type { HeartbeatJob } from '../src/scheduler/types';
 import { HEARTBEAT_NOOP } from '../src/scheduler/delivery-policy';
 
@@ -14,7 +14,7 @@ type Mode =
   | 'noop'
   | 'workspace-update';
 
-function makeConfig(baseDir: string, policyOverride?: Partial<AppConfig['heartbeat']['policy']>): AppConfig {
+function makeConfig(baseDir: string, policyOverride?: Partial<EffectiveConfig['heartbeat']['policy']>): EffectiveConfig {
   return {
     providers: {
       main: { type: 'ollama', model: 'qwen3.5:9b', baseUrl: 'http://localhost:11434/v1' },
@@ -51,7 +51,7 @@ function makeConfig(baseDir: string, policyOverride?: Partial<AppConfig['heartbe
   };
 }
 
-async function setupGateway(config: AppConfig): Promise<{
+async function setupGateway(config: EffectiveConfig): Promise<{
   gateway: Gateway;
   sessions: SessionManager;
   sendCountRef: { count: number };

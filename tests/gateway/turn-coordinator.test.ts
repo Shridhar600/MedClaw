@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { AgentLoop } from '../../src/agent/agent-loop';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { ProfileRuntime } from '../../src/gateway/runtime';
 import type { IncomingMessage } from '../../src/channels/types';
 import { OnboardingFlow } from '../../src/onboarding/flow';
@@ -11,6 +11,7 @@ import { HeartbeatPreemptedError, LLMSemaphore } from '../../src/tools/semaphore
 import { TurnCoordinator, TurnQueueFullError } from '../../src/gateway/turn-coordinator';
 import type { LLMProvider, LLMResponse, Message } from '../../src/providers/types';
 import { DaemonShutdownError } from '../../src/shared/errors';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 
 function deferred<T = void>() {
   let resolve!: (value?: T | PromiseLike<T>) => void;
@@ -22,8 +23,11 @@ function deferred<T = void>() {
   return { promise, resolve, reject };
 }
 
-function makeConfig(workspace: string): AppConfig {
+function makeConfig(workspace: string): EffectiveConfig {
+const owner = fixtureOwner(workspace);
   return {
+  schemaVersion: 2,
+  ...ownerSelection(owner),
     providers: {
       main: { type: 'ollama', model: 'test-main' },
       medical: { type: 'ollama', model: 'test-medical' },
@@ -69,7 +73,7 @@ type SessionDouble = {
 type RuntimeDouble = {
   profileId: 'default';
   workspace: string;
-  config: AppConfig;
+  config: EffectiveConfig;
   agentLoop: { run: jest.Mock };
   sessions: SessionDouble;
   capturePipeline?: { ingest: jest.Mock<Promise<void>> };

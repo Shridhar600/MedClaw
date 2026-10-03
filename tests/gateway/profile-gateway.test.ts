@@ -3,8 +3,9 @@ import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { ProfileRegistry } from '../../src/profiles/registry';
+import { withoutOwnerIdentity } from '../helpers/test-config';
 import { SessionManager } from '../../src/gateway/session';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { ProfileId } from '../../src/profiles/types';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 
@@ -18,9 +19,9 @@ function tmpBase(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'profile-gateway-test-'));
 }
 
-function makeConfig(tmpDir: string, opts?: { withProfiles?: boolean }): AppConfig {
-  const withProfiles = opts?.withProfiles ?? true;
+function makeConfig(tmpDir: string): EffectiveConfig {
   return {
+  schemaVersion: 2,
     providers: {
       main: { type: 'ollama', model: 'kimi-k2.5:cloud', baseUrl: 'http://localhost:11434/v1' },
       medical: { type: 'ollama', model: 'medgemma', baseUrl: 'http://localhost:11434/v1' },
@@ -56,10 +57,15 @@ function makeConfig(tmpDir: string, opts?: { withProfiles?: boolean }): AppConfi
       },
     },
     agent: { maxIterations: 15, disclaimerEnabled: true },
-    ...(withProfiles
-      ? { profiles: { baseDir: path.join(tmpDir, 'profiles-base'), defaultProfileId: 'default' } }
-      : {}),
+    profiles: { baseDir: path.join(tmpDir, 'profiles-base'), defaultProfileId: 'default' },
   };
+}
+
+/** RETIRED -> `withProfiles: false` used to omit the identity block. The block is now
+ *  mandatory in the type, and a document without one is refused by the decoder. The legacy
+ *  shape is still constructed explicitly where a suite proves the gateway fails closed. */
+function makeLegacyConfig(tmpDir: string): EffectiveConfig {
+  return withoutOwnerIdentity(makeConfig(tmpDir));
 }
 
 function makeMockAgentLoop(responseText = 'OK') {
@@ -105,7 +111,7 @@ describe('Gateway chat→profile pairing', () => {
     jest.restoreAllMocks();
   });
 
-  function buildGatewayWithRegistry(config: AppConfig) {
+  function buildGatewayWithRegistry(config: EffectiveConfig) {
     const gateway = new Gateway(config);
     const baseDir = config.profiles!.baseDir;
     fs.mkdirSync(baseDir, { recursive: true });
@@ -256,7 +262,7 @@ describe('Gateway chat→profile pairing', () => {
   });
 
   it('registry-less config still routes with default profileId (no crash)', async () => {
-    const config = makeConfig(tmpDir, { withProfiles: false });
+    const config = makeLegacyConfig(tmpDir);
     const gateway = new Gateway(config);
 
     const sessions = new SessionManager(

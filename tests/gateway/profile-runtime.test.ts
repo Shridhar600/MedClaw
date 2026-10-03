@@ -2,8 +2,9 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { ProfileId } from '../../src/profiles';
+import { withoutOwnerIdentity } from '../helpers/test-config';
 import type { LLMProvider } from '../../src/providers/types';
 import { LLMSemaphore } from '../../src/tools/semaphore';
 import { Gateway } from '../../src/gateway/gateway';
@@ -34,9 +35,10 @@ jest.mock('../../src/memory/indexer', () => ({
   })),
 }));
 
-function makeConfig(tmpDir: string, withProfiles = true): AppConfig {
+function makeConfig(tmpDir: string): EffectiveConfig {
   const workspace = path.join(tmpDir, 'workspace');
   return {
+  schemaVersion: 2,
     providers: {
       main: { type: 'ollama', model: 'runtime-test-main', baseUrl: 'http://127.0.0.1:9/v1' },
       medical: { type: 'ollama', model: 'runtime-test-main', baseUrl: 'http://127.0.0.1:9/v1' },
@@ -72,14 +74,10 @@ function makeConfig(tmpDir: string, withProfiles = true): AppConfig {
       },
     },
     agent: { maxIterations: 15, disclaimerEnabled: true },
-    ...(withProfiles
-      ? {
-        profiles: {
-          baseDir: path.join(tmpDir, 'profiles'),
-          defaultProfileId: 'default',
-        },
-      }
-      : {}),
+    profiles: {
+      baseDir: path.join(tmpDir, 'profiles'),
+      defaultProfileId: 'default',
+    },
   };
 }
 
@@ -267,7 +265,8 @@ describe('ProfileRuntime Seam Tests (R-S1)', () => {
   });
 
   it('legacy mode without profiles config builds runtime on legacy paths and operates', async () => {
-    const config = makeConfig(tmpDir, false); // no profiles section
+    // RETIRED -> 'no profiles section' is no longer a supported document shape.
+    const config = withoutOwnerIdentity(makeConfig(tmpDir));
     const gateway = new Gateway(config);
 
     await gateway.start();

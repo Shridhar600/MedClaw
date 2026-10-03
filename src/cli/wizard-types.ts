@@ -2,7 +2,7 @@ import type { ProviderConfig } from '../config/types';
 
 export type SetupStepId =
   | 'environment'
-  | 'workspace'
+  | 'state'
   | 'provider'
   | 'telegram'
   | 'preferences'
@@ -10,7 +10,7 @@ export type SetupStepId =
 
 export type ReviewAction =
   | 'apply'
-  | 'workspace'
+  | 'state'
   | 'provider'
   | 'telegram'
   | 'preferences'
@@ -20,7 +20,14 @@ export type CompletionAction = 'start' | 'review-config' | 'exit';
 
 export interface SetupWizardState {
   configPath: string;
-  workspace: string;
+  /**
+   * Owner state root — the ONLY path the owner chooses. The workspace, scheduler store, audit log,
+   * transcript directory, media staging and owner record are all derived from it plus `ownerId`,
+   * so there is no second path authority to disagree with.
+   */
+  stateRoot: string;
+  /** Owner identity, validated with the config decoder's grammar. */
+  ownerId: string;
   provider: ProviderConfig['type'];
   mainModel: string;
   medicalModel: string;
@@ -41,7 +48,7 @@ export interface SummaryRow {
 
 export const SETUP_STEP_ORDER: readonly SetupStepId[] = [
   'environment',
-  'workspace',
+  'state',
   'provider',
   'telegram',
   'preferences',
@@ -50,7 +57,7 @@ export const SETUP_STEP_ORDER: readonly SetupStepId[] = [
 
 export const REVIEW_ACTIONS: readonly ReviewAction[] = [
   'apply',
-  'workspace',
+  'state',
   'provider',
   'telegram',
   'preferences',

@@ -1,12 +1,15 @@
-import * as path from 'path';
-import { loadConfig } from '../config/config';
-import { listHeartbeats, setConfigValue, showConfig, showProfile, showStatus, showUserSummary } from './admin';
+import { defaultRuntimeConfigPath, loadRuntimeConfig, parseGlobalOptions } from '../runtime/startup';
+import {
+  issuePairingCode,
+  listHeartbeats,
+  setConfigValue,
+  showConfig,
+  showProfile,
+  showStatus,
+  showUserSummary,
+} from './admin';
 import { runServiceOnboarding } from './service-onboarding';
 import type { CliIO } from './prompts';
-
-export interface CliRunResult {
-  code: number;
-}
 
 function defaultIO(): CliIO {
   return {
@@ -28,33 +31,23 @@ function helpText(): string {
     '  profile show',
     '  user summary',
     '  heartbeats list',
+    '  pairing issue                (offline; only while the owner is unpaired)',
     '',
     'Global options:',
     '  --help',
     '  --config <path>',
+    '',
+    'Configuration is selected in this order:',
+    '  --config <path>, then REDACTED_CONFIG_PATH, then ~/.redacted/config.json',
   ].join('\n') + '\n';
 }
 
-function parseGlobalOptions(argv: string[]): { configPath?: string; rest: string[]; help: boolean } {
-  const rest: string[] = [];
-  let configPath: string | undefined;
-  let help = false;
-
-  for (let index = 0; index < argv.length; index += 1) {
-    const token = argv[index];
-    if (token === '--help' || token === '-h' || token === 'help') {
-      help = true;
-      continue;
-    }
-    if (token === '--config') {
-      configPath = argv[index + 1];
-      index += 1;
-      continue;
-    }
-    rest.push(token);
-  }
-
-  return { configPath, rest, help };
+/**
+ * Selected owner workspace for a command. Refuses when the document is unavailable, so no
+ * inspection command can fall back to a default identity or report a healthy-empty result.
+ */
+async function selectedConfig(flagConfigPath?: string) {
+  return loadRuntimeConfig({ configPath: flagConfigPath ?? defaultRuntimeConfigPath() });
 }
 
 export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
@@ -68,10 +61,21 @@ export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
 
   const [command, ...commandArgs] = rest;
 
+  // Global option parsing stops at the command, so `onboard --yes --owner-id kiran` reaches that
+  // command's own parser. A command that declares no options of its own must still refuse a stray
+  // flag rather than silently ignore it (`status --bogus`), so the refusal lives here instead.
+  if (command !== 'onboard' && command !== 'init' && command !== 'config') {
+    const stray = commandArgs.find((token) => token.startsWith('-'));
+    if (stray !== undefined) {
+      mergedIO.stderr?.(`Unknown option for \`${command}\`: ${stray}. Run \`medclaw ${command} --help\`.\n`);
+      return 1;
+    }
+  }
+
   try {
     if (command === 'init' || command === 'onboard') {
       return await runServiceOnboarding(
-        commandArgs.includes('--config') ? commandArgs : ['--config', configPath ?? path.join(process.env.HOME ?? '', '.redacted', 'config.json'), ...commandArgs],
+        ['--config', configPath ?? defaultRuntimeConfigPath(), ...commandArgs],
         mergedIO,
       );
     }
@@ -94,7 +98,9 @@ export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
           return 1;
         }
         const value = valueParts.join(' ');
-        mergedIO.stdout?.(await setConfigValue(configPath ?? path.join(process.env.HOME ?? '', '.redacted', 'config.json'), configKey, value));
+        mergedIO.stdout?.(
+          await setConfigValue(configPath ?? defaultRuntimeConfigPath(), configKey, value),
+        );
         return 0;
       }
       mergedIO.stderr?.(`Unknown config command: ${subcommand ?? '(missing)'}\n`);
@@ -104,8 +110,8 @@ export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
     if (command === 'profile') {
       const [subcommand] = commandArgs;
       if (subcommand === 'show') {
-        const config = await loadConfig({ configPath });
-        mergedIO.stdout?.(await showProfile({ configPath, workspacePath: config.memory.workspace }));
+        const config = await selectedConfig(configPath);
+        mergedIO.stdout?.(await showProfile({ workspacePath: config.memory.workspace }));
         return 0;
       }
       mergedIO.stderr?.(`Unknown profile command: ${subcommand ?? '(missing)'}\n`);
@@ -115,19 +121,31 @@ export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
     if (command === 'user') {
       const [subcommand] = commandArgs;
       if (subcommand === 'summary') {
-        const config = await loadConfig({ configPath });
-        mergedIO.stdout?.(await showUserSummary({ configPath, workspacePath: config.memory.workspace }));
+        const config = await selectedConfig(configPath);
+        mergedIO.stdout?.(await showUserSummary({ workspacePath: config.memory.workspace }));
         return 0;
       }
       mergedIO.stderr?.(`Unknown user command: ${subcommand ?? '(missing)'}\n`);
       return 1;
     }
 
+    if (command === 'pairing') {
+      const [subcommand] = commandArgs;
+      if (subcommand === 'issue') {
+        mergedIO.stdout?.(
+          await issuePairingCode({ configPath: configPath ?? defaultRuntimeConfigPath() }),
+        );
+        return 0;
+      }
+      mergedIO.stderr?.(`Unknown pairing command: ${subcommand ?? '(missing)'}\n`);
+      return 1;
+    }
+
     if (command === 'heartbeats') {
       const [subcommand] = commandArgs;
       if (subcommand === 'list') {
-        const config = await loadConfig({ configPath });
-        mergedIO.stdout?.(await listHeartbeats({ configPath, storePath: config.heartbeat.storePath }));
+        const config = await selectedConfig(configPath);
+        mergedIO.stdout?.(await listHeartbeats({ storePath: config.heartbeat.storePath }));
         return 0;
       }
       mergedIO.stderr?.(`Unknown heartbeats command: ${subcommand ?? '(missing)'}\n`);

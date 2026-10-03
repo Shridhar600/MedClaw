@@ -7,13 +7,14 @@ jest.mock('fs', () => {
   return { ...actual, renameSync: jest.fn(actual.renameSync) };
 });
 
-import type { AppConfig } from '../../src/config/types';
-import type { IncomingMessage } from '../../src/channels/types';
+import type { EffectiveConfig } from '../../src/config/types';
+import type { AdmittedMessage } from '../../src/channels/types';
 import type { ProfileRuntime } from '../../src/gateway/runtime';
 import type { ProfileId } from '../../src/profiles/types';
 import { ProfileRegistry } from '../../src/profiles/registry';
 import { GatewayMessageRouter, sweepStagedMedia } from '../../src/gateway/router';
 import { TurnQueueFullError } from '../../src/gateway/turn-coordinator';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 
 function deferred<T = void>() {
   let resolve!: (value?: T | PromiseLike<T>) => void;
@@ -21,8 +22,11 @@ function deferred<T = void>() {
   return { promise, resolve };
 }
 
-function makeConfig(workspace: string): AppConfig {
+function makeConfig(workspace: string): EffectiveConfig {
+const owner = fixtureOwner(workspace);
   return {
+  schemaVersion: 2,
+  ...ownerSelection(owner),
     providers: {
       main: { type: 'ollama', model: 'test-main' },
       medical: { type: 'ollama', model: 'test-medical' },
@@ -70,7 +74,7 @@ function makeRuntime(workspace: string) {
     },
     trackBackgroundOperation: jest.fn((_label: string, operation: () => Promise<void>) => { void operation(); }),
     turnCoordinator: {
-      runUser: jest.fn().mockImplementation(async (_incoming: IncomingMessage, egress: (text: string) => Promise<void>) => {
+      runUser: jest.fn().mockImplementation(async (_incoming: AdmittedMessage, egress: (text: string) => Promise<void>) => {
         await egress('agent reply');
         return 'agent reply';
       }),
@@ -78,7 +82,7 @@ function makeRuntime(workspace: string) {
   };
 }
 
-function message(text: string, mediaPath?: string): IncomingMessage {
+function message(text: string, mediaPath?: string): AdmittedMessage {
   return { chatId: 'chat-1', userId: 'user-1', text, ...(mediaPath ? { mediaPath } : {}) };
 }
 
@@ -103,8 +107,8 @@ describe('GatewayMessageRouter media lifecycle', () => {
     fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
     fs.writeFileSync(stagedPath, 'report bytes', { mode: 0o600 });
     const runtime = makeRuntime(workspace);
-    const seen: IncomingMessage[] = [];
-    runtime.turnCoordinator.runUser.mockImplementation(async (incoming: IncomingMessage, egress: (text: string) => Promise<void>) => {
+    const seen: AdmittedMessage[] = [];
+    runtime.turnCoordinator.runUser.mockImplementation(async (incoming: AdmittedMessage, egress: (text: string) => Promise<void>) => {
       seen.push(incoming);
       await egress('processed');
       return 'processed';
@@ -149,8 +153,8 @@ describe('GatewayMessageRouter media lifecycle', () => {
     fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
     fs.writeFileSync(stagedPath, 'report bytes', { mode: 0o600 });
     const runtime = makeRuntime(workspace);
-    const seen: IncomingMessage[] = [];
-    runtime.turnCoordinator.runUser.mockImplementation(async (incoming: IncomingMessage, egress: (text: string) => Promise<void>) => {
+    const seen: AdmittedMessage[] = [];
+    runtime.turnCoordinator.runUser.mockImplementation(async (incoming: AdmittedMessage, egress: (text: string) => Promise<void>) => {
       seen.push(incoming);
       await egress('processed');
       return 'processed';
