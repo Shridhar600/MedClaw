@@ -17,7 +17,7 @@ import { InstallationService, describeOwnershipRefusal } from '../runtime';
 import { OwnerAdmissionService, isBoundOwnerState } from '../profiles';
 import { systemClock } from '../ports/defaults';
 import type { ResourceLeasePort } from '../ports/resource-lease';
-import { defaultRuntimeConfigPath } from '../runtime';
+import { selectConfigPath } from '../runtime';
 import { redactConfig, validateConfig, protectedSetReason } from '../config/validation';
 import type { EffectiveConfig, StoredConfig } from '../config/types';
 import { providerEnvVar } from '../config/provider-env';
@@ -103,7 +103,7 @@ function setPathValue(target: Record<string, unknown>, dottedPath: string, value
 }
 
 export async function showConfig(paths: AdminPaths = {}): Promise<string> {
-  const selected = paths.configPath ?? defaultRuntimeConfigPath();
+  const selected = paths.configPath ?? selectConfigPath();
   const { stored } = readConfigDocument(selected, os.homedir());
   return showRedactedConfigSummary(effectiveConfigFor(stored));
 }
@@ -208,7 +208,7 @@ async function applyConfigValueUnderLease(
  * was never stored.
  */
 export async function issuePairingCode(options: AdminPaths = {}): Promise<string> {
-  const selected = options.configPath ?? defaultRuntimeConfigPath();
+  const selected = options.configPath ?? selectConfigPath();
   const services = new InstallationService(new DirectoryLease());
   const result = await services.acquireOwnership(selected, os.homedir());
 
@@ -311,7 +311,7 @@ function optionalInspectionText(filePath: string, label: string, missingLabel: s
 
 /** Selected owner paths for a config path, or an explicit refusal. Never a default grant. */
 function selectedOwnerPaths(configPath?: string): { workspace: string; storePath: string } {
-  const selected = configPath ?? defaultRuntimeConfigPath();
+  const selected = configPath ?? selectConfigPath();
   const { stored } = readConfigDocument(selected, os.homedir());
   const config = effectiveConfigFor(stored);
   return { workspace: config.memory.workspace, storePath: config.heartbeat.storePath };
@@ -477,7 +477,7 @@ export function buildReadinessSummaryLines(input: {
 }
 
 export async function showStatus(paths: AdminPaths = {}): Promise<string> {
-  const selected = paths.configPath ?? defaultRuntimeConfigPath();
+  const selected = paths.configPath ?? selectConfigPath();
   const { stored } = readConfigDocument(selected, os.homedir());
   const config = effectiveConfigFor(stored);
   const workspacePath = paths.workspacePath ?? config.memory.workspace;

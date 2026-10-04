@@ -1,4 +1,4 @@
-import { defaultRuntimeConfigPath, loadRuntimeConfig, parseGlobalOptions } from '../runtime';
+import { loadRuntimeConfig, parseGlobalOptions, selectConfigPath } from '../runtime';
 import {
   issuePairingCode,
   listHeartbeats,
@@ -43,11 +43,17 @@ function helpText(): string {
 }
 
 /**
- * Selected owner workspace for a command. Refuses when the document is unavailable, so no
+ * Load the ALREADY-RESOLVED selected configuration. Refuses when the document is unavailable, so no
  * inspection command can fall back to a default identity or report a healthy-empty result.
+ *
+ * This deliberately takes an absolute, already-selected path rather than an optional flag value.
+ * It used to do the selection itself with `flagConfigPath ?? defaultRuntimeConfigPath()`, which is
+ * how the environment step got skipped: eight hand-written copies of that expression across this
+ * file and `admin.ts` meant any one of them could reintroduce the bug. Selection now happens exactly
+ * once, in `runCli`, through the single locked implementation.
  */
-async function selectedConfig(flagConfigPath?: string) {
-  return loadRuntimeConfig({ configPath: flagConfigPath ?? defaultRuntimeConfigPath() });
+async function selectedConfig(resolvedConfigPath: string) {
+  return loadRuntimeConfig({ configPath: resolvedConfigPath });
 }
 
 export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
@@ -57,6 +63,27 @@ export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
   if (help || rest.length === 0) {
     mergedIO.stdout?.(helpText());
     return 0;
+  }
+
+  // ── THE single point where configuration selection happens ──
+  //
+  // Brief T1 requires `--config > REDACTED_CONFIG_PATH > ~/.redacted/config.json` to apply
+  // "everywhere". It used to be re-derived by hand at eight call sites as
+  // `configPath ?? defaultRuntimeConfigPath()`, which silently skips the environment step: the flag
+  // arrived here, but `REDACTED_CONFIG_PATH` never did. `onboard` compounded it by manufacturing a
+  // `--config` flag containing the default, so a correct selection anywhere downstream could not
+  // recover. The result was a daemon serving one installation while `status`, `config set` and
+  // `pairing issue` read or mutated another.
+  //
+  // Resolved once, here, and passed down explicitly. Every downstream helper now takes a required
+  // resolved path, so there is no second place to get this wrong. `selectConfigPath` also validates
+  // a present-but-empty `--config` and resolves relative values against the cwd.
+  let selectedConfigPath: string;
+  try {
+    selectedConfigPath = selectConfigPath({ flagValue: configPath });
+  } catch (error) {
+    mergedIO.stderr?.(`${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
   }
 
   const [command, ...commandArgs] = rest;
@@ -75,20 +102,20 @@ export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
   try {
     if (command === 'init' || command === 'onboard') {
       return await runServiceOnboarding(
-        ['--config', configPath ?? defaultRuntimeConfigPath(), ...commandArgs],
+        ['--config', selectedConfigPath, ...commandArgs],
         mergedIO,
       );
     }
 
     if (command === 'status') {
-      mergedIO.stdout?.(await showStatus({ configPath }));
+      mergedIO.stdout?.(await showStatus({ configPath: selectedConfigPath }));
       return 0;
     }
 
     if (command === 'config') {
       const [subcommand, ...subArgs] = commandArgs;
       if (subcommand === 'show') {
-        mergedIO.stdout?.(await showConfig({ configPath }));
+        mergedIO.stdout?.(await showConfig({ configPath: selectedConfigPath }));
         return 0;
       }
       if (subcommand === 'set') {
@@ -99,7 +126,7 @@ export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
         }
         const value = valueParts.join(' ');
         mergedIO.stdout?.(
-          await setConfigValue(configPath ?? defaultRuntimeConfigPath(), configKey, value),
+          await setConfigValue(selectedConfigPath, configKey, value),
         );
         return 0;
       }
@@ -110,7 +137,7 @@ export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
     if (command === 'profile') {
       const [subcommand] = commandArgs;
       if (subcommand === 'show') {
-        const config = await selectedConfig(configPath);
+        const config = await selectedConfig(selectedConfigPath);
         mergedIO.stdout?.(await showProfile({ workspacePath: config.memory.workspace }));
         return 0;
       }
@@ -121,7 +148,7 @@ export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
     if (command === 'user') {
       const [subcommand] = commandArgs;
       if (subcommand === 'summary') {
-        const config = await selectedConfig(configPath);
+        const config = await selectedConfig(selectedConfigPath);
         mergedIO.stdout?.(await showUserSummary({ workspacePath: config.memory.workspace }));
         return 0;
       }
@@ -133,7 +160,7 @@ export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
       const [subcommand] = commandArgs;
       if (subcommand === 'issue') {
         mergedIO.stdout?.(
-          await issuePairingCode({ configPath: configPath ?? defaultRuntimeConfigPath() }),
+          await issuePairingCode({ configPath: selectedConfigPath }),
         );
         return 0;
       }
@@ -144,7 +171,7 @@ export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
     if (command === 'heartbeats') {
       const [subcommand] = commandArgs;
       if (subcommand === 'list') {
-        const config = await selectedConfig(configPath);
+        const config = await selectedConfig(selectedConfigPath);
         mergedIO.stdout?.(await listHeartbeats({ storePath: config.heartbeat.storePath }));
         return 0;
       }
