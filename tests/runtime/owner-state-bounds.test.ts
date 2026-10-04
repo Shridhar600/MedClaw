@@ -4,12 +4,15 @@
 // wedges itself.** Two bounds are pinned here that no flow test isolates, and both were reported as
 // untested in review round 2.
 //
-// 1. `PAIRING_MAX_EVENT_IDS_PER_CHAT`. The `.slice(-PAIRING_MAX_EVENT_IDS_PER_CHAT)` in
-//    `OwnerAdmissionService.handlePairing` is the ONLY write-side enforcement. That makes it
-//    load-bearing in a way that is easy to miss: `decodeOwnerState` rejects a stored array LONGER
-//    than the bound, so if the slice were removed the array would grow to four on the next attempt
-//    and the decoder would then reject the whole record — every later read returning `unavailable`
-//    and every command refusing, for a reason that looks nothing like its cause.
+// 1. `PAIRING_MAX_EVENT_IDS_PER_CHAT`. NOTE: an earlier version of this header claimed the
+//    `.slice(-PAIRING_MAX_EVENT_IDS_PER_CHAT)` in `OwnerAdmissionService.handlePairing` was the only
+//    write-side enforcement and that removing it would grow the array to four and wedge the decoder.
+//    THAT WAS WRONG, and writing the test is what proved it: `PAIRING_ATTEMPTS_PER_CHAT_PER_DAY` is
+//    also 3, so the allowance cap refuses the fourth attempt BEFORE an event id is written and the
+//    slice never actually truncates. The claim is corrected at the case below rather than left here,
+//    because a header that states a disproven thing is the same failure as a false source comment.
+//    The slice becomes load-bearing only if the attempts cap is raised — which is exactly why the
+//    decoder's own bound must stay in step with it.
 //
 // 2. `OWNER_RECORD_MAX_BYTES`. A record above the bound is refused as too-large, not parsed and not
 //    silently truncated. This is the same shape as the 256 KiB config bound, which

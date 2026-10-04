@@ -279,20 +279,35 @@ describe('a real Telegram attachment reaches the owner runtime (transport -> cor
   }, 90_000);
 
   it('refuses an attachment the moment it is aborted mid-turn, leaving no file behind', async () => {
-    const { fixture, gateway } = await boot({ telegram: true, fetchSize: 4 * 1024 * 1024 });
+    const { fixture, gateway, fetchCount } = await boot({ telegram: true, fetchSize: 4 * 1024 * 1024 });
     await gateway.start();
     try {
-      // Drive the handler and stop the daemon while the 4 MB body is still streaming.
+      // Drive the handler, then WAIT until intake has genuinely begun before stopping.
+      //
+      // This wait is the whole point of the rewrite. The previous version called `stop()` immediately
+      // after starting the handler, but `deliverMessage` yields at its first `await`, so `stop()` set
+      // `stopping` and the turn returned BEFORE `admitAndStage` ever ran. Measured on the old code:
+      // `opens=0 cancels=0`. The test therefore asserted its way green without ever reaching the abort
+      // path it names — and it still passed with the abort itself neutered.
       const inFlight = handlerFor('message:document')(documentUpdate());
+
+      const deadline = Date.now() + 20_000;
+      while (fetchCount() === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      // Precondition: the body IS being fetched. Without this the assertions below are vacuous.
+      expect(fetchCount()).toBeGreaterThan(0);
+
       await gateway.stop();
       await inFlight.catch(() => undefined);
 
-      // Either the lane was never created, or intake was cleaned up. Never a surviving partial or a
-      // complete file left behind by an aborted retrieval.
-      const survivors = fs.existsSync(fixture.mediaStaging)
-        ? fs.readdirSync(fixture.mediaStaging)
-        : [];
-      expect(survivors.filter((n) => !n.endsWith('.part'))).toEqual([]);
+      // Never a complete, adoptable file left behind by an aborted retrieval.
+      const lane = fs.existsSync(fixture.mediaStaging) ? fs.readdirSync(fixture.mediaStaging) : [];
+      expect(lane.filter((n) => !n.endsWith('.part'))).toEqual([]);
+      // And no adopted report either: an aborted intake must not reach the reports directory.
+      const reportsDir = path.join(fixture.workspace, 'reports');
+      const reports = fs.existsSync(reportsDir) ? fs.readdirSync(reportsDir) : [];
+      expect(reports.filter((n) => n.endsWith('.pdf'))).toEqual([]);
     } finally {
       await gateway.stop().catch(() => undefined);
     }

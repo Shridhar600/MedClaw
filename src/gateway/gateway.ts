@@ -190,14 +190,20 @@ export class Gateway {
   /** Injected so a start/stop duration is measured, not guessed. */
   private readonly clock: Clock;
   /**
-   * Abort signal for in-flight media intake, owned by the Gateway's whole lifetime.
+   * Abort signal for in-flight media intake.
    *
-   * Constructed once here rather than lazily inside `serveOwner`, because it has to outlive any
+   * Created in the constructor rather than lazily inside `serveOwner`, because it has to outlive any
    * single promotion: a controller created per promotion would only ever abort that promotion's
-   * downloads. `stop()` aborts it (see `stop`), which is what finally makes the comment on the
-   * intake path true.
+   * downloads. `stop()` aborts it, which is what finally makes the comment on the intake path true.
+   *
+   * NOT `readonly`, and re-armed by `start()`. `stop()` aborting this controller is permanent for the
+   * object, so a `readonly` field meant a restarted Gateway refused every subsequent attachment with
+   * "That upload was cancelled" — forever, with no recovery short of constructing a new Gateway.
+   * `start()` -> `stop()` -> `start()` is an existing, exercised contract (see
+   * `tests/gateway/gateway-transcript-sweep.test.ts`), so this was a real latent break, not a
+   * theoretical one.
    */
-  private readonly mediaIntake = new AbortController();
+  private mediaIntake = new AbortController();
   /** In-flight unpaired -> bound promotion, so concurrent messages cannot both build a runtime. */
   private pairingTransition?: Promise<void>;
   /** Boot cleanup runs once per process; see `sweepOwnerStagingLane`. */
@@ -339,6 +345,10 @@ export class Gateway {
     // and an unpaired record must NOT build anything clinical. Both decisions are taken before a
     // provider is created, before the workspace is touched, and before any index or scheduler
     // exists, so "unpaired" cannot degrade into "serving on a default identity".
+    // Re-arm intake for this run of the daemon. `stop()` aborted the previous controller, and an
+    // aborted signal cannot be un-aborted, so a restart needs a fresh one.
+    this.mediaIntake = new AbortController();
+
     const admissionState = this.admission.inspectInstallation();
     if (admissionState.kind === 'refused') {
       // Emitted here rather than in the catch: the cause is an admission refusal, not a build

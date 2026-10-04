@@ -464,6 +464,14 @@ export class InstallationService {
         };
       }
 
+      // Claim the lease IMMEDIATELY, before any further call that could throw. Assigning it after the
+      // freshness check meant an `EACCES` from `readdirSync` on an unreadable-but-present workspace
+      // (mode 0300, a restored backup, an ACL) escaped the `try` and left the owner lease ON DISK.
+      // `finally` released only the config lease, so the target stayed permanently `busy`, reporting a
+      // PID that had already exited — and plan 15 §2.2 forbids automatic recovery, so the target was
+      // unusable until the operator removed it by hand. From here on, every path releases it.
+      ownerLease = acquired;
+
       // Freshness is decided UNDER BOTH LEASES, which is what makes it trustworthy: nothing can
       // appear or vanish between this check and the commit below.
       const freshness = assertFreshInstallation(
@@ -473,8 +481,6 @@ export class InstallationService {
         ownerPaths.workspaceLease,
       );
       if (freshness !== undefined) return { kind: 'not-fresh', message: freshness };
-
-      ownerLease = acquired;
 
       // Under BOTH leases: scoped templates and state first, then the unpaired owner record, then
       // the configuration document LAST. That order means a document that exists always has a record

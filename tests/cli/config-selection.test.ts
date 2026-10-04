@@ -38,7 +38,10 @@ async function twoInstallations(): Promise<Selected> {
   const homeDir = path.join(root, 'home');
 
   const envFixture = writeConfigFixture(envDir, { ownerId: 'alternate-owner' });
-  const homeFixture = writeConfigFixture(homeDir, { ownerId: 'home-default-owner' });
+  // MUST be `$HOME/.redacted/config.json` — that is what `defaultRuntimeConfigPath()` returns.
+  // My first version wrote it to `$HOME/config.json`, a path no code path ever resolves to,
+  // which made the "unselected install was untouched" assertions tautological.
+  const homeFixture = writeConfigFixture(path.join(homeDir, '.redacted'), { ownerId: 'home-default-owner' });
 
   // Real setup creates the unpaired owner record BEFORE anything may issue a code against it, and
   // `issueChallenge` expects to find that record. The config fixture writes only the document, so the

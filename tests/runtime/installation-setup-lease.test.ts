@@ -144,6 +144,45 @@ describe('installation setup holds both leases across its commit', () => {
     expect(fs.existsSync(path.dirname(ownerPaths.ownerRecord))).toBe(true);
   });
 
+  it('releases the owner lease when the workspace cannot be read', async () => {
+    // Regression for a real strand found by the bounded re-review. `ownerLease` was assigned AFTER the
+    // freshness check, and `assertFreshInstallation` -> `entriesExcept` rethrows anything that is not
+    // ENOENT. So a workspace that exists but cannot be listed (mode 0300 — write+execute, no read; a
+    // restored backup or an ACL produces the same shape) threw out of the `try`, and the `finally`
+    // released only the CONFIG lease.
+    //
+    // The damage was permanent: the owner lease stayed on disk, so every later setup into that target
+    // returned `busy` naming a PID that had already exited — and plan 15 §2.2 forbids automatic
+    // recovery, so the target was unusable until an operator removed the lease by hand.
+    const { configPath, ownerId, config, ownerPaths } = prospectiveSetup(root);
+
+    // A workspace that exists and is searchable but NOT readable.
+    fs.mkdirSync(ownerPaths.workspace, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(path.dirname(ownerPaths.workspaceLease), { recursive: true, mode: 0o700 });
+    fs.chmodSync(ownerPaths.workspace, 0o300);
+
+    try {
+      const service = new InstallationService(new DirectoryLease());
+      // The refusal itself is not the assertion — a thrown error is acceptable here. What must not
+      // happen is the lease being left behind, so the outcome is captured either way.
+      await service.setup({ configPath, config, ownerId }).catch(() => undefined);
+
+      // Nothing was committed...
+      expect(fs.existsSync(ownerPaths.ownerRecord)).toBe(false);
+      expect(fs.existsSync(configPath)).toBe(false);
+
+      // ...and, with the workspace readable again, the SAME target is usable. Before the fix this
+      // returned `busy` forever because the stranded lease was still on disk.
+      fs.chmodSync(ownerPaths.workspace, 0o700);
+      const retry = await new InstallationService(new DirectoryLease()).setup({ configPath, config, ownerId });
+      if (retry.kind !== 'committed') throw new Error(`expected committed after cleanup, got ${retry.kind}`);
+      expect(fs.existsSync(configPath)).toBe(true);
+    } finally {
+      // Restore permissions so the temp dir can be removed.
+      try { fs.chmodSync(ownerPaths.workspace, 0o700); } catch { /* already gone */ }
+    }
+  });
+
   it('still refuses a pre-existing installation rather than overwriting it', async () => {
     const { configPath, ownerId, config, ownerPaths } = prospectiveSetup(root);
 

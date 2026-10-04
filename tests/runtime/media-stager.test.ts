@@ -215,39 +215,83 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
     void blocker;
   });
 
-  it('REFUSES (never throws) when a queued attempt waits out the intake timeout', async () => {
-    // `stage()` is declared `Promise<MediaStageResult>` — a saved-or-refused result, no rejection.
-    // The queued path was the one place that broke that contract: `awaitSlot` rejects on abort, the
-    // queue-wait `try/finally` only decremented `waiting`, and nothing converted the throw into a
-    // refusal. The rejection escaped `admitAndStage` -> `deliverMessage`, so the owner got NO reply
-    // at all for that message — not the canned timeout text, not the text half — and no
-    // `media-intake` diagnostic.
-    //
-    // This case was previously unobservable because the queue-full test above discards the waiting
-    // promise with `void waiting;`, so a rejection there was an unhandled rejection nobody asserted
-    // on. Awaiting it is the whole point.
+  it('REFUSES (never throws) when a queued attempt is released by the ACTIVE one timing out', async () => {
+    // A queued attempt whose wait ends because the ACTIVE attempt finished — the ordinary
+    // queue-drain shape. The stager never rejects here, and this is the regression guard for the
+    // sibling case below: it must keep passing after the fix.
     const blocker = blockingSource();
     const stager = new FsMediaStager(blocker.source, staging, {
       limits: { maxFileBytes: 1024, intakeTimeoutMs: 40, maxActive: 1, maxWaiting: 2 },
     });
 
-    // Take the only active slot with an attempt that will block for its whole intake.
     const active = stager.stage(reference({ fileId: 'a' }), new AbortController().signal);
     await new Promise((resolve) => setTimeout(resolve, 10));
-
-    // This one cannot get a slot and must wait — then time out while waiting.
     const queued = stager.stage(reference({ fileId: 'b' }), new AbortController().signal);
 
-    // Awaited, so a rejection fails this test instead of vanishing.
-    await expect(queued).resolves.toEqual({ kind: 'refused', reason: 'timeout' });
+    await expect(queued).resolves.toMatchObject({ kind: 'refused' });
+    await expect(active).resolves.toMatchObject({ kind: 'refused' });
+    expect(listStaging(staging)).toEqual([]);
+    expect(stager.inFlight.waiting).toBe(0);
+  });
 
-    // The waiting slot was released on the way out, so the stager is not left permanently blocked.
+  it('REFUSES (never throws) when the slot is wedged by a source that ignores its signal', async () => {
+    // This is the case my first attempt at this coverage got WRONG, and the correction matters.
+    //
+    // I originally drove the queue wait with `blockingSource()` and a short budget, and reasoned that
+    // a queued attempt could never time out because the ACTIVE attempt's own timer fires first and
+    // wakes it. A cold re-reviewer deleted the new `catch` from a copy of this module and the test
+    // STILL PASSED — it never reached the changed line, so it pinned nothing.
+    //
+    // The timeout branch IS reachable, and this is how: `source.open()` was awaited bare, so a source
+    // that ignores its signal held the single `maxActive: 1` slot FOREVER. `active` was never
+    // decremented, every later owner upload queued, and each then expired in the queue wait — all
+    // reported as 'timeout'. One wedged fetch permanently killed the owner's media path for the life
+    // of the daemon. `open()` is now raced against the intake signal, which is what makes the bound
+    // real; this case is what proves it.
+    let opens = 0;
+    const wedged: MediaSourcePort = {
+      open: async (): Promise<OpenedMedia> => {
+        opens += 1;
+        // `open()` itself never settles and ignores the signal — the exact shape the race exists for.
+        // My first version of this case resolved `open()` and blocked the CHUNK iterator instead,
+        // which the pipeline race already handled, so the case passed with the open() race removed
+        // and pinned nothing. Verified by mutation.
+        await new Promise<void>(() => { /* never settles */ });
+        throw new Error('unreachable');
+      },
+    };
+    const stager = new FsMediaStager(wedged, staging, {
+      limits: { maxFileBytes: 1024, intakeTimeoutMs: 40, maxActive: 1, maxWaiting: 2 },
+    });
+
+    // This attempt takes the only slot. With `open()` awaited bare it would hold it forever; with the
+    // race it is released at the intake deadline.
+    const wedgedAttempt = stager.stage(reference({ fileId: 'a' }), new AbortController().signal);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(stager.inFlight.active).toBe(1);
+
+    // These queue behind it. With the wedge in place their only way out is the queue-wait timeout.
+    const first = stager.stage(reference({ fileId: 'b' }), new AbortController().signal);
+    const second = stager.stage(reference({ fileId: 'c' }), new AbortController().signal);
+
+    await expect(first).resolves.toEqual({ kind: 'refused', reason: 'timeout' });
+    await expect(second).resolves.toEqual({ kind: 'refused', reason: 'timeout' });
     expect(stager.inFlight.waiting).toBe(0);
 
-    // Nothing was written for the timed-out queued attempt.
-    await expect(active).resolves.toEqual({ kind: 'refused', reason: 'timeout' });
+    // The load-bearing assertion: the wedge is RELEASED. Without the race on `open()`, `active` stays
+    // 1 for the life of the stager and every later owner upload expires in the queue wait — one
+    // signal-ignoring fetch permanently killing the owner's media path. Bounded by a wall clock so the
+    // failure is an assertion rather than a suite timeout.
+    const released = await Promise.race([
+      wedgedAttempt,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('wedged slot was never released')), 1000)),
+    ]);
+    expect(released).toEqual({ kind: 'refused', reason: 'timeout' });
+    expect(stager.inFlight.active).toBe(0);
     expect(listStaging(staging)).toEqual([]);
-    void blocker;
+    // Each of the three attempts reached `open()` exactly once. Nothing retried in a loop, which is
+    // what a wedged slot used to cause.
+    expect(opens).toBe(3);
   });
 
   it('REFUSES (never throws) when the CALLER aborts while the attempt is waiting for a slot', async () => {
@@ -339,8 +383,15 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
     const result = await stager.stage(reference(), new AbortController().signal);
 
     expect(openCalls).toBe(1);
-    expect(cancels).toBe(1);
+    // The refusal now arrives at the intake deadline (~30ms) instead of waiting out `open()` (~120ms),
+    // because `open()` is raced against the abort signal. The late handle is cancelled by the losing
+    // side's own cleanup, which necessarily happens AFTER the refusal — so wait for it to land before
+    // asserting. This is the behavioural improvement: `stage()` no longer blocks on a source that
+    // ignores its signal.
     expect(result).toEqual({ kind: 'refused', reason: 'timeout' });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(cancels).toBe(1);
     expect(listStaging(staging)).toEqual([]);
   });
 

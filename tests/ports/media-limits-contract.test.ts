@@ -12,6 +12,9 @@
 // This is a contract pin, deliberately narrow: the values themselves, and the fact that
 // `DEFAULT_MEDIA_LIMITS` is wired from them rather than restated.
 
+import * as fs from 'fs';
+import * as path from 'path';
+
 import {
   DEFAULT_MEDIA_LIMITS,
   MEDIA_INTAKE_TIMEOUT_MS,
@@ -40,5 +43,29 @@ describe('media limits are the locked plan 15 2.5 bounds', () => {
       maxActive: MEDIA_MAX_ACTIVE,
       maxWaiting: MEDIA_MAX_WAITING,
     });
+  });
+
+  it('is what the production stager actually receives', () => {
+    // The two cases above pin the numbers; this pins that production USES them. `Gateway` constructs
+    // the only `FsMediaStager` in `src/` and passes no `limits`, so the stager falls through to
+    // `DEFAULT_MEDIA_LIMITS` — correct today, but nothing asserted it, so a second construction site
+    // with explicitly widened limits would have left this file green while the bound was gone.
+    const gatewaySource = fs.readFileSync(
+      path.join(__dirname, '..', '..', 'src', 'gateway', 'gateway.ts'),
+      'utf8',
+    );
+    const constructions = gatewaySource.match(/new FsMediaStager\(/g) ?? [];
+    expect(constructions.length).toBeGreaterThan(0);
+    // Every construction must omit `limits`, so the defaults are what reaches the stager.
+    for (const match of gatewaySource.matchAll(/new FsMediaStager\([\s\S]{0,400}?\)/g)) {
+      expect(match[0]).not.toContain('limits:');
+    }
+
+    // And the stager's own fallback is the same object, not a copy of the numbers.
+    const stagerSource = fs.readFileSync(
+      path.join(__dirname, '..', '..', 'src', 'runtime', 'adapters', 'media-stager.ts'),
+      'utf8',
+    );
+    expect(stagerSource).toContain('DEFAULT_MEDIA_LIMITS');
   });
 });

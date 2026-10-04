@@ -125,7 +125,7 @@ export class FsMediaStager {
         this.waiting += 1;
         try {
           await this.awaitSlot(timeout.signal);
-        } catch {
+        } catch (error) {
           // `awaitSlot` rejects when the intake signal fires while this attempt is QUEUED, and that
           // rejection used to escape `stage()` entirely: the queue wait had a `finally` but no
           // `catch`, so a timeout or caller abort mid-wait threw out of a method declared
@@ -139,6 +139,13 @@ export class FsMediaStager {
           // `signal.aborted` separates the two causes: the caller's own abort is `aborted`, while the
           // internal intake budget running out is `timeout`. Same distinction as every other abort
           // path in this method.
+          // `awaitSlot` has exactly one reject path today (its abort listener), so an abort error is
+          // provably all that can arrive. Anything else means the primitive changed underneath us,
+          // and reporting it as 'timeout' would hide it with no diagnostic — so it is logged rather
+          // than laundered.
+          if (!isAbortError(error)) {
+            console.warn('[media-stager] Queue wait failed unexpectedly:', summarizeErrorForLog(error));
+          }
           return this.refuse(signal.aborted ? 'aborted' : 'timeout', undefined, startedAt);
         } finally {
           this.waiting -= 1;
@@ -152,7 +159,28 @@ export class FsMediaStager {
       }
 
       try {
-        opened = await this.source.open(ref, timeout.signal);
+        // Raced against the intake signal. `MediaSourcePort` is a documented swap point (specs/16
+        // §2) and `open()` is allowed to ignore its signal, so awaiting it bare made a
+        // signal-ignoring source hold `maxActive: 1` FOREVER: `active` was never decremented, every
+        // later owner upload queued, and each then expired in the queue wait — all reported as
+        // 'timeout'. One wedged fetch permanently killed the owner's media path for the life of the
+        // daemon. Racing the abort is what makes "one active download" a real bound.
+        // Losing the race must still CLEAN UP the loser. If the abort wins, `open()` may resolve
+        // later with a live handle — a Telegram file connection, say — and dropping it on the floor
+        // would leak the transport for its own lifetime. So the open promise carries its own cleanup,
+        // armed only once we have actually stopped waiting. Without this, racing `open()` regressed
+        // the existing guarantee that a source finishing after the deadline is cancelled.
+        let abandoned = false;
+        const openPromise = this.source.open(ref, timeout.signal).then((handle) => {
+          if (abandoned) void this.cancelOnce(handle);
+          return handle;
+        });
+        try {
+          opened = await Promise.race([openPromise, abortRejection(timeout.signal)]);
+        } catch (error) {
+          abandoned = true;
+          throw error;
+        }
       } catch (error) {
         // A source that fails to open is a source failure, not a timeout — unless the abort that
         // fired is the one that explains it.
@@ -169,7 +197,16 @@ export class FsMediaStager {
         return this.refuse('too-large', undefined, startedAt);
       }
 
-      secureMkdir(this.stagingDir, { recursive: true });
+      // Inside the guarded region on purpose. `secureMkdir` is a bare `fs.mkdirSync` and throws on
+      // EACCES / ENOTDIR / ENOSPC; an unusable staging path therefore used to escape `stage()`
+      // entirely, which is the same "no reply at all, no media-intake diagnostic" symptom the queue
+      // wait had. An unwritable lane is a source-side failure from the caller's point of view.
+      try {
+        secureMkdir(this.stagingDir, { recursive: true });
+      } catch (error) {
+        await this.cancelOnce(opened);
+        return this.refuse('source-failed', error, startedAt);
+      }
       // The display name is presentation metadata. It is sanitised to a basename and never trusted
       // as a path, and the random stem means two uploads cannot collide.
       const stem = `${process.pid}-${Date.now()}-${randomSuffix()}`;
@@ -330,6 +367,11 @@ function abortRejection(signal: AbortSignal): Promise<never> {
     }
     signal.addEventListener('abort', () => reject(abortError()), { once: true });
   });
+}
+
+/** True for the abort rejection produced by `abortError()`. Keeps a catch from swallowing a bug. */
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.message === 'media intake aborted';
 }
 
 function abortError(): Error {
