@@ -227,7 +227,6 @@ export async function issuePairingCode(options: AdminPaths = {}): Promise<string
       codes: new CryptoPairingCodePort(),
       clock: systemClock,
       expectedOwnerId: ownerId,
-      diagnostics: { recordPairingOutcome: () => {} },
     });
 
     const issued = await admission.issueChallenge();

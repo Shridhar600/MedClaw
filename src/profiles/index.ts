@@ -33,9 +33,7 @@ export {
 export type {
   InstallationAdmission,
   IssueChallengeResult,
-  OwnerAccessDiagnostics,
   OwnerAdmissionDeps,
-  PairingOutcomeEvent,
 } from './owner-admission';
 export type {
   AdmissionDecision,

@@ -25,12 +25,15 @@ import type {
   MediaLimits,
   MediaReference,
   MediaSourcePort,
-  MediaStageDiagnostics,
   MediaStageReason,
   MediaStageResult,
   OpenedMedia,
 } from '../../ports/media-source';
 import { DEFAULT_MEDIA_LIMITS } from '../../ports/media-source';
+import type { Clock } from '../../ports/clock';
+import { systemClock } from '../../ports/defaults';
+import type { DiagnosticEvent, DiagnosticSink } from '../../ports/diagnostics';
+import { SILENT_DIAGNOSTIC_SINK, guardedDiagnosticSink } from '../../ports/diagnostics';
 
 /**
  * Suffix marking THIS operation's in-progress partial file. Cleanup targets exactly this suffix, so
@@ -40,7 +43,8 @@ const PARTIAL_SUFFIX = '.part';
 
 export interface MediaStagerOptions {
   limits?: MediaLimits;
-  diagnostics?: MediaStageDiagnostics;
+  /** The closed diagnostic contract. Silent by default; see `ports/diagnostics`. */
+  diagnostics?: DiagnosticSink;
   /** Presentation metadata is never a trusted path. */
   log?: (message: string) => void;
 }
@@ -53,27 +57,51 @@ export class FsMediaStager {
   /** Streams already cancelled, so a stream is never asked to abort twice. */
   private readonly cancelledSources = new WeakSet<OpenedMedia>();
 
+  /**
+   * Guarded once here rather than at each emit, so an adapter that throws can never fail a download.
+   * Intake runs on a request a stranger can trigger, and a broken log must not turn into a failed
+   * upload or a stuck intake slot.
+   */
+  private readonly sink: DiagnosticSink;
+  private readonly clock: Clock;
+
   constructor(
     private readonly source: MediaSourcePort,
     /** Absolute, already-trusted owner-scoped staging directory. */
     private readonly stagingDir: string,
     private readonly options: MediaStagerOptions = {},
-  ) {}
+    clock: Clock = systemClock,
+  ) {
+    this.sink = guardedDiagnosticSink(options.diagnostics ?? SILENT_DIAGNOSTIC_SINK);
+    this.clock = clock;
+  }
+
+  private emit(event: DiagnosticEvent): void {
+    this.sink.emit(event);
+  }
+
+  private elapsedSince(startedAt: number): number {
+    const elapsed = this.clock.now().getTime() - startedAt;
+    return elapsed > 0 ? elapsed : 0;
+  }
 
   get inFlight(): { active: number; waiting: number } {
     return { active: this.active, waiting: this.waiting };
   }
 
   async stage(ref: MediaReference | undefined, signal: AbortSignal): Promise<MediaStageResult> {
+    // Measured across the whole attempt, queue wait included: that wait is the interesting number when
+    // an owner asks why their photo was slow.
+    const startedAt = this.clock.now().getTime();
     if (!ref || (ref.kind !== 'photo' && ref.kind !== 'document')) {
-      return this.refuse('unsupported');
+      return this.refuse('unsupported', undefined, startedAt);
     }
     const limits = this.options.limits ?? DEFAULT_MEDIA_LIMITS;
 
     // The advertised size is a claim. If it already exceeds the cap we can refuse without opening a
     // stream at all — no network, no file.
     if (typeof ref.advertisedBytes === 'number' && ref.advertisedBytes > limits.maxFileBytes) {
-      return this.refuse('advertised-too-large');
+      return this.refuse('advertised-too-large', undefined, startedAt);
     }
 
     // The slot is RESERVED synchronously, before the first await. Deciding queue membership after
@@ -92,7 +120,7 @@ export class FsMediaStager {
         if (this.waiting >= limits.maxWaiting) {
           // Refuse rather than queue without bound: an unbounded wait is a denial of service with a
           // memory cap and a timer behind every entry.
-          return this.refuse('queue-full');
+          return this.refuse('queue-full', undefined, startedAt);
         }
         this.waiting += 1;
         try {
@@ -105,7 +133,7 @@ export class FsMediaStager {
       countedAsActive = true;
 
       if (timeout.signal.aborted) {
-        return this.refuse(signal.aborted ? 'aborted' : 'timeout');
+        return this.refuse(signal.aborted ? 'aborted' : 'timeout', undefined, startedAt);
       }
 
       try {
@@ -113,17 +141,17 @@ export class FsMediaStager {
       } catch (error) {
         // A source that fails to open is a source failure, not a timeout — unless the abort that
         // fired is the one that explains it.
-        return this.refuse(timeout.signal.aborted && !signal.aborted ? 'timeout' : 'source-failed', error);
+        return this.refuse(timeout.signal.aborted && !signal.aborted ? 'timeout' : 'source-failed', error, startedAt);
       }
 
       // The wait may have expired while the source was opening. A late completion must not stream.
       if (timeout.signal.aborted || signal.aborted) {
         await this.cancelOnce(opened);
-        return this.refuse(signal.aborted ? 'aborted' : 'timeout');
+        return this.refuse(signal.aborted ? 'aborted' : 'timeout', undefined, startedAt);
       }
       if (typeof opened.advertisedBytes === 'number' && opened.advertisedBytes > limits.maxFileBytes) {
         await this.cancelOnce(opened);
-        return this.refuse('too-large');
+        return this.refuse('too-large', undefined, startedAt);
       }
 
       secureMkdir(this.stagingDir, { recursive: true });
@@ -150,10 +178,10 @@ export class FsMediaStager {
         await this.cancelOnce(opened);
         this.unlinkQuietly(partialPath);
         partialPath = undefined;
-        if (counter.exceeded) return this.refuse('too-large');
-        if (signal.aborted) return this.refuse('aborted');
-        if (timeout.signal.aborted) return this.refuse('timeout');
-        return this.refuse('source-failed', error);
+        if (counter.exceeded) return this.refuse('too-large', undefined, startedAt);
+        if (signal.aborted) return this.refuse('aborted', undefined, startedAt);
+        if (timeout.signal.aborted) return this.refuse('timeout', undefined, startedAt);
+        return this.refuse('source-failed', error, startedAt);
       }
 
       if (counter.bytes === 0) {
@@ -161,7 +189,7 @@ export class FsMediaStager {
         await this.cancelOnce(opened);
         this.unlinkQuietly(partialPath);
         partialPath = undefined;
-        return this.refuse('source-failed');
+        return this.refuse('source-failed', undefined, startedAt);
       }
 
       try {
@@ -170,11 +198,11 @@ export class FsMediaStager {
       } catch (error) {
         this.unlinkQuietly(partialPath);
         partialPath = undefined;
-        return this.refuse('source-failed', error);
+        return this.refuse('source-failed', error, startedAt);
       }
 
       const bytes = counter.bytes;
-      this.options.diagnostics?.recordMediaStageOutcome({ result: 'saved', bytes });
+      this.emit({ stage: 'media-intake', outcome: 'saved', bytes, durationMs: this.elapsedSince(startedAt) });
       return { kind: 'saved', absolutePath: finalPath, bytes };
     } finally {
       clearTimeout(timer);
@@ -222,8 +250,13 @@ export class FsMediaStager {
     await opened.cancel().catch(() => undefined);
   }
 
-  private refuse(reason: MediaStageReason, error?: unknown): MediaStageResult {
-    this.options.diagnostics?.recordMediaStageOutcome({ result: 'refused', reason });
+  private refuse(reason: MediaStageReason, error?: unknown, startedAt?: number): MediaStageResult {
+    this.emit({
+      stage: 'media-intake',
+      outcome: 'refused',
+      reason,
+      durationMs: startedAt === undefined ? 0 : this.elapsedSince(startedAt),
+    });
     if (error !== undefined && this.options.log) {
       // Sanitized frame only: a source failure detail must never carry a URL, token or filename.
       this.options.log(`[media] staging refused (${reason}): ${summarizeErrorForLog(error)}`);

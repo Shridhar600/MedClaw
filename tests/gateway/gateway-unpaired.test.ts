@@ -45,7 +45,6 @@ describe('unpaired daemon boot', () => {
       codes: new CryptoPairingCodePort(),
       clock,
       expectedOwnerId: fixture.ownerId,
-      diagnostics: { recordPairingOutcome: () => {} },
     });
     await admission.initialize();
     const issued = await admission.issueChallenge();
@@ -93,7 +92,6 @@ describe('unpaired daemon boot', () => {
       codes: new CryptoPairingCodePort(),
       clock: new FixedClock(),
       expectedOwnerId: fixture.ownerId,
-      diagnostics: { recordPairingOutcome: () => {} },
     });
 
     const { loadRuntimeConfig } = await import('../../src/runtime/startup');
@@ -126,7 +124,6 @@ describe('unpaired daemon boot', () => {
       codes: new CryptoPairingCodePort(),
       clock: new FixedClock(),
       expectedOwnerId: fixture.ownerId,
-      diagnostics: { recordPairingOutcome: () => {} },
     });
 
     const { loadRuntimeConfig } = await import('../../src/runtime/startup');

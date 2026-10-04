@@ -27,7 +27,11 @@ import { ProfileRuntime } from './runtime';
 import { ProfileRuntimeManager } from './manager';
 import { GatewayMessageRouter, sweepStagedMedia, transportIdentityOf } from './router';
 import { FsMediaStager } from '../runtime/adapters/media-stager';
-import type { MediaSourcePort, MediaStageDiagnostics } from '../ports/media-source';
+import type { MediaSourcePort } from '../ports/media-source';
+import type { DiagnosticEvent, DiagnosticSink } from '../ports/diagnostics';
+import { SILENT_DIAGNOSTIC_SINK, guardedDiagnosticSink } from '../ports/diagnostics';
+import type { Clock } from '../ports/clock';
+import { systemClock } from '../ports/defaults';
 import { TurnQueueFullError, heartbeatTurnId } from './turn-coordinator';
 
 /**
@@ -76,8 +80,14 @@ export interface GatewayAdmissionDeps {
    * bytes must not appear to succeed.
    */
   mediaSource?: MediaSourcePort;
-  /** Diagnostics for bounded media outcomes. One event per attempt, no identifiers. */
-  mediaDiagnostics?: MediaStageDiagnostics;
+  /**
+   * The closed diagnostic contract, covering admission, pairing, media intake and start/stop.
+   * Silent by default: the brief requires outcomes to be EMITTABLE and requires local explicit
+   * output to be a separate surface, so production does not print.
+   */
+  diagnostics?: DiagnosticSink;
+  /** Optional: defaults to the system clock. Injected in tests so durations are real measurements. */
+  clock?: Clock;
 }
 
 const SHUTDOWN_RESPONSE = 'The health assistant is shutting down. Please try again in a moment.';
@@ -176,7 +186,9 @@ export class Gateway {
   private ownerPathsCache?: OwnerPaths;
   private readonly buildProvider: ProviderFactory;
   private readonly mediaSource?: MediaSourcePort;
-  private readonly mediaDiagnostics?: MediaStageDiagnostics;
+  private readonly sink: DiagnosticSink;
+  /** Injected so a start/stop duration is measured, not guessed. */
+  private readonly clock: Clock;
   private mediaIntake?: AbortController;
   /** In-flight unpaired -> bound promotion, so concurrent messages cannot both build a runtime. */
   private pairingTransition?: Promise<void>;
@@ -192,7 +204,8 @@ export class Gateway {
     this.admissionOwnerId = deps.ownerId;
     this.buildProvider = deps.createProvider ?? createProvider;
     this.mediaSource = deps.mediaSource;
-    this.mediaDiagnostics = deps.mediaDiagnostics;
+    this.sink = guardedDiagnosticSink(deps.diagnostics ?? SILENT_DIAGNOSTIC_SINK);
+    this.clock = deps.clock ?? systemClock;
   }
 
   /** True when the daemon is serving pairing only, with no clinical runtime built. */
@@ -273,6 +286,32 @@ export class Gateway {
   }
 
   async start(): Promise<void> {
+    const startedAt = this.clock.now().getTime();
+    try {
+      await this.startServing(startedAt);
+    } catch (error) {
+      this.sink.emit({
+        stage: 'start-stop',
+        outcome: 'failed',
+        reason: 'build-failed',
+        durationMs: this.elapsedSince(startedAt),
+      });
+      throw error;
+    }
+    this.sink.emit({ stage: 'start-stop', outcome: 'started', durationMs: this.elapsedSince(startedAt) });
+  }
+
+  /** Emit helpers. The sink is guarded in the constructor, so no emit can throw into a boot. */
+  private emit(event: DiagnosticEvent): void {
+    this.sink.emit(event);
+  }
+
+  private elapsedSince(startedAt: number): number {
+    const elapsed = this.clock.now().getTime() - startedAt;
+    return elapsed > 0 ? elapsed : 0;
+  }
+
+  private async startServing(startedAt: number): Promise<void> {
     const { config } = this;
     this.stopping = false;
     this.stopped = false;
@@ -292,6 +331,14 @@ export class Gateway {
     // exists, so "unpaired" cannot degrade into "serving on a default identity".
     const admissionState = this.admission.inspectInstallation();
     if (admissionState.kind === 'refused') {
+      // Emitted here rather than in the catch: the cause is an admission refusal, not a build
+      // failure, and the precise `AdmissionReason` is already recorded by the admission module.
+      this.emit({
+        stage: 'start-stop',
+        outcome: 'refused',
+        reason: 'admission-refused',
+        durationMs: this.elapsedSince(startedAt),
+      });
       throw new Error(
         `Refusing to serve: the owner record is ${admissionState.reason}. `
         + 'Re-run setup on this computer, then start the daemon again.',
@@ -685,14 +732,30 @@ export class Gateway {
   }
 
   async stop(): Promise<void> {
+    // Both early returns are idempotent no-ops: a second stop() during normal shutdown is not an
+    // event, and reporting one would teach an operator to ignore this channel.
     if (this.stopped) return;
     if (this.stopPromise) return this.stopPromise;
+    const startedAt = this.clock.now().getTime();
     this.stopping = true;
     this.runtime?.beginStopping();
-    const shared = this.stopResources().finally(() => {
-      this.stopped = true;
-      if (this.stopPromise === shared) this.stopPromise = undefined;
-    });
+    const shared = this.stopResources()
+      .then(() => {
+        this.emit({ stage: 'start-stop', outcome: 'stopped', durationMs: this.elapsedSince(startedAt) });
+      })
+      .catch((error: unknown) => {
+        this.emit({
+          stage: 'start-stop',
+          outcome: 'failed',
+          reason: 'release-failed',
+          durationMs: this.elapsedSince(startedAt),
+        });
+        throw error;
+      })
+      .finally(() => {
+        this.stopped = true;
+        if (this.stopPromise === shared) this.stopPromise = undefined;
+      });
     this.stopPromise = shared;
     return shared;
   }
@@ -1364,7 +1427,7 @@ export class Gateway {
     const stagingDir = this.mediaStagingDir();
     if (!this.mediaSource || !stagingDir) return undefined;
     this.mediaStagerCache ??= new FsMediaStager(this.mediaSource, stagingDir, {
-      diagnostics: this.mediaDiagnostics,
+      diagnostics: this.sink,
     });
     return this.mediaStagerCache;
   }

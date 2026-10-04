@@ -20,6 +20,7 @@ import * as path from 'path';
 import { runCli } from '../../src/cli';
 import { startDaemon, type DaemonHandle } from '../../src/index';
 import { Gateway } from '../../src/gateway/gateway';
+import type { DiagnosticEvent, DiagnosticSink } from '../../src/ports/diagnostics';
 import type { LLMProvider, LLMResponse } from '../../src/providers/types';
 import type { IncomingMessage } from '../../src/channels/types';
 import { CryptoPairingCodePort, FileOwnerStatePort, DirectoryLease } from '../../src/runtime/adapters';
@@ -152,17 +153,21 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
     ]);
   }
 
-  function admissionFor(): OwnerAdmissionService {
+  function admissionFor(diagnostics?: DiagnosticSink): OwnerAdmissionService {
     return new OwnerAdmissionService({
       store: new FileOwnerStatePort(fixture.ownerRecord, fixture.ownerId),
       codes: new CryptoPairingCodePort(),
       clock: systemClock,
       expectedOwnerId: fixture.ownerId,
-      diagnostics: { recordPairingOutcome: () => {} },
+      ...(diagnostics ? { diagnostics } : {}),
     });
   }
 
-  async function bootDaemon(provider: ScriptedProvider): Promise<DaemonHandle> {
+  async function bootDaemon(
+    provider: ScriptedProvider,
+    /** When supplied, the real boot reports its outcomes through the closed diagnostic contract. */
+    diagnostics?: DiagnosticSink,
+  ): Promise<DaemonHandle> {
     const config = await loadRuntimeConfig({ configPath: fixture.configPath });
     return startDaemon({
       services: new InstallationService(new DirectoryLease()),
@@ -170,9 +175,10 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
       homeDir: root,
       createGateway: () => {
         const gateway = new Gateway(config, {
-          admission: admissionFor(),
+          admission: admissionFor(diagnostics),
           ownerId: asProfileId(fixture.ownerId)!,
           createProvider: () => provider,
+          ...(diagnostics ? { diagnostics } : {}),
         });
         return gateway;
       },
@@ -369,6 +375,79 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
 
     // Both leases released: a clean shutdown leaves nothing held.
     expect(fs.existsSync(fixture.workspaceLease)).toBe(false);
+  }, 120_000);
+
+  it('reports useful outcomes through the closed diagnostic contract during a real boot', async () => {
+    // Why this earns its place: the contract is only worth having if the REAL composition root emits
+    // through it. A unit test on a hand-built sink cannot catch a wiring gap — an adapter that is never
+    // passed to `new Gateway(...)`, or an admission service built without it, emits nothing at all and
+    // every contract test still passes. This boots the real daemon, pairs the owner, serves a turn and
+    // stops, and asserts on what was actually emitted.
+    expect((await setup()).code).toBe(0);
+
+    const events: DiagnosticEvent[] = [];
+    const capture: DiagnosticSink = { emit: (event) => events.push(event) };
+    const owner = identityFor('owner-chat', 'owner-user', '1');
+    const replies: string[] = [];
+    const deliver = (message: IncomingMessage): Promise<void> =>
+      daemon.gateway.deliverMessage(message, async (reply) => { replies.push(reply); });
+
+    // Issued BEFORE the daemon boots, because the CLI needs the installation lease the running
+    // daemon holds. Admission re-reads the record on every message, so the daemon still observes the
+    // pairing event itself.
+    // Declared out here, not inside the try, so the post-shutdown leak assertions can check it too.
+    // A pairing code that reached a diagnostic would be the worst possible leak in this contract.
+    const issued = await cli(['--config', fixture.configPath, 'pairing', 'issue']);
+    expect(issued.code).toBe(0);
+    const pairingCode = issued.output.match(/\b[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}\b/)?.[0];
+    expect(pairingCode).toBeTruthy();
+
+    const provider = new ScriptedProvider([textResponse('ok'), textResponse('ok')]);
+    const daemon = await bootDaemon(provider, capture);
+    try {
+      // Boot: the record is unpaired, so admission must report pairing-only — NOT admitted. A boot
+      // that claimed 'admitted' here would be asserting a clinical runtime it deliberately did not build.
+      expect(events).toContainEqual(
+        expect.objectContaining({ stage: 'owner-admission', outcome: 'pairing-only' }),
+      );
+      expect(events).toContainEqual(expect.objectContaining({ stage: 'start-stop', outcome: 'started' }));
+
+      // A stranger in a group is refused at admission, and the contract records which reason.
+      await deliver({
+        channel: 'telegram', chatType: 'group', eventId: 'telegram:group-999:g1',
+        chatId: 'group-999', userId: 'nobody', text: 'what is my blood pressure?',
+      });
+      expect(events).toContainEqual(
+        expect.objectContaining({ stage: 'owner-admission', outcome: 'refused', reason: 'non-private-chat' }),
+      );
+      // …and nothing about their question reached a provider or the transcript.
+      expect(replies.join(' ')).not.toMatch(/blood pressure/i);
+
+      // The owner pairs over the real inbound path.
+      await deliver(telegramMessage(owner.chatId, owner.userId, 'p1', pairingCode as string));
+      expect(events).toContainEqual(expect.objectContaining({ stage: 'pairing', outcome: 'paired' }));
+
+      // An owner turn: admission admits, with a real measured duration.
+      await deliver(telegramMessage(owner.chatId, owner.userId, 'm1', 'I slept badly last night'));
+      expect(events).toContainEqual(expect.objectContaining({ stage: 'owner-admission', outcome: 'admitted' }));
+    } finally {
+      await daemon.shutdown();
+    }
+
+    // Stop is reported too, so an operator can tell a clean shutdown from a dropped process.
+    expect(events).toContainEqual(expect.objectContaining({ stage: 'start-stop', outcome: 'stopped' }));
+
+    // The privacy half of the contract, over the REAL emitted stream: nothing identifier-shaped.
+    const serialized = JSON.stringify(events);
+    for (const secret of [owner.chatId, owner.userId, fixture.ownerRecord, fixture.baseDir, pairingCode as string]) {
+      expect(serialized).not.toContain(secret);
+    }
+    // And every event is well-formed against the closed shape, with a real duration.
+    expect(events.length).toBeGreaterThan(4);
+    for (const event of events) {
+      expect(Number.isFinite(event.durationMs)).toBe(true);
+      expect(event.durationMs).toBeGreaterThanOrEqual(0);
+    }
   }, 120_000);
 
   it('refuses to start a second daemon while the first holds the installation', async () => {

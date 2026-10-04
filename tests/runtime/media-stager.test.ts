@@ -21,6 +21,7 @@ import type {
   MediaStageResult,
   OpenedMedia,
 } from '../../src/ports/media-source';
+import type { DiagnosticEvent } from '../../src/ports/diagnostics';
 import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 
 function reference(overrides: Partial<MediaReference> = {}): MediaReference {
@@ -295,18 +296,20 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
   });
 
   it('reports a bounded, identifier-free diagnostic per attempt', async () => {
-    const outcomes: unknown[] = [];
+    const outcomes: DiagnosticEvent[] = [];
     const { source } = streamingSource(1024);
     const stager = new FsMediaStager(source, staging, {
-      diagnostics: { recordMediaStageOutcome: (outcome) => outcomes.push(outcome) },
+      diagnostics: { emit: (event) => outcomes.push(event) },
     });
 
     await stager.stage(reference(), new AbortController().signal);
     await stager.stage(reference({ kind: 'video' as unknown as MediaReference['kind'] }), new AbortController().signal);
 
+    // One event per attempt, each naming its stage and carrying a measured duration. The old channel
+    // could not say which operation produced an event, nor how long it took.
     expect(outcomes).toEqual([
-      { result: 'saved', bytes: 1024 },
-      { result: 'refused', reason: 'unsupported' },
+      { stage: 'media-intake', outcome: 'saved', bytes: 1024, durationMs: expect.any(Number) },
+      { stage: 'media-intake', outcome: 'refused', reason: 'unsupported', durationMs: expect.any(Number) },
     ]);
     // No chat, sender, file id, filename or URL in the diagnostic channel.
     const serialised = JSON.stringify(outcomes);

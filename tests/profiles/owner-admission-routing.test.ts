@@ -147,7 +147,6 @@ describe('S1 routing: admission replaces the first-contact grant', () => {
       codes: new CryptoPairingCodePort(),
       clock: new FixedClock(),
       expectedOwnerId: OWNER_ID,
-      diagnostics: { recordPairingOutcome: () => {} },
     });
     await admission.initialize();
 
@@ -342,7 +341,6 @@ describe('S1 routing: a group message never gains health state even when text lo
         codes: new CryptoPairingCodePort(),
         clock: new FixedClock(),
         expectedOwnerId: OWNER_ID,
-        diagnostics: { recordPairingOutcome: () => {} },
       });
       await admission.initialize();
 

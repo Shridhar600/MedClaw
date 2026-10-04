@@ -35,7 +35,20 @@ import {
   type PairingResult,
   type TransportIdentity,
 } from '../ports/owner-state';
+import type { DiagnosticEvent, DiagnosticSink, PairingDiagnosticReason } from '../ports/diagnostics';
+import { SILENT_DIAGNOSTIC_SINK, guardedDiagnosticSink } from '../ports/diagnostics';
 import { newUnpairedOwnerState, utcDayOf } from './owner-state';
+
+/** What a pairing attempt produced: the user-facing result plus the diagnostic-only cause. */
+interface PairingOutcome {
+  result: PairingResult;
+  reason: PairingDiagnosticReason;
+}
+
+/** Outcomes that are progress rather than refusal, so they carry no reason. */
+function isProgressOutcome(kind: PairingResult['kind']): kind is 'paired' | 'already-paired' | 'prompt' {
+  return kind === 'paired' || kind === 'already-paired' || kind === 'prompt';
+}
 
 // ── Canned copy ──────────────────────────────────────────────────────────────────────────
 // Pairing is never a health answer, and none of these mention health state.
@@ -85,26 +98,18 @@ export function refusalTextFor(reason: AdmissionReason): string {
   return REFUSAL_TEXT[reason] ?? PAIRING_REFUSED_TEXT;
 }
 
-export interface PairingOutcomeEvent {
-  result: PairingResult['kind'];
-  chatType: TransportIdentity['chatType'] | 'unknown';
-}
-
-/**
- * Bounded, identifier-free outcome channel. One event per attempt, no identifiers, no code, no
- * exception payload — so a diagnostic can never become a pairing oracle.
- */
-export interface OwnerAccessDiagnostics {
-  recordPairingOutcome(outcome: PairingOutcomeEvent): void;
-}
-
 export interface OwnerAdmissionDeps {
   store: OwnerStatePort;
   codes: PairingCodePort;
   clock: Clock;
   /** The configured owner identity. Plain string: this module must not import the config layer. */
   expectedOwnerId: string;
-  diagnostics: OwnerAccessDiagnostics;
+  /**
+   * The closed diagnostic contract from `ports/diagnostics`. Optional only so that a caller which
+   * genuinely has no sink (a CLI admin inspection, a test asserting a refusal text) is not forced to
+   * write one; the default is silence, never a stdout print.
+   */
+  diagnostics?: DiagnosticSink;
   /** Optional for tests that must not print to stdout. */
   log?: (message: string) => void;
 }
@@ -171,13 +176,31 @@ export class OwnerAdmissionService {
    */
   private tail: Promise<unknown> = Promise.resolve();
 
-  constructor(private readonly deps: OwnerAdmissionDeps) {}
+  /**
+   * The sink every event in this module goes through, guarded once at construction.
+   *
+   * Guarding here rather than at each call site means a future caller cannot forget: there is one
+   * `emit`, and it cannot throw into the admission decision.
+   */
+  private readonly sink: DiagnosticSink;
+
+  constructor(private readonly deps: OwnerAdmissionDeps) {
+    this.sink = guardedDiagnosticSink(deps.diagnostics ?? SILENT_DIAGNOSTIC_SINK);
+  }
 
   /**
    * Boot check. A missing, unreadable, corrupt or wrong-owner record refuses: the daemon must not
    * come up in a state where it would serve on a default identity.
    */
   inspectInstallation(): InstallationAdmission {
+    const startedAt = this.deps.clock.now().getTime();
+    const decision = this.readInstallation();
+    this.emit(this.installationEvent(decision, startedAt));
+    return decision;
+  }
+
+  /** The boot answer itself, without the diagnostic. Split out so the emit has exactly one exit. */
+  private readInstallation(): InstallationAdmission {
     const read = this.deps.store.read();
     if (read.kind === 'missing') return { kind: 'refused', reason: 'unavailable' };
     if (read.kind === 'unavailable') {
@@ -197,6 +220,21 @@ export class OwnerAdmissionService {
    * so a binding change takes effect without a restart.
    */
   inspect(identity: TransportIdentity): AdmissionDecision {
+    const startedAt = this.deps.clock.now().getTime();
+    const decision = this.decide(identity);
+    this.emit(this.admissionEvent(decision, startedAt));
+    return decision;
+  }
+
+  /**
+   * The admission decision itself, with no diagnostic side effect.
+   *
+   * Split out from `inspect` so that the decision has exactly one place that computes it and exactly
+   * one place that reports it. Emitting from inside the decision's own branches would mean a new
+   * early return could silently skip its diagnostic — and a refusal nobody recorded is the one event
+   * an operator actually needs.
+   */
+  private decide(identity: TransportIdentity): AdmissionDecision {
     const read = this.deps.store.read();
     if (read.kind === 'missing') {
       // No record is not a fresh installation: setup owns creating it.
@@ -278,6 +316,25 @@ export class OwnerAdmissionService {
    * verification so a crash mid-attempt cannot refund it.
    */
   async handlePairing(identity: TransportIdentity, text: string): Promise<PairingResult> {
+    const startedAt = this.deps.clock.now().getTime();
+    const { result, reason } = await this.pair(identity, text);
+    // Only `kind` and the diagnostic reason are emitted. `boundOwnerId` is an identifier and stays out
+    // of diagnostics; a chat id or owner id in a log line is both a disclosure and a rate-limit oracle.
+    this.emit(this.pairingEvent(result.kind, reason, startedAt));
+    return result;
+  }
+
+  /**
+   * The pairing state machine itself, with no diagnostic side effect.
+   *
+   * Split from `handlePairing` so the outcome is reported from one place instead of fifteen `finish()`
+   * branches. A new refusal branch cannot forget to report itself, and cannot accidentally report a
+   * different outcome than the one it returned.
+   */
+  private async pair(
+    identity: TransportIdentity,
+    text: string,
+  ): Promise<PairingOutcome> {
     const run = this.tail.then(
       () => this.handlePairingLocked(identity, text),
       () => this.handlePairingLocked(identity, text),
@@ -286,15 +343,15 @@ export class OwnerAdmissionService {
     return run;
   }
 
-  private async handlePairingLocked(identity: TransportIdentity, text: string): Promise<PairingResult> {
+  private async handlePairingLocked(identity: TransportIdentity, text: string): Promise<PairingOutcome> {
     const read = this.deps.store.read();
 
     if (read.kind === 'missing' || read.kind === 'unavailable') {
-      return this.finish('unavailable', identity);
+      return this.finish('unavailable', identity, undefined, 'record-unavailable');
     }
     let state = read.state;
     if (state.ownerId !== this.deps.expectedOwnerId) {
-      return this.finish('refused', identity);
+      return this.finish('refused', identity, undefined, 'owner-mismatch');
     }
 
     if (state.phase === 'bound') {
@@ -302,13 +359,13 @@ export class OwnerAdmissionService {
       if (identity.eventId === state.binding.pairingEventId) {
         return this.finish('already-paired', identity);
       }
-      return this.finish('refused', identity);
+      return this.finish('refused', identity, undefined, 'already-bound');
     }
 
     const problem = transportIdentityProblem(identity);
     if (problem || identity.chatType !== 'private') {
       // No allowance is spent for a request that is not a private pairing attempt.
-      return this.finish('refused', identity);
+      return this.finish('refused', identity, undefined, 'not-a-private-pairing-identity');
     }
 
     const today = utcDayOf(this.deps.clock.now());
@@ -330,13 +387,13 @@ export class OwnerAdmissionService {
     const isNewCandidate = candidate === undefined;
     if (isNewCandidate && attempts.chats.length >= PAIRING_MAX_CANDIDATE_CHATS) {
       // Saturation refuses rather than evicting, because eviction would reset live limits.
-      return this.finish('limited', identity);
+      return this.finish('limited', identity, undefined, 'daily-allowance-spent');
     }
 
     const allowanceLeft = (candidate?.attempts ?? 0) < PAIRING_ATTEMPTS_PER_CHAT_PER_DAY;
     if (!allowanceLeft) {
       // Fourth attempt: silent, even when the code is correct.
-      return this.finish('limited', identity);
+      return this.finish('limited', identity, undefined, 'daily-allowance-spent');
     }
 
     const now = this.deps.clock.now();
@@ -360,7 +417,7 @@ export class OwnerAdmissionService {
     // ── Reserve first, then verify ──────────────────────────────────────────────────────
     const committed = await this.replace(nextState);
     if (committed.kind !== 'committed') {
-      return this.finish('unavailable', identity);
+      return this.finish('unavailable', identity, undefined, 'record-unavailable');
     }
     state = committed.state;
 
@@ -372,14 +429,14 @@ export class OwnerAdmissionService {
 
     const challenge = state.phase === 'unpaired' ? state.challenge : undefined;
     if (!challenge) {
-      return this.finish('invalid', identity);
+      return this.finish('invalid', identity, undefined, 'code-mismatch');
     }
     const expiry = new Date(challenge.expiresAt).getTime();
     if (!Number.isFinite(expiry) || this.deps.clock.now().getTime() >= expiry) {
-      return this.finish('expired', identity);
+      return this.finish('expired', identity, undefined, 'code-expired');
     }
     if (!this.deps.codes.matches(submission, challenge.verifier)) {
-      return this.finish('invalid', identity);
+      return this.finish('invalid', identity, undefined, 'code-mismatch');
     }
 
     const bound: OwnerState = {
@@ -412,9 +469,9 @@ export class OwnerAdmissionService {
       ) {
         return this.finish('paired', identity, reread.state.ownerId);
       }
-      return this.finish('unavailable', identity);
+      return this.finish('unavailable', identity, undefined, 'record-unavailable');
     }
-    return this.finish('unavailable', identity);
+    return this.finish('unavailable', identity, undefined, 'record-unavailable');
   }
 
   /**
@@ -496,14 +553,71 @@ export class OwnerAdmissionService {
     }
   }
 
-  private finish(kind: PairingResult['kind'], identity: TransportIdentity, boundOwnerId?: string): PairingResult {
-    this.deps.diagnostics.recordPairingOutcome({
-      result: kind,
-      chatType: identity?.chatType ?? 'unknown',
-    });
-    return kind === 'paired' && boundOwnerId !== undefined
+  /**
+   * Build a pairing result. `reason` is required for every non-progress outcome, so this method cannot
+   * produce a refusal that does not say what failed — enforced by the parameter type below rather than
+   * by review.
+   */
+  private finish(
+    kind: PairingResult['kind'],
+    identity: TransportIdentity,
+    boundOwnerId?: string,
+    reason: PairingDiagnosticReason = 'record-unavailable',
+  ): PairingOutcome {
+    this.log(`[admission] pairing outcome ${kind}${isProgressOutcome(kind) ? '' : ` (${reason})`}`);
+    const result: PairingResult = kind === 'paired' && boundOwnerId !== undefined
       ? { kind, boundOwnerId }
       : { kind };
+    return { result, reason };
+  }
+
+  /** Narrow a pairing outcome into its exact event variant. */
+  private pairingEvent(
+    kind: PairingResult['kind'],
+    reason: PairingDiagnosticReason,
+    startedAt: number,
+  ): DiagnosticEvent {
+    const durationMs = this.elapsedSince(startedAt);
+    if (isProgressOutcome(kind)) return { stage: 'pairing', outcome: kind, durationMs };
+    // `daily-allowance-spent` is the only refusal where the spent count is the interesting fact.
+    return reason === 'daily-allowance-spent'
+      ? { stage: 'pairing', outcome: kind, reason, attempts: PAIRING_ATTEMPTS_PER_CHAT_PER_DAY, durationMs }
+      : { stage: 'pairing', outcome: kind, reason, durationMs };
+  }
+
+  /**
+   * Emit through the guarded sink.
+   *
+   * The guard is applied HERE, at the single point every event in this module passes through, rather
+   * than trusting each caller to wrap its own adapter. `emit` runs inside the admission decision, so
+   * an adapter that throws would otherwise be reachable from a stranger's message and would turn a
+   * logging fault into a denial of service.
+   */
+  private emit(event: DiagnosticEvent): void {
+    this.sink.emit(event);
+  }
+
+  /** Narrow an inbound-message decision into its exact event variant. */
+  private admissionEvent(decision: AdmissionDecision, startedAt: number): DiagnosticEvent {
+    const durationMs = this.elapsedSince(startedAt);
+    if (decision.kind === 'owner') return { stage: 'owner-admission', outcome: 'admitted', durationMs };
+    if (decision.kind === 'pairing-only') {
+      return { stage: 'owner-admission', outcome: 'pairing-only', durationMs };
+    }
+    return { stage: 'owner-admission', outcome: 'refused', reason: decision.reason, durationMs };
+  }
+
+  /** Narrow a boot-time answer into its exact event variant. */
+  private installationEvent(decision: InstallationAdmission, startedAt: number): DiagnosticEvent {
+    const durationMs = this.elapsedSince(startedAt);
+    if (decision.kind === 'bound') return { stage: 'owner-admission', outcome: 'admitted', durationMs };
+    if (decision.kind === 'unpaired') return { stage: 'owner-admission', outcome: 'pairing-only', durationMs };
+    return { stage: 'owner-admission', outcome: 'refused', reason: decision.reason, durationMs };
+  }
+
+  private elapsedSince(startedAt: number): number {
+    const elapsed = this.deps.clock.now().getTime() - startedAt;
+    return elapsed > 0 ? elapsed : 0;
   }
 
   private log(message: string): void {

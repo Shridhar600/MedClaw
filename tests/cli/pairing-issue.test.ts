@@ -55,7 +55,6 @@ describe('medclaw pairing issue', () => {
       codes: new CryptoPairingCodePort(),
       clock: systemClock,
       expectedOwnerId: fixture.ownerId,
-      diagnostics: { recordPairingOutcome: () => {} },
     });
     await service.initialize();
   }
@@ -100,7 +99,6 @@ describe('medclaw pairing issue', () => {
       codes: new CryptoPairingCodePort(),
       clock: systemClock,
       expectedOwnerId: fixture.ownerId,
-      diagnostics: { recordPairingOutcome: () => {} },
     });
     expect(await admission.handlePairing({
       channel: 'telegram', chatId: 'c', userId: 'u', chatType: 'private', eventId: 'e1',
@@ -151,7 +149,6 @@ describe('medclaw pairing issue', () => {
       codes: new CryptoPairingCodePort(),
       clock: systemClock,
       expectedOwnerId: fixture.ownerId,
-      diagnostics: { recordPairingOutcome: () => {} },
     });
     await admission.handlePairing({
       channel: 'telegram', chatId: 'c', userId: 'u', chatType: 'private', eventId: 'e1',

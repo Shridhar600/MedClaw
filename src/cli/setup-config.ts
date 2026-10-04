@@ -230,7 +230,6 @@ async function initializeOwnerRecord(ownerRecordPath: string, ownerId: ProfileId
     codes: new CryptoPairingCodePort(),
     clock: systemClock,
     expectedOwnerId: ownerId,
-    diagnostics: { recordPairingOutcome: () => {} },
   });
   const outcome = await service.initialize();
   if (outcome !== 'created') {

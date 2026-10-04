@@ -1,5 +1,7 @@
 import { OwnerAdmissionService } from '../profiles';
-import type { OwnerAccessDiagnostics, ProfileId } from '../profiles';
+import type { ProfileId } from '../profiles';
+import type { DiagnosticSink } from '../ports/diagnostics';
+import { SILENT_DIAGNOSTIC_SINK } from '../ports/diagnostics';
 import { systemClock } from '../ports/defaults';
 import { CryptoPairingCodePort, FileOwnerStatePort } from './adapters';
 import type { OwnerPaths } from '../profiles';
@@ -33,7 +35,7 @@ export interface OwnerAuthoritySource {
  */
 export function composeOwnerAuthority(
   ownership: OwnerAuthoritySource,
-  diagnostics: OwnerAccessDiagnostics = SILENT_DIAGNOSTICS,
+  diagnostics: DiagnosticSink = SILENT_DIAGNOSTIC_SINK,
 ): OwnerAuthority {
   return {
     ownerId: ownership.ownerId,
@@ -47,13 +49,12 @@ export function composeOwnerAuthority(
   };
 }
 
-/**
- * Diagnostics sink for callers that only need authority, not observability.
+/*
+ * Diagnostics default to silence, deliberately.
  *
- * Pairing outcomes are deliberately not logged anywhere: the event carries a chat-shaped identifier
- * and plan 15 §50 plus rollout §456 forbid identifiers and health text in logs. A surface that wants
- * real diagnostics supplies its own sink.
+ * The closed `DiagnosticEvent` union carries no identifier, no path and no exception text — a chat id
+ * or pairing code in a log line would be a disclosure and a rate-limit oracle (plan 15 §50, rollout
+ * §456). So there is no longer a reason to keep pairing outcomes out of a local log on privacy grounds:
+ * a caller that wants outcomes supplies a sink over the closed contract, and a caller that does not
+ * gets silence rather than an accidental stdout print.
  */
-const SILENT_DIAGNOSTICS: OwnerAccessDiagnostics = {
-  recordPairingOutcome: () => {},
-};

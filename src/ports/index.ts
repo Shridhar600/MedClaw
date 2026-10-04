@@ -27,13 +27,19 @@ export type {
 } from './owner-state';
 export { isBoundOwnerState, isUnpairedOwnerState } from './owner-state';
 export type {
+  DiagnosticEvent,
+  DiagnosticSink,
+  DiagnosticStage,
+  StartStopReason,
+} from './diagnostics';
+export { SILENT_DIAGNOSTIC_SINK, guardedDiagnosticSink } from './diagnostics';
+export type {
   MediaReference,
   MediaSourcePort,
   MediaStageResult,
   MediaStageReason,
   MediaLimits,
   OpenedMedia,
-  MediaStageDiagnostics,
 } from './media-source';
 export {
   DEFAULT_MEDIA_LIMITS,

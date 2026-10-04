@@ -19,6 +19,7 @@ import {
 } from '../../src/runtime/adapters';
 import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 import type { Clock } from '../../src/ports/clock';
+import type { DiagnosticEvent } from '../../src/ports/diagnostics';
 import {
   PAIRING_CODE_EXPIRY_MS,
   PAIRING_MAX_CANDIDATE_CHATS,
@@ -81,7 +82,7 @@ interface Harness {
   store: FileOwnerStatePort;
   codes: CryptoPairingCodePort;
   clock: TestClock;
-  outcomes: string[];
+  outcomes: DiagnosticEvent[];
   /** A brand new service over the same on-disk record — this is how "restart" is tested. */
   reopen(): OwnerAdmissionService;
   readRecord(): OwnerState | undefined;
@@ -95,16 +96,14 @@ function makeHarness(root: string, clock = new TestClock(START)): Harness {
   const paths = ownerAt(root);
   const store = new FileOwnerStatePort(paths.ownerRecord, OWNER_ID);
   const codes = new CryptoPairingCodePort();
-  const outcomes: string[] = [];
+  const outcomes: DiagnosticEvent[] = [];
   const build = (): OwnerAdmissionService =>
     new OwnerAdmissionService({
       store,
       codes,
       clock,
       expectedOwnerId: OWNER_ID,
-      diagnostics: {
-        recordPairingOutcome: (event) => outcomes.push(`${event.result}:${event.chatType}`),
-      },
+      diagnostics: { emit: (event) => outcomes.push(event) },
     });
   return {
     root,
@@ -235,13 +234,18 @@ describe('owner enrollment: a record must exist before anything is served', () =
 
     await service.handlePairing(identity({ eventId: 'telegram:chat-1:9' }), WRONG_CODE);
 
-    expect(harness.outcomes).toEqual(['invalid:private']);
-    // Only "<result>:<chatType>" is ever emitted — no chat, no sender, no code.
-    for (const entry of harness.outcomes) {
-      expect(entry).not.toContain('chat-1');
-      expect(entry).not.toContain('user-1');
-    }
-    expect(JSON.stringify(harness.outcomes)).not.toContain(WRONG_CODE);
+    // The closed contract now names the cause, which the old `<result>:<chatType>` channel could not:
+    // a wrong code and an expired code used to be indistinguishable in diagnostics.
+    expect(harness.outcomes).toEqual([
+      { stage: 'pairing', outcome: 'invalid', reason: 'code-mismatch', durationMs: expect.any(Number) },
+    ]);
+    // Nothing identifier-shaped may appear. `chatType` is deliberately GONE from the contract now — it
+    // was the one chat-shaped field the old channel still emitted, and it was never needed.
+    const serialized = JSON.stringify(harness.outcomes);
+    expect(serialized).not.toContain('chat-1');
+    expect(serialized).not.toContain('user-1');
+    expect(serialized).not.toContain('private');
+    expect(serialized).not.toContain(WRONG_CODE);
   });
 });
 
@@ -580,7 +584,6 @@ describe('owner enrollment: commit outcomes are distinguished from uncertainty',
       codes: new CryptoPairingCodePort(),
       clock,
       expectedOwnerId: OWNER_ID,
-      diagnostics: { recordPairingOutcome: () => {} },
     });
     await seeder.initialize();
     const issued = await seeder.issueChallenge();
@@ -619,7 +622,6 @@ describe('owner enrollment: commit outcomes are distinguished from uncertainty',
       codes: new CryptoPairingCodePort(),
       clock,
       expectedOwnerId: OWNER_ID,
-      diagnostics: { recordPairingOutcome: () => {} },
     });
   }
 
