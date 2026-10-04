@@ -513,18 +513,33 @@ export class Gateway {
   }
 
   /**
-   * Development/diagnostic entry point.
+   * Local-transport test seam. NOT a serving path.
    *
-   * It presents an explicit `local` transport identity rather than none, because admission refuses
-   * a message with no transport identity — and silently omitting it would make this path
-   * untestable and its refusals meaningless. A local conversation is NOT the bound Telegram chat,
-   * so once an owner is paired this path is refused as a stranger. That is correct: a local REPL
-   * must not become a serving bypass around enrollment.
+   * It presents an explicit `local` transport identity rather than none, because admission refuses a
+   * message with no transport identity — and silently omitting it would make this path untestable and
+   * its refusals meaningless. Because the identity is `local`, this seam only reaches the owner when the
+   * owner was bound over `local`; against a Telegram binding it is correctly refused as a stranger.
+   *
+   * It used to call `requireRouter().route(...)` directly. To be precise about what that did and did
+   * not mean: it was NOT an admission bypass, because `route()` runs `admission.inspect()` before
+   * anything else. What it DID skip is the front half of `deliverMessage`:
+   *
+   *   - `ensureOwnerServing`, so a daemon that booted unpaired and then paired could NOT be driven to
+   *     build its runtime through this seam, even though a real Telegram message would build it; and
+   *   - `admitAndStage`, so the admitted-message normalisation and its `mediaError` handling never ran.
+   *
+   * So this seam could not serve a stranger, but it was not the same path production takes, and a test
+   * using it was asserting against a subtly different machine. It now delegates to `deliverMessage`, so
+   * a test exercises the same admission and promotion path a real message takes.
+   *
+   * Note this seam takes no media: its signature has no place to put a `MediaReference`. Tests that need
+   * admitted media must drive `deliverMessage` directly, which is what the media suites do.
    */
   async handleTestMessage(chatId: string, text: string, sourceMessageId?: string): Promise<string> {
     if (this.stopping) return SHUTDOWN_RESPONSE;
     const eventId = `local:${chatId}:${sourceMessageId ?? 'adhoc'}`;
-    return this.trackInboundTurn(() => this.requireRouter().route(
+    let reply = '';
+    await this.deliverMessage(
       {
         chatId,
         userId: 'local',
@@ -534,9 +549,11 @@ export class Gateway {
         eventId,
         ...(sourceMessageId ? { messageId: sourceMessageId } : {}),
       },
-      async () => undefined,
-      false,
-    ).then((response) => response ?? ''));
+      async (response) => {
+        reply = response;
+      },
+    );
+    return reply;
   }
 
   /**

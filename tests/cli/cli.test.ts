@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
 import { runCli } from '../../src/cli/index';
-import { createCliSessionManager } from '../../src/test-cli';
+import { SessionManager } from '../../src/gateway/session';
 import { writeConfigFixture } from '../helpers/config-fixture';
 
 function createTempHome(): { tmpDir: string; restore: () => void } {
@@ -24,10 +24,13 @@ function createTempHome(): { tmpDir: string; restore: () => void } {
 }
 
 describe('cli router', () => {
-  it('keeps web-harness sessions isolated by chat id', async () => {
+  it('keeps per-chat session archives isolated by chat id', async () => {
     const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-cli-sessions-'));
     try {
-      const sessions = createCliSessionManager({ sessionsPath: sessionsDir });
+      // Constructed exactly as production does (`src/gateway/runtime.ts`), rather than through the
+      // web-harness wrapper this test used to import. Same option, same isolation — one fewer
+      // indirection between the test and the thing it is testing.
+      const sessions = new SessionManager({ sessionsPath: sessionsDir, perChatArchive: true });
       await sessions.recordTurn('chat-a', [{ role: 'user', content: 'private A' }]);
       await sessions.recordTurn('chat-b', [{ role: 'user', content: 'private B' }]);
 

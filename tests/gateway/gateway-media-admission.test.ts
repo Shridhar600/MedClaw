@@ -235,4 +235,60 @@ describe('admitted media reaches the owner runtime through the real inbound path
     // No staged file survived, and no partial was left behind.
     expect(fs.readdirSync(fixture.mediaStaging)).toEqual([]);
   }, 60_000);
+  it('the local test seam follows the binding and cannot cross transports', async () => {
+    // ── Why this earns its place ────────────────────────────────────────────────────────
+    // `handleTestMessage` is the seam the suite drives the Gateway through when it wants a `local`
+    // identity. Because it is the easiest way to reach a running Gateway from a test, it is also the
+    // easiest way to accidentally assert owner behaviour that production would refuse. This pins the
+    // property that makes it safe: the seam obeys the OWNER RECORD, and nothing else.
+    //
+    // It deliberately makes NO claim about `deliverMessage` delegation. I checked: this test passes
+    // against BOTH the old direct-`route` seam and the current `deliverMessage` delegation, because in
+    // this scenario `route()` already inspects admission and the Gateway was never started. So it is
+    // not evidence for that refactor — it is a containment invariant in its own right.
+    const stagingEntries = (dir: string): string[] => (fs.existsSync(dir) ? fs.readdirSync(dir) : []);
+
+    // ── The owner is bound over TELEGRAM, so a `local` seam message is a stranger ────────
+    const { fixture, gateway } = await bootBoundGateway({ fileSize: 1024 });
+    const seamReply = await gateway.handleTestMessage(OWNER_CHAT, 'here is my lab result');
+    expect(seamReply).not.toMatch(/lab result|Noted/i);
+    // A refused message stages nothing — the seam gets no media handling before admission.
+    expect(stagingEntries(fixture.mediaStaging)).toEqual([]);
+
+    // ── Rebind the SAME installation over `local`, and the same call reaches the owner ───
+    // A fresh record at the same path is the honest way to say "this owner paired over local"
+    // without inventing a second fixture shape.
+    fs.rmSync(fixture.ownerRecord);
+    const localAuthority = composeOwnerAuthority({
+      ownerId: asProfileId(fixture.ownerId)!,
+      ownerPaths: { ownerRecord: fixture.ownerRecord },
+    });
+    await localAuthority.admission.initialize();
+    const localIssued = await localAuthority.admission.issueChallenge();
+    if (localIssued.kind !== 'issued') throw new Error(`issue failed: ${localIssued.kind}`);
+    await localAuthority.admission.handlePairing(
+      { channel: 'local', chatId: OWNER_CHAT, userId: 'local', chatType: 'private', eventId: 'local:owner-chat:p1' },
+      localIssued.plaintext,
+    );
+
+    const loaded = await loadRuntimeConfig({ configPath: fixture.configPath });
+    const localGateway = new Gateway(loaded, {
+      admission: localAuthority.admission,
+      ownerId: asProfileId(fixture.ownerId)!,
+      mediaSource: {
+        open: async () => ({
+          chunks: (async function* () { yield Buffer.from('%PDF-1.4 seam media'); })(),
+          cancel: async () => {},
+        }),
+      },
+    });
+
+    const localReply = await localGateway.handleTestMessage(OWNER_CHAT, 'here is my lab result', 'seam-1');
+    // Same chat id, same text, different binding: not refused this time. `servesPairingOnly` is the
+    // observable — it is false only once a bound owner is recognised for this transport.
+    expect(localGateway.servesPairingOnly).toBe(false);
+    expect(localReply).not.toMatch(/not the owner|pairing code/i);
+    // No media was offered, so nothing may be staged.
+    expect(stagingEntries(fixture.mediaStaging)).toEqual([]);
+  }, 60_000);
 });
