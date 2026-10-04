@@ -382,7 +382,11 @@ export class Gateway {
     this.bootstrapWorkspace(config.memory.workspace);
     // Sweep ONLY this owner's staging lane, and only now that this process owns the owner's
     // resources — so a crash-left orphan cannot be cleaned up by, or clean up over, another owner.
-    // Intake is aborted on stop, so a staged file in flight is accounted for in the disposition.
+    // NOTE (2026-10-04, review round 2): the comment here used to claim "Intake is aborted on stop".
+    // It is NOT — `mediaIntake.abort()` is called nowhere in `src/` or `tests/`, so a staged file in
+    // flight is NOT accounted for by an abort and a write can continue past `stop()`. Two reviewers
+    // found this independently. The controller is constructed and its signal read, so it looks wired;
+    // the missing piece is the abort on the stop path. Tracked as a P2 in the adjudication.
     this.mediaIntake ??= new AbortController();
     const ownerStaging = this.mediaStagingDir();
     if (ownerStaging) sweepStagedMedia(ownerStaging, this.ownerStagingBase());

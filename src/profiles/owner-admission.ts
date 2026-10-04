@@ -554,9 +554,13 @@ export class OwnerAdmissionService {
   }
 
   /**
-   * Build a pairing result. `reason` is required for every non-progress outcome, so this method cannot
-   * produce a refusal that does not say what failed — enforced by the parameter type below rather than
-   * by review.
+   * Build a pairing result.
+   *
+   * `reason` carries why a non-progress outcome failed. It has a DEFAULT, so the parameter type enforces
+   * nothing here — an earlier version of this comment claimed it did, and that was false. What actually
+   * enforces a reason is `pairingEvent`, which cannot build a refusal variant without one, and review of
+   * the call sites below. Every refusal branch passes its cause explicitly; the default exists only so a
+   * future progress branch can be added without inventing a reason.
    */
   private finish(
     kind: PairingResult['kind'],
