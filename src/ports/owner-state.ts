@@ -55,7 +55,18 @@ export interface TransportIdentity {
   channel: string;
   chatId: string;
   userId: string;
-  chatType: 'private' | 'group' | 'supergroup' | 'channel' | 'local';
+  /**
+   * The chat type the transport ASSERTED, or `undefined` when it asserted none.
+   *
+   * The key stays required so every producer must state the field explicitly, but `undefined` is a
+   * representable value on purpose. It was previously impossible to represent absence here, which is
+   * exactly why `transportIdentityOf` had to fabricate `'private'` for an omitted field — the single
+   * chat type that grants owner health access. Plan 15 §3 also requires that "missing transport
+   * identity is refused", which cannot hold while absence is unrepresentable.
+   *
+   * `undefined` is refused as `missing-transport-identity`, never treated as private.
+   */
+  chatType: 'private' | 'group' | 'supergroup' | 'channel' | 'local' | undefined;
   eventId: string;
 }
 

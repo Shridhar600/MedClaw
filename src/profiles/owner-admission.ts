@@ -145,6 +145,11 @@ export function isWellFormedSubmission(text: string): boolean {
 }
 
 function transportIdentityProblem(identity: TransportIdentity): AdmissionReason | undefined {
+  // `chatType` was the one required identity field with no presence check here, and the one field the
+  // normaliser used to fabricate a value for. Omitting it is a missing required field, so it is
+  // refused as such — never upgraded to a private chat.
+  if (identity.chatType === undefined) return 'missing-transport-identity';
+
   const fields: [string, number][] = [
     [identity.channel, 64],
     [identity.chatId, PAIRING_MAX_ID_LENGTH],

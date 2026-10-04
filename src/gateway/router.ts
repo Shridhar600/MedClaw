@@ -508,13 +508,19 @@ export type IncomingMessageLike = {
  * Normalize an inbound message into the transport identity admission requires. A missing or
  * over-long field is carried through as-is so the admission service — not this adapter — decides it
  * is missing identity.
+ *
+ * Every field here obeys that sentence now. `chatType` used to be the exception, defaulting to
+ * `'private'` — the one value that grants owner health access, and the input to the
+ * `non-private-chat` guard at three sites in `OwnerAdmissionService`. A transport that omitted the
+ * field therefore had its request laundered into an owner-bound private message. Omission is now
+ * carried through as `undefined` and refused as `missing-transport-identity`.
  */
 export function transportIdentityOf(incoming: IncomingMessageLike): TransportIdentity {
   return {
     channel: incoming.channel ?? '',
     chatId: incoming.chatId,
     userId: incoming.userId,
-    chatType: incoming.chatType ?? 'private',
+    chatType: incoming.chatType,
     eventId: incoming.eventId ?? '',
   };
 }
