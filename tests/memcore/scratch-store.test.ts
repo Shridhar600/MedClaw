@@ -1,13 +1,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { ScratchStore } from '../../src/memcore/scratch-store';
 import { mutableClock, advanceClock, seqIdGen } from '../helpers/memcore-fixtures';
+import { makeTestTemp } from '../helpers/test-temp';
 
 let tmpDir: string;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-scratch-'));
+  tmpDir = makeTestTemp('redacted-scratch-');
 });
 
 afterEach(() => {
@@ -50,7 +50,7 @@ describe('ScratchStore.put/get', () => {
   });
 
   it('refuses a symlinked scratch lane instead of writing outside the profile root', async () => {
-    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-scratch-outside-'));
+    const outside = makeTestTemp('redacted-scratch-outside-');
     try {
       fs.symlinkSync(outside, path.join(tmpDir, 'scratch'), 'dir');
       const store = new ScratchStore(tmpDir, mutableClock('2026-08-18T10:00:00Z'), seqIdGen('scratch'));

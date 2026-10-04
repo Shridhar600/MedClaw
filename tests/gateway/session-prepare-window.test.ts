@@ -1,8 +1,7 @@
 import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import type { LLMProvider, Message } from '../../src/providers/types';
 import { SessionManager } from '../../src/gateway/session';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // P2b Wave D-1 / D1.4 — `prepareHistory` returns the WINDOW: `[summary system message?, ...verbatim
 // tail]`, sanitized with `stripOrphanToolMessages` (DD2). The idle soft/hard reset branches are gone
@@ -11,7 +10,7 @@ import { SessionManager } from '../../src/gateway/session';
 
 describe('prepareHistory window (D1.4)', () => {
   let dir: string;
-  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sm-win-')); });
+  beforeEach(() => { dir = makeTestTemp('sm-win-'); });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
   const makeProvider = (text: string): LLMProvider => ({

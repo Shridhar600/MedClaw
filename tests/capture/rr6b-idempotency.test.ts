@@ -1,15 +1,15 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { CapturePipeline, FileCaptureIdempotency, makeSafetyRenderer, type QueuePort } from '../../src/capture';
 import { LedgerStore, NarrativeStore, SafetyView } from '../../src/memcore';
 import { WriteQueue } from '../../src/profiles';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('RR-6b capture idempotency', () => {
   let root: string;
 
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr6b-capture-'));
+    root = makeTestTemp('redacted-rr6b-capture-');
   });
 
   afterEach(() => {

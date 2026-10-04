@@ -9,14 +9,14 @@
 // barrel consolidation pass after Wave B.
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { CuratedMemory } from '../../src/memcore/curated-memory';
 import { BudgetExceededError } from '../../src/shared/errors';
+import { makeTestTemp } from '../helpers/test-temp';
 
 let tmpDir: string;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-curated-memory-'));
+  tmpDir = makeTestTemp('redacted-curated-memory-');
 });
 
 afterEach(() => {

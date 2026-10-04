@@ -8,13 +8,13 @@
 // model.
 import { spawn } from 'child_process';
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { InstallationService, describeOwnershipRefusal } from '../../src/runtime/installation';
 import { DirectoryLease, leasePathFor, readHolder } from '../../src/runtime/adapters/directory-lease';
 import { setConfigValue } from '../../src/cli/admin';
 import { writeConfigFixture } from '../helpers/config-fixture';
 import { fixtureOwner } from '../helpers/test-config';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const CONTENDER = path.join(__dirname, '..', 'helpers', 'ownership-contender.ts');
 
@@ -101,7 +101,7 @@ describe('installation resource ownership', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'socs-s1-ownership-'));
+    tmpDir = makeTestTemp('socs-s1-ownership-');
   });
 
   afterEach(() => {
@@ -372,7 +372,7 @@ describe('ownership release requires quiescence', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'socs-s1-quiescence-'));
+    tmpDir = makeTestTemp('socs-s1-quiescence-');
   });
 
   afterEach(() => {

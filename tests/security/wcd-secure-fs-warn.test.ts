@@ -1,17 +1,16 @@
 // W-C/D hostile-panel fix pass — secure-fs warn sanitization (PPHI / SB-14).
 // Proven RED on p1-memory-core @ cbf6c40: the warn carried the ABSOLUTE target
 // path AND the raw err.message (e.g. `ENOENT: ... chmod '/abs/identifying/path'`).
-import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { secureChmodFile } from '../../src/security';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('W-C/D fix pass — secure-fs warn never logs abs paths or raw error messages', () => {
   afterEach(() => jest.restoreAllMocks());
 
   it('a failing chmod warns with basename + sanitized reason only', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wcd-securefs-'));
+    const tmpDir = makeTestTemp('wcd-securefs-');
     // Real failure: the target does not exist → chmodSync throws ENOENT whose raw
     // message embeds the absolute identifying path.
     const target = path.join(tmpDir, 'deeply', 'identifying', 'profile-x', 'medications.md');

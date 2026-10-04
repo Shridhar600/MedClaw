@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { SqliteVecIndex } from '../../src/indexstore';
+import { makeTestTemp } from '../helpers/test-temp';
 
 async function collect(iterable: AsyncIterable<unknown>): Promise<unknown[]> {
   const rows: unknown[] = [];
@@ -18,7 +18,7 @@ describe('SqliteVecIndex live-path dimension (C-1)', () => {
   let dbPath: string;
 
   beforeEach(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-vecidx-live-'));
+    dir = makeTestTemp('redacted-vecidx-live-');
     dbPath = path.join(dir, 'search.db');
   });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });

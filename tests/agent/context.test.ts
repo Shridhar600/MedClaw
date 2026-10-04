@@ -1,8 +1,7 @@
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import { ContextAssembler } from '../../src/agent/context';
 import { MemoryEngine } from '../../src/memory/memory-engine';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('ContextAssembler', () => {
   let tmpDir: string;
@@ -10,7 +9,7 @@ describe('ContextAssembler', () => {
   let assembler: ContextAssembler;
 
   beforeEach(async () => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-ctx-'));
+    tmpDir = makeTestTemp('redacted-ctx-');
     engine = new MemoryEngine(tmpDir);
     assembler = new ContextAssembler(engine, 20000);
 

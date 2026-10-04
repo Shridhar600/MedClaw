@@ -1,14 +1,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { SqliteChunkStats } from '../../src/indexstore';
+import { makeTestTemp } from '../helpers/test-temp';
 
 let tmpDir: string;
 let stats: SqliteChunkStats;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-chunkstats-'));
+  tmpDir = makeTestTemp('redacted-chunkstats-');
   stats = new SqliteChunkStats({ dbPath: path.join(tmpDir, 'search.db') });
 });
 afterEach(() => {

@@ -1,7 +1,7 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { SessionManager } from '../../src/gateway/session';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // P2b Wave D-1 / D1.2 — recordTurn also writes the append-only day-file archive
 // (<sessionsPath>/YYYY-MM-DD.jsonl, or <sessionsPath>/<chatId>/YYYY-MM-DD.jsonl in per-chat / no-registry
@@ -11,7 +11,7 @@ import { SessionManager } from '../../src/gateway/session';
 describe('session day-file archive (D1.2)', () => {
   let dir: string;
   beforeEach(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sm-day-'));
+    dir = makeTestTemp('sm-day-');
     jest.useFakeTimers();
   });
   afterEach(() => {
@@ -67,7 +67,7 @@ describe('session day-file archive (D1.2)', () => {
 
   it('refuses a pre-existing symlinked chat lane before appending', async () => {
     jest.setSystemTime(new Date('2026-08-26T10:00:00.000Z'));
-    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-session-outside-'));
+    const outside = makeTestTemp('redacted-session-outside-');
     try {
       fs.symlinkSync(outside, path.join(dir, 'chatS'), 'dir');
       const m = new SessionManager({ sessionsPath: dir, perChatArchive: true });

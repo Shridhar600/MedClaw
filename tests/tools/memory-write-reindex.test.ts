@@ -1,11 +1,11 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { createMemoryTools } from '../../src/tools/memory-tools';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import { SqliteStore } from '../../src/memory/sqlite-store';
 import { MemoryIndexer } from '../../src/memory/indexer';
 import type { LLMProvider } from '../../src/providers/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('Memory Write Reindex', () => {
   let tmpDir: string;
@@ -15,7 +15,7 @@ describe('Memory Write Reindex', () => {
   let mockProvider: LLMProvider;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-reindex-'));
+    tmpDir = makeTestTemp('redacted-reindex-');
     engine = new MemoryEngine(tmpDir);
     store = new SqliteStore(path.join(tmpDir, 'test.db'));
     mockProvider = {

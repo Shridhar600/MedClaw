@@ -1,6 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import type { EffectiveConfig } from '../../src/config/types';
 import type { ProfileId } from '../../src/profiles';
@@ -12,6 +11,7 @@ import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
 import { ProfileRuntime } from '../../src/gateway/runtime';
 import { SqliteChunkStats, SqliteEventSink, SqliteFactMirror, SqliteKeywordIndex, SqliteSessionIndex, SqliteVecIndex } from '../../src/indexstore';
 import { SqliteStore } from '../../src/memory/sqlite-store';
+import { makeTestTemp } from '../helpers/test-temp';
 
 
 const mockMainProvider: LLMProvider = {
@@ -87,7 +87,7 @@ describe('ProfileRuntime Seam Tests (R-S1)', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-profile-runtime-'));
+    tmpDir = makeTestTemp('redacted-profile-runtime-');
     fs.mkdirSync(path.join(tmpDir, 'workspace'), { recursive: true });
   });
 

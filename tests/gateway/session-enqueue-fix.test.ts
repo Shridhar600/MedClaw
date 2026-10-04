@@ -1,14 +1,13 @@
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import { SessionManager } from '../../src/gateway/session';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('SessionManager Enqueue Fix', () => {
   let tmpDir: string;
   let manager: SessionManager;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-enqueue-'));
+    tmpDir = makeTestTemp('redacted-enqueue-');
     manager = new SessionManager(240, 1440, tmpDir);
   });
 

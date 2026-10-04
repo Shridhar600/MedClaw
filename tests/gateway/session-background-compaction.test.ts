@@ -1,15 +1,14 @@
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import type { LLMProvider } from '../../src/providers/types';
 import { SessionManager } from '../../src/gateway/session';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // F8 — compaction LLM calls must run through the injected background runner (semaphore 'background'
 // priority in production) so background compaction never starves or collides with user turns.
 describe('Compaction runs at background priority (F8)', () => {
   let tmpDir: string;
 
-  beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-bg-compaction-')); });
+  beforeEach(() => { tmpDir = makeTestTemp('redacted-bg-compaction-'); });
   afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true }); jest.restoreAllMocks(); });
 
   function makeProvider(summaryText: string): LLMProvider {

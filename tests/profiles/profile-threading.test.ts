@@ -1,5 +1,4 @@
 import * as path from 'path';
-import * as os from 'os';
 import type { LLMProvider } from '../../src/providers/types';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import { SqliteStore } from '../../src/memory/sqlite-store';
@@ -11,12 +10,19 @@ import { SchedulerAuditLog } from '../../src/scheduler/audit-log';
 import { DEFAULT_STORED_CONFIG, cloneStoredDefaults } from '../../src/config/defaults';
 import { loadRuntimeConfig } from '../../src/runtime/startup';
 import { writeConfigFixture } from '../helpers/config-fixture';
+import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 
 jest.mock('../../src/providers/types', () => ({}));
 
-const tmpDir = path.join(os.tmpdir(), 'profile-threading-test');
+const tmpDir = makeTestTemp('profile-threading-test');
 
 describe('profileId threading', () => {
+  // This root previously was a FIXED path under the system temp directory with no cleanup, so every run
+  // left a directory behind there and two concurrent runs would collide. It is now unique and removed.
+  afterAll(() => {
+    removeTestTemp(tmpDir);
+  });
+
   beforeAll(() => {
     jest.restoreAllMocks();
   });

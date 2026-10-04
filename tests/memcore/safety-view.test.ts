@@ -7,14 +7,14 @@
 // barrel consolidation pass after Wave B.
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { SafetyView, SafetyRemovalRefusedError } from '../../src/memcore/safety-view';
 import { fact } from '../helpers/memcore-fixtures';
+import { makeTestTemp } from '../helpers/test-temp';
 
 let tmpDir: string;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-safety-view-'));
+  tmpDir = makeTestTemp('redacted-safety-view-');
 });
 
 afterEach(() => {

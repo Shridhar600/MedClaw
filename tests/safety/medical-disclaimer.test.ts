@@ -3,7 +3,6 @@
 // agent-loop and medical-tools must append the identical constant so a future
 // wording change happens in exactly one place (medical-safety rule).
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { MEDICAL_DISCLAIMER, MEDICAL_DISCLAIMER_SENTINEL } from '../../src/safety/medical-disclaimer';
 import { AgentLoop } from '../../src/agent/agent-loop';
@@ -11,6 +10,7 @@ import { ToolRegistry } from '../../src/tools/registry';
 import { createMedicalTools } from '../../src/tools/medical-tools';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import type { LLMProvider, LLMResponse } from '../../src/providers/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('Unified MEDICAL_DISCLAIMER constant (PROD-P2-8)', () => {
   it('exports a non-empty disclaimer containing the AI-health-companion sentinel', () => {
@@ -21,7 +21,7 @@ describe('Unified MEDICAL_DISCLAIMER constant (PROD-P2-8)', () => {
   });
 
   it('medical tools append the exact exported constant', async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-disclaimer-med-'));
+    const tmpDir = makeTestTemp('redacted-disclaimer-med-');
     try {
       const engine = new MemoryEngine(tmpDir);
       fs.writeFileSync(path.join(tmpDir, 'HEALTH_PROFILE.md'), '# Profile\nnone');

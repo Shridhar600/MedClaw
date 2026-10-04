@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { SafetyView } from '../../src/memcore';
@@ -7,6 +6,7 @@ import type { EffectiveConfig } from '../../src/config/types';
 import type { LLMProvider, LLMResponse, Message } from '../../src/providers/types';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const CHAT_BINDING = 'chat-1';
 
@@ -91,7 +91,7 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
   let workspace: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-recall-cutover-'));
+    tmpDir = makeTestTemp('redacted-recall-cutover-');
     workspace = fixtureOwner(tmpDir).workspace;
   });
   afterEach(async () => {

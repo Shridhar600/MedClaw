@@ -1,10 +1,10 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 
 import { SqliteFactMirror } from '../../src/indexstore';
 import { headWins } from '../../src/indexstore/adapters/sqlite-fact-mirror';
 import type { FactRecord } from '../../src/ports';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const tmpDirs: string[] = [];
 
@@ -41,7 +41,7 @@ async function collect(iterable: AsyncIterable<FactRecord>): Promise<FactRecord[
 
 describe('RR-9a C-36 bounded entity-head reads', () => {
   it('returns the legacy head set while parsing only one row per type/entity', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr9a-heads-'));
+    const dir = makeTestTemp('redacted-rr9a-heads-');
     tmpDirs.push(dir);
     const mirror = new SqliteFactMirror({ dbPath: path.join(dir, 'search.db') });
     const facts: FactRecord[] = [];

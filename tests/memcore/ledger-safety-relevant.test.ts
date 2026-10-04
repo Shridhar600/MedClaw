@@ -1,8 +1,7 @@
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import { LedgerStore } from '../../src/memcore';
 import { mutableClock } from '../helpers/memcore-fixtures';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const prov = () => ({ source: 'user' as const, confidence: 0.9, anchor: 'memory/2026-08-12.md#L1', capturedAt: '2026-08-12T00:00:00.000Z' });
 
@@ -11,7 +10,7 @@ describe('LedgerStore.listSafetyRelevant (Task 13 SafetyRenderer source)', () =>
   let ledger: LedgerStore;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-safelist-'));
+    tmp = makeTestTemp('redacted-safelist-');
     ledger = new LedgerStore(tmp, mutableClock('2026-08-20T10:00:00.000Z'));
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));

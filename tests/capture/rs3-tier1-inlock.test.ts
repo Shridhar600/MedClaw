@@ -1,11 +1,11 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { CapturePipeline, FileCaptureIdempotency, makeSafetyRenderer, type QueuePort, type Rederiver } from '../../src/capture';
 import { LedgerStore, NarrativeStore, SafetyView, TYPE_TO_FILE } from '../../src/memcore';
 import type { FactType } from '../../src/memcore';
 import { WriteQueue } from '../../src/profiles';
 import { SqliteFactMirror, ledgerFactToRecord } from '../../src/indexstore';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // Part A/B (mini-plan v3 §3.6/§3.7): Tier-1 FactMirror derivation must run SYNCHRONOUSLY INSIDE
 // the write lock — the write and its safety-critical projection land atomically, so there is no
@@ -21,7 +21,7 @@ describe('RR-STRUCT R-S3 — Tier-1 FactMirror lands atomically with the write (
   let pipeline: CapturePipeline;
 
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rs3-tier1-'));
+    root = makeTestTemp('redacted-rs3-tier1-');
     dbPath = path.join(root, 'search.db');
     ledger = new LedgerStore(root);
     const narrative = new NarrativeStore(root);

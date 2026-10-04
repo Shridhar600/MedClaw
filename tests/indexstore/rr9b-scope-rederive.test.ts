@@ -1,9 +1,9 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 
 import { SqliteFactMirror } from '../../src/indexstore';
 import type { FactRecord } from '../../src/ports';
+import { makeTestTemp } from '../helpers/test-temp';
 
 async function collect(iterable: AsyncIterable<FactRecord>): Promise<FactRecord[]> {
   const rows: FactRecord[] = [];
@@ -30,7 +30,7 @@ function fact(overrides: Partial<FactRecord>): FactRecord {
 
 describe('RR-9b scoped FactMirror replacement', () => {
   it('replaces one type/entity scope and preserves unrelated mirror rows', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr9b-mirror-'));
+    const dir = makeTestTemp('redacted-rr9b-mirror-');
     const mirror = new SqliteFactMirror({ dbPath: path.join(dir, 'search.db') });
     try {
       await mirror.upsert([

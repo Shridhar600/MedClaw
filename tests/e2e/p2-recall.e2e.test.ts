@@ -9,13 +9,12 @@
 // deterministically). Here we prove the SAFETY.md strong path (KNEE-07 guaranteed retrieval) and the
 // stale-fail-closed next-turn behavior (CONTRA-09 / KNEE-10), neither of which needs embeddings.
 import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import type { EffectiveConfig } from '../../src/config/types';
 import type { LLMProvider, LLMResponse, Message } from '../../src/providers/types';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const CHAT_BINDING = 'chat-1';
 
@@ -89,7 +88,7 @@ describe('P2 E2E — recall/context gate via handleTestMessage', () => {
   let tmpDir: string;
   let gateway: Gateway;
 
-  beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-p2-e2e-')); });
+  beforeEach(() => { tmpDir = makeTestTemp('redacted-p2-e2e-'); });
   afterEach(async () => {
     try { await gateway?.stop(); } catch { /* ignore */ }
     fs.rmSync(tmpDir, { recursive: true, force: true });

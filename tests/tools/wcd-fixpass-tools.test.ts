@@ -2,7 +2,6 @@
 // Each test was proven RED on p1-memory-core @ cbf6c40 before its fix landed.
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { createLedgerTools } from '../../src/tools/ledger-tools';
 import { createSafetyTools } from '../../src/tools/safety-tools';
@@ -10,6 +9,7 @@ import { LedgerStore, NarrativeStore, SafetyView, CuriosityQueue } from '../../s
 import { CapturePipeline, makeSafetyRenderer, type QueuePort } from '../../src/capture';
 import { mutableClock, seqIdGen } from '../helpers/memcore-fixtures';
 import type { Tool } from '../../src/tools/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const DAY = '2026-08-20T10:00:00.000Z';
 const SECRET = 'password: "hunter2hunter2hunter2x"'; // label + ≥16 alnum value
@@ -23,7 +23,7 @@ describe('W-C/D fix pass — CRED: credential scan on agent-facing v2 write tool
   const byName = (tools: Tool[]) => (n: string): Tool => tools.find(t => t.name === n)!;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-tools-'));
+    tmp = makeTestTemp('redacted-wcd-tools-');
     const clock = mutableClock(DAY);
     ledger = new LedgerStore(tmp, clock);
     const narrative = new NarrativeStore(tmp, clock);
@@ -82,7 +82,7 @@ describe('W-C/D fix pass — PHI/PPHI: health content never reaches logs or pers
   const byName = (tools: Tool[]) => (n: string): Tool => tools.find(t => t.name === n)!;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-phi-'));
+    tmp = makeTestTemp('redacted-wcd-phi-');
     const clock = mutableClock(DAY);
     ledger = new LedgerStore(tmp, clock);
     const narrative = new NarrativeStore(tmp, clock);
@@ -142,7 +142,7 @@ describe('W-C/D fix pass — DT/MED-9: declining a change BURNS its token', () =
   const byName = (n: string): Tool => tools.find(t => t.name === n)!;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-dt-'));
+    tmp = makeTestTemp('redacted-wcd-dt-');
     const clock = mutableClock(DAY);
     ledger = new LedgerStore(tmp, clock);
     const narrative = new NarrativeStore(tmp, clock);
@@ -179,7 +179,7 @@ describe('W-C/D fix pass — RM: agent-reachable med removal (discontinue → co
   const byName = (n: string): Tool => tools.find(t => t.name === n)!;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-rm-'));
+    tmp = makeTestTemp('redacted-wcd-rm-');
     const clock = mutableClock(DAY);
     ledger = new LedgerStore(tmp, clock);
     const narrative = new NarrativeStore(tmp, clock);
@@ -239,7 +239,7 @@ describe('W-C/D fix pass — self-review CRITICAL-1: ledger_remove reason is sca
   const byName = (n: string): Tool => tools.find(t => t.name === n)!;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-rmr-'));
+    tmp = makeTestTemp('redacted-wcd-rmr-');
     const clock = mutableClock(DAY);
     ledger = new LedgerStore(tmp, clock);
     const narrative = new NarrativeStore(tmp, clock);
@@ -289,7 +289,7 @@ describe('W-C/D fix pass — SBX-1: ledger_record rejects structure-injecting fi
   const byName = (tools: Tool[]) => (n: string): Tool => tools.find(t => t.name === n)!;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-sbx1-tools-'));
+    tmp = makeTestTemp('redacted-wcd-sbx1-tools-');
     const clock = mutableClock(DAY);
     ledger = new LedgerStore(tmp, clock);
     const narrative = new NarrativeStore(tmp, clock);

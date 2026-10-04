@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import {
   LedgerStore,
@@ -11,6 +10,7 @@ import {
   type Provenance,
 } from '../../src/memcore';
 import { fact } from '../helpers/memcore-fixtures';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const doctor: Provenance = {
   source: 'doctor', confidence: 0.95, anchor: 'memory/visit.md#L1', capturedAt: '2026-08-31T00:00:00.000Z',
@@ -24,7 +24,7 @@ describe('RR-1 ledger confirmation and safety integrity', () => {
   let store: LedgerStore;
 
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr1-ledger-'));
+    root = makeTestTemp('redacted-rr1-ledger-');
     store = new LedgerStore(root);
   });
 

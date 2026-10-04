@@ -1,14 +1,14 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 
 import { HeartbeatStore } from '../../src/scheduler/store';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const fsReal = jest.requireActual<typeof import('fs')>('fs');
 
 describe('RR-9b scheduler state simplification', () => {
   it('uses one simple cold JSON read and the fingerprint cache for warm reads', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr9b-scheduler-'));
+    const dir = makeTestTemp('redacted-rr9b-scheduler-');
     const filePath = path.join(dir, 'jobs.json');
     fs.writeFileSync(filePath, JSON.stringify([{
       id: 'job-1',

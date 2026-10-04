@@ -1,6 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import type { EffectiveConfig } from '../../src/config/types';
@@ -292,8 +291,13 @@ describe('Gateway media flow', () => {
   });
 
   it('fails startup bootstrap instead of silently continuing with an unusable workspace path', async () => {
-    const tmpFile = path.join(os.tmpdir(), `redacted-bootstrap-file-${Date.now()}`);
-    fs.writeFileSync(tmpFile, 'not a directory', 'utf8');
+    // The failure under test needs a path that EXISTS AS A FILE where a workspace directory is
+    // expected. So this takes a unique NAME inside a workspace-local root — it must not be
+    // `makeTestTemp`, which creates the directory and would make `writeFileSync` fail with EISDIR
+    // before the code under test ever ran.
+    const tmpRoot = makeTestTemp('r14-bootstrap-file');
+    const tmpFile = path.join(tmpRoot, `not-a-directory-${Date.now()}`);
+    fs.writeFileSync(tmpFile, 'not a directory', { encoding: 'utf8', mode: 0o600 });
     const config = makeConfig();
     const gateway = new Gateway(config, await bindGatewayOwner(config, CHAT_BINDING, { channel: 'local', userId: 'user-1' }));
 
@@ -301,7 +305,7 @@ describe('Gateway media flow', () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       expect(() => (gateway as any).bootstrapWorkspace(tmpFile)).toThrow('Workspace bootstrap failed');
     } finally {
-      fs.rmSync(tmpFile, { force: true });
+      removeTestTemp(tmpRoot);
     }
   });
 

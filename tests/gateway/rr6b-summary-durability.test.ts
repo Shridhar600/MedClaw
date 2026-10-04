@@ -1,14 +1,14 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import type { LLMProvider } from '../../src/providers/types';
 import { SessionManager } from '../../src/gateway/session';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('RR-6b compaction summary durability', () => {
   let sessionsDir: string;
 
   beforeEach(() => {
-    sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr6b-summary-'));
+    sessionsDir = makeTestTemp('redacted-rr6b-summary-');
   });
 
   afterEach(() => {

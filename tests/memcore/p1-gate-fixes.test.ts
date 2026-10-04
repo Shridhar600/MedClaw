@@ -2,11 +2,11 @@
 // Each was proven RED on p1-memory-core @ 941078d before its fix landed.
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { LedgerStore, EpisodeStore } from '../../src/memcore';
 import type { Provenance } from '../../src/memcore';
 import { mutableClock } from '../helpers/memcore-fixtures';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const DAY = '2026-08-22T10:00:00.000Z';
 function prov(source: Provenance['source'], capturedAt: string = DAY): Provenance {
@@ -16,7 +16,7 @@ function prov(source: Provenance['source'], capturedAt: string = DAY): Provenanc
 describe('P1 gate fix — SB-2: version heads MERGE fields, never silently drop carried fields', () => {
   let tmp: string;
   let store: LedgerStore;
-  beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-sb2-')); store = new LedgerStore(tmp, mutableClock(DAY)); });
+  beforeEach(() => { tmp = makeTestTemp('redacted-sb2-'); store = new LedgerStore(tmp, mutableClock(DAY)); });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
   it('a non-conflicting field add preserves the prior fields on the new active head', async () => {
@@ -43,7 +43,7 @@ describe('P1 gate fix — SB-2: version heads MERGE fields, never silently drop 
 describe('P1 gate fix — H-1: resume never bypasses the med/allergy confirmation gate', () => {
   let tmp: string;
   let store: LedgerStore;
-  beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-h1-')); store = new LedgerStore(tmp, mutableClock(DAY)); });
+  beforeEach(() => { tmp = makeTestTemp('redacted-h1-'); store = new LedgerStore(tmp, mutableClock(DAY)); });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
   it('resuming a paused MEDICATION requires confirmation', async () => {
@@ -64,7 +64,7 @@ describe('P1 gate fix — H-1: resume never bypasses the med/allergy confirmatio
 describe('P1 gate fix — M-5: quarantine sentinels never surface as active facts', () => {
   let tmp: string;
   let store: LedgerStore;
-  beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-m5-')); store = new LedgerStore(tmp, mutableClock(DAY)); });
+  beforeEach(() => { tmp = makeTestTemp('redacted-m5-'); store = new LedgerStore(tmp, mutableClock(DAY)); });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
   it('a v0 parse-error sentinel (provenance-less block) is excluded from getActive/listByType', async () => {
@@ -78,7 +78,7 @@ describe('P1 gate fix — M-5: quarantine sentinels never surface as active fact
 
 describe('P1 gate fix — M-4: episode array elements cannot forge metadata on round-trip', () => {
   let tmp: string;
-  beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-m4-')); });
+  beforeEach(() => { tmp = makeTestTemp('redacted-m4-'); });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
   it('a bodyRegion carrying newline+meta does not forge episode status', async () => {

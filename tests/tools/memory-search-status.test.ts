@@ -1,12 +1,11 @@
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import { createMemoryTools } from '../../src/tools/memory-tools';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import type { MemorySearch } from '../../src/memory/search';
 import type { SearchResult } from '../../src/memory/types';
 import type { FactMirror, FactRecord } from '../../src/ports';
 import type { Tool } from '../../src/tools/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // E1.1 — CONTRA-06 / CONTRA-08. memory_search is chunk/hybrid search over Markdown (NOT a
 // fact-version query — version ordering lives in ledger_query). Its `status` filter therefore
@@ -53,7 +52,7 @@ describe('memory_search status filter (CONTRA-06/08)', () => {
     createMemoryTools(engine, fakeSearch, undefined, 'p1', mirror).find(t => t.name === 'memory_search')!;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-search-status-'));
+    tmpDir = makeTestTemp('redacted-search-status-');
     engine = new MemoryEngine(tmpDir);
   });
   afterEach(() => fs.rmSync(tmpDir, { recursive: true, force: true }));

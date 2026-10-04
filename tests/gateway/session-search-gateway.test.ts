@@ -1,10 +1,10 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import type { EffectiveConfig } from '../../src/config/types';
 import {} from '../helpers/test-config';
 import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const CHAT_BINDING = 'chat-c';
 
@@ -60,7 +60,7 @@ describe('Gateway session_search wiring (Wave D-2)', () => {
   let gateway: Gateway;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-sess-search-wire-'));
+    tmpDir = makeTestTemp('redacted-sess-search-wire-');
   });
   afterEach(async () => {
     try { await gateway?.stop(); } catch { /* ignore */ }

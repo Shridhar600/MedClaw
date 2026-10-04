@@ -13,7 +13,6 @@
 //   KNEE-08 recall half → P2; DIAB-01 MEMORY.md-summary half → budget-gated/best-effort (not asserted here).
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { LedgerStore, NarrativeStore, SafetyView, CuriosityQueue } from '../../src/memcore';
 import type { Provenance } from '../../src/memcore';
@@ -21,6 +20,7 @@ import { CapturePipeline, makeSafetyRenderer, type QueuePort } from '../../src/c
 import { createLedgerTools } from '../../src/tools/ledger-tools';
 import { mutableClock, seqIdGen } from '../helpers/memcore-fixtures';
 import type { Tool } from '../../src/tools/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const KNOWN_SIDE_EFFECTS: Record<string, string[]> = {
   metformin: ['nausea', 'b12-deficiency'],
@@ -44,7 +44,7 @@ describe('KNEE + DIAB acceptance (specs/09 Suites A/B — ledger half)', () => {
   const read = (rel: string): string => fs.readFileSync(path.join(tmp, rel), 'utf8');
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-kneediab-'));
+    tmp = makeTestTemp('redacted-kneediab-');
     clock = mutableClock('2026-07-07T09:00:00.000Z');
     ledger = new LedgerStore(tmp, clock);
     narrative = new NarrativeStore(tmp, clock);

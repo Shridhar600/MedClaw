@@ -26,11 +26,11 @@ jest.mock('pdf-parse', () => {
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { createMedicalTools, type MedicalContextProvider } from '../../src/tools/medical-tools';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import type { LLMProvider, LLMResponse, TextResponse } from '../../src/providers/types';
 import type { Tool } from '../../src/tools/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // Mock LLMProvider factory
 function createMockProvider(responses: TextResponse[], options: { vision?: boolean } = {}): LLMProvider {
@@ -131,7 +131,7 @@ describe('Medical Tools', () => {
   let mockSearch: MedicalContextProvider;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-medical-tools-'));
+    tmpDir = makeTestTemp('redacted-medical-tools-');
     engine = new MemoryEngine(tmpDir);
 
     // Set up workspace files for health context

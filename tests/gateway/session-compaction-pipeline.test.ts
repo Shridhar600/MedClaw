@@ -1,15 +1,15 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { SessionManager } from '../../src/gateway/session';
 import { dateKey, countDayFileLines } from '../../src/gateway/session-window';
 import type { LLMProvider, LLMResponse } from '../../src/providers/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const tmpDirs: string[] = [];
 
 function tmpSessions(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-compact-pipe-'));
+  const dir = makeTestTemp('redacted-compact-pipe-');
   tmpDirs.push(dir);
   const sessionsPath = path.join(dir, 'sessions');
   fs.mkdirSync(sessionsPath, { recursive: true });

@@ -1,7 +1,7 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { SessionManager } from '../../src/gateway/session';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // P2b Wave D-1 / A-M4 — SessionManager gains an options-object constructor (the new canonical shape).
 // Expand-contract: the legacy positional form keeps working during D1 (56 call sites) and is removed
@@ -10,7 +10,7 @@ import { SessionManager } from '../../src/gateway/session';
 
 describe('SessionManager options-object constructor (A-M4)', () => {
   let dir: string;
-  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sm-opts-')); });
+  beforeEach(() => { dir = makeTestTemp('sm-opts-'); });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
   it('constructs from an options object and records a turn to sessionsPath', async () => {

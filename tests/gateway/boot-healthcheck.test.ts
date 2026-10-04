@@ -1,6 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import type { EffectiveConfig } from '../../src/config/types';
 import type { ReadinessResult } from '../../src/providers/healthcheck';
 
@@ -38,6 +36,7 @@ import { Gateway } from '../../src/gateway/gateway';
 import {} from '../helpers/test-config';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const CHAT_BINDING = 'chat-1';
 
@@ -67,7 +66,7 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-boot-health-'));
+    tmpDir = makeTestTemp('redacted-boot-health-');
     mockCheckSystemReadiness.mockReset();
     mockCheckProviderBindAddresses.mockReset();
     mockVerifyWorkspacePermissions.mockReset();

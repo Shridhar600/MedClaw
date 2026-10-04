@@ -1,12 +1,11 @@
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import { createLedgerTools } from '../../src/tools/ledger-tools';
 import { LedgerStore, NarrativeStore, SafetyView, CuriosityQueue } from '../../src/memcore';
 import { CapturePipeline, makeSafetyRenderer, type QueuePort } from '../../src/capture';
 import { mutableClock, seqIdGen } from '../helpers/memcore-fixtures';
 import type { FactType } from '../../src/memcore';
 import type { Tool } from '../../src/tools/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const DAY = '2026-08-20T10:00:00.000Z';
 
@@ -21,7 +20,7 @@ describe('ledger tools recall re-derive hook (E2 / CONTRA-09)', () => {
   const tokenOf = (text: string): string => (text.match(/tokenId="([0-9a-f-]+)"/) ?? [])[1]!;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-mutation-rederive-'));
+    tmp = makeTestTemp('redacted-mutation-rederive-');
     mutations = [];
     const clock = mutableClock(DAY);
     const ledger = new LedgerStore(tmp, clock);

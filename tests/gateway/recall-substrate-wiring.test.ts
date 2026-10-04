@@ -1,12 +1,11 @@
 import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { MemoryIndexer } from '../../src/memory/indexer';
 import type { EffectiveConfig } from '../../src/config/types';
 import type { FactRecord } from '../../src/ports';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const CHAT_BINDING = 'owner-chat';
 
@@ -74,7 +73,7 @@ describe('Gateway recall substrate wiring (P2 Wave A)', () => {
   let warn: jest.SpyInstance;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-recall-sub-'));
+    tmpDir = makeTestTemp('redacted-recall-sub-');
     warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
   });
   afterEach(async () => {

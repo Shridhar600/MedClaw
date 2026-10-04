@@ -1,7 +1,7 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { SessionManager } from '../../src/gateway/session';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // P2b Wave D-1 / D1.3 — day-file line-count tracking + stable {file, line} anchors.
 //
@@ -15,7 +15,7 @@ import { SessionManager } from '../../src/gateway/session';
 describe('session day-file anchors (D1.3)', () => {
   let dir: string;
   beforeEach(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sm-anchor-'));
+    dir = makeTestTemp('sm-anchor-');
     jest.useFakeTimers();
     jest.setSystemTime(new Date('2026-08-26T10:00:00.000Z'));
   });

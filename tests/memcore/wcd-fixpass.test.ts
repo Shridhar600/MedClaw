@@ -2,11 +2,11 @@
 // Each test was proven RED on p1-memory-core @ cbf6c40 before its fix landed.
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { LedgerStore, SafetyView, EpisodeStore } from '../../src/memcore';
 import type { Provenance } from '../../src/memcore';
 import { mutableClock, seqIdGen } from '../helpers/memcore-fixtures';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const DAY = '2026-08-20T10:00:00.000Z';
 
@@ -19,7 +19,7 @@ describe('W-C/D fix pass — AR: authority-rank never bypasses med/allergy confi
   let store: LedgerStore;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-'));
+    tmp = makeTestTemp('redacted-wcd-');
     store = new LedgerStore(tmp, mutableClock(DAY));
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -60,7 +60,7 @@ describe('W-C/D fix pass — INJ-b: value coercion never false-positives a confl
   let store: LedgerStore;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-'));
+    tmp = makeTestTemp('redacted-wcd-');
     store = new LedgerStore(tmp, mutableClock(DAY));
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -91,7 +91,7 @@ describe('W-C/D fix pass — INJ: markdown/newline injection cannot cross render
   let view: SafetyView;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-'));
+    tmp = makeTestTemp('redacted-wcd-');
     store = new LedgerStore(tmp, mutableClock(DAY));
     view = new SafetyView(tmp, mutableClock(DAY));
   });
@@ -168,7 +168,7 @@ describe('W-C/D fix pass — DS: dispute reconstruction carries BOTH competing v
   let store: LedgerStore;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-ds-'));
+    tmp = makeTestTemp('redacted-wcd-ds-');
     store = new LedgerStore(tmp, mutableClock(DAY));
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -220,7 +220,7 @@ describe('W-C/D fix pass — DS: disputed safety facts stay visible on SAFETY.md
   let view: SafetyView;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-dsr-'));
+    tmp = makeTestTemp('redacted-wcd-dsr-');
     store = new LedgerStore(tmp, mutableClock(DAY));
     view = new SafetyView(tmp, mutableClock(DAY));
   });
@@ -267,7 +267,7 @@ describe('W-C/D fix pass — self-review CRITICAL-2: dedupe keys by type::entity
   let view: SafetyView;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-dup-'));
+    tmp = makeTestTemp('redacted-wcd-dup-');
     store = new LedgerStore(tmp, mutableClock(DAY));
     view = new SafetyView(tmp, mutableClock(DAY));
   });
@@ -290,7 +290,7 @@ describe('W-C/D fix pass — SBX-1: ledger field KEYS cannot forge structure ont
   let store: LedgerStore;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-sbx1-'));
+    tmp = makeTestTemp('redacted-wcd-sbx1-');
     store = new LedgerStore(tmp, mutableClock(DAY));
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));

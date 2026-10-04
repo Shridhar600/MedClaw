@@ -1,19 +1,18 @@
 import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import { CuratedMemory } from '../../src/memcore';
 import { BudgetExceededError } from '../../src/shared/errors';
 import { DEFAULT_STORED_CONFIG } from '../../src/config/defaults';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // E1.4 — the 60/20/20 MEMORY.md split becomes configurable (config.memory.budgetRatios), while the
 // no-cross-category + health-never-evicted invariants stay code-enforced (CHAT-02/05 unchanged).
 
 describe('CuratedMemory configurable budget ratios (E1.4)', () => {
   let tmp: string;
-  beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-cm-ratios-')); });
+  beforeEach(() => { tmp = makeTestTemp('redacted-cm-ratios-'); });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-  const mkDir = (): string => fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-cm-ratios-'));
+  const mkDir = (): string => makeTestTemp('redacted-cm-ratios-');
 
   it('respects a custom health share (an entry that overflows the default fits the larger budget)', async () => {
     // A single health line of 700 chars renders to 703 bytes: over the default 600 (0.6×1000),

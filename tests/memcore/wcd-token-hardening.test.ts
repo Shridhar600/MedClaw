@@ -3,11 +3,11 @@
 // technique (src/ stashed, tests kept, failures observed, stash popped).
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { LedgerStore } from '../../src/memcore';
 import type { Provenance } from '../../src/memcore';
 import { mutableClock } from '../helpers/memcore-fixtures';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const DAY = '2026-08-20T10:00:00.000Z';
 
@@ -20,7 +20,7 @@ describe('W-C/D fix pass — CH: confirm rejects a stale token instead of clobbe
   let store: LedgerStore;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-ch-'));
+    tmp = makeTestTemp('redacted-wcd-ch-');
     store = new LedgerStore(tmp, mutableClock(DAY));
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -68,7 +68,7 @@ describe('W-C/D fix pass — TB: a failed apply leaves the token usable; success
   let store: LedgerStore;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-tb-'));
+    tmp = makeTestTemp('redacted-wcd-tb-');
     store = new LedgerStore(tmp, mutableClock(DAY));
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -106,7 +106,7 @@ describe('W-C/D fix pass — self-review IMPORTANT-3: fresh active during a disp
   let store: LedgerStore;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-da-'));
+    tmp = makeTestTemp('redacted-wcd-da-');
     store = new LedgerStore(tmp, mutableClock(DAY));
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));

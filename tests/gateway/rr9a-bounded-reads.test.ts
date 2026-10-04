@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 
 import { SessionManager } from '../../src/gateway/session';
@@ -13,6 +12,7 @@ import {
   walkBackAnchor,
   type ArchiveTail,
 } from '../../src/gateway/session-window';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const fsReal = jest.requireActual<typeof import('fs')>('fs');
 
@@ -36,7 +36,7 @@ function writeDay(dir: string, day: string, count: number): string {
 
 describe('RR-9a C-38 bounded session-window reads', () => {
   it('uses a current archive tail watermark without reading any JSONL file', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr9a-window-'));
+    const dir = makeTestTemp('redacted-rr9a-window-');
     tmpDirs.push(dir);
     writeDay(dir, '2026-08-28', 40);
     const latest = writeDay(dir, '2026-08-29', 30);
@@ -57,7 +57,7 @@ describe('RR-9a C-38 bounded session-window reads', () => {
   });
 
   it('falls back from a stale watermark to the identical physical-anchor result', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr9a-window-'));
+    const dir = makeTestTemp('redacted-rr9a-window-');
     tmpDirs.push(dir);
     writeDay(dir, '2026-08-27', 3);
     writeDay(dir, '2026-08-28', 4);
@@ -75,7 +75,7 @@ describe('RR-9a C-38 bounded session-window reads', () => {
   });
 
   it('persists a separate physical tail watermark for each chat archive', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr9a-window-'));
+    const dir = makeTestTemp('redacted-rr9a-window-');
     tmpDirs.push(dir);
     jest.useFakeTimers();
     jest.setSystemTime(new Date('2026-08-29T10:00:00.000Z'));
@@ -103,7 +103,7 @@ describe('RR-9a C-38 bounded session-window reads', () => {
   });
 
   it('rebuilds the session index without slurping the archive into readFileSync', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr9a-index-'));
+    const dir = makeTestTemp('redacted-rr9a-index-');
     tmpDirs.push(dir);
     const sessionsDir = path.join(dir, 'sessions');
     fs.mkdirSync(sessionsDir, { recursive: true });
@@ -125,7 +125,7 @@ describe('RR-9a C-38 bounded session-window reads', () => {
   });
 
   it('preserves a JSONL record that crosses the fixed read-buffer boundary', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr9a-boundary-'));
+    const dir = makeTestTemp('redacted-rr9a-boundary-');
     tmpDirs.push(dir);
     const filePath = path.join(dir, '2026-08-29.jsonl');
     const long = JSON.stringify({ content: 'x'.repeat(70_000), marker: 'long-line' });

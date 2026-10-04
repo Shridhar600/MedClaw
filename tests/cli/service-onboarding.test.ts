@@ -1,11 +1,11 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { validateConfig } from '../../src/config/validation';
 import { loadRuntimeConfig } from '../../src/runtime/startup';
 import { buildConfigFromArgs, modelDefaultsForProvider, SUPPORTED_ONBOARDING_PROVIDERS } from '../../src/cli/setup-config';
 import { runServiceOnboarding, startDaemon } from '../../src/cli/service-onboarding';
 import { fixtureOwner } from '../helpers/test-config';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('service onboarding init', () => {
   let tmpDir: string;
@@ -13,7 +13,7 @@ describe('service onboarding init', () => {
   let configPath: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-cli-init-'));
+    tmpDir = makeTestTemp('redacted-cli-init-');
     workspacePath = path.join(tmpDir, 'workspace');
     configPath = path.join(tmpDir, 'config.json');
   });

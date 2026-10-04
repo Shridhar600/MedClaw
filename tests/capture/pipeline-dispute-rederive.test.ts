@@ -1,10 +1,9 @@
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import { LedgerStore, NarrativeStore, SafetyView, CuriosityQueue } from '../../src/memcore';
 import { CapturePipeline, makeSafetyRenderer, type QueuePort } from '../../src/capture';
 import { mutableClock, seqIdGen } from '../helpers/memcore-fixtures';
 import type { Provenance } from '../../src/memcore/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const DAY = '2026-08-20T10:00:00.000Z';
 const userProv: Provenance = { source: 'user', confidence: 1, anchor: '', capturedAt: DAY, note: '' };
@@ -18,7 +17,7 @@ describe('CapturePipeline re-derives the recall mirror on a disputed mint (H-1)'
   let rederiveCalls: string[][];
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-dispute-rederive-'));
+    tmp = makeTestTemp('redacted-dispute-rederive-');
     const clock = mutableClock(DAY);
     const ledger = new LedgerStore(tmp, clock);
     const narrative = new NarrativeStore(tmp, clock);

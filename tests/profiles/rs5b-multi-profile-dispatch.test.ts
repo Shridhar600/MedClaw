@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { GatewayMessageRouter } from '../../src/gateway/router';
@@ -8,6 +7,7 @@ import type { ProfileId } from '../../src/profiles/types';
 import { EMERGENCY_RESPONSE } from '../../src/safety/emergency-detector';
 import {} from '../helpers/test-config';
 import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // RR-STRUCT R-S5b (mini-plan v3 §5 R-S5b): multi-profile ACTIVATION — the RR-4 interim refusal
 // is retired and every entry path dispatches to the RESOLVED profile's runtime. Closes C-01.
@@ -45,7 +45,7 @@ describe('RR-STRUCT R-S5b: live multi-profile dispatch (C-01 close)', () => {
   let gateway: Gateway | undefined;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rs5b-'));
+    tmpDir = makeTestTemp('redacted-rs5b-');
     baseDir = path.join(tmpDir, 'redacted-home');
     legacyWorkspace = path.join(tmpDir, 'legacy-workspace');
     jest.spyOn(console, 'log').mockImplementation(() => undefined);

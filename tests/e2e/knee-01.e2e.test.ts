@@ -7,13 +7,13 @@
 // off; providers point at unreachable local endpoints so runBootHealthchecks warns-and-continues; the
 // one-time indexAll on the empty temp profile degrades to keyword-only. No network, no real model.
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import type { EffectiveConfig } from '../../src/config/types';
 import type { LLMProvider, LLMResponse } from '../../src/providers/types';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const CHAT_BINDING = 'owner-chat';
 
@@ -88,7 +88,7 @@ describe('KNEE-01 E2E (real Gateway.handleTestMessage)', () => {
   let gateway: Gateway;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-knee-e2e-'));
+    tmpDir = makeTestTemp('redacted-knee-e2e-');
     workspace = fixtureOwner(tmpDir).workspace;
   });
   afterEach(async () => {

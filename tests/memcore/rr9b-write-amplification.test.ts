@@ -1,11 +1,11 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { createHash } from 'crypto';
 
 import { LedgerStore, NarrativeStore, renderLedgerFile } from '../../src/memcore';
 import { fixedClock } from '../helpers/memcore-fixtures';
 import type { Provenance } from '../../src/memcore/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const fsReal = jest.requireActual<typeof import('fs')>('fs');
 
@@ -21,7 +21,7 @@ describe('RR-9b source-format write amplification', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr9b-core-'));
+    tmpDir = makeTestTemp('redacted-rr9b-core-');
   });
 
   afterEach(() => {

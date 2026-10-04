@@ -1,13 +1,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { NarrativeStore } from '../../src/memcore';
 import { fixedClock } from '../helpers/memcore-fixtures';
+import { makeTestTemp } from '../helpers/test-temp';
 
 let tmpDir: string;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-narrative-'));
+  tmpDir = makeTestTemp('redacted-narrative-');
 });
 
 afterEach(() => {

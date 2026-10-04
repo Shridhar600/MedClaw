@@ -1,6 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { SessionManager } from '../../src/gateway/session';
@@ -9,6 +8,7 @@ import type { EffectiveConfig } from '../../src/config/types';
 import type { HeartbeatJob } from '../../src/scheduler/types';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const FALLBACK = "I'm having trouble right now. Please try again in a moment.";
 
@@ -16,7 +16,7 @@ describe('RR-6b gateway delivery durability', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr6b-gateway-'));
+    tmpDir = makeTestTemp('redacted-rr6b-gateway-');
   });
 
   afterEach(() => {

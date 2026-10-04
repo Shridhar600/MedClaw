@@ -1,12 +1,12 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { createSafetyTools } from '../../src/tools/safety-tools';
 import { SafetyView } from '../../src/memcore';
 import { WriteQueue } from '../../src/profiles';
 import type { QueuePort } from '../../src/capture';
 import { mutableClock } from '../helpers/memcore-fixtures';
 import type { Tool } from '../../src/tools/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // RED item #2 (safety-critical flavor): `safety_note add-critical-event` used to write DIRECTLY
 // to `SafetyView.addCriticalEvent` (load -> push -> write, a read-modify-write on SAFETY.md) with
@@ -17,7 +17,7 @@ describe('RR-STRUCT R-S3 — safety_note add-critical-event atomic append (C-46)
   let view: SafetyView;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rs3-safety-'));
+    tmp = makeTestTemp('redacted-rs3-safety-');
     view = new SafetyView(tmp, mutableClock('2026-08-20T10:00:00.000Z'));
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));

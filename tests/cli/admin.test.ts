@@ -19,6 +19,7 @@ import {
   listHeartbeats,
 } from '../../src/cli/admin';
 import { writeConfigFixture } from '../helpers/config-fixture';
+import { makeTestTemp } from '../helpers/test-temp';
 
 /** A durability seam that fails after the replacement is already visible on disk. */
 const failingDirectoryFlush: ConfigFileSync = {
@@ -35,7 +36,7 @@ describe('cli admin surfaces', () => {
   let storePath: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-cli-admin-'));
+    tmpDir = makeTestTemp('redacted-cli-admin-');
     workspacePath = path.join(tmpDir, 'workspace');
     storePath = path.join(tmpDir, 'heartbeats', 'jobs.json');
     fs.mkdirSync(workspacePath, { recursive: true });

@@ -1,10 +1,9 @@
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import { createSafetyTools } from '../../src/tools/safety-tools';
 import { SafetyView } from '../../src/memcore';
 import { mutableClock } from '../helpers/memcore-fixtures';
 import type { Tool } from '../../src/tools/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('safety_note (Task 12.5)', () => {
   let tmp: string;
@@ -12,7 +11,7 @@ describe('safety_note (Task 12.5)', () => {
   let tool: Tool;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-safetytool-'));
+    tmp = makeTestTemp('redacted-safetytool-');
     view = new SafetyView(tmp, mutableClock('2026-08-20T10:00:00.000Z'));
     tool = createSafetyTools({ safetyView: view }).find(t => t.name === 'safety_note')!;
   });

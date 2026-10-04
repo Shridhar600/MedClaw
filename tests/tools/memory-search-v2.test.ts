@@ -1,11 +1,10 @@
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import { createMemoryTools } from '../../src/tools/memory-tools';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import type { MemorySearch } from '../../src/memory/search';
 import type { SearchResult } from '../../src/memory/types';
 import type { Tool } from '../../src/tools/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // Task 12.7: memory_search v2 — optional `lane` filter (path-prefix) + the existing
 // full|keyword-only|failed quality flag. `status` is accepted but a documented no-op (P2).
@@ -22,7 +21,7 @@ describe('memory_search v2 (lane filter)', () => {
   const fakeSearch = { search: async (): Promise<SearchResult[]> => canned } as unknown as MemorySearch;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-search2-'));
+    tmpDir = makeTestTemp('redacted-search2-');
     engine = new MemoryEngine(tmpDir);
     searchTool = createMemoryTools(engine, fakeSearch).find(t => t.name === 'memory_search')!;
   });

@@ -1,10 +1,10 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { SessionManager } from '../../src/gateway/session';
+import { makeTestTemp } from '../helpers/test-temp';
 
 let dir: string;
-beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-daylines-')); });
+beforeEach(() => { dir = makeTestTemp('redacted-daylines-'); });
 afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
 describe('SessionManager.readDayFileLines (D4.4 sweep seam)', () => {
@@ -38,7 +38,7 @@ describe('SessionManager.readDayFileLines (D4.4 sweep seam)', () => {
 
   it('does NOT follow a symlinked day file (no cross-profile read)', () => {
     const sm = new SessionManager({ sessionsPath: dir, perChatArchive: true });
-    const otherDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-other-'));
+    const otherDir = makeTestTemp('redacted-other-');
     const otherFile = path.join(otherDir, 'secret.jsonl');
     fs.writeFileSync(otherFile, JSON.stringify({ role: 'user', content: 'other profile ibuprofen', chatId: 'x' }) + '\n');
     const day = `${new Date().toISOString().slice(0, 10)}.jsonl`;

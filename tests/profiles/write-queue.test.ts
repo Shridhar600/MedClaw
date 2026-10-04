@@ -1,13 +1,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { WriteQueue, replayJournal } from '../../src/profiles';
+import { makeTestTemp } from '../helpers/test-temp';
 
 let tmpDir: string;
 let jp: string;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wq-'));
+  tmpDir = makeTestTemp('redacted-wq-');
   jp = path.join(tmpDir, '.state', 'journal');
 });
 

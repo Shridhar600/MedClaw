@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { verifyWorkspacePermissions } from '../../src/security/perms-check';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('verifyWorkspacePermissions', () => {
   let tmpDir: string;
@@ -13,7 +13,7 @@ describe('verifyWorkspacePermissions', () => {
   });
 
   it('detects 0755 perms as insecure', () => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'perms-test-'));
+    tmpDir = makeTestTemp('perms-test-');
     fs.chmodSync(tmpDir, 0o755);
 
     const result = verifyWorkspacePermissions(tmpDir);
@@ -23,7 +23,7 @@ describe('verifyWorkspacePermissions', () => {
   });
 
   it('passes on 0700 perms', () => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'perms-test-'));
+    tmpDir = makeTestTemp('perms-test-');
     fs.chmodSync(tmpDir, 0o700);
 
     const result = verifyWorkspacePermissions(tmpDir);
@@ -32,7 +32,9 @@ describe('verifyWorkspacePermissions', () => {
   });
 
   it('produces warning for non-existent path', () => {
-    const badPath = path.join(os.tmpdir(), 'nonexistent-workspace-' + Date.now());
+    // A path that does not exist. Workspace-local like everything else: the assertion under test is
+    // "no such directory", which is equally true inside `.test-tmp/` and does not need system temp.
+    const badPath = path.join(makeTestTemp('r14-absent-parent'), 'nonexistent-workspace-' + Date.now());
     const result = verifyWorkspacePermissions(badPath);
     expect(result.secure).toBe(false);
     expect(result.warnings.length).toBeGreaterThan(0);

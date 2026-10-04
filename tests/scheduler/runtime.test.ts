@@ -1,8 +1,8 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { HeartbeatStore } from '../../src/scheduler/store';
 import { HeartbeatScheduler } from '../../src/scheduler/runtime';
+import { makeTestTemp } from '../helpers/test-temp';
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -15,7 +15,7 @@ describe('HeartbeatScheduler', () => {
   let storePath: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-heartbeat-runtime-'));
+    tmpDir = makeTestTemp('redacted-heartbeat-runtime-');
     storePath = path.join(tmpDir, 'heartbeats', 'jobs.json');
   });
 
@@ -568,7 +568,7 @@ describe('HeartbeatScheduler destination-ownership guard (RR2-B1)', () => {
   let storePath: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-heartbeat-guard-'));
+    tmpDir = makeTestTemp('redacted-heartbeat-guard-');
     storePath = path.join(tmpDir, 'heartbeats', 'jobs.json');
   });
 

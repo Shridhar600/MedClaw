@@ -1,7 +1,7 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { listDayFiles, walkBackAnchor, readLinesAfter } from '../../src/gateway/session-window';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // P2b Wave D-1 / D1.5 — the resume substrate: enumerate day files, compute the tail's start anchor by
 // walking back K lines from the archive EOF, and read every archive line strictly after a `verbatimFrom`
@@ -11,7 +11,7 @@ import { listDayFiles, walkBackAnchor, readLinesAfter } from '../../src/gateway/
 
 describe('session-window replay helpers (D1.5)', () => {
   let dir: string;
-  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'swr-')); });
+  beforeEach(() => { dir = makeTestTemp('swr-'); });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
   // Write `n` JSONL entries `{i: <fileTag>-<k>}` to a day file, return the basename.

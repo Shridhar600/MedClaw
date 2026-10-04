@@ -1,14 +1,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { SessionManager, windowTriggerFor } from '../../src/gateway/session';
 import { loadWindow } from '../../src/gateway/session-window';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const tmpDirs: string[] = [];
 
 function tmpSessions(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-triggers-'));
+  const dir = makeTestTemp('redacted-triggers-');
   tmpDirs.push(dir);
   const sessionsPath = path.join(dir, 'sessions');
   fs.mkdirSync(sessionsPath, { recursive: true });

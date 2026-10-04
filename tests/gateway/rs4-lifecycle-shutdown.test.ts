@@ -1,6 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import type { EffectiveConfig } from '../../src/config/types';
 import type { ProfileId } from '../../src/profiles';
@@ -17,6 +16,7 @@ import {
   SqliteVecIndex,
 } from '../../src/indexstore';
 import { SqliteStore } from '../../src/memory/sqlite-store';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const mockMainProvider: LLMProvider = {
   modelName: 'rs4-main',
@@ -114,7 +114,7 @@ describe('RR-STRUCT R-S4 — ProfileRuntime lifecycle state machine', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rs4-lifecycle-'));
+    tmpDir = makeTestTemp('redacted-rs4-lifecycle-');
     fs.mkdirSync(path.join(tmpDir, 'workspace'), { recursive: true });
   });
 
@@ -207,7 +207,7 @@ describe('RR-STRUCT R-S4 — bounded hard-stop', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rs4-bound-'));
+    tmpDir = makeTestTemp('redacted-rs4-bound-');
     fs.mkdirSync(path.join(tmpDir, 'workspace'), { recursive: true });
   });
 

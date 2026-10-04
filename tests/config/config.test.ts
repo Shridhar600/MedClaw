@@ -15,6 +15,7 @@ import { loadRuntimeConfig } from '../../src/runtime/startup';
 import { readConfigDocument, effectiveConfigFor, writeConfigDocument } from '../../src/runtime/installation';
 import { toStoredView } from '../../src/config/validation';
 import { writeConfigFixture, storedConfigFor } from '../helpers/config-fixture';
+import { makeTestTemp } from '../helpers/test-temp';
 
 function decode(raw: unknown, homeDir: string) {
   return decodeConfigDocument(raw, { homeDir });
@@ -38,7 +39,7 @@ describe('stored config decoding', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-test-'));
+    tmpDir = makeTestTemp('redacted-test-');
   });
 
   afterEach(() => {
@@ -303,7 +304,7 @@ describe('effective config assembly', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-test-'));
+    tmpDir = makeTestTemp('redacted-test-');
   });
 
   afterEach(() => {
@@ -405,7 +406,7 @@ describe('bounded config file IO', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-test-'));
+    tmpDir = makeTestTemp('redacted-test-');
   });
 
   afterEach(() => {

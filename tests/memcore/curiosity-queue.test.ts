@@ -1,14 +1,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { CuriosityQueue } from '../../src/memcore/curiosity-queue';
 import type { CuriosityItem } from '../../src/memcore';
 import { fixedClock, seqIdGen } from '../helpers/memcore-fixtures';
+import { makeTestTemp } from '../helpers/test-temp';
 
 let tmpDir: string;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-curiosity-'));
+  tmpDir = makeTestTemp('redacted-curiosity-');
 });
 
 afterEach(() => {

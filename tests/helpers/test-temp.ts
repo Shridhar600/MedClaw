@@ -3,10 +3,15 @@
 // Synthetic test data lives INSIDE the workspace, under the gitignored `.test-tmp/` root.
 //
 // The founder rule for this task is that no work — including test work — may create or touch
-// files in `/tmp`, `$HOME`, or another workspace. The repo predates that rule and many suites
-// still use `os.tmpdir()`; rewriting all of them is a separate change, and is called out as a
-// residual. Every suite added or materially changed under S1 uses these helpers instead, so the
-// direction of travel is unambiguous and no new outside-workspace path is introduced.
+// files in `/tmp`, `$HOME`, or another workspace.
+//
+// R-14 is now CLOSED rather than a residual: every suite that used `os.tmpdir()` was migrated to
+// these helpers. `tests/security/workspace-temp.test.ts` fails the moment a suite reintroduces
+// `os.tmpdir()`, so the rule is enforced rather than merely stated.
+//
+// That test is what the migration needed, and it is also what proved the migration could not be
+// faked with a central redirect: patching `os.tmpdir` is impossible on current Node (non-
+// configurable accessor), and setting `TMPDIR` is ignored by macOS inside a jest worker.
 //
 // Cleanup is the caller's job (normally `afterEach`). Nothing here reads a real home directory,
 // touches the network, or creates owner-scoped content outside the returned directory.
@@ -17,6 +22,17 @@ import { randomBytes } from 'crypto';
 
 /** Absolute path of the workspace-local synthetic root. */
 export const TEST_TEMP_ROOT = path.resolve(process.cwd(), '.test-tmp');
+
+/**
+ * Whether `candidate` resolves inside the workspace-local synthetic root.
+ *
+ * Used by the R-14 workspace-temp contract test to assert that a path a suite actually wrote to is
+ * inside the workspace, rather than only asserting that some configuration variable was set.
+ */
+export function isInsideTestTemp(candidate: string): boolean {
+  const relative = path.relative(TEST_TEMP_ROOT, candidate);
+  return relative.length > 0 && !relative.startsWith('..') && !path.isAbsolute(relative);
+}
 
 /**
  * Create a unique directory for one suite or case. Returns the absolute path; nothing else on

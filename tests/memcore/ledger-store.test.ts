@@ -1,14 +1,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { LedgerStore } from '../../src/memcore/ledger-store';
 import { Provenance } from '../../src/memcore/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 let tmpDir: string;
 let store: LedgerStore;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-ledger-'));
+  tmpDir = makeTestTemp('redacted-ledger-');
   store = new LedgerStore(tmpDir);
 });
 
@@ -22,7 +22,7 @@ const sensorProv: Provenance = { source: 'sensor', confidence: 0.8, anchor: 'mem
 const labProv: Provenance = { source: 'lab', confidence: 0.9, anchor: 'memory/lab.md#L1', capturedAt: '', note: 'Lab result' };
 describe('LedgerStore', () => {
   it('refuses a symlinked ledger lane instead of writing outside the profile root', async () => {
-    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-ledger-outside-'));
+    const outside = makeTestTemp('redacted-ledger-outside-');
     try {
       fs.symlinkSync(outside, path.join(tmpDir, 'ledger'), 'dir');
 

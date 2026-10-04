@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { LedgerStore, SafetyView, TYPE_TO_FILE } from '../../src/memcore';
 import type { FactType, Provenance } from '../../src/memcore/types';
@@ -8,6 +7,7 @@ import { ContextAssembler } from '../../src/context2';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import { SqliteVecIndex, SqliteKeywordIndex, SqliteFactMirror, SqliteChunkStats, ledgerFactToRecord } from '../../src/indexstore';
 import type { Chunk, Clock, EmbeddingPort } from '../../src/ports';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // P2 E2.1 — recall acceptance suite. REAL objects, disk-backed: real LedgerStore/SafetyView (Markdown),
 // real SqliteVecIndex/KeywordIndex/FactMirror/ChunkStats (one temp search.db), the real RecallEngine,
@@ -93,7 +93,7 @@ describe('P2 recall acceptance (real adapters, disk-backed → assembled prompt)
   const writeSafety = (text: string): void => fs.writeFileSync(path.join(tmp, 'SAFETY.md'), text, 'utf8');
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-recall-accept-'));
+    tmp = makeTestTemp('redacted-recall-accept-');
     dbPath = path.join(tmp, 'search.db');
     clock = fixedClock(NOW);
     ledger = new LedgerStore(tmp, clock);

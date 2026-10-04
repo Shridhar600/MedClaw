@@ -1,15 +1,15 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { SessionManager, pruneToolResults, PRUNED_TOOL_MARKER, stripOrphanToolMessages } from '../../src/gateway/session';
 import { SqliteSessionIndex } from '../../src/indexstore';
 import type { Message } from '../../src/providers/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const tmpDirs: string[] = [];
 
 function tmp(): { sessionsPath: string; dbPath: string } {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-prune-'));
+  const dir = makeTestTemp('redacted-prune-');
   tmpDirs.push(dir);
   const sessionsPath = path.join(dir, 'sessions');
   fs.mkdirSync(sessionsPath, { recursive: true });

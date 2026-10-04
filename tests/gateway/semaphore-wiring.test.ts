@@ -1,6 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { AgentLoop } from '../../src/agent/agent-loop';
 import { LLMSemaphore, HeartbeatQueueFullError } from '../../src/tools/semaphore';
@@ -15,6 +14,7 @@ import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 import {} from '../helpers/test-config';
 import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { makeTestTemp } from '../helpers/test-temp';
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -40,7 +40,7 @@ describe('LLM semaphore wiring', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-sem-wiring-'));
+    tmpDir = makeTestTemp('redacted-sem-wiring-');
   });
 
   afterEach(() => {

@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { SessionManager } from '../../src/gateway/session';
@@ -11,12 +10,13 @@ import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 import {} from '../helpers/test-config';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('Gateway heartbeat integration', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-heartbeat-gateway-'));
+    tmpDir = makeTestTemp('redacted-heartbeat-gateway-');
   });
 
   afterEach(() => {

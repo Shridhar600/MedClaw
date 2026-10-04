@@ -1,15 +1,15 @@
 // Regression tests for the Wave A+B panel findings in the non-ledger stores.
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { SafetyView } from '../../src/memcore/safety-view';
 import { CuratedMemory } from '../../src/memcore/curated-memory';
 import { EpisodeStore } from '../../src/memcore/episode-store';
 import { CuriosityQueue } from '../../src/memcore/curiosity-queue';
 import { fixedClock, seqIdGen } from '../helpers/memcore-fixtures';
+import { makeTestTemp } from '../helpers/test-temp';
 
 let tmpDir: string;
-beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-store-panel-')); });
+beforeEach(() => { tmpDir = makeTestTemp('redacted-store-panel-'); });
 afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
 const sidecars = (glob: string) => fs.readdirSync(tmpDir).filter(n => n.includes(glob) && n.includes('quarantine'));

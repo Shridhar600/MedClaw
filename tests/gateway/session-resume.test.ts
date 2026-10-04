@@ -1,8 +1,8 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import type { LLMProvider, Message } from '../../src/providers/types';
 import { SessionManager } from '../../src/gateway/session';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // P2b Wave D-1 / D1.5+D1.6 — resume-after-restart reads the WINDOW (session-window.json, per-chat in
 // no-registry mode) + replays the day-file tail from `verbatimFrom` to EOF. It NO LONGER reads the
@@ -14,7 +14,7 @@ import { SessionManager } from '../../src/gateway/session';
 describe('session resume from window + day files (D1.5)', () => {
   let dir: string;
   beforeEach(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sm-resume-'));
+    dir = makeTestTemp('sm-resume-');
     jest.useFakeTimers();
     jest.setSystemTime(new Date('2026-08-26T12:00:00.000Z'));
   });
@@ -96,7 +96,7 @@ describe('session resume from window + day files (D1.5)', () => {
   });
 
   it('does not resume a symlinked day file into a chat window', () => {
-    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-resume-outside-'));
+    const outside = makeTestTemp('redacted-resume-outside-');
     try {
       const day = '2026-08-26.jsonl';
       const outsideDay = path.join(outside, day);

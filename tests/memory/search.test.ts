@@ -3,7 +3,7 @@ import { SqliteStore } from '../../src/memory/sqlite-store';
 import type { LLMProvider } from '../../src/providers/types';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('MemorySearch', () => {
   let tmpDir: string;
@@ -16,7 +16,7 @@ describe('MemorySearch', () => {
 
   describe('basic queries', () => {
     beforeEach(async () => {
-      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-search-'));
+      tmpDir = makeTestTemp('redacted-search-');
       store = new SqliteStore(path.join(tmpDir, 'test.db'));
     });
 
@@ -51,7 +51,7 @@ describe('MemorySearch', () => {
 
   describe('hybrid merge with known embeddings', () => {
     beforeEach(async () => {
-      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-search-'));
+      tmpDir = makeTestTemp('redacted-search-');
       store = new SqliteStore(path.join(tmpDir, 'test.db'));
     });
 
@@ -79,7 +79,7 @@ describe('MemorySearch', () => {
 
   describe('deduplication', () => {
     beforeEach(async () => {
-      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-search-'));
+      tmpDir = makeTestTemp('redacted-search-');
       store = new SqliteStore(path.join(tmpDir, 'test.db'));
     });
 
@@ -104,7 +104,7 @@ describe('MemorySearch', () => {
 
   describe('chunk metadata', () => {
     beforeEach(async () => {
-      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-search-'));
+      tmpDir = makeTestTemp('redacted-search-');
       store = new SqliteStore(path.join(tmpDir, 'test.db'));
     });
 
@@ -134,7 +134,7 @@ describe('MemorySearch', () => {
 
   describe('empty result set', () => {
     beforeEach(async () => {
-      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-search-'));
+      tmpDir = makeTestTemp('redacted-search-');
       store = new SqliteStore(path.join(tmpDir, 'test.db'));
     });
 
@@ -153,7 +153,7 @@ describe('MemorySearch', () => {
 
   describe('SearchStatus', () => {
     beforeEach(async () => {
-      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-search-status-'));
+      tmpDir = makeTestTemp('redacted-search-status-');
       store = new SqliteStore(path.join(tmpDir, 'test.db'));
     });
 
@@ -221,7 +221,7 @@ describe('MemorySearch', () => {
 
   describe('keyword ranking order', () => {
     beforeEach(async () => {
-      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-search-'));
+      tmpDir = makeTestTemp('redacted-search-');
       store = new SqliteStore(path.join(tmpDir, 'test.db'));
     });
 
@@ -258,7 +258,7 @@ describe('MemorySearch', () => {
 
   describe('graceful degradation', () => {
     beforeEach(async () => {
-      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-search-'));
+      tmpDir = makeTestTemp('redacted-search-');
       store = new SqliteStore(path.join(tmpDir, 'test.db'));
     });
 

@@ -1,10 +1,10 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 
 import { MemoryIndexer } from '../../src/memory/indexer';
 import { SqliteStore } from '../../src/memory/sqlite-store';
 import type { LLMProvider } from '../../src/providers/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const IndexerWithDelta = MemoryIndexer as unknown as {
   new (
@@ -21,7 +21,7 @@ describe('RR-9b delta indexing', () => {
   let store: SqliteStore;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr9b-index-'));
+    tmpDir = makeTestTemp('redacted-rr9b-index-');
     store = new SqliteStore(path.join(tmpDir, 'search.db'));
   });
 

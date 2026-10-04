@@ -1,9 +1,9 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import type { LLMProvider, Message } from '../../src/providers/types';
 import { SessionManager } from '../../src/gateway/session';
 import { dateKey, resolveWindow } from '../../src/gateway/session-window';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const fsReal = jest.requireActual<typeof import('fs')>('fs');
 
@@ -11,7 +11,7 @@ describe('RR-6b session and window durability', () => {
   let sessionsDir: string;
 
   beforeEach(() => {
-    sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr6b-session-'));
+    sessionsDir = makeTestTemp('redacted-rr6b-session-');
     jest.useFakeTimers();
     jest.setSystemTime(new Date('2026-08-26T12:00:00.000Z'));
   });

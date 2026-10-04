@@ -1,14 +1,14 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { writeOnboardingProfile } from '../../src/onboarding/profile-writer';
 import type { OnboardingAnswers } from '../../src/onboarding/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('writeOnboardingProfile', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-profile-writer-'));
+    tmpDir = makeTestTemp('redacted-profile-writer-');
     fs.writeFileSync(path.join(tmpDir, 'USER.md'), '# User Preferences\n\nKeep this user edit.\n', 'utf8');
     fs.writeFileSync(path.join(tmpDir, 'HEALTH_PROFILE.md'), '# Health Profile\n\nKeep this health edit.\n', 'utf8');
   });

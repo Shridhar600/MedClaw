@@ -6,12 +6,12 @@
 // post-scan / rollback) sequence instead of serializing as ONE coordinator op.
 
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { MutationCoordinator, type QueuePort } from '../../src/capture';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import { WriteQueue } from '../../src/profiles';
 import { createMemoryTools } from '../../src/tools/memory-tools';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // A MemoryEngine-shaped fake whose methods yield exactly once, so two UNSERIALIZED
 // concurrent callers deterministically overlap (maxInFlight === 2), while
@@ -95,7 +95,7 @@ describe('R-S3b Part A — memory_write single-writer routing', () => {
   });
 
   it('serializes two concurrent appends to the SAME file (no overlap inside the write body)', async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rs3b-mem-'));
+    const root = makeTestTemp('redacted-rs3b-mem-');
     try {
       const engine = new TrackingEngine();
       const queue = new WriteQueue({ journalPath: path.join(root, '.state', 'write-queue.journal') });
@@ -118,7 +118,7 @@ describe('R-S3b Part A — memory_write single-writer routing', () => {
   });
 
   it('without a coordinator, a single caller still works (append + overwrite + credential rejection unchanged)', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rs3b-memfb-'));
+    const dir = makeTestTemp('redacted-rs3b-memfb-');
     try {
       const engine = new MemoryEngine(dir);
       const tools = createMemoryTools(engine);
@@ -146,7 +146,7 @@ describe('R-S3b Part A — memory_write single-writer routing', () => {
   });
 
   it('an accessor that resolves to undefined degrades to inline (availability over atomicity)', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rs3b-memdeg-'));
+    const dir = makeTestTemp('redacted-rs3b-memdeg-');
     try {
       const engine = new MemoryEngine(dir);
       const tools = createMemoryTools(engine, undefined, undefined, undefined, undefined, () => undefined);

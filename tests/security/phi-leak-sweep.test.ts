@@ -8,7 +8,6 @@
 // because the raw error object/message was logged directly.
 
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { MemoryIndexer } from '../../src/memory/indexer';
 import { MemorySearch } from '../../src/memory/search';
@@ -32,7 +31,7 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
   it('medgemma_query logs a sanitized frame, never the PHI-bearing provider error', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phi-med-'));
+    const tmpDir = makeTestTemp('phi-med-');
     try {
       fs.writeFileSync(path.join(tmpDir, 'HEALTH_PROFILE.md'), '# none');
       const engine = new MemoryEngine(tmpDir);
@@ -64,7 +63,7 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
   // ── gateway/session.ts: compaction flush + summary chat both throw PHI error.
   it('session compaction logs a sanitized frame, never the PHI-bearing provider error', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phi-sess-'));
+    const tmpDir = makeTestTemp('phi-sess-');
     try {
       const provider: LLMProvider = {
         chat: jest.fn().mockRejectedValue(new Error(`compact summary failed: ${PHI}`)),
@@ -103,7 +102,7 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
   // ── memory/indexer.ts: embedding failure logs sanitized frame.
   it('indexer embed failure logs a sanitized frame, never the PHI-bearing chunk error', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phi-idx-'));
+    const tmpDir = makeTestTemp('phi-idx-');
     try {
       const store = new SqliteStore(path.join(tmpDir, 'test.db'));
       const provider: LLMProvider = {
@@ -128,7 +127,7 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
   // ── memory/search.ts: vector search embedding failure logs sanitized frame.
   it('search vector failure logs a sanitized frame, never the PHI-bearing query error', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phi-search-'));
+    const tmpDir = makeTestTemp('phi-search-');
     try {
       const store = new SqliteStore(path.join(tmpDir, 'test.db'));
       const query = `glucose spikes ${PHI}`;
@@ -216,7 +215,7 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
 
   it('memory_write append reindex failure logs a sanitized frame, never the PHI-bearing reindex error', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phi-reindex-'));
+    const tmpDir = makeTestTemp('phi-reindex-');
     try {
       const engine = new MemoryEngine(tmpDir);
       const failingIndexer = {
@@ -241,7 +240,7 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
   // scheduler/audit-log.ts:43 rotation failure logs sanitized frame.
   it('audit-log rotation failure logs a sanitized frame, never the PHI-bearing rotation error', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phi-audit-'));
+    const tmpDir = makeTestTemp('phi-audit-');
     try {
       // Force the rotation check to throw on the first append (appendCount === 1
       // triggers a rotation check). Inject a PHI-bearing throw via the rotation

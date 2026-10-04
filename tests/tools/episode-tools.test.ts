@@ -1,10 +1,9 @@
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import { createEpisodeTools } from '../../src/tools/episode-tools';
 import { EpisodeStore } from '../../src/memcore';
 import { mutableClock, seqIdGen } from '../helpers/memcore-fixtures';
 import type { Tool } from '../../src/tools/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('episode_manage (Task 12.4)', () => {
   let tmp: string;
@@ -12,7 +11,7 @@ describe('episode_manage (Task 12.4)', () => {
   let tool: Tool;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-eptool-'));
+    tmp = makeTestTemp('redacted-eptool-');
     store = new EpisodeStore(tmp, mutableClock('2026-08-20T10:00:00.000Z'), seqIdGen('ep'));
     tool = createEpisodeTools({ store, profileId: 'default' }).find(t => t.name === 'episode_manage')!;
   });

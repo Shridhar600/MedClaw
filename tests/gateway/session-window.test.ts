@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import {
   loadWindow,
@@ -9,6 +8,7 @@ import {
   dateKey,
   type SessionWindow,
 } from '../../src/gateway/session-window';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // P2b Wave D-1 / Task D1.1 — SessionWindow state file (the rolling window persisted separately from
 // the append-only day-file archive; spec 14 §2). Absent OR corrupt ⇒ a fresh empty window pointing at
@@ -16,7 +16,7 @@ import {
 
 describe('session-window (D1.1)', () => {
   let dir: string;
-  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sw-')); });
+  beforeEach(() => { dir = makeTestTemp('sw-'); });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
   const win = (over: Partial<SessionWindow> = {}): SessionWindow => ({

@@ -6,7 +6,6 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import { SessionManager } from '../../src/gateway/session';
@@ -28,6 +27,7 @@ import {
 import { writeConfigDocument } from '../../src/runtime/installation';
 import { cloneStoredDefaults } from '../../src/config/defaults';
 import { LedgerStore } from '../../src/memcore/ledger-store';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const DIR = 0o700;
 const FILE = 0o600;
@@ -60,7 +60,7 @@ function listFiles(dir: string): string[] {
 }
 
 function makeRoot(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-modes-'));
+  return makeTestTemp('redacted-modes-');
 }
 
 describe('PHI file modes', () => {

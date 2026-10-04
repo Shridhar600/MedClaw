@@ -1,9 +1,9 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { CapturePipeline, FileCaptureIdempotency, makeSafetyRenderer, type QueuePort } from '../../src/capture';
 import { LedgerStore, NarrativeStore, SafetyView } from '../../src/memcore';
 import { WriteQueue } from '../../src/profiles';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // RED item #7 / mini-plan v3 §3.7: generations are CONTENT-HASH and DOMAIN-SCOPED
 // (`ledgerGeneration`/`narrativeGeneration`/`sessionGeneration`) — SAFETY depends ONLY on
@@ -18,7 +18,7 @@ describe('RR-STRUCT R-S3 — domain isolation: narrative-only writes never touch
   let pipeline: CapturePipeline;
 
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rs3-isolation-'));
+    root = makeTestTemp('redacted-rs3-isolation-');
     ledger = new LedgerStore(root);
     const narrative = new NarrativeStore(root);
     view = new SafetyView(root, undefined, () => ledger.listSafetyRelevant());

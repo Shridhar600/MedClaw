@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { SqliteStore } from '../../src/memory/sqlite-store';
+import { makeTestTemp } from '../helpers/test-temp';
 
 function cosineSimilarity(a: number[], b: number[]): number {
   if (a.length !== b.length) return 0;
@@ -21,7 +21,7 @@ describe('vec0 ANN Search', () => {
   let warnSpy: jest.SpyInstance;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-vec0-'));
+    tmpDir = makeTestTemp('redacted-vec0-');
     store = new SqliteStore(path.join(tmpDir, 'test.db'));
     store.ensureVecTable(4);
     warnSpy = jest.spyOn(console, 'warn').mockImplementation();
@@ -125,7 +125,7 @@ describe('vec0 ANN Search', () => {
   });
 
   it('profile-scoped indexes isolated', () => {
-    const tmpDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-vec0-2-'));
+    const tmpDir2 = makeTestTemp('redacted-vec0-2-');
     const store2 = new SqliteStore(path.join(tmpDir2, 'test.db'));
     store2.ensureVecTable(4);
 
@@ -151,7 +151,7 @@ describe('vec0 ANN Search', () => {
     it('vectorSearch top-10 over 5000 chunks (768 dims) completes in <200ms', () => {
       const DIM = 768;
       const CHUNKS = 5000;
-      const perfDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-vec0-perf-'));
+      const perfDir = makeTestTemp('redacted-vec0-perf-');
       const perfStore = new SqliteStore(path.join(perfDir, 'perf.db'));
       try {
         perfStore.ensureVecTable(DIM);

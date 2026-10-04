@@ -1,14 +1,14 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { SchedulerAuditLog } from '../../src/scheduler/audit-log';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('SchedulerAuditLog', () => {
   let tmpDir: string;
   let logPath: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-scheduler-audit-log-'));
+    tmpDir = makeTestTemp('redacted-scheduler-audit-log-');
     logPath = path.join(tmpDir, 'audit.jsonl');
   });
 

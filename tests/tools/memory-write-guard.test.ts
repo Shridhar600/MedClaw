@@ -1,9 +1,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { createMemoryTools } from '../../src/tools/memory-tools';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import type { Tool } from '../../src/tools/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // Task 12.6 (G1): memory_write must refuse writes to every invariant-bearing managed path,
 // directing the agent to the owning tool. `memory/**` (narrative) and core files stay
@@ -14,7 +14,7 @@ describe('memory_write managed-path guard (G1 / CONTRA-03)', () => {
   let write: Tool;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wguard-'));
+    tmpDir = makeTestTemp('redacted-wguard-');
     engine = new MemoryEngine(tmpDir);
     write = createMemoryTools(engine).find(t => t.name === 'memory_write')!;
   });

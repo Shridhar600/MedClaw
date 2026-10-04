@@ -1,9 +1,9 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { WriteQueue } from '../../src/profiles';
 import { MutationCoordinator } from '../../src/capture';
 import { DaemonShutdownError } from '../../src/shared/errors';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // RR-STRUCT R-S4 (mini-plan v3 §3.9, closes C-27 core): the MutationCoordinator is the choke
 // point for every ledger/episode/safety/memory/capture write (post-R-S3). A write attempted
@@ -25,7 +25,7 @@ describe('RR-STRUCT R-S4 — MutationCoordinator isShutdown write-gate', () => {
   let queue: WriteQueue;
 
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rs4-coordinator-'));
+    root = makeTestTemp('redacted-rs4-coordinator-');
     queue = new WriteQueue({ journalPath: path.join(root, 'write-queue.journal') });
   });
   afterEach(() => fs.rmSync(root, { recursive: true, force: true }));

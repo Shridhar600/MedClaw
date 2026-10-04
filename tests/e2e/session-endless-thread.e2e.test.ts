@@ -10,7 +10,6 @@
 // the compacted window and keeps appending to the SAME day file (endless thread).
 
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { dateKey, countDayFileLines } from '../../src/gateway/session-window';
@@ -19,6 +18,7 @@ import type { EffectiveConfig } from '../../src/config/types';
 import type { LLMProvider, LLMResponse, Message } from '../../src/providers/types';
 import {} from '../helpers/test-config';
 import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const CHAT_BINDING = 'owner-chat';
 
@@ -104,7 +104,7 @@ describe('P2b E2E — endless per-chat thread (real Gateway.handleTestMessage)',
   let gateway: Gateway;
   let gateway2: Gateway | undefined;
 
-  beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-endless-e2e-')); });
+  beforeEach(() => { tmpDir = makeTestTemp('redacted-endless-e2e-'); });
   afterEach(async () => {
     try { await gateway?.stop(); } catch { /* ignore */ }
     try { await gateway2?.stop(); } catch { /* ignore */ }

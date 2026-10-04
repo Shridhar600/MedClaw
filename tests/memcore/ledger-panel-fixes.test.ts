@@ -2,15 +2,15 @@
 // Each test reproduces a CONFIRMED bug; it must be RED on the pre-fix code.
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { LedgerStore } from '../../src/memcore/ledger-store';
 import { Provenance } from '../../src/memcore/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 let tmpDir: string;
 let store: LedgerStore;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-ledger-panel-'));
+  tmpDir = makeTestTemp('redacted-ledger-panel-');
   store = new LedgerStore(tmpDir);
 });
 

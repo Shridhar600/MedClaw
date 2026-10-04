@@ -1,11 +1,11 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { makeSelfHealingSafetyReader } from '../../src/gateway/runtime';
 import { LedgerStore, SafetyView, SafetyProjectionDirtyError } from '../../src/memcore';
 import { MutationCoordinator } from '../../src/capture';
 import { WriteQueue } from '../../src/profiles';
 import { mutableClock } from '../helpers/memcore-fixtures';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // RED item #6 / mini-plan v3 §3.7 Part C: on HEAD a678272 there is no self-heal at all — a
 // `SafetyProjectionDirtyError` read simply propagates (correct fail-closed, but a TRANSIENT
@@ -19,7 +19,7 @@ describe('RR-STRUCT R-S3 — SAFETY self-heal (Part C)', () => {
   let coordinator: MutationCoordinator;
 
   beforeEach(async () => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rs3-selfheal-'));
+    tmp = makeTestTemp('redacted-rs3-selfheal-');
     const clock = mutableClock('2026-08-20T10:00:00.000Z');
     ledger = new LedgerStore(tmp, clock);
     view = new SafetyView(tmp, clock, () => ledger.listSafetyRelevant());

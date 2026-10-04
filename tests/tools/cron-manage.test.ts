@@ -1,9 +1,9 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { HeartbeatStore } from '../../src/scheduler/store';
 import { HeartbeatScheduler } from '../../src/scheduler/runtime';
 import { createCronManageTool } from '../../src/tools/cron-manage';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('cron_manage tool', () => {
   let tmpDir: string;
@@ -12,7 +12,7 @@ describe('cron_manage tool', () => {
   let scheduler: HeartbeatScheduler;
 
   beforeEach(async () => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-cron-manage-'));
+    tmpDir = makeTestTemp('redacted-cron-manage-');
     workspacePath = path.join(tmpDir, 'workspace');
     storePath = path.join(tmpDir, 'heartbeats', 'jobs.json');
     fs.mkdirSync(workspacePath, { recursive: true });

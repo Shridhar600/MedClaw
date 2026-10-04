@@ -2,11 +2,11 @@
 // Each test was proven RED on p1-memory-core @ cbf6c40 before its fix landed.
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { LedgerStore, NarrativeStore, SafetyView, CuriosityQueue } from '../../src/memcore';
 import { CapturePipeline, type QueuePort } from '../../src/capture';
 import { mutableClock, seqIdGen } from '../helpers/memcore-fixtures';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const DAY = '2026-08-20T10:00:00.000Z';
 const SECRET = 'api_key: "abcd1234abcd1234abcd1234ab"';
@@ -17,7 +17,7 @@ describe('W-C/D fix pass — CRED: pipeline-level credential scan (defense-in-de
   let pipeline: CapturePipeline;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-cap-'));
+    tmp = makeTestTemp('redacted-wcd-cap-');
     const clock = mutableClock(DAY);
     const ledger = new LedgerStore(tmp, clock);
     narrative = new NarrativeStore(tmp, clock);
@@ -71,7 +71,7 @@ describe('W-C/D fix pass — PHI: correction warn never carries the entity name'
   }
 
   it('correction retract needs-confirmation warns WITHOUT the wrong entity', async () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-phicap-'));
+    const tmp = makeTestTemp('redacted-wcd-phicap-');
     try {
       const { pl } = makePl(tmp);
       // Active med fact → a later correction's retract arm will need confirmation.
@@ -98,7 +98,7 @@ describe('W-C/D fix pass — PHI: correction warn never carries the entity name'
   });
 
   it('CT: correction surfaces the dropped retract token so DAD-10 end-state is reachable', async () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-ct-'));
+    const tmp = makeTestTemp('redacted-wcd-ct-');
     try {
       const { pl, ledger } = makePl(tmp);
       await ledgerSeed(pl);
@@ -147,7 +147,7 @@ describe('W-C/D fix pass — DS/A1: a minted dispute creates a follow-up curiosi
   let tmpRoot: string;
 
   beforeEach(() => {
-    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-curio-'));
+    tmpRoot = makeTestTemp('redacted-wcd-curio-');
   });
   afterEach(() => fs.rmSync(tmpRoot, { recursive: true, force: true }));
 
@@ -216,7 +216,7 @@ describe('W-C/D fix pass — self-review IMPORTANT-4: pendingRetract survives a 
   afterEach(() => jest.restoreAllMocks());
 
   it('correction whose CORRECTED fact also needs confirmation still relays the retract token', async () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-ct2-'));
+    const tmp = makeTestTemp('redacted-wcd-ct2-');
     try {
       const clock = mutableClock(DAY);
       const ledger = new LedgerStore(tmp, clock);

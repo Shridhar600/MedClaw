@@ -1,8 +1,8 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { WriteQueue } from '../../src/profiles';
 import { MutationCoordinator, ReentrantMutationError, computeIdempotencyKey } from '../../src/capture';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('RR-STRUCT R-S3 — MutationCoordinator', () => {
   let root: string;
@@ -10,7 +10,7 @@ describe('RR-STRUCT R-S3 — MutationCoordinator', () => {
   let coordinator: MutationCoordinator;
 
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rs3-coordinator-'));
+    root = makeTestTemp('redacted-rs3-coordinator-');
     queue = new WriteQueue({ journalPath: path.join(root, 'write-queue.journal') });
     coordinator = new MutationCoordinator(queue);
   });

@@ -1,6 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import type { LLMProvider } from '../../src/providers/types';
 import type { EffectiveConfig } from '../../src/config/types';
@@ -10,6 +9,7 @@ import { SqliteChunkStats, SqliteKeywordIndex, SqliteVecIndex } from '../../src/
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 import {} from '../helpers/test-config';
 import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const mockMainProvider: LLMProvider = {
   modelName: 'rr7-main',
@@ -131,7 +131,7 @@ describe('Gateway RR-7 concurrency and lifecycle', () => {
   let gateway: Gateway | undefined;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr7-'));
+    tmpDir = makeTestTemp('redacted-rr7-');
     jest.clearAllMocks();
   });
 

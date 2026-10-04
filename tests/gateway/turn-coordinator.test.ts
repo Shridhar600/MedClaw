@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { AgentLoop } from '../../src/agent/agent-loop';
 import type { EffectiveConfig } from '../../src/config/types';
@@ -12,6 +11,7 @@ import { TurnCoordinator, TurnQueueFullError } from '../../src/gateway/turn-coor
 import type { LLMProvider, LLMResponse, Message } from '../../src/providers/types';
 import { DaemonShutdownError } from '../../src/shared/errors';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { makeTestTemp } from '../helpers/test-temp';
 
 function deferred<T = void>() {
   let resolve!: (value?: T | PromiseLike<T>) => void;
@@ -81,7 +81,7 @@ type RuntimeDouble = {
 };
 
 function makeRuntime(): RuntimeDouble {
-  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-turn-coordinator-'));
+  const workspace = makeTestTemp('redacted-turn-coordinator-');
   fs.mkdirSync(path.join(workspace, '.redacted'), { recursive: true });
   fs.writeFileSync(
     path.join(workspace, '.redacted', 'onboarding.json'),

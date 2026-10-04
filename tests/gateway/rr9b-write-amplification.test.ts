@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 
 import { Gateway } from '../../src/gateway/gateway';
@@ -8,6 +7,7 @@ import type { LLMProvider } from '../../src/providers/types';
 import type { ToolRegistry } from '../../src/tools/registry';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const CHAT_BINDING = 'owner-chat';
 
@@ -75,7 +75,7 @@ describe('RR-9b Gateway delta wiring', () => {
   let gateway: Gateway;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr9b-gateway-'));
+    tmpDir = makeTestTemp('redacted-rr9b-gateway-');
     jest.clearAllMocks();
   });
 

@@ -1,15 +1,15 @@
 // tests/memory/memory-engine.test.ts
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { MemoryEngine } from '../../src/memory/memory-engine';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('MemoryEngine', () => {
   let tmpDir: string;
   let engine: MemoryEngine;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-mem-'));
+    tmpDir = makeTestTemp('redacted-mem-');
     engine = new MemoryEngine(tmpDir);
   });
 
@@ -78,7 +78,7 @@ describe('MemoryEngine', () => {
 
   describe('symlink guard (TOCTOU)', () => {
     it('rejects read through a symlink pointing outside workspace', async () => {
-      const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-outside-'));
+      const outsideDir = makeTestTemp('redacted-outside-');
       try {
         const outsideFile = path.join(outsideDir, 'secret.txt');
         fs.writeFileSync(outsideFile, 'outside content', 'utf-8');
@@ -92,7 +92,7 @@ describe('MemoryEngine', () => {
     });
 
     it('rejects write through a directory symlink pointing outside workspace', async () => {
-      const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-outside-'));
+      const outsideDir = makeTestTemp('redacted-outside-');
       try {
         const symlinkPath = path.join(tmpDir, 'evil-dir');
         fs.symlinkSync(outsideDir, symlinkPath, 'dir');

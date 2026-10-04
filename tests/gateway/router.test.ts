@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 
 jest.mock('fs', () => {
@@ -16,6 +15,7 @@ import { bindOwnerFixture, TEST_OWNER_CHAT } from '../helpers/owner-authority-fi
 import type { OwnerAdmissionService } from '../../src/profiles';
 import { TurnQueueFullError } from '../../src/gateway/turn-coordinator';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { makeTestTemp } from '../helpers/test-temp';
 
 function deferred<T = void>() {
   let resolve!: (value?: T | PromiseLike<T>) => void;
@@ -126,7 +126,7 @@ describe('GatewayMessageRouter media lifecycle', () => {
   let staging: string;
 
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-router-'));
+    root = makeTestTemp('redacted-router-');
     workspace = path.join(root, 'workspace');
     staging = path.join(root, 'staging', 'media');
     fs.mkdirSync(workspace, { recursive: true });
@@ -393,7 +393,7 @@ describe('GatewayMessageRouter routing decisions', () => {
   let staging: string;
 
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-router-decisions-'));
+    root = makeTestTemp('redacted-router-decisions-');
     workspace = path.join(root, 'workspace');
     staging = path.join(root, 'staging', 'media');
     fs.mkdirSync(workspace, { recursive: true });
@@ -543,7 +543,7 @@ describe('GatewayMessageRouter emergency raw-input boundary (RR2-A2)', () => {
   let staging: string;
 
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-router-rr2a2-'));
+    root = makeTestTemp('redacted-router-rr2a2-');
     workspace = path.join(root, 'workspace');
     staging = path.join(root, 'staging', 'media');
     fs.mkdirSync(workspace, { recursive: true });

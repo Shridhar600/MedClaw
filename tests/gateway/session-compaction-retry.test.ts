@@ -1,8 +1,7 @@
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import type { LLMProvider } from '../../src/providers/types';
 import { SessionManager } from '../../src/gateway/session';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // I3: compaction LLM calls are the LARGEST request a session makes, so on
 // free/shared-pool providers they are the most exposed to transient upstream
@@ -13,7 +12,7 @@ describe('Compaction LLM retry (I3)', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-compaction-retry-'));
+    tmpDir = makeTestTemp('redacted-compaction-retry-');
   });
 
   afterEach(() => {

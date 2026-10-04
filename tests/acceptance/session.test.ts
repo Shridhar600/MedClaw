@@ -4,7 +4,6 @@
 // real integration gap, not a unit edge case.
 
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 
 import { SessionManager, pruneToolResults, windowTriggerFor, PRUNED_TOOL_MARKER } from '../../src/gateway/session';
@@ -14,12 +13,13 @@ import { CuriosityQueue, sweep } from '../../src/memcore';
 import { runNightlySweep } from '../../src/scheduler/transcript-sweep-job';
 import type { LLMProvider, LLMResponse, Message } from '../../src/providers/types';
 import type { SweepLexicon } from '../../src/memcore';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const tmpDirs: string[] = [];
 const openIndexes: SqliteSessionIndex[] = [];
 
 function tmp(): { sessionsPath: string; dbPath: string } {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-accept-session-'));
+  const dir = makeTestTemp('redacted-accept-session-');
   tmpDirs.push(dir);
   const sessionsPath = path.join(dir, 'sessions');
   fs.mkdirSync(sessionsPath, { recursive: true });

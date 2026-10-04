@@ -1,12 +1,11 @@
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 
 import { createLedgerTools } from '../../src/tools/ledger-tools';
 import { LedgerStore, NarrativeStore, SafetyView, CuriosityQueue } from '../../src/memcore';
 import { CapturePipeline, makeSafetyRenderer as makeSharedSafetyRenderer, type QueuePort } from '../../src/capture';
 import { mutableClock, seqIdGen } from '../helpers/memcore-fixtures';
 import type { Tool } from '../../src/tools/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const DAY = '2026-08-20T10:00:00.000Z';
 
@@ -33,7 +32,7 @@ describe('ledger tools (Task 12.1–12.3)', () => {
   };
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-ledgertool-'));
+    tmp = makeTestTemp('redacted-ledgertool-');
     build();
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -174,7 +173,7 @@ describe('ledger tools arg validation (I2)', () => {
   };
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-ledgerarg-'));
+    tmp = makeTestTemp('redacted-ledgerarg-');
     build();
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -223,7 +222,7 @@ describe('ledger tools arg validation — review findings (I2)', () => {
   };
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-ledgerarg2-'));
+    tmp = makeTestTemp('redacted-ledgerarg2-');
     build();
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));

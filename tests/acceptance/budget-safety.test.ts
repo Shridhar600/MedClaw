@@ -7,8 +7,6 @@
 //     eviction; the "clinical merged LAST" ordering is a P3 L1-manual instruction (not asserted).
 //   - PLAT-04/05 also carry deep unit coverage in tests/agent/context.test.ts + context2/safety-invariant.
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 
 import { CuratedMemory, ScratchStore } from '../../src/memcore';
 import { BudgetExceededError, InvariantViolationError } from '../../src/shared/errors';
@@ -16,10 +14,11 @@ import { ContextAssembler } from '../../src/agent/context';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import { assertSafetyInjected } from '../../src/context2';
 import { mutableClock } from '../helpers/memcore-fixtures';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('Budget + safety acceptance (specs/09 CHAT/PLAT)', () => {
   let tmp: string;
-  beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-budget-')); });
+  beforeEach(() => { tmp = makeTestTemp('redacted-budget-'); });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
   // --- CHAT: MEMORY.md category budgets (60/20/20, fail-loud, no cross-category eviction) --------

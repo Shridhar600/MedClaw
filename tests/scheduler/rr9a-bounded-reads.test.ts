@@ -1,9 +1,9 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 
 import { SchedulerAuditLog } from '../../src/scheduler/audit-log';
 import { HeartbeatStore } from '../../src/scheduler/store';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const tmpDirs: string[] = [];
 
@@ -17,7 +17,7 @@ afterAll(() => {
 
 describe('RR-9a R6-17 bounded scheduler reads', () => {
   it('readRecent(limit) parses only the tail needed for the last events', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr9a-audit-'));
+    const dir = makeTestTemp('redacted-rr9a-audit-');
     tmpDirs.push(dir);
     const filePath = path.join(dir, 'audit.jsonl');
     const lines = Array.from({ length: 250 }, (_, index) => JSON.stringify({
@@ -39,7 +39,7 @@ describe('RR-9a R6-17 bounded scheduler reads', () => {
   });
 
   it('reuses a valid scheduler-state snapshot across reads in one store instance', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr9a-store-'));
+    const dir = makeTestTemp('redacted-rr9a-store-');
     tmpDirs.push(dir);
     const storePath = path.join(dir, 'jobs.json');
     const store = new HeartbeatStore(storePath);
@@ -63,7 +63,7 @@ describe('RR-9a R6-17 bounded scheduler reads', () => {
   });
 
   it('loads a large JSON-array scheduler state once and caches the fingerprint', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr9a-stream-'));
+    const dir = makeTestTemp('redacted-rr9a-stream-');
     tmpDirs.push(dir);
     const storePath = path.join(dir, 'jobs.json');
     const jobs = Array.from({ length: 1200 }, (_, index) => ({
@@ -96,7 +96,7 @@ describe('RR-9a R6-17 bounded scheduler reads', () => {
   });
 
   it('reads a large Unicode audit record across a buffer boundary without a trailing newline', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr9a-audit-boundary-'));
+    const dir = makeTestTemp('redacted-rr9a-audit-boundary-');
     tmpDirs.push(dir);
     const filePath = path.join(dir, 'audit.jsonl');
     const event = (id: string, index: number) => JSON.stringify({

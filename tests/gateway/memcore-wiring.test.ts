@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { ContextAssembler } from '../../src/agent/context';
@@ -7,6 +6,7 @@ import { InvariantViolationError } from '../../src/shared/errors';
 import type { EffectiveConfig } from '../../src/config/types';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const CHAT_BINDING = 'chat-1';
 
@@ -65,7 +65,7 @@ describe('Gateway memory-core wiring (Task 13)', () => {
   let workspace: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-memcore-wire-'));
+    tmpDir = makeTestTemp('redacted-memcore-wire-');
     workspace = fixtureOwner(tmpDir).workspace;
   });
   afterEach(async () => {

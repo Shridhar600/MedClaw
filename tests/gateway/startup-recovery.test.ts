@@ -1,10 +1,10 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import type { EffectiveConfig } from '../../src/config/types';
 import type { HeartbeatJob } from '../../src/scheduler/types';
 import {} from '../helpers/test-config';
 import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const mockSendMessage = jest.fn();
 const mockBotOn = jest.fn();
@@ -56,7 +56,7 @@ describe('Gateway scheduler recovery wiring', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-startup-recovery-'));
+    tmpDir = makeTestTemp('redacted-startup-recovery-');
     jest.clearAllMocks();
     mockBotStart.mockResolvedValue(undefined);
     mockBotStop.mockResolvedValue(undefined);

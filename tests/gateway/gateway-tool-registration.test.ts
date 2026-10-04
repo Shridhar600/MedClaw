@@ -1,11 +1,10 @@
 import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import type { EffectiveConfig } from '../../src/config/types';
 import {} from '../helpers/test-config';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const CHAT_BINDING = 'owner-chat';
 
@@ -21,7 +20,7 @@ describe('Gateway boot tool-group degradation (RES-P2-1)', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-tool-degrade-'));
+    tmpDir = makeTestTemp('redacted-tool-degrade-');
   });
 
   afterEach(() => {

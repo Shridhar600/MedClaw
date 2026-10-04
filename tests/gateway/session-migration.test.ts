@@ -1,9 +1,9 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { SessionManager } from '../../src/gateway/session';
 import { SqliteSessionIndex } from '../../src/indexstore/session-index';
 import { sweep } from '../../src/memcore/transcript-sweep';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const fsReal = jest.requireActual<typeof import('fs')>('fs');
 
@@ -15,7 +15,7 @@ const fsReal = jest.requireActual<typeof import('fs')>('fs');
 
 describe('legacy session migration (D1.6)', () => {
   let dir: string;
-  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sm-migrate-')); });
+  beforeEach(() => { dir = makeTestTemp('sm-migrate-'); });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
   type E = { ts: string; role: string; content: string; chatId?: string };

@@ -11,7 +11,6 @@
 // is SEED-based + tool-surfaced — a dual-active seed is surfaced (both actives visible) to the agent.
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { LedgerStore, NarrativeStore, SafetyView, CuriosityQueue, renderLedgerFile } from '../../src/memcore';
 import type { Provenance } from '../../src/memcore';
@@ -19,6 +18,7 @@ import { CapturePipeline, makeSafetyRenderer, type QueuePort } from '../../src/c
 import { createLedgerTools } from '../../src/tools/ledger-tools';
 import { mutableClock, seqIdGen, fact } from '../helpers/memcore-fixtures';
 import type { Tool } from '../../src/tools/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 function prov(source: Provenance['source'], capturedAt: string): Provenance {
   return { source, confidence: 0.9, anchor: '', capturedAt };
@@ -35,7 +35,7 @@ describe('CONTRA acceptance (specs/09 Suite C)', () => {
   const tokenOf = (text: string): string => (text.match(/tokenId="([0-9a-f-]+)"/) ?? [])[1]!;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-contra-'));
+    tmp = makeTestTemp('redacted-contra-');
     clock = mutableClock('2026-07-01T09:00:00.000Z');
     ledger = new LedgerStore(tmp, clock);
     const narrative = new NarrativeStore(tmp, clock);

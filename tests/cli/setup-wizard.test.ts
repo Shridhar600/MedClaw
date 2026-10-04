@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import type { SpawnOptions } from 'child_process';
 import { loadRuntimeConfig } from '../../src/runtime/startup';
@@ -12,6 +11,7 @@ import {
   runServiceOnboarding,
   startDaemon,
 } from '../../src/cli/service-onboarding';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('setup wizard', () => {
   let tmpDir: string;
@@ -20,7 +20,7 @@ describe('setup wizard', () => {
   let configPath: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-setup-wizard-'));
+    tmpDir = makeTestTemp('redacted-setup-wizard-');
     workspacePath = path.join(tmpDir, 'workspace');
     // S1 change (old -> new): the wizard now asks for the owner STATE ROOT and the OWNER ID
     // instead of a raw workspace path. Everything about the owner workspace is derived from that

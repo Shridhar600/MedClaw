@@ -1,9 +1,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import type { LLMProvider } from '../../src/providers/types';
 import { SessionManager } from '../../src/gateway/session';
 import { dateKey } from '../../src/gateway/session-window';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // The raw CJS module object so writeFileSync can be spied reliably.
 const fsReal = jest.requireActual<typeof import('fs')>('fs');
@@ -16,7 +16,7 @@ describe('Compaction disk-preservation (DD1)', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-compaction-atomic-'));
+    tmpDir = makeTestTemp('redacted-compaction-atomic-');
     jest.useFakeTimers();
     jest.setSystemTime(new Date('2026-08-26T12:00:00.000Z'));
   });

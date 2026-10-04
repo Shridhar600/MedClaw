@@ -1,10 +1,10 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import type { CreateHeartbeatJobInput } from '../../src/scheduler/types';
 import { HeartbeatStore } from '../../src/scheduler/store';
 import { reconcilePolicyJobs } from '../../src/scheduler/reconciler';
 import { HeartbeatScheduler } from '../../src/scheduler/runtime';
+import { makeTestTemp } from '../helpers/test-temp';
 
 function makeDesiredJob(
   patch: Partial<CreateHeartbeatJobInput & { prompt: string; policyKey: string }> = {},
@@ -27,7 +27,7 @@ describe('reconcilePolicyJobs', () => {
   let scheduler: HeartbeatScheduler;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-reconciler-'));
+    tmpDir = makeTestTemp('redacted-reconciler-');
     storePath = path.join(tmpDir, 'heartbeats', 'jobs.json');
     scheduler = new HeartbeatScheduler(new HeartbeatStore(storePath), async () => undefined, 'Asia/Kolkata');
   });

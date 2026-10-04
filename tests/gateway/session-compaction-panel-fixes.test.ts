@@ -1,9 +1,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { SessionManager, turnAwareSplit, estimateTokens } from '../../src/gateway/session';
 import type { LLMProvider, LLMResponse, Message } from '../../src/providers/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // P2b Wave D hostile-panel fix-pass — compaction concurrency + correctness.
 //   H1  emergency during an in-flight compact must NOT start a 2nd LLM pipeline (await the existing one).
@@ -17,7 +17,7 @@ import type { LLMProvider, LLMResponse, Message } from '../../src/providers/type
 
 const tmpDirs: string[] = [];
 function tmpSessions(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-panelfix-'));
+  const dir = makeTestTemp('redacted-panelfix-');
   tmpDirs.push(dir);
   const sessionsPath = path.join(dir, 'sessions');
   fs.mkdirSync(sessionsPath, { recursive: true });

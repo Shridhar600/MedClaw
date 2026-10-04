@@ -1,14 +1,13 @@
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import { LedgerStore } from '../../src/memcore/ledger-store';
 import { Provenance } from '../../src/memcore/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 let tmpDir: string;
 let store: LedgerStore;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-ledger-completion-'));
+  tmpDir = makeTestTemp('redacted-ledger-completion-');
   store = new LedgerStore(tmpDir);
 });
 

@@ -1,14 +1,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { SqliteEventSink } from '../../src/indexstore';
 import { runEventSinkContract } from '../ports/event-sink.contract';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const tmpDirs: string[] = [];
 
 runEventSinkContract(() => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-eventsink-'));
+  const dir = makeTestTemp('redacted-eventsink-');
   tmpDirs.push(dir);
   return new SqliteEventSink({ dbPath: path.join(dir, 'search.db') });
 });

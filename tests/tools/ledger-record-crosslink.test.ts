@@ -1,11 +1,11 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { createLedgerTools } from '../../src/tools/ledger-tools';
 import { LedgerStore, NarrativeStore, SafetyView, CuriosityQueue } from '../../src/memcore';
 import { CapturePipeline, makeSafetyRenderer, type QueuePort } from '../../src/capture';
 import { mutableClock, seqIdGen } from '../helpers/memcore-fixtures';
 import type { Tool } from '../../src/tools/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const DAY = '2026-08-20T10:00:00.000Z';
 
@@ -18,7 +18,7 @@ describe('ledger_record cross-link params (E1.2)', () => {
   const byName = (n: string): Tool => tools.find(t => t.name === n)!;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-record-crosslink-'));
+    tmp = makeTestTemp('redacted-record-crosslink-');
     const clock = mutableClock(DAY);
     ledger = new LedgerStore(tmp, clock);
     const narrative = new NarrativeStore(tmp, clock);

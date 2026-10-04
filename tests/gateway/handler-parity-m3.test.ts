@@ -1,6 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import type { EffectiveConfig } from '../../src/config/types';
 import { EMERGENCY_RESPONSE } from '../../src/safety/emergency-detector';
@@ -187,7 +185,7 @@ describe('persistence-failure guards (C-2 / H9 — never-crash + mirror-sync)', 
 
   it('onboarding: a recordTurn failure still returns the onboarding response (does not throw)', async () => {
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
-    const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-onb-'));
+    const ws = makeTestTemp('redacted-onb-');
     const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-media', { channel: 'local', userId: 'user-1' }));
     attachGatewayTestRuntime(gateway, makeConfig(), {
       workspace: ws,

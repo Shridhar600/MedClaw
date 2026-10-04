@@ -2,7 +2,6 @@
 // Each behavior change was proven RED on p1-memory-core @ 941078d before its fix.
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { LedgerStore, NarrativeStore, SafetyView, CuriosityQueue, EpisodeStore, renderLedgerFile } from '../../src/memcore';
 import { CapturePipeline, makeSafetyRenderer, type QueuePort } from '../../src/capture';
@@ -10,6 +9,7 @@ import { createLedgerTools } from '../../src/tools/ledger-tools';
 import { createEpisodeTools } from '../../src/tools/episode-tools';
 import { mutableClock, seqIdGen, fact } from '../helpers/memcore-fixtures';
 import type { Tool } from '../../src/tools/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const DAY = '2026-08-22T10:00:00.000Z';
 const SECRET = 'password: "hunter2hunter2hunter2x"'; // label + ≥16 alnum value
@@ -31,7 +31,7 @@ const byName = (tools: Tool[]) => (n: string): Tool => tools.find(t => t.name ==
 
 describe('P1 gate fix — SB-1: episode lane rejects credentials like every other write path', () => {
   let tmp: string;
-  beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-sb1-')); });
+  beforeEach(() => { tmp = makeTestTemp('redacted-sb1-'); });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
   it('episode_manage create rejects a credential in the note and writes nothing', async () => {
@@ -53,7 +53,7 @@ describe('P1 gate fix — SB-1: episode lane rejects credentials like every othe
 
 describe('P1 gate fix — SB-3: dual-active facts are DETECTED and surfaced (CONTRA-02)', () => {
   let tmp: string;
-  beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-sb3-')); });
+  beforeEach(() => { tmp = makeTestTemp('redacted-sb3-'); });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
   it('ledger_query surfaces a conflict warning when an entity has >1 active version', async () => {
@@ -76,7 +76,7 @@ describe('P1 gate fix — SB-3: dual-active facts are DETECTED and surfaced (CON
 
 describe('P1 gate fix — DAD-09: terse acknowledgements are captured losslessly to the narrative lane', () => {
   let tmp: string;
-  beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-dad09-')); });
+  beforeEach(() => { tmp = makeTestTemp('redacted-dad09-'); });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
   it('a one-word "ok" ack lands in the daily narrative (no-spam/adherence legs are P4)', async () => {

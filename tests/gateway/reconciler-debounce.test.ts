@@ -1,6 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { SessionManager } from '../../src/gateway/session';
@@ -9,6 +8,7 @@ import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
 import {} from '../helpers/test-config';
 import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { makeTestTemp } from '../helpers/test-temp';
 
 jest.mock('../../src/memory/indexer', () => ({
   MemoryIndexer: jest.fn().mockImplementation(() => ({
@@ -53,7 +53,7 @@ describe('Gateway reconciler debounce', () => {
 
   beforeEach(() => {
     jest.useFakeTimers();
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-reconciler-debounce-'));
+    tmpDir = makeTestTemp('redacted-reconciler-debounce-');
     mockBuildDesired.mockClear();
     mockReconcile.mockClear();
     mockSyncMarkdown.mockClear();

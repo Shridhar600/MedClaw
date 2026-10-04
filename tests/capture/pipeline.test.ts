@@ -1,6 +1,5 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import {
   CapturePipeline,
@@ -21,6 +20,7 @@ import {
 } from '../../src/memcore';
 import { WriteQueue } from '../../src/profiles';
 import { mutableClock, seqIdGen } from '../helpers/memcore-fixtures';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const CLOCK_DAY = '2026-08-20T10:00:00.000Z'; // the store clock's "today"
 const CAPTURED = '2026-08-12T09:00:00.000Z'; // the event's captured day (divergent)
@@ -45,7 +45,7 @@ describe('CapturePipeline (Task 10 — both-lane, cross-anchored, port-injected)
   let pipeline: CapturePipeline;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-capture-'));
+    tmp = makeTestTemp('redacted-capture-');
     const clock = mutableClock(CLOCK_DAY);
     ledger = new LedgerStore(tmp, clock);
     narrative = new NarrativeStore(tmp, clock);

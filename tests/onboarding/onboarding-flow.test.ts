@@ -1,15 +1,15 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { OnboardingFlow } from '../../src/onboarding/flow';
 import { OnboardingStore } from '../../src/onboarding/store';
 import { MEDICAL_DISCLAIMER } from '../../src/safety/medical-disclaimer';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('OnboardingFlow', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-onboarding-flow-'));
+    tmpDir = makeTestTemp('redacted-onboarding-flow-');
     fs.writeFileSync(path.join(tmpDir, 'USER.md'), '# User Preferences\n', 'utf8');
     fs.writeFileSync(path.join(tmpDir, 'HEALTH_PROFILE.md'), '# Health Profile\n', 'utf8');
   });

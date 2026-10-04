@@ -1,7 +1,6 @@
 // W-C/D hostile-panel fix pass — gateway-layer regressions (CAP / BL / REC).
 // Each test was proven RED on p1-memory-core @ cbf6c40 before its fix landed.
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import type { EffectiveConfig } from '../../src/config/types';
@@ -11,6 +10,7 @@ import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
 import { composeOwnerAuthority } from '../../src/runtime/owner-authority';
 import type { ProfileId } from '../../src/profiles/types';
 import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const CHAT_BINDING = 'chat-1';
 
@@ -65,7 +65,7 @@ describe('W-C/D fix pass — CAP: emergency + onboarding turns are losslessly ca
   let workspace: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-gw-'));
+    tmpDir = makeTestTemp('redacted-wcd-gw-');
     workspace = fixtureOwner(tmpDir).workspace;
   });
   afterEach(async () => {
@@ -164,7 +164,7 @@ describe('W-C/D fix pass — REC: boot-time SAFETY reconciliation', () => {
   }
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-rec-'));
+    tmpDir = makeTestTemp('redacted-wcd-rec-');
     workspace = fixtureOwner(tmpDir).workspace;
   });
   afterEach(async () => {
@@ -218,7 +218,7 @@ describe('W-C/D fix pass — BL: KNEE-01 back-link written on the CONFIRM path',
   }
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wcd-bl-'));
+    tmpDir = makeTestTemp('redacted-wcd-bl-');
     workspace = fixtureOwner(tmpDir).workspace;
   });
   afterEach(async () => {

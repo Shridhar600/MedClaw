@@ -1,6 +1,5 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import type { LLMProvider, LLMResponse, Message } from '../../src/providers/types';
 import {
   SessionManager,
@@ -8,6 +7,7 @@ import {
   contextWindowFor,
   stripOrphanToolMessages,
 } from '../../src/gateway/session';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // -----------------------------------------------------------------------------
 // #16: compaction must never split an assistant+tool_calls / tool group.
@@ -130,7 +130,7 @@ describe('Compaction never splits a tool-call group (#16)', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-compaction-toolgroup-'));
+    tmpDir = makeTestTemp('redacted-compaction-toolgroup-');
   });
 
   afterEach(() => {
@@ -291,7 +291,7 @@ describe('Token-budget compaction trigger (#15)', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-compaction-token-'));
+    tmpDir = makeTestTemp('redacted-compaction-token-');
   });
 
   afterEach(() => {
@@ -404,7 +404,7 @@ describe('Reload sanitizes an OpenAI-invalid persisted history (F1)', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-reload-sanitize-'));
+    tmpDir = makeTestTemp('redacted-reload-sanitize-');
   });
 
   afterEach(() => {
@@ -459,7 +459,7 @@ describe('Compaction window-save failure degrades gracefully (F6 / M5)', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-compaction-f6-'));
+    tmpDir = makeTestTemp('redacted-compaction-f6-');
   });
 
   afterEach(() => {

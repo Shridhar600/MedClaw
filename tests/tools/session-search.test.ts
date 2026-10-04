@@ -1,15 +1,15 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { SqliteSessionIndex } from '../../src/indexstore';
 import type { SessionSearchResult } from '../../src/indexstore';
 import { createSessionTools } from '../../src/tools/session-tools';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const tmpDirs: string[] = [];
 
 function realIndex(): SqliteSessionIndex {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-sesstool-'));
+  const dir = makeTestTemp('redacted-sesstool-');
   tmpDirs.push(dir);
   return new SqliteSessionIndex({ dbPath: path.join(dir, 'search.db'), sessionsDir: path.join(dir, 'sessions') });
 }

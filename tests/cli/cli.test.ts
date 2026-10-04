@@ -1,13 +1,13 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
 import { runCli } from '../../src/cli/index';
 import { SessionManager } from '../../src/gateway/session';
 import { writeConfigFixture } from '../helpers/config-fixture';
+import { makeTestTemp } from '../helpers/test-temp';
 
 function createTempHome(): { tmpDir: string; restore: () => void } {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-cli-home-'));
+  const tmpDir = makeTestTemp('redacted-cli-home-');
   const originalHome = process.env.HOME;
   process.env.HOME = tmpDir;
   return {
@@ -25,7 +25,7 @@ function createTempHome(): { tmpDir: string; restore: () => void } {
 
 describe('cli router', () => {
   it('keeps per-chat session archives isolated by chat id', async () => {
-    const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-cli-sessions-'));
+    const sessionsDir = makeTestTemp('redacted-cli-sessions-');
     try {
       // Constructed exactly as production does (`src/gateway/runtime.ts`), rather than through the
       // web-harness wrapper this test used to import. Same option, same isolation — one fewer

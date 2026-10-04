@@ -1,8 +1,8 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { getDefaultConfig } from '../../src/config/config';
 import { ensureOllamaRuntime, preflightStartCheck, verifyTelegramRuntime } from '../../src/cli/setup-readiness';
+import { makeTestTemp } from '../helpers/test-temp';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -24,7 +24,7 @@ describe('setup readiness', () => {
   const originalOpenAiApiKey = process.env.OPENAI_API_KEY;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-setup-readiness-'));
+    tmpDir = makeTestTemp('redacted-setup-readiness-');
     configPath = path.join(tmpDir, 'config.json');
     workspacePath = path.join(tmpDir, 'workspace');
     fs.mkdirSync(workspacePath, { recursive: true });

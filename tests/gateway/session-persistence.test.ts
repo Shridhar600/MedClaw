@@ -1,8 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import type { LLMProvider, Message } from '../../src/providers/types';
 import { SessionManager } from '../../src/gateway/session';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // The raw CJS module object — spyable, unlike the ts-jest __importStar clone
 // produced by `import * as fs`, whose getter-only properties reject spyOn.
@@ -13,7 +13,7 @@ describe('SessionManager JSONL Persistence', () => {
   let manager: SessionManager;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-session-'));
+    tmpDir = makeTestTemp('redacted-session-');
     manager = new SessionManager(240, 1440, tmpDir);
   });
 

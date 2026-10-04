@@ -1,11 +1,11 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import * as cron from 'node-cron';
 import { Gateway } from '../../src/gateway/gateway';
 import type { EffectiveConfig } from '../../src/config/types';
 import {} from '../helpers/test-config';
 import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const CHAT_BINDING = 'owner-chat';
 
@@ -46,7 +46,7 @@ describe('Gateway.runTranscriptSweep (F-6 integration, MEDIUM-6)', () => {
   let tmpDir: string;
   let gateway: Gateway;
 
-  beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-gw-sweep-')); });
+  beforeEach(() => { tmpDir = makeTestTemp('redacted-gw-sweep-'); });
   afterEach(async () => {
     try { await gateway?.stop(); } catch { /* ignore */ }
     fs.rmSync(tmpDir, { recursive: true, force: true });

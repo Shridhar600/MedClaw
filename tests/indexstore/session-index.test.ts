@@ -1,13 +1,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { SqliteSessionIndex } from '../../src/indexstore';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const tmpDirs: string[] = [];
 
 function tmp(): { dir: string; dbPath: string; sessionsDir: string } {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-sessidx-'));
+  const dir = makeTestTemp('redacted-sessidx-');
   tmpDirs.push(dir);
   const sessionsDir = path.join(dir, 'sessions');
   fs.mkdirSync(sessionsDir, { recursive: true });
@@ -215,7 +215,7 @@ describe('SqliteSessionIndex', () => {
 
   test('rebuild skips symlinked day files', () => {
     const { dbPath, sessionsDir } = tmp();
-    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-index-outside-'));
+    const outside = makeTestTemp('redacted-index-outside-');
     try {
       const outsideDay = path.join(outside, 'secret.jsonl');
       fs.writeFileSync(

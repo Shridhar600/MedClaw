@@ -1,12 +1,12 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { createEpisodeTools } from '../../src/tools/episode-tools';
 import { EpisodeStore } from '../../src/memcore';
 import { WriteQueue } from '../../src/profiles';
 import type { QueuePort } from '../../src/capture';
 import { mutableClock, seqIdGen } from '../helpers/memcore-fixtures';
 import type { Tool } from '../../src/tools/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // RED item #2: two concurrent keyed mutations on the SAME episode id must not lost-update.
 // `EpisodeStore` stores one file per episode id and `update()`/`link()` are read-then-write on
@@ -18,7 +18,7 @@ describe('RR-STRUCT R-S3 — episode_manage atomic read-modify-write (C-46)', ()
   let store: EpisodeStore;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rs3-episode-'));
+    tmp = makeTestTemp('redacted-rs3-episode-');
     store = new EpisodeStore(tmp, mutableClock('2026-08-20T10:00:00.000Z'), seqIdGen('ep'));
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));

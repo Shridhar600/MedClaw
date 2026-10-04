@@ -1,10 +1,10 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { CapturePipeline, FileCaptureIdempotency, makeSafetyRenderer, type QueuePort } from '../../src/capture';
 import { LedgerStore, NarrativeStore, SafetyView } from '../../src/memcore';
 import type { RecordFactResult } from '../../src/memcore';
 import { WriteQueue } from '../../src/profiles';
+import { makeTestTemp } from '../helpers/test-temp';
 
 function expectApplied(r: RecordFactResult | void): Extract<RecordFactResult, { kind: 'applied' }> {
   if (!r || r.kind !== 'applied') throw new Error(`expected an applied result, got: ${JSON.stringify(r)}`);
@@ -25,7 +25,7 @@ describe('RR-STRUCT R-S3 — idempotency cache-return (Finding-5/C-39)', () => {
   let root: string;
 
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rs3-idem-'));
+    root = makeTestTemp('redacted-rs3-idem-');
   });
   afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 

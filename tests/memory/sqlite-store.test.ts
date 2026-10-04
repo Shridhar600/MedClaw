@@ -1,16 +1,16 @@
 // tests/memory/sqlite-store.test.ts
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { SqliteStore } from '../../src/memory/sqlite-store';
 import type { Chunk } from '../../src/memory/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('SqliteStore', () => {
   let tmpDir: string;
   let store: SqliteStore;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-sqlite-'));
+    tmpDir = makeTestTemp('redacted-sqlite-');
     store = new SqliteStore(path.join(tmpDir, 'test.db'));
   });
 
@@ -66,7 +66,7 @@ describe('SqliteStore corruption recovery (RES-P0-3)', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-sqlite-corrupt-'));
+    tmpDir = makeTestTemp('redacted-sqlite-corrupt-');
   });
 
   afterEach(() => {

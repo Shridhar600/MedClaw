@@ -1,14 +1,14 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { WriteQueue, replayJournal } from '../../src/profiles';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('RR-6b WriteQueue intent and commit journal', () => {
   let tmpDir: string;
   let journalPath: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rr6b-wq-'));
+    tmpDir = makeTestTemp('redacted-rr6b-wq-');
     journalPath = path.join(tmpDir, '.state', 'journal');
   });
 

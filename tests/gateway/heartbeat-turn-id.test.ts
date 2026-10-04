@@ -7,7 +7,6 @@
 // tomorrow's recurring reminder as a duplicate of tonight's.
 
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { CapturePipeline, FileCaptureIdempotency, makeSafetyRenderer } from '../../src/capture';
 import { LedgerStore, NarrativeStore, SafetyView } from '../../src/memcore';
@@ -17,6 +16,7 @@ import { LLMSemaphore } from '../../src/tools/semaphore';
 import { TurnCoordinator, heartbeatTurnId } from '../../src/gateway/turn-coordinator';
 import type { ProfileRuntime } from '../../src/gateway/runtime';
 import type { AgentRunResult } from '../../src/providers/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 function heartbeatResponse(text: string): AgentRunResult {
   return {
@@ -105,7 +105,7 @@ describe('R-S3b Part B — a heartbeat ledger_record dedupes on retry, fires ane
   let root: string;
 
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rs3b-hb-'));
+    root = makeTestTemp('redacted-rs3b-hb-');
   });
   afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 

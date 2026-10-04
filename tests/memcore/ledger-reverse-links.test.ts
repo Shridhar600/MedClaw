@@ -1,9 +1,8 @@
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import { LedgerStore } from '../../src/memcore';
 import type { Provenance } from '../../src/memcore/types';
 import { mutableClock } from '../helpers/memcore-fixtures';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // E1.2 (M-6) — reverse-link stamping. When a fact declares `replaces`/`corrects: <ref>`, the store
 // stamps the reciprocal `replacedBy`/`correctedBy` on the TARGET fact (same-type file; ref resolved
@@ -15,7 +14,7 @@ const prov = (source: Provenance['source']): Provenance =>
 describe('LedgerStore reverse-link stamping (M-6 / E1.2)', () => {
   let tmp: string;
   let store: LedgerStore;
-  beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-revlink-')); store = new LedgerStore(tmp); });
+  beforeEach(() => { tmp = makeTestTemp('redacted-revlink-'); store = new LedgerStore(tmp); });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
   it('stamps replacedBy on the target resolved by fact id (applied path)', async () => {

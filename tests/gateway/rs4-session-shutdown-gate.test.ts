@@ -1,8 +1,8 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { SessionManager } from '../../src/gateway/session';
 import { DaemonShutdownError } from '../../src/shared/errors';
+import { makeTestTemp } from '../helpers/test-temp';
 
 // RR-STRUCT R-S4 (mini-plan v3 §3.9): the session-archive writes (recordTurn/recordPromptUsage/
 // runCompaction) do NOT go through the MutationCoordinator — they write the day-file JSONL
@@ -15,7 +15,7 @@ describe('RR-STRUCT R-S4 — SessionManager isShutdown write-gate', () => {
   let manager: SessionManager;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rs4-session-'));
+    tmpDir = makeTestTemp('redacted-rs4-session-');
     manager = new SessionManager(240, 1440, tmpDir);
   });
   afterEach(() => fs.rmSync(tmpDir, { recursive: true, force: true }));

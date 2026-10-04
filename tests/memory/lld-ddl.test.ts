@@ -1,14 +1,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { SqliteStore } from '../../src/memory/sqlite-store';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('LLD §4 DDL addendum tables', () => {
   let tmpDir: string;
   let store: SqliteStore;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-lld-ddl-'));
+    tmpDir = makeTestTemp('redacted-lld-ddl-');
     store = new SqliteStore(path.join(tmpDir, 'test.db'));
     store.ensureVecTable(4);
   });

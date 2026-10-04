@@ -5,7 +5,6 @@
 // replacement asserts identity selection plus derivation, and additionally that the
 // selection precedence and the usage errors are real.
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import {
   ConfigSelectionError,
@@ -16,13 +15,14 @@ import {
   selectConfigPath,
 } from '../src/runtime/startup';
 import { writeConfigFixture } from './helpers/config-fixture';
+import { makeTestTemp } from './helpers/test-temp';
 
 describe('runtime startup config resolution', () => {
   const originalConfigPath = process.env.REDACTED_CONFIG_PATH;
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-runtime-startup-'));
+    tmpDir = makeTestTemp('redacted-runtime-startup-');
     delete process.env.REDACTED_CONFIG_PATH;
   });
 
@@ -130,7 +130,11 @@ describe('runtime startup config resolution', () => {
   it('reports the selected path so a refusal names the document it refused', async () => {
     const fixture = writeConfigFixture(tmpDir, { raw: 'not json at all {' });
 
-    await expect(loadRuntimeConfig({ configPath: fixture.configPath, homeDir: os.tmpdir() })).rejects.toThrow(
+    // A homeDir with no config document in it. Workspace-local, and strictly better than system temp:
+    // a shared temp directory could in principle hold a stray config, which would make this pass or
+    // fail for reasons unrelated to the behaviour under test.
+    const emptyHome = makeTestTemp('r14-empty-home');
+    await expect(loadRuntimeConfig({ configPath: fixture.configPath, homeDir: emptyHome })).rejects.toThrow(
       new RegExp(fixture.configPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
     );
   });

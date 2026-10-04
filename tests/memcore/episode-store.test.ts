@@ -1,13 +1,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { EpisodeStore } from '../../src/memcore/episode-store';
 import { fixedClock, seqIdGen } from '../helpers/memcore-fixtures';
+import { makeTestTemp } from '../helpers/test-temp';
 
 let tmpDir: string;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-episodes-'));
+  tmpDir = makeTestTemp('redacted-episodes-');
 });
 
 afterEach(() => {
@@ -33,7 +33,7 @@ describe('EpisodeStore.create', () => {
   });
 
   it('rejects a symlinked episodes lane before writing outside the profile root', async () => {
-    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-episode-outside-'));
+    const outside = makeTestTemp('redacted-episode-outside-');
     try {
       fs.symlinkSync(outside, path.join(tmpDir, 'episodes'), 'dir');
       const s = new EpisodeStore(tmpDir, fixedClock('2026-08-18T10:00:00Z'), seqIdGen('ep'));
