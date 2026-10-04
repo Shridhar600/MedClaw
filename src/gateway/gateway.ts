@@ -189,9 +189,19 @@ export class Gateway {
   private readonly sink: DiagnosticSink;
   /** Injected so a start/stop duration is measured, not guessed. */
   private readonly clock: Clock;
-  private mediaIntake?: AbortController;
+  /**
+   * Abort signal for in-flight media intake, owned by the Gateway's whole lifetime.
+   *
+   * Constructed once here rather than lazily inside `serveOwner`, because it has to outlive any
+   * single promotion: a controller created per promotion would only ever abort that promotion's
+   * downloads. `stop()` aborts it (see `stop`), which is what finally makes the comment on the
+   * intake path true.
+   */
+  private readonly mediaIntake = new AbortController();
   /** In-flight unpaired -> bound promotion, so concurrent messages cannot both build a runtime. */
   private pairingTransition?: Promise<void>;
+  /** Boot cleanup runs once per process; see `sweepOwnerStagingLane`. */
+  private bootSwept = false;
   /**
    * One media stager per Gateway. Its active/waiting counters implement the intake concurrency bound,
    * so it must NOT be rebuilt per message — see `mediaStager()`.
@@ -344,6 +354,26 @@ export class Gateway {
         + 'Re-run setup on this computer, then start the daemon again.',
       );
     }
+    // ── The staging sweep. BOOT ONLY, and this is its only call site. ──
+    //
+    // It used to live inside `serveOwner`, which is shared by boot AND the mid-session unpaired ->
+    // bound promotion. That placement is what made it dangerous, and this module's README already
+    // stated the intended rule: "sweepStagedMedia is exported because boot must call it, and boot is
+    // the only safe moment". Two failures came from the old placement:
+    //
+    //   1. `unpairedOnly` is cleared only at the END of `serveOwner`, so a promotion that failed
+    //      anywhere earlier left it set and the NEXT owner message re-entered and swept again — this
+    //      time over a lane holding live staged media.
+    //   2. The sweep was never mutually exclusive with `stager.stage(...)`. Two messages interleave,
+    //      so one could be mid-download while the other's promotion swept the lane underneath it,
+    //      deleting a file the owner was actively uploading.
+    //
+    // Here it runs once, after admission has confirmed the record belongs to this owner and while
+    // `startDaemon` still holds the workspace lease, and before any intake is accepted. An unpaired
+    // boot sweeps too: nothing can be in flight yet, so there is nothing to destroy, and it keeps
+    // S1-R-01 true for a daemon that pairs later.
+    this.sweepOwnerStagingLane();
+
     if (admissionState.kind === 'unpaired') {
       this.unpairedOnly = true;
       await this.startUnpaired(config);
@@ -370,6 +400,25 @@ export class Gateway {
    * answered with the canned "profile temporarily unavailable" until the operator restarted. The
    * restart was never documented anywhere.
    */
+  /**
+   * Remove this owner's crash-left media staging contents, once per process, at boot.
+   *
+   * Split out from `startServing` so the single call site and the "boot only" rule are visible
+   * together, and so `bootSwept` can make a second sweep impossible even if a future caller is
+   * added by mistake. The sweep deletes every entry in the owner's own lane, so running it while
+   * intake is live would destroy a real upload — the invariant `tests/gateway/gateway-boot-sweep.test.ts`
+   * protects.
+   */
+  private sweepOwnerStagingLane(): void {
+    if (this.bootSwept) return;
+    this.bootSwept = true;
+    const ownerStaging = this.mediaStagingDir();
+    // Scoped to THIS owner's lane and swept only while this process owns the installation, so a
+    // crash-left orphan cannot be cleaned up by — or clean up over — another owner. Bounded
+    // iteration inside; never a global or recursive scan, and never a symlink traversal.
+    if (ownerStaging) sweepStagedMedia(ownerStaging, this.ownerStagingBase());
+  }
+
   private async serveOwner(options: { connectChannel: boolean; runHealthchecks: boolean }): Promise<void> {
     const { config } = this;
 
@@ -380,16 +429,6 @@ export class Gateway {
 
     // Bootstrap workspace with template files on first run
     this.bootstrapWorkspace(config.memory.workspace);
-    // Sweep ONLY this owner's staging lane, and only now that this process owns the owner's
-    // resources — so a crash-left orphan cannot be cleaned up by, or clean up over, another owner.
-    // NOTE (2026-10-04, review round 2): the comment here used to claim "Intake is aborted on stop".
-    // It is NOT — `mediaIntake.abort()` is called nowhere in `src/` or `tests/`, so a staged file in
-    // flight is NOT accounted for by an abort and a write can continue past `stop()`. Two reviewers
-    // found this independently. The controller is constructed and its signal read, so it looks wired;
-    // the missing piece is the abort on the stop path. Tracked as a P2 in the adjudication.
-    this.mediaIntake ??= new AbortController();
-    const ownerStaging = this.mediaStagingDir();
-    if (ownerStaging) sweepStagedMedia(ownerStaging, this.ownerStagingBase());
 
     const mainProvider = this.buildProvider(config.providers.main);
     this.mainProvider = mainProvider;
@@ -427,6 +466,23 @@ export class Gateway {
     // "aborts boot when the SAFETY.md injection invariant is violated"). Every OTHER paired
     // profile is then eager-built via buildAll — individually guarded, so a secondary profile's
     // broken storage degrades only that profile and never touches the default or aborts boot.
+    // Drain any runtime from an EARLIER entry into this method before replacing it.
+    //
+    // A promotion that fails after this point leaves `unpairedOnly` set, so the next owner message
+    // re-enters `serveOwner` and reaches this line again — and the assignment below simply overwrites
+    // `this.manager` and `this.mainProvider`. `stopResources` only ever drains the CURRENT manager, so
+    // the previous one kept its open handles and its unclosed store against owner state, for the rest
+    // of the process. Draining first makes re-entry safe rather than merely survivable.
+    if (this.manager !== undefined) {
+      try {
+        await this.manager.drainAndCloseAll();
+      } catch (error) {
+        // A failure to drain the old runtime must not stop the new one from being built, or a retry
+        // could never make progress. It is reported, not swallowed.
+        console.warn('[gateway] Failed to drain the previous runtime before rebuilding:', summarizeErrorForLog(error));
+      }
+    }
+
     this.manager = new ProfileRuntimeManager((id) => this.buildRuntimeFor(id));
     this.runtime = await this.manager.get(profileId);
     await this.manager.buildAll(this.pairedProfileIds());
@@ -684,7 +740,7 @@ export class Gateway {
       return admitted;
     }
 
-    const signal = this.mediaIntake?.signal ?? new AbortController().signal;
+    const signal = this.mediaIntake.signal;
     const staged = await this.trackInboundTurn(() => stager.stage(incoming.media, signal));
     if (staged.kind === 'refused') {
       admitted.mediaError = MEDIA_REFUSAL_TEXT[staged.reason];
@@ -759,6 +815,11 @@ export class Gateway {
     if (this.stopPromise) return this.stopPromise;
     const startedAt = this.clock.now().getTime();
     this.stopping = true;
+    // Abort in-flight media intake FIRST, before draining. Without this the comment on the intake
+    // path was fiction: a `stage()` in progress kept streaming and writing after `stop()` returned,
+    // burning the drain budget and leaving a partial behind. Plan 15 T4 requires abort on stop, and
+    // review round 2 found (twice, independently) that nothing ever called this.
+    this.mediaIntake.abort();
     this.runtime?.beginStopping();
     const shared = this.stopResources()
       .then(() => {
