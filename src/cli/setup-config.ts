@@ -13,20 +13,19 @@
 // This module does no prompting and no daemon launch. Those stay in the wizard and the service
 // entry.
 
-import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { getDefaultConfig } from '../config/config';
-import { toStoredView, validateConfig } from '../config/validation';
-import { writeConfigDocument } from '../runtime';
+import { validateConfig } from '../config/validation';
+import { DirectoryLease } from '../runtime/adapters/directory-lease';
+import { InstallationService } from '../runtime/installation';
+import type { SetupResult } from '../runtime/installation';
 import { providerEnvVar } from '../config/provider-env';
 import type { EffectiveConfig, ProviderConfig } from '../config/types';
 import { OPENROUTER_DEFAULT_BASE_URL } from '../providers/openai';
 import { asProfileId, resolveOwnerPaths } from '../profiles';
 import type { ProfileId } from '../profiles';
 import type { SetupWizardState } from './wizard-types';
-import { ensureWorkspaceTemplates } from './prompts';
-import { secureMkdir } from '../security';
 
 export interface ServiceOnboardingArgs {
   yes?: boolean;
@@ -174,70 +173,6 @@ export function parseArgs(argv: string[]): ServiceOnboardingArgs {
     }
   }
   return args;
-}
-
-function ensureParent(filePath: string): void {
-  secureMkdir(path.dirname(filePath));
-}
-
-/**
- * Refuse any pre-existing installation state. This replaces `--force`: there is no overwrite, no
- * resume and no unsolicited wipe. A stale credential file or an existing piece of owner evidence is
- * left exactly where it is.
- */
-export function assertFreshInstallation(configPath: string, ownerRecordPath: string, workspace: string): void {
-  if (fs.existsSync(configPath)) {
-    throw new Error(
-      `Setup refused: a configuration already exists at ${configPath}. `
-      + 'Setup never overwrites an installation. Choose a fresh --config and/or --state-root target.',
-    );
-  }
-  if (fs.existsSync(ownerRecordPath)) {
-    throw new Error(
-      `Setup refused: an owner record already exists at ${ownerRecordPath}. `
-      + 'Setup never overwrites an installation. Choose a fresh --state-root target.',
-    );
-  }
-  if (directoryHasEntries(workspace)) {
-    throw new Error(
-      `Setup refused: the owner workspace ${workspace} is not empty. `
-      + 'Existing owner evidence is never removed. Choose a fresh --state-root target.',
-    );
-  }
-}
-
-function directoryHasEntries(directory: string): boolean {
-  try {
-    return fs.readdirSync(directory).length > 0;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
-    throw error;
-  }
-}
-
-/**
- * Create the unpaired owner record. `initialize()` is a no-op when one already exists, and refuses
- * when the existing record is unreadable — setup must not overwrite or repair an existing record.
- */
-async function initializeOwnerRecord(ownerRecordPath: string, ownerId: ProfileId): Promise<void> {
-  const { FileOwnerStatePort } = await import('../runtime/adapters/owner-state-file');
-  const { CryptoPairingCodePort } = await import('../runtime/adapters/pairing-code');
-  const { OwnerAdmissionService } = await import('../profiles');
-  const { systemClock } = await import('../ports/defaults');
-
-  const service = new OwnerAdmissionService({
-    store: new FileOwnerStatePort(ownerRecordPath, ownerId),
-    codes: new CryptoPairingCodePort(),
-    clock: systemClock,
-    expectedOwnerId: ownerId,
-  });
-  const outcome = await service.initialize();
-  if (outcome !== 'created') {
-    throw new Error(
-      `Setup refused: the owner record at ${ownerRecordPath} already exists (${outcome}). `
-      + 'Setup never overwrites or repairs an existing installation. Choose a fresh --state-root target.',
-    );
-  }
 }
 
 // forka #11: the default on-device medical model + Ollama URL, used whenever the
@@ -500,39 +435,48 @@ export function collectSetupErrors(args: ServiceOnboardingArgs, config: Effectiv
 }
 
 /**
- * Write the scoped workspace, then the configuration document last.
+ * Commit a new installation by calling the lease-owning writer.
  *
- * The persisted form is the STORED document: derived owner paths are never written, so
- * there is no second path authority. T3 replaces this sequence with the lease-owned
- * `InstallationService.setup()` that also creates the unpaired owner record.
+ * This function used to do the work itself: an `assertFreshInstallation` CHECK, then templates, then
+ * the owner record, then the config document — all holding **no lease at all**. Nothing stopped that
+ * from committing a second installation beside a running daemon (which holds both leases), or from
+ * letting two concurrent setups both pass the check. The locked rule in plan 15 §2.2 is that
+ * "short-lived setup/config/pairing writers hold both until their commit/refusal completes", so the
+ * sequence now lives in `InstallationService.setup()`, which acquires the config lease, then the
+ * owner workspace lease, decides freshness UNDER BOTH, and releases only what it acquired.
+ *
+ * Kept as a function because both callers need it: the service entry and the wizard's retry loop.
+ * It stays a thin adapter — CLI in, CLI error text out — so no writer logic is reintroduced here.
  */
 export async function persistSetupArtifacts(configPath: string, config: EffectiveConfig): Promise<void> {
-  const ownerId = asProfileId(config.profiles.defaultProfileId) as ProfileId;
-  const ownerPaths = resolveOwnerPaths(config.profiles.baseDir, ownerId);
-
-  // Setup is additive only. An existing installation, record or non-empty owner workspace is
-  // refused with guidance; nothing is overwritten, resumed or wiped on the owner's behalf.
-  assertFreshInstallation(configPath, ownerPaths.ownerRecord, ownerPaths.workspace);
-
-  ensureWorkspaceTemplates(config.memory.workspace);
-  ensureParent(configPath);
-  // The scheduler store and audit log are derived inside the owner's state directory, so setup
-  // creates that directory rather than a sibling `heartbeats/` tree beside the config.
-  secureMkdir(path.dirname(config.heartbeat.storePath));
-
-  // The unpaired owner record is created BEFORE the configuration document, so a document that
-  // exists always has a record behind it and a record never exists without one.
-  await initializeOwnerRecord(ownerPaths.ownerRecord, ownerId);
-
-  const outcome = writeConfigDocument(configPath, toStoredView(config));
-  if (outcome.status === 'failed') {
+  const ownerId = asProfileId(config.profiles.defaultProfileId);
+  if (ownerId === undefined) {
     throw new Error(
-      'Setup could not write the configuration document; the workspace was created but setup is incomplete. Re-run setup into a fresh target.',
+      'Setup refused: profiles.defaultProfileId is not a valid owner ID, so no owner record could be created.',
     );
   }
-  if (outcome.status === 'uncertain') {
-    throw new Error(
-      'Setup wrote the configuration document but could not confirm its durability. Setup is incomplete; inspect the file before re-running setup.',
-    );
+
+  const outcome = await new InstallationService(new DirectoryLease()).setup({ configPath, config, ownerId });
+
+  if (outcome.kind === 'committed') return;
+  // Every non-commit result is a refusal with operator-facing guidance already attached. Throwing
+  // keeps both existing callers unchanged: the service entry prints it, and the wizard's retry loop
+  // catches it, reports it and lets the operator adjust the target.
+  throw new Error(describeSetupRefusal(outcome));
+}
+
+/** Refusal text for a setup result, safe to show in local CLI output. */
+function describeSetupRefusal(outcome: SetupResult): string {
+  switch (outcome.kind) {
+    case 'busy':
+      return `Setup refused: ${outcome.lease.guidance}`;
+    case 'unavailable':
+      return `Setup refused: ${outcome.guidance}`;
+    case 'not-fresh':
+      return outcome.message;
+    default:
+      // Unreachable: the caller returns on `committed` before reaching here. Stated rather than
+      // left implicit so a future variant cannot silently report a success as a refusal.
+      return 'Setup refused: the installation was not committed.';
   }
 }
