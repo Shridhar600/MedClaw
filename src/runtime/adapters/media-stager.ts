@@ -125,6 +125,21 @@ export class FsMediaStager {
         this.waiting += 1;
         try {
           await this.awaitSlot(timeout.signal);
+        } catch {
+          // `awaitSlot` rejects when the intake signal fires while this attempt is QUEUED, and that
+          // rejection used to escape `stage()` entirely: the queue wait had a `finally` but no
+          // `catch`, so a timeout or caller abort mid-wait threw out of a method declared
+          // `Promise<MediaStageResult>` (saved-or-refused, never a rejection). In the Gateway that
+          // throw travelled `admitAndStage` -> `deliverMessage`, so the owner got NO reply at all for
+          // that message and no `media-intake` diagnostic was emitted.
+          //
+          // Reachable in production because `Gateway.stop()` aborts the intake controller, so every
+          // attempt queued at shutdown took this path.
+          //
+          // `signal.aborted` separates the two causes: the caller's own abort is `aborted`, while the
+          // internal intake budget running out is `timeout`. Same distinction as every other abort
+          // path in this method.
+          return this.refuse(signal.aborted ? 'aborted' : 'timeout', undefined, startedAt);
         } finally {
           this.waiting -= 1;
         }

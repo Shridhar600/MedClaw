@@ -228,29 +228,57 @@ describe('owner runtime isolation: storage, ledger, sweep and drain are per-iden
     await first.drainAndClose();
   });
 
-  it('a transcript sweep failure in one identity does not abort the other', async () => {
-    const a = await buildFor('default');
-    const b = await buildFor('father');
+  it('a failing transcript sweep does not throw out of the Gateway sweep coordinator', async () => {
+    // This leg replaced `rs5a`'s "one profile sweep failure does not abort the other". Two things
+    // changed and both are recorded here rather than papered over.
+    //
+    // 1. The TWO-PROFILE form is gone by design, not by accident: `pairedProfileIds()` returns exactly
+    //    one identity, so `sweepAllBuiltProfiles` fans out over a single runtime in S1 production.
+    //    Reinstating a second profile would need a test-only injection seam for a case the cutover
+    //    deliberately made unreachable, and the brief forbids patching private fields. The per-profile
+    //    isolation itself is still implemented (`Promise.allSettled` plus a per-runtime catch) and
+    //    still correct for the multi-user wave.
+    //
+    // 2. What IS reachable, and was previously untested, is that a sweep failure must not escape as an
+    //    exception. A corrupt sessions lane is a real condition on a real owner's disk, and it must
+    //    degrade to an honest "did not scan" rather than take the daemon down.
+    //
+    // The version this replaced asserted only `toBeDefined()` on two object literals — one of them
+    // returned by the test's own `catch` — so it could not fail for any reason.
+    const { writeConfigFixture } = await import('../helpers/config-fixture');
+    const fixture = writeConfigFixture(tmpDir, { telegramEnabled: false, ownerId: 'default' });
+    const { readConfigDocument, effectiveConfigFor } = await import('../../src/runtime/installation');
+    const bootConfig = effectiveConfigFor(readConfigDocument(fixture.configPath, tmpDir).stored);
+
+    const { bindGatewayOwner } = await import('../helpers/gateway-owner-deps');
+    const gateway = new Gateway(bootConfig, await bindGatewayOwner(bootConfig, 'owner-chat'));
+    await gateway.start();
+
     try {
-      // ONE failure, ONE success, concurrently — the coordinator must survive the pair.
-      const results = await Promise.all([
-        a.runTranscriptSweep(),
-        (async () => {
-          // Simulate the failure shape by running against a runtime whose sessions lane is unusable.
-          try {
-            fs.rmSync(b.sessions!.sessionsDir, { recursive: true, force: true });
-            fs.writeFileSync(b.sessions!.sessionsDir, 'not-a-directory', { mode: 0o600 });
-            return await b.runTranscriptSweep();
-          } catch {
-            return { scanned: false, added: 0 };
-          }
-        })(),
-      ]);
-      expect(results[0]).toBeDefined();
-      expect(results[1]).toBeDefined();
+      // A healthy sweep first, so the assertion below cannot pass merely because the coordinator was
+      // already inert.
+      const healthy = await gateway.runTranscriptSweep();
+      expect(healthy.scanned).toBe(true);
+
+      // Inject a failing sweep into the RUNTIME — the collaborator — so the COORDINATOR's own guard is
+      // what is exercised. This is fault injection at a seam, not a mock of the behaviour under test:
+      // `sweepAllBuiltProfiles`' per-runtime catch is the unit here, and the real `runTranscriptSweep`
+      // above already proved the healthy path works. `rs5a` injected its secondary failure the same
+      // way. Corrupting the sessions lane on disk was tried first and rejected: the sweep tolerates it
+      // and still reports `scanned: true`, so that route never reached the guard at all.
+      const runtime = gateway.runtimeInstance!;
+      const failing = jest.spyOn(runtime, 'runTranscriptSweep')
+        .mockRejectedValue(new Error('simulated unreadable ledger lane'));
+
+      // The coordinator RESOLVES with an honest degraded result. Without the per-runtime catch this
+      // REJECTED, and a cron sweep over a damaged lane would take the daemon down.
+      await expect(gateway.runTranscriptSweep()).resolves.toEqual({ scanned: false, added: 0 });
+
+      // And the failure is not sticky: the owner sweeps normally again once the lane recovers.
+      failing.mockRestore();
+      await expect(gateway.runTranscriptSweep()).resolves.toMatchObject({ scanned: true });
     } finally {
-      await a.drainAndClose();
-      await b.drainAndClose();
+      await gateway.stop();
     }
   });
 

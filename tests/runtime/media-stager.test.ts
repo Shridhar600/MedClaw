@@ -215,6 +215,72 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
     void blocker;
   });
 
+  it('REFUSES (never throws) when a queued attempt waits out the intake timeout', async () => {
+    // `stage()` is declared `Promise<MediaStageResult>` — a saved-or-refused result, no rejection.
+    // The queued path was the one place that broke that contract: `awaitSlot` rejects on abort, the
+    // queue-wait `try/finally` only decremented `waiting`, and nothing converted the throw into a
+    // refusal. The rejection escaped `admitAndStage` -> `deliverMessage`, so the owner got NO reply
+    // at all for that message — not the canned timeout text, not the text half — and no
+    // `media-intake` diagnostic.
+    //
+    // This case was previously unobservable because the queue-full test above discards the waiting
+    // promise with `void waiting;`, so a rejection there was an unhandled rejection nobody asserted
+    // on. Awaiting it is the whole point.
+    const blocker = blockingSource();
+    const stager = new FsMediaStager(blocker.source, staging, {
+      limits: { maxFileBytes: 1024, intakeTimeoutMs: 40, maxActive: 1, maxWaiting: 2 },
+    });
+
+    // Take the only active slot with an attempt that will block for its whole intake.
+    const active = stager.stage(reference({ fileId: 'a' }), new AbortController().signal);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // This one cannot get a slot and must wait — then time out while waiting.
+    const queued = stager.stage(reference({ fileId: 'b' }), new AbortController().signal);
+
+    // Awaited, so a rejection fails this test instead of vanishing.
+    await expect(queued).resolves.toEqual({ kind: 'refused', reason: 'timeout' });
+
+    // The waiting slot was released on the way out, so the stager is not left permanently blocked.
+    expect(stager.inFlight.waiting).toBe(0);
+
+    // Nothing was written for the timed-out queued attempt.
+    await expect(active).resolves.toEqual({ kind: 'refused', reason: 'timeout' });
+    expect(listStaging(staging)).toEqual([]);
+    void blocker;
+  });
+
+  it('REFUSES (never throws) when the CALLER aborts while the attempt is waiting for a slot', async () => {
+    // The reachable form of the same contract break. `awaitSlot` is handed the INTERNAL timeout
+    // signal, but the caller's signal is bridged onto it (`onAbort = () => timeout.abort()`), so a
+    // caller abort reaches `awaitSlot` too and rejects it.
+    //
+    // This matters in production because `Gateway.stop()` aborts the intake controller — so every
+    // queued attempt in flight at shutdown took this path, and the rejection escaped `stage()`.
+    const blocker = blockingSource();
+    const stager = new FsMediaStager(blocker.source, staging, {
+      limits: { maxFileBytes: 1024, intakeTimeoutMs: 60_000, maxActive: 1, maxWaiting: 2 },
+    });
+
+    const active = stager.stage(reference({ fileId: 'a' }), new AbortController().signal);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // A long intake budget, so ONLY the caller's abort can end this wait.
+    const caller = new AbortController();
+    const queued = stager.stage(reference({ fileId: 'b' }), caller.signal);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(stager.inFlight).toEqual({ active: 1, waiting: 1 });
+
+    caller.abort();
+
+    // Awaited: a rejection fails this test instead of becoming an unhandled rejection.
+    await expect(queued).resolves.toEqual({ kind: 'refused', reason: 'aborted' });
+    expect(stager.inFlight.waiting).toBe(0);
+
+    void active;
+    void blocker;
+  });
+
   it('cannot write a file when the intake wait expires mid-stream', async () => {
     const blocker = blockingSource();
     const stager = new FsMediaStager(blocker.source, staging, {
