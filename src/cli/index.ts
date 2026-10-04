@@ -1,4 +1,4 @@
-import { defaultRuntimeConfigPath, loadRuntimeConfig, parseGlobalOptions } from '../runtime/startup';
+import { defaultRuntimeConfigPath, loadRuntimeConfig, parseGlobalOptions } from '../runtime';
 import {
   issuePairingCode,
   listHeartbeats,

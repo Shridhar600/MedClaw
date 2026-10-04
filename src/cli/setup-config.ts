@@ -18,7 +18,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { getDefaultConfig } from '../config/config';
 import { toStoredView, validateConfig } from '../config/validation';
-import { writeConfigDocument } from '../runtime/installation';
+import { writeConfigDocument } from '../runtime';
 import { providerEnvVar } from '../config/provider-env';
 import type { EffectiveConfig, ProviderConfig } from '../config/types';
 import { OPENROUTER_DEFAULT_BASE_URL } from '../providers/openai';

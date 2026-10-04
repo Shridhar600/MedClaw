@@ -9,15 +9,15 @@ import {
   describeRefusal,
   readConfigDocument,
   writeConfigDocument,
-} from '../runtime/installation';
-import type { ConfigFileSync } from '../runtime/installation';
+} from '../runtime';
+import type { ConfigFileSync } from '../runtime';
 import { DirectoryLease } from '../runtime/adapters/directory-lease';
 import { CryptoPairingCodePort, FileOwnerStatePort } from '../runtime/adapters';
-import { InstallationService, describeOwnershipRefusal } from '../runtime/installation';
+import { InstallationService, describeOwnershipRefusal } from '../runtime';
 import { OwnerAdmissionService, isBoundOwnerState } from '../profiles';
 import { systemClock } from '../ports/defaults';
 import type { ResourceLeasePort } from '../ports/resource-lease';
-import { defaultRuntimeConfigPath } from '../runtime/startup';
+import { defaultRuntimeConfigPath } from '../runtime';
 import { redactConfig, validateConfig, protectedSetReason } from '../config/validation';
 import type { EffectiveConfig, StoredConfig } from '../config/types';
 import { providerEnvVar } from '../config/provider-env';

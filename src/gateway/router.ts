@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { EffectiveConfig } from '../config/types';
-import type { AdmittedMessage, ChatType } from '../channels/types';
+import type { AdmittedMessage, ChatType } from '../channels';
 import type { ProfileId } from '../profiles';
 import type { OwnerAdmissionService, PairingResult } from '../profiles';
 import {

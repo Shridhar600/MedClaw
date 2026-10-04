@@ -1,15 +1,20 @@
-import { Gateway } from './gateway/gateway';
-import { loadRuntimeConfig, selectConfigPath } from './runtime/startup';
+// The composition root imports MODULE BARRELS, never a module's private files. The one deliberate
+// exception is `./runtime/adapters/directory-lease` below: concrete adapters are intentionally not
+// re-exported from the runtime barrel, so that choosing a real lease implementation stays visible here
+// rather than disappearing behind an import.
 import {
   InstallationService,
+  composeOwnerAuthority,
   describeOwnershipRefusal,
   effectiveConfigFor,
-} from './runtime/installation';
+  loadRuntimeConfig,
+  selectConfigPath,
+} from './runtime';
+import type { InstallationOwnership } from './runtime';
 import { DirectoryLease, describeLeaseForLocalInspection } from './runtime/adapters/directory-lease';
-import { composeOwnerAuthority } from './runtime/owner-authority';
-import { TelegramMediaSource } from './channels/telegram-media-source';
+import { Gateway } from './gateway';
+import { TelegramMediaSource } from './channels';
 import { Bot } from 'grammy';
-import type { InstallationOwnership } from './runtime/installation';
 import { summarizeErrorForLog } from './security';
 import * as os from 'os';
 

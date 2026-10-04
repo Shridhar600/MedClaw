@@ -1,4 +1,4 @@
-import type { AdmittedMessage } from '../channels/types';
+import type { AdmittedMessage } from '../channels';
 import type { AgentRunResult, Message } from '../providers/types';
 import { OnboardingFlow } from '../onboarding/flow';
 import { OnboardingStore } from '../onboarding/store';

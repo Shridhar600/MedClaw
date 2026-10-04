@@ -10,7 +10,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { spawn, type SpawnOptions } from 'child_process';
-import { effectiveConfigFor, readConfigDocument } from '../runtime/installation';
+import { effectiveConfigFor, readConfigDocument } from '../runtime';
 import { showConfig, showRedactedConfigSummary } from './admin';
 import type { CliIO } from './prompts';
 import { preflightStartCheck, type SetupReadinessDependencies } from './setup-readiness';
