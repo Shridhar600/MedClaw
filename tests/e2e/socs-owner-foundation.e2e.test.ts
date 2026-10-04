@@ -27,6 +27,7 @@ import { CryptoPairingCodePort, FileOwnerStatePort, DirectoryLease } from '../..
 import { InstallationService } from '../../src/runtime/installation';
 import { OwnerAdmissionService, asProfileId } from '../../src/profiles';
 import type { TransportIdentity } from '../../src/ports/owner-state';
+import type { MediaSourcePort } from '../../src/ports/media-source';
 import { systemClock } from '../../src/ports/defaults';
 import { loadRuntimeConfig } from '../../src/runtime/startup';
 import { resolveOwnerPaths } from '../../src/profiles';
@@ -167,6 +168,8 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
     provider: ScriptedProvider,
     /** When supplied, the real boot reports its outcomes through the closed diagnostic contract. */
     diagnostics?: DiagnosticSink,
+    /** When supplied, admitted owner media is served from this source. */
+    mediaSource?: MediaSourcePort,
   ): Promise<DaemonHandle> {
     const config = await loadRuntimeConfig({ configPath: fixture.configPath });
     return startDaemon({
@@ -179,6 +182,7 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
           ownerId: asProfileId(fixture.ownerId)!,
           createProvider: () => provider,
           ...(diagnostics ? { diagnostics } : {}),
+          ...(mediaSource ? { mediaSource } : {}),
         });
         return gateway;
       },
@@ -449,6 +453,121 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
       expect(event.durationMs).toBeGreaterThanOrEqual(0);
     }
   }, 120_000);
+
+  it('S1-R-01: a restart sweeps the owner\'s crash-left staging and touches nothing else', async () => {
+    // ── Why this shape ──────────────────────────────────────────────────────────────────
+    // Plan 15 §8 requires this proof in the REAL installation/Telegram E2E, not a helper test, because
+    // the property under test is the WIRING: that `sweepStagedMedia` runs on the production boot path,
+    // after workspace ownership is taken and before intake is accepted. A unit test calling
+    // `sweepStagedMedia` directly would pass even if the boot never called it.
+    //
+    // What is deliberately NOT claimed: this seeds synthetic artifacts between two clean stops. It is
+    // NOT an executed hard-crash or power-loss test, and a real crash could also leave a `.part` file
+    // mid-write. It proves startup cleanup is wired and correctly scoped.
+    expect((await setup()).code).toBe(0);
+    const issued = await cli(['--config', fixture.configPath, 'pairing', 'issue']);
+    expect(issued.code).toBe(0);
+    const pairingCode = issued.output.match(/\n\s{4}([A-Z2-9]{8})\s/)![1];
+    expect(await admissionFor().handlePairing(identityFor(OWNER_CHAT, OWNER_USER, 'bind-1'), pairingCode))
+      .toMatchObject({ kind: 'paired' });
+
+    // ── The selected owner's staging lane, plus sentinels everywhere else ───────────────
+    const ownerStaging = resolveOwnerPaths(fixture.baseDir, asProfileId(fixture.ownerId)!).mediaStaging;
+    // A SECONDARY owner's lane: a different identity must never share a staging directory, and a
+    // sweep that widened its paths would delete a real second owner's in-flight media.
+    const secondaryStaging = resolveOwnerPaths(fixture.baseDir, 'secondary-owner' as never).mediaStaging;
+
+    // Artifacts the sweep is expected to remove: an unadopted final name and an in-progress partial.
+    const orphanUnadopted = path.join(ownerStaging, 'orphan-report.pdf');
+    const orphanPartial = path.join(ownerStaging, 'interrupted-upload.pdf.part');
+    // An ADOPTED report: already handed to the clinical pipeline, so it must survive untouched.
+    const adoptedReport = path.join(fixture.workspace, 'reports', '2026-10-02-sleep.md');
+
+    fs.mkdirSync(ownerStaging, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(path.dirname(adoptedReport), { recursive: true, mode: 0o700 });
+    fs.mkdirSync(secondaryStaging, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(orphanUnadopted, 'staged bytes never adopted', { mode: 0o600 });
+    fs.writeFileSync(orphanPartial, 'partial bytes', { mode: 0o600 });
+    fs.writeFileSync(adoptedReport, '# Sleep log\n\nSlept badly.\n', { mode: 0o600 });
+
+    // Sentinels OUTSIDE the swept lane.
+    const outsideSibling = path.join(path.dirname(ownerStaging), 'unrelated-note.txt');
+    const secondaryOrphan = path.join(secondaryStaging, 'secondary-inflight.pdf');
+    const outsideWorkspace = path.join(fixture.baseDir, 'outside-workspace.txt');
+    fs.writeFileSync(outsideSibling, 'not media', { mode: 0o600 });
+    fs.writeFileSync(secondaryOrphan, 'a real second owner\'s staged media', { mode: 0o600 });
+    fs.writeFileSync(outsideWorkspace, 'unrelated state', { mode: 0o600 });
+
+    // ── Restart through PRODUCTION boot composition ────────────────────────────────────
+    const provider = new ScriptedProvider([textResponse('Noted.'), textResponse('Got it.')]);
+    // A real media source, so the post-sweep owner media turn is a genuine staged-and-adopted flow
+    // rather than an assertion that nothing threw. The installation lease is exclusive, so this has to
+    // be the SAME daemon that swept — a second boot here would be (correctly) refused.
+    const mediaSource: MediaSourcePort = {
+      open: async () => ({
+        chunks: (async function* () {
+          yield new TextEncoder().encode('%PDF-1.4 post-sweep owner media');
+        })(),
+        cancel: async () => {},
+      }),
+    };
+    const daemon = await bootDaemon(provider, undefined, mediaSource);
+    try {
+      expect(daemon.kind).toBe('owned');
+
+      // The selected owner's crash-left artifacts are gone.
+      expect(fs.existsSync(orphanUnadopted)).toBe(false);
+      expect(fs.existsSync(orphanPartial)).toBe(false);
+
+      // The adopted report is untouched.
+      expect(fs.readFileSync(adoptedReport, 'utf8')).toBe('# Sleep log\n\nSlept badly.\n');
+
+      // Every sentinel outside the lane is untouched — including a second owner's staging, which is
+      // the sharpest test that the sweep did not widen its paths.
+      expect(fs.readFileSync(outsideSibling, 'utf8')).toBe('not media');
+      expect(fs.readFileSync(secondaryOrphan, 'utf8')).toBe('a real second owner\'s staged media');
+      expect(fs.readFileSync(outsideWorkspace, 'utf8')).toBe('unrelated state');
+
+      // Sweeping must not have cost owner authority: binding survived and the owner is served.
+      expect(admissionFor().inspectInstallation()).toMatchObject({ kind: 'bound' });
+
+      // Normal owner text flow still works after the sweep.
+      const replies: string[] = [];
+      await daemon.gateway.deliverMessage(
+        telegramMessage(OWNER_CHAT, OWNER_USER, 'post-sweep-1', 'I slept badly last night'),
+        async (reply) => { replies.push(reply); },
+      );
+      expect(provider.chatCalls.length).toBeGreaterThan(0);
+      expect(replies.join('\n')).not.toMatch(/temporarily unavailable/i);
+
+      // Owner MEDIA still works after the sweep. This is the half that matters most for the sweep:
+      // a sweep that deleted too eagerly would leave intake fine and adoption broken, and only a real
+      // staged-and-adopted media turn shows that.
+      const mediaReplies: string[] = [];
+      await daemon.gateway.deliverMessage(
+        {
+          ...telegramMessage(OWNER_CHAT, OWNER_USER, 'post-sweep-media', 'here is my lab result'),
+          media: { channel: 'telegram', fileId: 'file-post-sweep', kind: 'document', displayName: 'lab.pdf' },
+        },
+        async (reply) => { mediaReplies.push(reply); },
+      );
+      expect(mediaReplies.join('\n')).not.toMatch(/temporarily unavailable/i);
+      // The owner's media was staged AND ADOPTED after this boot's sweep. Adoption MOVES the file out
+      // of staging into the owner's reports directory, so staging being empty afterwards is correct —
+      // the evidence that intake still works is that our bytes arrived there. Asserting on a lingering
+      // staging file would have tested the wrong thing and passed for the wrong reason.
+      const reportsDir = path.join(fixture.workspace, 'reports');
+      const adopted = fs.readdirSync(reportsDir).filter((name) => {
+        const full = path.join(reportsDir, name);
+        return fs.statSync(full).isFile() && fs.readFileSync(full, 'utf8').includes('post-sweep owner media');
+      });
+      expect(adopted.length).toBeGreaterThan(0);
+      // …and a second owner's in-flight media was still not disturbed by our intake.
+      expect(fs.existsSync(secondaryOrphan)).toBe(true);
+    } finally {
+      await daemon.shutdown();
+    }
+  }, 180_000);
 
   it('refuses to start a second daemon while the first holds the installation', async () => {
     expect((await setup()).code).toBe(0);
