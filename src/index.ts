@@ -143,7 +143,7 @@ export async function startDaemon(
         if (disposition === 'pending') {
           const inFlight = gateway.shutdownWorkInFlight();
           console.warn(
-            `[main] Shutdown returned while work was still in flight (turns=${inFlight.turns}, builds=${inFlight.builds}); retaining local resource ownership. Confirm this process has exited, then remove the installation lease yourself.`,
+            `[main] Shutdown returned while work was still in flight (turns=${inFlight.turns}, builds=${inFlight.builds}, runtimes=${inFlight.runtimes}); retaining local resource ownership. Confirm this process has exited, then remove the installation lease yourself.`,
           );
           return;
         }

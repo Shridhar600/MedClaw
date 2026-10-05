@@ -258,6 +258,20 @@ export class ProfileRuntime {
    */
   private lifecycleState: 'running' | 'stopping' | 'closed' = 'running';
 
+  /**
+   * C01 (R01): drain-phase continuations that have been STARTED and not yet really settled.
+   *
+   * `drainAndClose()` abandons a phase at the shared budget, but the phase keeps running. That
+   * continuation can still touch owner resources (the nightly sweep's `curiosity.md` write is the
+   * concrete case), so it must remain visible to `getShutdownDisposition()` until its own `finally`
+   * runs. `lifecycleState === 'closed'`, a cleared store field and a `Promise.race` timeout winner
+   * are all explicitly NOT settlement.
+   *
+   * Instance-local, populated and drained only by `withBudget`, in the same idiom as
+   * `backgroundOperations`/`inFlightOperations` above. No global registry, no new port.
+   */
+  private readonly unsettledDrainWork = new Set<Promise<unknown>>();
+
   /** `true` from the moment `beginStopping()` runs through `closed` (inclusive) — matches the
    *  pre-R-S4 field's semantics exactly (never resets to false once past `running`). */
   get stopping(): boolean {
@@ -297,6 +311,40 @@ export class ProfileRuntime {
    *  and tests. `isStopping()`/`isClosed()` remain the public seam production callers consult. */
   getLifecycleState(): 'running' | 'stopping' | 'closed' {
     return this.lifecycleState;
+  }
+
+  /**
+   * C01 (R01): whether this runtime still has real work that can touch owner resources.
+   *
+   * This is the truthful half of `isClosed()`, and the two deliberately disagree. `isClosed()`
+   * answers "did `closeStore()` run"; this answers "has everything that started actually finished".
+   * Plan 15 §2.2 makes the second question the one that gates installation-ownership release: a
+   * runtime that closed its stores while a drain phase was abandoned at the 10s budget still has a
+   * continuation running, so it reports `pending`.
+   *
+   * Reported sources, all instance-local:
+   *  - `unsettledDrainWork`: a drain phase started by `drainAndClose()` that has not settled. This
+   *    covers phases abandoned at the shared deadline AND phases fired best-effort after it.
+   *  - `sweepInFlight`: the nightly sweep promise, when a sweep was launched outside the drain.
+   *  - `inFlightOperations` / `backgroundOperations` / `reindexTails`: the class's existing tracked
+   *    operation sets, for work that arrives after the drain phase that would have awaited it.
+   *
+   * S5 still owns bounded cancellation; forever-pending work therefore means retained ownership,
+   * not a promise that shutdown ever completes.
+   */
+  getShutdownDisposition(): 'pending' | 'quiescent' {
+    if (this.unsettledDrainWork.size > 0) return 'pending';
+    if (this.sweepInFlight !== undefined) return 'pending';
+    if (this.inFlightOperations.size > 0) return 'pending';
+    if (this.backgroundOperations.size > 0) return 'pending';
+    if (this.reindexTails.size > 0) return 'pending';
+    // A drain that began but never reached `closeStore()` (a phase escaping with an uncaught
+    // failure, so `lifecycleState` is still `stopping`) has NOT released anything. Today every phase
+    // body catches internally so this is unreachable; the term is here so a future phase cannot turn
+    // that into a false `quiescent` over still-open handles. Reporting `pending` is the safe
+    // direction: it retains ownership until the operator intervenes.
+    if (this.stopping && !this.closed) return 'pending';
+    return 'quiescent';
   }
 
   static async create(deps: ProfileRuntimeDeps): Promise<ProfileRuntime> {
@@ -891,12 +939,24 @@ export class ProfileRuntime {
     const stillPending: string[] = [];
 
     const withBudget = async (label: string, work: () => Promise<void>): Promise<void> => {
+      // C01 (R01): register the phase's continuation the moment it STARTS, and unregister it only
+      // when it really settles. This function RETURNING is not that point — that is the whole defect:
+      // an abandoned phase keeps running, so `getShutdownDisposition()` must keep reporting
+      // `pending` (and the installation must keep its leases) until the phase's own settlement.
+      const register = (started: Promise<void>): Promise<void> => {
+        this.unsettledDrainWork.add(started);
+        void started.then(
+          () => { this.unsettledDrainWork.delete(started); },
+          () => { this.unsettledDrainWork.delete(started); },
+        );
+        return started;
+      };
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
         // Budget already exhausted by an earlier phase: fire this phase for best-effort
         // background progress, but do not make shutdown wait on it any further.
         stillPending.push(label);
-        void work();
+        void register(work());
         return;
       }
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -905,7 +965,22 @@ export class ProfileRuntime {
         timer.unref?.();
       });
       try {
-        const outcome = await Promise.race([work().then(() => 'done' as const), timedOut]);
+        // C01 (R01): `register`'s own rejection callback already observes the phase promise, and a
+        // phase that rejects must not become a derived unhandled rejection here — otherwise an
+        // abandoned-then-failed phase would surface as a process-level warning with nothing left to
+        // attribute it. `firstError` keeps the existing "drain throws the first real failure"
+        // behaviour; the label is added so the message names which phase failed.
+        const outcome = await Promise.race([
+          register(work()).then(
+            () => 'done' as const,
+            (error: unknown) => {
+              firstError = firstError ?? error;
+              console.warn(`[gateway] Shutdown drain phase failed: ${label}`, summarizeErrorForLog(error));
+              return 'done' as const;
+            },
+          ),
+          timedOut,
+        ]);
         if (outcome === 'timeout') stillPending.push(label);
       } finally {
         if (timer) clearTimeout(timer);

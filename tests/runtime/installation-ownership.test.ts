@@ -12,6 +12,7 @@ import * as path from 'path';
 import { InstallationService, describeOwnershipRefusal } from '../../src/runtime/installation';
 import { DirectoryLease, leasePathFor, readHolder } from '../../src/runtime/adapters/directory-lease';
 import { setConfigValue } from '../../src/cli/admin';
+import type { LedgerFact } from '../../src/memcore';
 import { writeConfigFixture } from '../helpers/config-fixture';
 import { fixtureOwner } from '../helpers/test-config';
 import { makeTestTemp } from '../helpers/test-temp';
@@ -389,14 +390,28 @@ describe('ownership release requires quiescence', () => {
    * Real collaborators: a real Gateway over a real owner workspace. Only the external channel is
    * absent (telegram is disabled), which is the supported local configuration.
    */
-  async function buildRealGateway(fixture: ReturnType<typeof writeConfigFixture>): Promise<import('../../src/gateway/gateway').Gateway> {
+  async function buildRealGateway(
+    fixture: ReturnType<typeof writeConfigFixture>,
+    diagnostics?: import('../../src/ports').DiagnosticSink,
+    onBuildProvider?: () => void,
+  ): Promise<import('../../src/gateway/gateway').Gateway> {
     const { Gateway } = await import('../../src/gateway/gateway');
     const { effectiveConfigFor, readConfigDocument } = await import('../../src/runtime/installation');
+    const { createProvider } = await import('../../src/providers/factory');
     const config = effectiveConfigFor(readConfigDocument(fixture.configPath, tmpDir).stored);
     // S1: admission is REQUIRED. This suite drives real boots, so it binds the owner for real rather than
     // stubbing the authority that decides who may serve.
     const { bindGatewayOwner } = await import('../helpers/gateway-owner-deps');
-    return new Gateway(config, await bindGatewayOwner(config, 'owner-chat'));
+    const deps = await bindGatewayOwner(config, 'owner-chat');
+    // A counting wrapper, not a stub: provider CONSTRUCTION is what "a refusal builds nothing" is
+    // measured against, and the real factory keeps every other behaviour of the suite unchanged.
+    const withCount = onBuildProvider
+      ? { createProvider: (cfg: Parameters<typeof createProvider>[0]): ReturnType<typeof createProvider> => {
+          onBuildProvider();
+          return createProvider(cfg);
+        } }
+      : {};
+    return new Gateway(config, diagnostics ? { ...deps, ...withCount, diagnostics } : { ...deps, ...withCount });
   }
 
   async function bootRealGateway(fixture: ReturnType<typeof writeConfigFixture>): Promise<import('../../src/gateway/gateway').Gateway> {
@@ -405,12 +420,105 @@ describe('ownership release requires quiescence', () => {
     return gateway;
   }
 
+  /**
+   * Hold ONE real transcript sweep past the runtime's drain budget, through real collaborators only.
+   *
+   * Real prior-day day-file on disk with an unlogged medication (so a sweep that completes genuinely
+   * persists a curiosity item), and a real `LedgerStore.listAllOfType` read parked on an explicit
+   * barrier and then delegated to the original implementation — so the sweep that eventually finishes
+   * is the real sweep over real data. The single substitution is where that one read blocks.
+   *
+   * Shared by every R01 sweep case so the held-sweep preconditions are defined exactly once; each case
+   * still asserts its own outcomes.
+   */
+  function holdRealTranscriptSweep(
+    fixture: ReturnType<typeof writeConfigFixture>,
+    runtime: import('../../src/gateway/runtime').ProfileRuntime,
+  ): {
+    sweep: Promise<unknown>;
+    whenHeld: Promise<void>;
+    curiosityPath: string;
+    curiosityBefore: string;
+    release: () => void;
+    restoreLedger: () => void;
+  } {
+    const yesterdayKey = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+    const chatLane = path.join(fixture.sessions, 'owner-chat');
+    fs.mkdirSync(chatLane, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+      path.join(chatLane, `${yesterdayKey}.jsonl`),
+      `${JSON.stringify({
+        timestamp: `${yesterdayKey}T10:00:00.000Z`,
+        role: 'user',
+        origin: 'chat',
+        content: 'synthetic note: took naproxen yesterday',
+        chatId: 'owner-chat',
+      })}\n`,
+      { mode: 0o600 },
+    );
+
+    const ledger = runtime.ledgerStore!;
+    const originalListAllOfType = ledger.listAllOfType.bind(ledger);
+    let releaseLedgerRead!: () => void;
+    const ledgerBarrier = new Promise<void>((resolve) => { releaseLedgerRead = resolve; });
+    let enteredLedgerRead!: () => void;
+    const ledgerReadEntered = new Promise<void>((resolve) => { enteredLedgerRead = resolve; });
+    ledger.listAllOfType = async (type): Promise<LedgerFact[]> => {
+      enteredLedgerRead();
+      await ledgerBarrier;
+      return originalListAllOfType(type);
+    };
+
+    const curiosityPath = path.join(fixture.workspace, 'curiosity.md');
+    const curiosityBefore = fs.existsSync(curiosityPath) ? fs.readFileSync(curiosityPath, 'utf8') : '';
+
+    // Launch through the SAME entry the installed cron callback uses.
+    runtime.launchBackgroundSweep();
+    const sweep = runtime.sweepInFlight!;
+    expect(sweep).toBeDefined();
+
+    return {
+      sweep,
+      whenHeld: ledgerReadEntered,
+      curiosityPath,
+      curiosityBefore,
+      release: releaseLedgerRead,
+      restoreLedger: (): void => { ledger.listAllOfType = originalListAllOfType; },
+    };
+  }
+
+  /**
+   * Drive `daemon.shutdown()` across the runtime's shared 10,000ms drain budget deterministically:
+   * fake timers pinned with `jest.setSystemTime()` so the sweep's own `new Date()` cannot drift while
+   * the clock is advanced, then advanced in bulk. Never a wall-clock sleep, never a forced exit.
+   */
+  async function shutdownAcrossDrainBudget(shutdown: () => Promise<void>): Promise<void> {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date());
+    let settled = false;
+    const running = shutdown().then(
+      () => { settled = true; },
+      () => { settled = true; },
+    );
+    try {
+      await jest.advanceTimersByTimeAsync(60_000);
+      for (let i = 0; i < 50 && !settled; i += 1) {
+        await jest.advanceTimersByTimeAsync(1_000);
+      }
+    } finally {
+      jest.useRealTimers();
+    }
+    await running;
+  }
+
   it('reports quiescent when nothing is in flight', async () => {
     const fixture = makeOwnerFixture();
     const gateway = await bootRealGateway(fixture);
 
     expect(gateway.getShutdownDisposition()).toBe('quiescent');
-    expect(gateway.shutdownWorkInFlight()).toEqual({ turns: 0, builds: 0, stopping: false });
+    // C01 strengthened this assertion rather than replacing it: the same "nothing in flight" claim,
+    // now also covering the runtime-continuation count the pending warning reports.
+    expect(gateway.shutdownWorkInFlight()).toEqual({ turns: 0, builds: 0, runtimes: 0, stopping: false });
 
     await gateway.stop();
   }, 60_000);
@@ -473,6 +581,525 @@ describe('ownership release requires quiescence', () => {
 
     await daemon.shutdown();
   }, 60_000);
+
+  /**
+   * C01 / R01: the nightly transcript sweep is real production work that keeps touching owner
+   * files AFTER `drainAndClose()` has closed the stores and set the runtime to `closed`.
+   *
+   * Everything here is real: the real `startDaemon`, the real `Gateway`, the real `ProfileRuntime`,
+   * the real session day-file on disk, the real `LedgerStore` and the real `CuriosityQueue`. The
+   * only substitutions are (a) one real ledger read held behind an explicit barrier and then
+   * delegated to the original implementation, and (b) real child OS processes for the contenders.
+   * The clock is controlled with fake timers so the 10s shared drain budget is exceeded
+   * deterministically instead of by a 10s wall-clock sleep.
+   */
+  it('retains both installation leases while a real transcript sweep outlives the drain budget', async () => {
+    const fixture = makeOwnerFixture();
+    const gateway = await buildRealGateway(fixture);
+    const services = new InstallationService(new DirectoryLease());
+    const { startDaemon } = await import('../../src/index');
+
+    // A second configuration document pointing at the SAME owner workspace: the workspace lease,
+    // not the config lease, must be what protects this installation.
+    const aliasDir = path.join(tmpDir, 'alias');
+    fs.mkdirSync(aliasDir, { recursive: true });
+    const aliasConfigPath = path.join(aliasDir, 'other-config.json');
+    fs.copyFileSync(fixture.configPath, aliasConfigPath);
+
+    const daemon = await startDaemon({
+      services,
+      configPath: fixture.configPath,
+      homeDir: tmpDir,
+      createGateway: () => gateway,
+    });
+    expect(daemon.kind).toBe('owned');
+
+    const runtime = gateway.runtimeInstance!;
+    expect(runtime.sessions).toBeDefined();
+    expect(runtime.ledgerStore).toBeDefined();
+    expect(runtime.curiosity).toBeDefined();
+
+    // Real prior-day transcript plus a held real ledger read — see `holdRealTranscriptSweep`.
+    const held = holdRealTranscriptSweep(fixture, runtime);
+    const { sweep, curiosityPath, curiosityBefore, release: releaseLedgerRead, restoreLedger } = held;
+    await held.whenHeld;
+
+    // Controlled clock: cross the runtime's shared drain budget deterministically, with no
+    // wall-clock wait — see `shutdownAcrossDrainBudget`.
+    const budgetWarnings: string[] = [];
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+      budgetWarnings.push(args.map((a) => String(a)).join(' '));
+    });
+    await shutdownAcrossDrainBudget(() => daemon.shutdown());
+    warnSpy.mockRestore();
+
+    // The drain really did abandon a phase at the shared budget — the sanitized warning names the
+    // budget and the phase label, and pins the 10,000ms constant outcome 6 requires preserved.
+    const budgetWarning = budgetWarnings.find((line) => /drain budget/i.test(line));
+    expect(budgetWarning).toMatch(/Shutdown drain budget \(10000ms\) exceeded/);
+    expect(budgetWarning).toContain('transcript-sweep');
+    // Sanitized: phase labels and the constant only. No owner/chat id, path, or transcript text.
+    expect(budgetWarning).not.toContain('owner-chat');
+    expect(budgetWarning).not.toContain(tmpDir);
+    expect(budgetWarning).not.toContain('naproxen');
+
+    // Stop returned: it did NOT wait for the stuck sweep. The bound is the real one — the sweep is
+    // demonstrably still running at the moment shutdown resolves.
+    expect(runtime.isClosed()).toBe(true);
+    let sweepSettled = false;
+    void sweep.then(() => { sweepSettled = true; }, () => { sweepSettled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(sweepSettled).toBe(false);
+
+    // `closed` is not quiescence. Asserted in the order the harm would happen: the leases must still
+    // be held, and only then does the disposition explain why.
+    expect(fs.existsSync(leasePathFor(fixture.configPath))).toBe(true);
+    expect(fs.existsSync(fixture.workspaceLease)).toBe(true);
+    expect(daemon.gateway.getShutdownDisposition()).toBe('pending');
+
+    // Real contender OS processes must be refused: the same config, and a different config that
+    // resolves to the same owner workspace.
+    const barrierFile = path.join(tmpDir, 'go');
+    const releaseMarker = path.join(tmpDir, 'release');
+    fs.writeFileSync(barrierFile, 'go');
+    const same = await spawnContender('same-config', fixture.configPath, barrierFile, releaseMarker);
+    const alias = await spawnContender('alias-config', aliasConfigPath, barrierFile, releaseMarker);
+    expect(same.outcome).toBe('busy');
+    expect(alias.outcome).toBe('busy');
+    expect(alias.resource).toBe('owner');
+    // The lease directory on disk is still ours, not a contender's.
+    expect(readHolder(fixture.workspaceLease)?.pid).toBe(process.pid);
+
+    // Release the barrier and observe the ACTUAL late outcome: the still-running sweep finishes and
+    // persists its item — while ownership is still held, which is exactly why it must be.
+    releaseLedgerRead();
+    restoreLedger();
+    const sweepResult = await sweep;
+    expect(sweepResult).toMatchObject({ scanned: true });
+    const curiosityAfter = fs.readFileSync(curiosityPath, 'utf8');
+    expect(curiosityAfter).not.toBe(curiosityBefore);
+    expect(curiosityAfter).toContain('naproxen');
+    // The late write happened under retained ownership, not under a second installation.
+    expect(fs.existsSync(fixture.workspaceLease)).toBe(true);
+    expect(readHolder(fixture.workspaceLease)?.pid).toBe(process.pid);
+
+    // Only once the continuation has really settled may a repeated root shutdown release. This is
+    // the real release path — no lease is deleted by hand anywhere in this test.
+    await daemon.shutdown();
+    expect(fs.existsSync(leasePathFor(fixture.configPath))).toBe(false);
+    expect(fs.existsSync(fixture.workspaceLease)).toBe(false);
+
+    // …and a contender now genuinely succeeds.
+    fs.writeFileSync(barrierFile, 'go');
+    fs.writeFileSync(releaseMarker, 'go');
+    const next = await spawnContender('after-release', fixture.configPath, barrierFile, releaseMarker);
+    expect(next.outcome).toBe('owned');
+  }, 120_000);
+
+  /**
+   * C01 follow-up / R01: the SAME defect, reached through a runtime REPLACEMENT instead of through
+   * stop(). `gateway-transcript-sweep.test.ts` already proves `start()/stop()/start()` is a supported
+   * contract, so this is the common boundary, not an exotic path.
+   *
+   * Mechanism: `stop()` correctly retains both leases (asserted above and in the sibling case), but a
+   * subsequent `start()` drains the previous manager and then OVERWRITES it. `getShutdownDisposition()`
+   * reads only the replacement manager, so the still-`pending` old runtime — holding a live sweep that
+   * will write owner files — becomes invisible. A repeated root shutdown then sees false quiescence,
+   * releases both leases, a contender acquires, and the old sweep writes under the contender.
+   *
+   * Real collaborators throughout: real `startDaemon`, real `Gateway`, real runtime, real day file,
+   * real ledger read behind a barrier, real child-process contenders. No private manager assignment, no
+   * fake pending getter, no manual lease deletion.
+   */
+  it('refuses a runtime replacement while the previous runtime still has unsettled work, then recovers after settlement', async () => {
+    const fixture = makeOwnerFixture();
+    // Real diagnostic sink, so the refusal is asserted as an emitted outcome rather than trusted from
+    // a comment: one truthful `refused`, and no `started` / `build-failed` for a start that built nothing.
+    const events: import('../../src/ports').DiagnosticEvent[] = [];
+    let providerBuilds = 0;
+    const gateway = await buildRealGateway(
+      fixture,
+      { emit: (event) => { events.push(event); } },
+      () => { providerBuilds += 1; },
+    );
+    const services = new InstallationService(new DirectoryLease());
+    const { startDaemon } = await import('../../src/index');
+
+    const daemon = await startDaemon({
+      services,
+      configPath: fixture.configPath,
+      homeDir: tmpDir,
+      createGateway: () => gateway,
+    });
+    expect(daemon.kind).toBe('owned');
+
+    const runtime = gateway.runtimeInstance!;
+    expect(runtime.ledgerStore).toBeDefined();
+    expect(runtime.curiosity).toBeDefined();
+
+    const held = holdRealTranscriptSweep(fixture, runtime);
+    const { sweep, curiosityPath, curiosityBefore, release: releaseLedgerRead, restoreLedger } = held;
+    await held.whenHeld;
+
+    await shutdownAcrossDrainBudget(() => daemon.shutdown());
+
+    // The stop half of R01 still holds: bounded return, both leases retained, work still running.
+    expect(runtime.isClosed()).toBe(true);
+    let sweepSettled = false;
+    void sweep.then(() => { sweepSettled = true; }, () => { sweepSettled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(sweepSettled).toBe(false);
+    expect(gateway.getShutdownDisposition()).toBe('pending');
+    expect(fs.existsSync(leasePathFor(fixture.configPath))).toBe(true);
+    expect(fs.existsSync(fixture.workspaceLease)).toBe(true);
+
+    // ── The replacement half. The old runtime is still `pending`, so this process may not truthfully
+    // start serving again: replacing it would hide a live continuation from root.
+    events.length = 0;
+    const buildsBeforeRefusal = providerBuilds;
+    await expect(gateway.start()).rejects.toThrow(/previous runtime/i);
+
+    // A refusal builds NOTHING. This is what the FIRST of the two guard checks is for, and it is why
+    // the check runs before any provider, semaphore or workspace bootstrap is touched: the refusal is
+    // refused at the boundary rather than after constructing a serving generation to throw it away.
+    expect(providerBuilds).toBe(buildsBeforeRefusal);
+
+    // Truthful, and only truthful: exactly one start-stop event, it says refused, and its duration is
+    // a real measured span — never a false `started`, never `build-failed` for a start that built
+    // nothing, never a fabricated `0`.
+    const startStop = events.filter((e) => e.stage === 'start-stop');
+    expect(startStop).toHaveLength(1);
+    expect(startStop[0]).toMatchObject({ outcome: 'refused', reason: 'previous-work-unsettled' });
+    expect(Number.isFinite(startStop[0].durationMs)).toBe(true);
+    expect(startStop[0].durationMs).toBeGreaterThanOrEqual(0);
+
+    // A refusal must be non-destructive AND must not hide anything: the old generation is still the
+    // one this Gateway owns, still reports pending, and is still counted by the diagnostic root reads.
+    expect(gateway.runtimeInstance).toBe(runtime);
+    expect(gateway.getShutdownDisposition()).toBe('pending');
+    expect(gateway.shutdownWorkInFlight().runtimes).toBeGreaterThanOrEqual(1);
+    expect(fs.existsSync(leasePathFor(fixture.configPath))).toBe(true);
+    expect(fs.existsSync(fixture.workspaceLease)).toBe(true);
+    expect(readHolder(fixture.workspaceLease)?.pid).toBe(process.pid);
+
+    // Repeated root shutdown during the refusal must NOT release. This is the step the inherited C01
+    // repair already protects, and a refusal must not reopen it.
+    await daemon.shutdown();
+    expect(fs.existsSync(leasePathFor(fixture.configPath))).toBe(true);
+    expect(fs.existsSync(fixture.workspaceLease)).toBe(true);
+    expect(readHolder(fixture.workspaceLease)?.pid).toBe(process.pid);
+
+    const barrierFile = path.join(tmpDir, 'go');
+    const releaseMarker = path.join(tmpDir, 'release');
+    fs.writeFileSync(barrierFile, 'go');
+    const same = await spawnContender('during-refusal', fixture.configPath, barrierFile, releaseMarker);
+    expect(same.outcome).toBe('busy');
+    expect(readHolder(fixture.workspaceLease)?.pid).toBe(process.pid);
+
+    // Release the barrier: the old sweep really persists — while THIS installation still owns the
+    // workspace. That is the whole point of retaining ownership across the replacement.
+    releaseLedgerRead();
+    restoreLedger();
+    await expect(sweep).resolves.toMatchObject({ scanned: true });
+    const curiosityAfter = fs.readFileSync(curiosityPath, 'utf8');
+    expect(curiosityAfter).not.toBe(curiosityBefore);
+    expect(curiosityAfter).toContain('naproxen');
+    expect(readHolder(fixture.workspaceLease)?.pid).toBe(process.pid);
+
+    // ── Settlement, then a genuinely safe retry. Refusal preserved the later retry rather than
+    // bricking the daemon.
+    for (let i = 0; i < 200 && gateway.getShutdownDisposition() !== 'quiescent'; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(gateway.getShutdownDisposition()).toBe('quiescent');
+    await gateway.start();
+    expect(gateway.runtimeInstance).not.toBe(runtime);
+    expect(gateway.getShutdownDisposition()).toBe('quiescent');
+    // Ownership was retained throughout; a restart while serving does not hand it away.
+    expect(readHolder(fixture.workspaceLease)?.pid).toBe(process.pid);
+
+    // Safe shutdown of the settled replacement releases, and only then does a contender win.
+    await daemon.shutdown();
+    expect(fs.existsSync(leasePathFor(fixture.configPath))).toBe(false);
+    expect(fs.existsSync(fixture.workspaceLease)).toBe(false);
+    fs.writeFileSync(barrierFile, 'go');
+    fs.writeFileSync(releaseMarker, 'go');
+    const next = await spawnContender('after-release', fixture.configPath, barrierFile, releaseMarker);
+    expect(next.outcome).toBe('owned');
+  }, 180_000);
+
+  /**
+   * C01 follow-up / R01: the replacement guard has to run TWICE, and this case isolates the second,
+   * load-bearing check.
+   *
+   * The first check only covers a generation that is ALREADY pending when `serveOwner()` is entered.
+   * The drain it then performs can itself CREATE pendingness on the very generation it is draining:
+   * `drainAndClose()` registers each phase in the runtime's `unsettledDrainWork`, and a phase
+   * abandoned at the shared 10,000ms budget stays registered. A `session-compactions` phase awaiting a
+   * compaction and a `scheduler-stop` phase awaiting a stalled heartbeat are both real shapes, and
+   * neither is a source of `ProfileRuntime.getShutdownDisposition()` — only the abandoned-phase
+   * registration is.
+   *
+   * So the schedule here is: a generation that is genuinely `quiescent` on entry, whose drain then
+   * overruns the budget and leaves it `pending`, and which is then dropped by the overwrite. Without
+   * the post-drain re-check, root sees `quiescent`, releases both leases, a contender enters, and the
+   * abandoned write-queue continuation writes into a workspace it no longer owns.
+   *
+   * The held continuation is a REAL `WriteQueue` op — `WriteQueue` keeps its own queues and is not a
+   * runtime pending source, which is exactly what makes this generation read `quiescent` beforehand.
+   */
+  it('refuses a runtime replacement when the drain itself leaves the previous generation pending', async () => {
+    const fixture = makeOwnerFixture();
+    const gateway = await buildRealGateway(fixture);
+    const services = new InstallationService(new DirectoryLease());
+    const { startDaemon } = await import('../../src/index');
+
+    const daemon = await startDaemon({
+      services,
+      configPath: fixture.configPath,
+      homeDir: tmpDir,
+      createGateway: () => gateway,
+    });
+    expect(daemon.kind).toBe('owned');
+
+    const runtime = gateway.runtimeInstance!;
+    // Load-bearing precondition: this continuation is reached through a real write queue and is
+    // visible to no runtime-owned pending set, so the generation reads quiescent on entry.
+    expect(runtime.writeQueue).toBeDefined();
+    const writeQueue = runtime.writeQueue!;
+
+    let releaseWriteQueue!: () => void;
+    const writeQueueBarrier = new Promise<void>((resolve) => { releaseWriteQueue = resolve; });
+    const artifact = path.join(fixture.workspace, 'late-write-queue-after-drain.txt');
+    const writeQueueOp = writeQueue.enqueue('background', {
+      label: 'c01-followup-write-queue-continuation',
+      run: async () => {
+        await writeQueueBarrier;
+        fs.writeFileSync(artifact, 'write-queue write after the drain budget', { mode: 0o600 });
+        return 'written';
+      },
+    });
+
+    // The precondition this case turns on: quiescent NOW, so the first guard cannot fire.
+    expect(gateway.getShutdownDisposition()).toBe('quiescent');
+
+    // A replacement attempt with NO prior stop, so the manager has never been drained and the drain
+    // inside `serveOwner` is the first one. Controlled clock, advanced while the restart is in flight.
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date());
+    let restartSettled = false;
+    const restarting = gateway.start().then(
+      () => { restartSettled = true; return undefined; },
+      (error: unknown) => { restartSettled = true; return error; },
+    );
+    try {
+      await jest.advanceTimersByTimeAsync(60_000);
+      for (let i = 0; i < 50 && !restartSettled; i += 1) {
+        await jest.advanceTimersByTimeAsync(1_000);
+      }
+    } finally {
+      jest.useRealTimers();
+    }
+    await expect(restarting).resolves.toBeInstanceOf(Error);
+    await expect(restarting).resolves.toThrow(/previous runtime/i);
+
+    // The drain overran the budget and left the OLD generation pending. That is the transition the
+    // pre-check could not see and the post-drain re-check must.
+    expect(runtime.isClosed()).toBe(true);
+    expect(runtime.getShutdownDisposition()).toBe('pending');
+    // …and it was not replaced: ownership is still visible and still held.
+    expect(gateway.runtimeInstance).toBe(runtime);
+    expect(gateway.getShutdownDisposition()).toBe('pending');
+    expect(gateway.shutdownWorkInFlight().runtimes).toBeGreaterThanOrEqual(1);
+    expect(fs.existsSync(leasePathFor(fixture.configPath))).toBe(true);
+    expect(fs.existsSync(fixture.workspaceLease)).toBe(true);
+    expect(readHolder(fixture.workspaceLease)?.pid).toBe(process.pid);
+    expect(fs.existsSync(artifact)).toBe(false);
+
+    const barrierFile = path.join(tmpDir, 'go');
+    const releaseMarker = path.join(tmpDir, 'release');
+    fs.writeFileSync(barrierFile, 'go');
+    const contender = await spawnContender('during-drain-created-pending', fixture.configPath, barrierFile, releaseMarker);
+    expect(contender.outcome).toBe('busy');
+
+    // Repeated root shutdown during the refusal must not release either.
+    await daemon.shutdown();
+    expect(fs.existsSync(fixture.workspaceLease)).toBe(true);
+    expect(readHolder(fixture.workspaceLease)?.pid).toBe(process.pid);
+
+    // Settle the continuation: the real late owner-file write lands while THIS holder still owns it.
+    releaseWriteQueue();
+    await expect(writeQueueOp).resolves.toBe('written');
+    expect(fs.readFileSync(artifact, 'utf8')).toBe('write-queue write after the drain budget');
+    expect(readHolder(fixture.workspaceLease)?.pid).toBe(process.pid);
+
+    for (let i = 0; i < 200 && gateway.getShutdownDisposition() !== 'quiescent'; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(gateway.getShutdownDisposition()).toBe('quiescent');
+    await gateway.start();
+    expect(gateway.runtimeInstance).not.toBe(runtime);
+
+    await daemon.shutdown();
+    expect(fs.existsSync(leasePathFor(fixture.configPath))).toBe(false);
+    expect(fs.existsSync(fixture.workspaceLease)).toBe(false);
+    fs.writeFileSync(barrierFile, 'go');
+    fs.writeFileSync(releaseMarker, 'go');
+    const next = await spawnContender('after-release', fixture.configPath, barrierFile, releaseMarker);
+    expect(next.outcome).toBe('owned');
+  }, 180_000);
+
+  /**
+   * C01 / R01, non-sweep continuation — and the case that isolates the new mechanism.
+   *
+   * Two REAL drain continuations, held past the shared budget:
+   *
+   *  - a real background continuation (`ProfileRuntime.trackBackgroundOperation`, the same seam the
+   *    Gateway uses for heartbeat reconciliation). It is visible to the PRE-EXISTING
+   *    `backgroundOperations` set, and it is what consumes the whole drain budget at the
+   *    `background-operations` phase.
+   *  - a real write-queue continuation. `WriteQueue` keeps its own internal queues, so this
+   *    continuation is visible to NOTHING except the phase that awaits it. Because the budget is
+   *    already spent when `write-queue` starts, that phase takes the *fast-forward* branch — the one
+   *    that fires the phase and returns immediately — and only the new drain-work tracking can see
+   *    it.
+   *
+   * That is what makes this case fail if the drain-work tracking is reverted: once the background
+   * continuation settles and `backgroundOperations` empties, the write-queue continuation is still
+   * running and ownership must STILL be retained.
+   *
+   * The write-queue continuation then settles by REJECTING, so rejection and its cleanup are
+   * covered too: a rejected op is still a settled op, and settlement must be reported as such.
+   */
+  it('retains ownership for a fast-forwarded non-sweep drain continuation that settles by rejecting', async () => {
+    const fixture = makeOwnerFixture();
+    const gateway = await buildRealGateway(fixture);
+    const services = new InstallationService(new DirectoryLease());
+    const { startDaemon } = await import('../../src/index');
+
+    const daemon = await startDaemon({
+      services,
+      configPath: fixture.configPath,
+      homeDir: tmpDir,
+      createGateway: () => gateway,
+    });
+    const runtime = gateway.runtimeInstance!;
+    // The load-bearing precondition: the continuation this case isolates is reached through a REAL
+    // write queue. Without it the case would silently stop testing anything.
+    expect(runtime.writeQueue).toBeDefined();
+
+    let releaseBackground!: () => void;
+    const backgroundBarrier = new Promise<void>((resolve) => { releaseBackground = resolve; });
+    let releaseWriteQueue!: () => void;
+    const writeQueueBarrier = new Promise<void>((resolve) => { releaseWriteQueue = resolve; });
+    // Distinct artifacts per continuation, so each assertion below is attributed to the right one.
+    const backgroundArtifact = path.join(fixture.workspace, 'late-background-write.txt');
+    const writeQueueArtifact = path.join(fixture.workspace, 'late-write-queue-write.txt');
+
+    // Real background continuation: visible to the pre-existing `backgroundOperations` set, and it
+    // blocks the `background-operations` drain phase until the shared budget runs out.
+    runtime.trackBackgroundOperation('c01-background-continuation', async () => {
+      await backgroundBarrier;
+      fs.writeFileSync(backgroundArtifact, 'background write after the drain budget', { mode: 0o600 });
+    });
+
+    // Real write-queue continuation. Not present in any runtime-owned set: only the phase that
+    // awaits it can see it. Its outcome is a real owner-file write followed by a real rejection.
+    const writeQueueOp = runtime.writeQueue!.enqueue('background', {
+      label: 'c01-write-queue-continuation',
+      run: async () => {
+        await writeQueueBarrier;
+        fs.writeFileSync(writeQueueArtifact, 'write-queue write after the drain budget', { mode: 0o600 });
+        throw new Error('synthetic write-queue continuation failure');
+      },
+    });
+    // The op's own rejection belongs to its caller; observe it rather than leaking an unhandled one.
+    let writeQueueRejected = false;
+    void writeQueueOp.catch(() => { writeQueueRejected = true; });
+
+    // Controlled clock, pinned, plus the sanitized drain-budget warning captured so the fast-forward
+    // is asserted rather than assumed.
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date());
+    const budgetWarnings: string[] = [];
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+      budgetWarnings.push(args.map((a) => String(a)).join(' '));
+    });
+    let shutdownSettled = false;
+    const firstShutdown = daemon.shutdown().then(
+      () => { shutdownSettled = true; },
+      () => { shutdownSettled = true; },
+    );
+    try {
+      await jest.advanceTimersByTimeAsync(60_000);
+      for (let i = 0; i < 50 && !shutdownSettled; i += 1) {
+        await jest.advanceTimersByTimeAsync(1_000);
+      }
+    } finally {
+      jest.useRealTimers();
+    }
+    await firstShutdown;
+    warnSpy.mockRestore();
+
+    // The budget really ran out, and the phases after it really took the fast-forward path. This is
+    // what makes the isolation below meaningful: the write-queue phase was fired, not awaited.
+    const budgetWarning = budgetWarnings.find((line) => /drain budget/i.test(line));
+    expect(budgetWarning).toMatch(/Shutdown drain budget \(10000ms\) exceeded/);
+    expect(budgetWarning).toContain('background-operations');
+    expect(budgetWarning).toContain('write-queue');
+    expect(budgetWarning).not.toContain(tmpDir);
+
+    expect(runtime.isClosed()).toBe(true);
+    expect(daemon.gateway.getShutdownDisposition()).toBe('pending');
+    expect(fs.existsSync(leasePathFor(fixture.configPath))).toBe(true);
+    expect(fs.existsSync(fixture.workspaceLease)).toBe(true);
+    // Neither continuation has produced its outcome yet.
+    expect(fs.existsSync(backgroundArtifact)).toBe(false);
+    expect(fs.existsSync(writeQueueArtifact)).toBe(false);
+
+    const barrierFile = path.join(tmpDir, 'go');
+    const releaseMarker = path.join(tmpDir, 'release');
+    fs.writeFileSync(barrierFile, 'go');
+    const contender = await spawnContender('during-drain', fixture.configPath, barrierFile, releaseMarker);
+    expect(contender.outcome).toBe('busy');
+
+    // Settle the background continuation. It empties the pre-existing tracked set, so afterwards the
+    // ONLY remaining evidence of live work is the fast-forwarded write-queue phase — which is exactly
+    // the continuation the new tracking exists to see. Its artifact is written; the write-queue
+    // artifact is not, so this attribution cannot come from ordering luck.
+    releaseBackground();
+    for (let i = 0; i < 200 && runtime.backgroundOperations.size > 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(runtime.backgroundOperations.size).toBe(0);
+    expect(fs.readFileSync(backgroundArtifact, 'utf8')).toBe('background write after the drain budget');
+    expect(fs.existsSync(writeQueueArtifact)).toBe(false);
+    expect(daemon.gateway.getShutdownDisposition()).toBe('pending');
+    expect(fs.existsSync(leasePathFor(fixture.configPath))).toBe(true);
+    expect(fs.existsSync(fixture.workspaceLease)).toBe(true);
+
+    // Now settle the write-queue continuation — by rejecting. Rejection is settlement: it must not
+    // hold ownership open forever, and its cleanup must not be mistaken for pending.
+    releaseWriteQueue();
+    for (let i = 0; i < 200; i += 1) {
+      if (daemon.gateway.getShutdownDisposition() === 'quiescent') break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(writeQueueRejected).toBe(true);
+    // The rejected continuation still completed its real owner-file write before failing.
+    expect(fs.readFileSync(writeQueueArtifact, 'utf8')).toBe('write-queue write after the drain budget');
+    expect(daemon.gateway.getShutdownDisposition()).toBe('quiescent');
+
+    // Only now may a repeated root shutdown release.
+    await daemon.shutdown();
+    expect(fs.existsSync(leasePathFor(fixture.configPath))).toBe(false);
+    expect(fs.existsSync(fixture.workspaceLease)).toBe(false);
+
+    fs.writeFileSync(barrierFile, 'go');
+    fs.writeFileSync(releaseMarker, 'go');
+    const next = await spawnContender('after-release', fixture.configPath, barrierFile, releaseMarker);
+    expect(next.outcome).toBe('owned');
+  }, 120_000);
 
   it('holds both leases for the whole daemon lifetime, not just boot', async () => {
     const fixture = makeOwnerFixture();

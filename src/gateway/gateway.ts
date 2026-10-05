@@ -133,6 +133,17 @@ function readinessLabel(result: ReadinessResult): 'OK' | 'FAIL' | 'PENDING' {
   return result.ready ? 'OK' : 'FAIL';
 }
 
+/**
+ * C01 follow-up (R01): `serveOwner()` refused to replace a runtime generation that still has unsettled
+ * resource-touching work.
+ *
+ * A dedicated type rather than a string match, because the refusal needs one honest diagnostic
+ * (`start-stop`/`refused`) instead of two contradictory ones: `start()`'s generic catch would otherwise
+ * also report `failed`/`build-failed` for a start that built nothing at all. Carries no owner, chat or
+ * path data — the message is fixed operator guidance.
+ */
+class PreviousWorkUnsettledError extends Error {}
+
 export class Gateway {
   private config: EffectiveConfig;
   private channel?: Channel;
@@ -306,12 +317,26 @@ export class Gateway {
     try {
       await this.startServing(startedAt);
     } catch (error) {
-      this.sink.emit({
-        stage: 'start-stop',
-        outcome: 'failed',
-        reason: 'build-failed',
-        durationMs: this.elapsedSince(startedAt),
-      });
+      // C01 follow-up (R01): the replacement refusal gets its OWN truthful outcome. Reporting
+      // `failed`/`build-failed` for it would be a lie twice over — nothing was built, and the refusal
+      // has to be distinguishable from a real build failure by an operator reading the sink.
+      // `durationMs` is the real elapsed start span, measured here rather than fabricated at the
+      // refusal site, which has no start timestamp.
+      if (error instanceof PreviousWorkUnsettledError) {
+        this.sink.emit({
+          stage: 'start-stop',
+          outcome: 'refused',
+          reason: 'previous-work-unsettled',
+          durationMs: this.elapsedSince(startedAt),
+        });
+      } else {
+        this.sink.emit({
+          stage: 'start-stop',
+          outcome: 'failed',
+          reason: 'build-failed',
+          durationMs: this.elapsedSince(startedAt),
+        });
+      }
       throw error;
     }
     this.sink.emit({ stage: 'start-stop', outcome: 'started', durationMs: this.elapsedSince(startedAt) });
@@ -429,8 +454,67 @@ export class Gateway {
     if (ownerStaging) sweepStagedMedia(ownerStaging, this.ownerStagingBase());
   }
 
+  /**
+   * C01 follow-up (R01): whether replacing the runtime generation currently installed on this Gateway
+   * would hide work that can still touch owner resources.
+   *
+   * Read from exactly the sources `stopResources()` drains and `getShutdownDisposition()` reports — an
+   * unfinished stop, a construction still in flight, and the manager's resolved runtimes (or the
+   * directly attached fallback) — so this can never disagree with the disposition root releases on.
+   *
+   * Two conditions are deliberately NOT here. An in-flight inbound turn needs no guard: the counter
+   * lives on the Gateway, so replacement does not hide it, and the drain already awaits turns under
+   * the same bounded budget (the post-drain re-check below catches the case where that budget expires).
+   * And a "replacement already refused" flag is not here, because a flag would be a permanent
+   * closed-flag refusal that no amount of real settlement could clear.
+   *
+   * Deliberately NOT a retained list of retired generations: pruning such a list requires observing
+   * each old runtime's settlement, which is not available synchronously, so it would grow without
+   * bound or need polling (spec16 §1/§3, and brief §8.2).
+   */
+  private replacementWouldHideLiveWork(): boolean {
+    // An unfinished stop means this Gateway is mid-teardown. Replacing the generation now would
+    // redirect `stopResources()`'s drain at the NEW manager and strand the old one entirely.
+    if (this.stopPromise) return true;
+    // An un-settled construction is awaited by `ProfileRuntimeManager.performDrain()` with NO budget
+    // of its own (`manager.ts:154`), so replacing nothing here would let `start()` block forever.
+    if ((this.manager?.pendingBuildCount() ?? 0) > 0) return true;
+    const runtimes = this.manager ? this.manager.all() : (this.runtime ? [this.runtime] : []);
+    for (const runtime of runtimes) {
+      if (runtime.getShutdownDisposition() === 'pending') return true;
+    }
+    return false;
+  }
+
+  /**
+   * Throw the R01 replacement refusal. One message, no owner/chat/path data, and no mutation: the old
+   * generation stays installed, visible to the disposition, and drainable by `stopResources()`.
+   */
+  private refuseRuntimeReplacement(): never {
+    throw new PreviousWorkUnsettledError(
+      'Refusing to serve: the previous runtime still has work in flight that can write to this '
+      + 'installation, so ownership cannot be handed to a replacement. Wait for it to finish, then '
+      + 'start the daemon again.',
+    );
+  }
+
   private async serveOwner(options: { connectChannel: boolean; runHealthchecks: boolean }): Promise<void> {
     const { config } = this;
+
+    // C01 follow-up (R01), FIRST of two checks: refuse to REPLACE a generation that already owns
+    // resource-touching work.
+    //
+    // `drainAndCloseAll()` further down is bounded and memoized — it resolves at the shared drain
+    // budget whether or not the old runtime actually settled. Overwriting `this.manager` therefore
+    // proves nothing finished; it only makes the old continuation unreachable from
+    // `getShutdownDisposition()`, which is how a timed-out sweep became invisible to root and let a
+    // second installation acquire a workspace the old runtime was still writing to.
+    //
+    // Placed at the TOP of the method, before any provider, runtime, router or scheduler is built, so
+    // a refusal cannot leave a half-built serving generation behind. It is here rather than in
+    // `start()` because `serveOwner` is the single replacement site shared by BOTH callers — the boot
+    // and the unpaired->bound promotion re-entry — and patching one caller would leave the other open.
+    if (this.replacementWouldHideLiveWork()) this.refuseRuntimeReplacement();
 
     // The owner's derived paths. Resolved once, here, so a config that cannot name a valid owner
     // refuses the boot BEFORE a provider, a runtime or a scheduler exists.
@@ -479,10 +563,11 @@ export class Gateway {
     // Drain any runtime from an EARLIER entry into this method before replacing it.
     //
     // A promotion that fails after this point leaves `unpairedOnly` set, so the next owner message
-    // re-enters `serveOwner` and reaches this line again — and the assignment below simply overwrites
-    // `this.manager` and `this.mainProvider`. `stopResources` only ever drains the CURRENT manager, so
-    // the previous one kept its open handles and its unclosed store against owner state, for the rest
-    // of the process. Draining first makes re-entry safe rather than merely survivable.
+    // re-enters `serveOwner` and reaches this line again. It no longer simply overwrites: the two R01
+    // checks decide whether replacement is allowed at all, and when it is allowed the previous manager
+    // is drained here first — `stopResources` only ever drains the CURRENT manager, so skipping this
+    // would leave the previous one holding open handles against owner state for the rest of the
+    // process. Draining first makes re-entry safe rather than merely survivable.
     if (this.manager !== undefined) {
       try {
         await this.manager.drainAndCloseAll();
@@ -491,6 +576,18 @@ export class Gateway {
         // could never make progress. It is reported, not swallowed.
         console.warn('[gateway] Failed to drain the previous runtime before rebuilding:', summarizeErrorForLog(error));
       }
+      // C01 follow-up (R01), SECOND of two checks, and the load-bearing one: this drain can CREATE
+      // pendingness on the very generation it is draining. `drainAndClose()` registers each phase in
+      // the runtime's `unsettledDrainWork`, and a phase abandoned at the shared 10,000ms budget stays
+      // there — so a generation that was quiescent a moment ago can be `pending` by the time control
+      // reaches here. A `session-compactions` phase awaiting a compaction, or a `scheduler-stop`
+      // awaiting a stalled heartbeat, are both real shapes: neither is a source of
+      // `ProfileRuntime.getShutdownDisposition()`, so only this re-check sees them.
+      //
+      // The drain is memoized, so re-checking is free and non-destructive, and it is placed
+      // immediately before the overwrite with nothing in between — the check and the thing it guards
+      // are now adjacent rather than separated by the operation that invalidates the check.
+      if (this.replacementWouldHideLiveWork()) this.refuseRuntimeReplacement();
     }
 
     this.manager = new ProfileRuntimeManager((id) => this.buildRuntimeFor(id));
@@ -798,22 +895,43 @@ export class Gateway {
    * Whether anything that can still touch owner resources has settled.
    *
    * `pending` covers in-flight runtime construction, in-flight inbound turns (which include
-   * admission-state replacement, media staging and their cleanup) and an unfinished drain. Only
-   * `quiescent` authorises releasing the installation's resource ownership. A stop that returns
-   * after a timeout is NOT quiescence; S5 owns bounded cancellation and the shared stop deadline.
+   * admission-state replacement, media staging and their cleanup), an unfinished drain, and — since
+   * C01 (R01) — any runtime continuation that started and has not really settled, including a drain
+   * phase abandoned at the shared 10s budget. Only `quiescent` authorises releasing the
+   * installation's resource ownership. A stop that returns after a timeout is NOT quiescence; S5
+   * owns bounded cancellation and the shared stop deadline.
    */
   getShutdownDisposition(): 'quiescent' | 'pending' {
     if (this.stopPromise) return 'pending';
     if (this.inboundTurnsInFlight > 0) return 'pending';
     if (this.manager?.pendingBuildCount() ?? 0 > 0) return 'pending';
+    // C01 (R01): a runtime that closed its stores while a drain phase was abandoned at the shared
+    // budget still has a continuation that can write owner files. `closed` is not quiescence.
+    // Read exactly the runtime sources `stopResources()` drains — the manager's resolved runtimes
+    // and the directly attached fallback — so the test-double path is protected too.
+    for (const runtime of this.manager ? this.manager.all() : (this.runtime ? [this.runtime] : [])) {
+      if (runtime.getShutdownDisposition() === 'pending') return 'pending';
+    }
     return 'quiescent';
   }
 
-  /** Counters behind the disposition, for honest local reporting and tests. */
-  shutdownWorkInFlight(): { turns: number; builds: number; stopping: boolean } {
+  /**
+   * Counters behind the disposition, for honest local reporting and tests.
+   *
+   * `runtimes` counts the runtimes currently reporting `pending`. Without it the R01 production case
+   * (a stuck nightly sweep, no inbound turn, no pending build) reports `turns=0, builds=0` on the one
+   * path that tells the operator ownership was retained and the lease may need removing by hand — a
+   * self-contradicting report. Counts and a boolean only; never an identifier, path or payload.
+   */
+  shutdownWorkInFlight(): { turns: number; builds: number; runtimes: number; stopping: boolean } {
+    let runtimes = 0;
+    for (const runtime of this.manager ? this.manager.all() : (this.runtime ? [this.runtime] : [])) {
+      if (runtime.getShutdownDisposition() === 'pending') runtimes += 1;
+    }
     return {
       turns: this.inboundTurnsInFlight,
       builds: this.manager?.pendingBuildCount() ?? 0,
+      runtimes,
       stopping: this.stopping,
     };
   }

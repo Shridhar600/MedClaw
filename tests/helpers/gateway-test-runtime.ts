@@ -31,6 +31,11 @@ export function attachGatewayTestRuntime(
       }
     },
     beginStopping: (): void => undefined,
+    // C01 (R01): `Gateway.getShutdownDisposition()` reads this from the attached runtime, so the
+    // structural double must answer it or a double-backed Gateway throws instead of reporting.
+    // `'quiescent'` is the honest answer for this double: it is a test seam that is never given a
+    // blocking collaborator, so it has no continuation that could outlive a drain.
+    getShutdownDisposition: (): 'quiescent' => 'quiescent',
     initializeScheduler: async (options: {
       schedulerPaths: { storePath: string; auditLogPath: string };
       runScheduledJob: (job: HeartbeatJob) => Promise<void>;

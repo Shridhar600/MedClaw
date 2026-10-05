@@ -8,6 +8,22 @@ through a channel, is admitted, becomes a turn, and reaches the owner's runtime 
   provider construction, the media stager, start/stop, quiescence reporting.
 - `GatewayMessageRouter`, `GatewayMessageRouterDeps`, `transportIdentityOf`, `sweepStagedMedia`.
 - `ProfileRuntime`, `ProfileRuntimeDeps`, `ProfileRuntimeManager`, `BuildRuntimeFor`.
+  `ProfileRuntime.getShutdownDisposition()` reports `'pending'` while any continuation that can touch
+  owner resources is still unsettled — including a `drainAndClose()` phase abandoned at the shared
+  10s budget. It deliberately disagrees with `isClosed()`: `closed` means the stores were closed, not
+  that the work finished. `Gateway.getShutdownDisposition()` aggregates it over every built runtime,
+  and only `'quiescent'` authorises the root to release installation ownership.
+  `Gateway.start()` refuses (throws, and `start()` emits `start-stop`/`refused` with reason
+  `previous-work-unsettled`) rather than *replacing* a generation that still reports `'pending'`:
+  draining the old manager is bounded and memoized, so overwriting it would not prove anything
+  finished — it would only make the live continuation unreachable from the disposition above. The
+  check runs twice, before any provider is built and again immediately after the drain, because that
+  drain can itself abandon a phase and make a previously-quiescent generation pending. Neither
+  refusal builds a runtime, router or scheduler, and neither drops or loses the old generation, so a
+  later `start()` succeeds once the old work really settles. The FIRST refusal additionally happens
+  before any provider/semaphore/workspace work, so it is side-effect free; the post-drain re-check
+  necessarily runs after the provider and semaphore construction `serveOwner` does ahead of the drain,
+  which is why it exists at all.
 - `TurnCoordinator`, `TurnQueueFullError`, `heartbeatTurnId`, `HeartbeatTurnRequest/Result`.
 - `SessionManager`, `SessionManagerOptions`.
 

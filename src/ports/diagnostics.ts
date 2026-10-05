@@ -51,6 +51,16 @@ export type StartStopReason =
   | 'already-running'
   /** Building the owner runtime, its stores or its providers failed. */
   | 'build-failed'
+  /**
+   * Start was refused because the runtime generation it would REPLACE still has work in flight that
+   * can write to this installation.
+   *
+   * Its own reason rather than a reuse of `build-failed` (nothing was built) or `already-running`
+   * (the gateway did stop): replacing a still-unsettled generation is what made an abandoned
+   * continuation invisible to the ownership-release check, so the operator needs to be told that
+   * specific fact. Constant string; no identifier, path or payload.
+   */
+  | 'previous-work-unsettled'
   /** Releasing a resource during stop failed. */
   | 'release-failed';
 
