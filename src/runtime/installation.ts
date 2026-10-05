@@ -30,12 +30,22 @@ import {
 import { ConfigUnavailableError, ONBOARD_GUIDANCE } from './startup';
 import { secureMkdir } from '../security';
 import { ensureWorkspaceBootstrap } from '../workspace/bootstrap';
+import type { OwnerStatePort } from '../ports/owner-state';
+import type { InitializeResult } from '../profiles';
 import type {
   LeaseAcquired,
   LeaseBusy,
   LeaseUnavailableReason,
   ResourceLeasePort,
 } from '../ports/resource-lease';
+
+/** How the owner record store is built for one setup. Production uses the real file adapter. */
+export type OwnerStateStoreFactory = (ownerRecordPath: string, ownerId: ProfileId) => OwnerStatePort;
+
+/** Optional setup inputs. Production passes none; a test supplies a store or nothing else changes. */
+export interface InstallationServiceOptions {
+  ownerStore?: OwnerStateStoreFactory;
+}
 
 export interface LoadedConfigDocument {
   stored: StoredConfig;
@@ -180,7 +190,13 @@ export type SetupResult =
   | { kind: 'committed'; canonicalConfigPath: string; ownerPaths: OwnerPaths }
   | { kind: 'busy'; resource: 'config' | 'owner'; lease: LeaseBusy }
   | { kind: 'unavailable'; resource: 'config' | 'owner'; reason: LeaseUnavailableReason; guidance: string }
-  | { kind: 'not-fresh'; message: string };
+  | { kind: 'not-fresh'; message: string }
+  /**
+   * Setup reached a real attempt and stopped part-way: a required record was not confirmed created,
+   * or a published document's durability could not be confirmed. Distinct from `not-fresh`, which
+   * means "there was existing owner evidence here and setup refuses to touch it".
+   */
+  | { kind: 'incomplete'; message: string };
 
 /**
  * Refuse any pre-existing installation state. Returns the refusal text, or `undefined` when the
@@ -333,30 +349,50 @@ function directoryExists(candidate: string): boolean {
   }
 }
 
+/** What one attempt to create the required owner record achieved, plus what a readback can see. */
+interface OwnerRecordAttempt {
+  result: InitializeResult;
+  /** A fresh read of the record AFTER the attempt. Only meaningful for a non-`created` result. */
+  readable: boolean;
+}
+
 /**
- * Create the unpaired owner record. `initialize()` is a no-op when one already exists and refuses
+ * Build the unpaired owner record. `initialize()` is a no-op when one already exists and refuses
  * when the existing record is unreadable — setup must not overwrite or repair an existing record.
+ *
+ * `ownerStore` is the one injection seam: production builds the real file adapter, and a test that
+ * has to prove what setup does when the RECORD WRITE fails or comes back unconfirmed supplies its own
+ * port instead of mocking the surrounding lease machinery.
  */
 async function createUnpairedOwnerRecord(
   ownerRecordPath: string,
   ownerId: ProfileId,
-): Promise<'created' | 'exists' | 'unavailable'> {
+  ownerStore: OwnerStateStoreFactory | undefined,
+): Promise<OwnerRecordAttempt> {
   const { FileOwnerStatePort } = await import('./adapters/owner-state-file');
   const { CryptoPairingCodePort } = await import('./adapters/pairing-code');
   const { OwnerAdmissionService } = await import('../profiles');
   const { systemClock } = await import('../ports/defaults');
 
   const service = new OwnerAdmissionService({
-    store: new FileOwnerStatePort(ownerRecordPath, ownerId),
+    store: ownerStore ? ownerStore(ownerRecordPath, ownerId) : new FileOwnerStatePort(ownerRecordPath, ownerId),
     codes: new CryptoPairingCodePort(),
     clock: systemClock,
     expectedOwnerId: ownerId,
   });
-  return service.initialize();
+  const result = await service.initialize();
+  return {
+    result,
+    // An unconfirmed publication still needs real evidence about what an operator will find on disk.
+    readable: result === 'uncertain' && service.inspectInstallation().kind !== 'refused',
+  };
 }
 
 export class InstallationService {
-  constructor(private readonly leases: ResourceLeasePort) {}
+  constructor(
+    private readonly leases: ResourceLeasePort,
+    private readonly options: InstallationServiceOptions = {},
+  ) {}
 
   /**
    * Take ownership of the selected configuration and the selected owner workspace.
@@ -575,8 +611,42 @@ export class InstallationService {
       ensureWorkspaceBootstrap(ownerPaths.workspace, { preserveExisting: true });
       secureMkdir(path.dirname(ownerPaths.schedulerStore));
 
-      const record = await createUnpairedOwnerRecord(ownerPaths.ownerRecord, ownerId);
+      const attempt = await createUnpairedOwnerRecord(ownerPaths.ownerRecord, ownerId, this.options.ownerStore);
+      const record = attempt.result;
       if (record !== 'created') {
+        if (record === 'uncertain') {
+          // `uncertain` means the outcome of the publication is UNKNOWN, not that it happened. A store
+          // whose replacement throws before touching the disk — the lost-acknowledgement case — lands
+          // here with nothing written at all, so this message must assert neither publication nor
+          // nonpublication. A readback may establish that a record is present and readable; it can
+          // never establish that the record was durably published, and an unreadable readback does not
+          // establish absence either. Publishing no configuration and keeping whatever bytes are there
+          // is unchanged: this is still not a fresh install and not an empty target.
+          return {
+            kind: 'incomplete',
+            message:
+              `Setup could not confirm the owner record at ${ownerPaths.ownerRecord}. `
+              + (attempt.readable
+                ? 'A record is present and readable; its durability could not be confirmed. '
+                : 'The owner record could not be read back, so setup cannot say whether it was published. ')
+              + 'No configuration document was written. Setup never overwrites or repairs an installation, '
+              + 'so re-running it into this target is refused: inspect that record, and choose a fresh '
+              + '--state-root target if you want a clean installation.',
+          };
+        }
+        if (record === 'refused') {
+          // Nothing was published, and nothing pre-existed either: this target was fresh and the
+          // filesystem refused the write. It is incomplete, NOT not-fresh — telling the operator to
+          // choose a different --state-root would be advice for a problem they do not have.
+          return {
+            kind: 'incomplete',
+            message:
+              `Setup could not create the owner record at ${ownerPaths.ownerRecord} (${record}). `
+              + 'No configuration document was written, and the owner workspace that setup created is left in place. '
+              + 'Setup never overwrites or repairs a workspace, so re-running it into this target is refused: '
+              + 'check local permissions and disk space, then choose a fresh --state-root target.',
+          };
+        }
         // `exists` and `unavailable` are both refusals, and for the same reason: an existing or
         // unreadable record is owner evidence that setup must never overwrite or attempt to repair.
         return {
@@ -590,7 +660,7 @@ export class InstallationService {
       const outcome = writeConfigDocument(canonicalPath, stored);
       if (outcome.status === 'failed') {
         return {
-          kind: 'not-fresh',
+          kind: 'incomplete',
           message:
             'Setup could not write the configuration document; the workspace was created but setup is '
             + 'incomplete. Re-run setup into a fresh target.',
@@ -598,7 +668,7 @@ export class InstallationService {
       }
       if (outcome.status === 'uncertain') {
         return {
-          kind: 'not-fresh',
+          kind: 'incomplete',
           message:
             'Setup wrote the configuration document but could not confirm its durability. Setup is '
             + 'incomplete; inspect the file before re-running setup.',

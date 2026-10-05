@@ -62,6 +62,17 @@ adjust the target.
 `config set` and `pairing issue` take the config/owner leases the same way, so a running daemon
 refuses the command rather than two writers racing on the same document.
 
+Setup publishes the configuration document LAST and only after the required owner record was confirmed
+created. A record outcome that is not a confirmed `created` stops setup with no config document and no
+success line. It is `incomplete` when setup reached a real attempt and could not confirm it — a
+publication that may or may not have happened, or a refusal to write into a target that was fresh — and
+`not-fresh` when there was pre-existing owner evidence to protect, which covers an `exists` or
+`unavailable` record. Either way the operator is told to inspect rather than given a fresh-install
+reset. `pairing issue` describes only what it knows: a definite pre-publication refusal prints that the
+previous record is unchanged, while an unconfirmed publication asserts NEITHER direction, because the
+same lost-acknowledgement case can mean the record was replaced or that nothing was written at all. It
+never shows a code.
+
 `src/cli/` must stay acyclic (`no-circular-cli` in `.dependency-cruiser.cjs`). `setup-config.ts`
 exists so the wizard and the service entry never import each other.
 

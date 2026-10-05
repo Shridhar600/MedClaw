@@ -17,6 +17,7 @@ import {
   CryptoPairingCodePort,
   FileOwnerStatePort,
 } from '../../src/runtime/adapters';
+import type { OwnerRecordFileSync } from '../../src/runtime/adapters';
 import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 import type { Clock } from '../../src/ports/clock';
 import type { DiagnosticEvent } from '../../src/ports/diagnostics';
@@ -603,14 +604,42 @@ describe('owner enrollment: commit outcomes are distinguished from uncertainty',
     return fs.readFileSync(path.join(root, 'code.txt'), 'utf8');
   }
 
-  /** A store whose `replace` fails in a chosen way before touching the disk. */
-  function failingStore(failure: (error: NodeJS.ErrnoException) => void): OwnerStatePort {
-    const real = new FileOwnerStatePort(recordPath, OWNER_ID);
+  /** A real file flush that fails BEFORE the rename, so nothing is ever published. */
+  function failingFileFlushSync(): OwnerRecordFileSync {
+    return {
+      syncFile: (): void => {
+        const error: NodeJS.ErrnoException = new Error('injected file flush failure');
+        error.code = 'EIO';
+        throw error;
+      },
+      syncDir: (dir: string): void => {
+        const dfd = fs.openSync(dir, 'r');
+        try {
+          fs.fsyncSync(dfd);
+        } finally {
+          fs.closeSync(dfd);
+        }
+      },
+    };
+  }
+
+  /** The real file adapter with one controlled durability fault. No mocked policy result. */
+  function storeOver(record: string, sync: OwnerRecordFileSync): FileOwnerStatePort {
+    return new FileOwnerStatePort(record, OWNER_ID, undefined, sync);
+  }
+
+  function refusingStore(): OwnerStatePort {
+    return storeOver(recordPath, failingFileFlushSync());
+  }
+
+  /** Publishes and then loses the acknowledgement: the out-of-contract case the policy must survive. */
+  function unacknowledgedStore(record: string): OwnerStatePort {
+    const real = new FileOwnerStatePort(record, OWNER_ID);
     return {
       read: () => real.read(),
-      replace: async () => {
-        const error: NodeJS.ErrnoException = new Error('injected write fault');
-        failure(error);
+      replace: async (): Promise<never> => {
+        const error: NodeJS.ErrnoException = new Error('acknowledgement lost before any write');
+        error.code = 'EIO';
         throw error;
       },
     };
@@ -626,17 +655,58 @@ describe('owner enrollment: commit outcomes are distinguished from uncertainty',
   }
 
   it('refuses without binding when the write demonstrably failed', async () => {
-    const service = serviceOver(
-      failingStore((error) => {
-        error.code = 'EACCES';
-      }),
-    );
+    const bytesBefore = fs.readFileSync(recordPath);
+    const service = serviceOver(refusingStore());
 
     const result: PairingResult = await service.handlePairing(identity(), code());
 
     expect(result).toEqual({ kind: 'unavailable' });
+    // Byte-for-byte, not merely "still unpaired": a pre-publication refusal must leave the previous
+    // record exactly as it was, which is what lets a caller honestly say so.
+    expect(fs.readFileSync(recordPath)).toEqual(bytesBefore);
     const reread = new FileOwnerStatePort(recordPath, OWNER_ID).read();
     expect(reread.kind === 'available' && reread.state.phase).toBe('unpaired');
+  });
+
+  it('never reports a created record when the record was not published', async () => {
+    // R02, at the policy boundary. `initialize()` used to ignore its replacement result entirely and
+    // answer 'created' unconditionally, so real setup published a configuration document on top of a
+    // record that did not exist and printed success.
+    const freshRoot = makeTestTemp('socs-s1-init-refused');
+    try {
+      const freshRecord = path.join(freshRoot, 'owner-access.json');
+      const refused = await new OwnerAdmissionService({
+        store: storeOver(freshRecord, failingFileFlushSync()),
+        codes: new CryptoPairingCodePort(),
+        clock,
+        expectedOwnerId: OWNER_ID,
+      }).initialize();
+
+      // Definite pre-publication refusal, so it is stated as such — never as 'created', and never as
+      // the unreadable-record refusal that would send an operator looking for evidence to preserve.
+      expect(refused).toBe('refused');
+      expect(fs.existsSync(freshRecord)).toBe(false);
+    } finally {
+      removeTestTemp(freshRoot);
+    }
+  });
+
+  it('reports an unconfirmed publication as uncertain, not as created', async () => {
+    // The record may be live and only its confirmation is lost. Calling that 'created' would claim a
+    // confirmation nobody has; calling it 'unavailable' would deny a record that may exist.
+    const freshRoot = makeTestTemp('socs-s1-init-uncertain');
+    try {
+      const uncertain = await new OwnerAdmissionService({
+        store: unacknowledgedStore(path.join(freshRoot, 'owner-access.json')),
+        codes: new CryptoPairingCodePort(),
+        clock,
+        expectedOwnerId: OWNER_ID,
+      }).initialize();
+
+      expect(uncertain).toBe('uncertain');
+    } finally {
+      removeTestTemp(freshRoot);
+    }
   });
 
   it('binds when an uncertain write turns out to have landed, instead of undoing it', async () => {
@@ -647,12 +717,13 @@ describe('owner enrollment: commit outcomes are distinguished from uncertainty',
     const store: OwnerStatePort = {
       read: () => real.read(),
       replace: async (next: OwnerState) => {
-        await real.replace(next);
+        const outcome = await real.replace(next);
         if (next.phase === 'bound') {
           boundWriteAcknowledged = true;
           const error: NodeJS.ErrnoException = new Error('acknowledgement lost after commit');
           throw error;
         }
+        return outcome;
       },
     };
 
@@ -672,15 +743,12 @@ describe('owner enrollment: commit outcomes are distinguished from uncertainty',
       ? before.state.challenge?.verifier
       : undefined;
 
-    const service = serviceOver(
-      failingStore((error) => {
-        error.code = 'ENOSPC';
-      }),
-    );
+    const issued = await serviceOver(refusingStore()).issueChallenge();
 
-    const issued = await service.issueChallenge();
-
-    expect(issued).toEqual({ kind: 'refused', reason: 'uncertain' });
+    // `unavailable`, not `uncertain`: a pre-publication refusal is DEFINITE, and reporting it as
+    // unconfirmed used to tell the operator to inspect a record that provably did not change. The
+    // closed cause travels with it rather than being collapsed into the read-failure word.
+    expect(issued).toEqual({ kind: 'refused', reason: 'unavailable', writeReason: 'flush-failed' });
     const after = real.read();
     const verifierAfter = after.kind === 'available' && after.state.phase === 'unpaired'
       ? after.state.challenge?.verifier
@@ -689,6 +757,43 @@ describe('owner enrollment: commit outcomes are distinguished from uncertainty',
     // was not shown.
     expect(verifierAfter).toBe(verifierBefore);
     expect(verifierAfter).toBeDefined();
+  });
+
+  it('reports an unconfirmed replacement as uncertain while keeping the new record readable', async () => {
+    // A REAL publication that only fails to confirm its own durability. The stored code changes, and
+    // since the plaintext is unrecoverable by design no code may be shown — the operator is told to
+    // reissue instead of being handed a code that does not match the record.
+    const real = new FileOwnerStatePort(recordPath, OWNER_ID);
+    const before = real.read();
+    const verifierBefore = before.kind === 'available' && before.state.phase === 'unpaired'
+      ? before.state.challenge?.verifier
+      : undefined;
+
+    const unconfirmed = new OwnerAdmissionService({
+      store: storeOver(recordPath, {
+        syncFile: (fd: number): void => fs.fsyncSync(fd),
+        syncDir: (): void => {
+          const error: NodeJS.ErrnoException = new Error('injected directory flush failure');
+          error.code = 'EIO';
+          throw error;
+        },
+      }),
+      codes: new CryptoPairingCodePort(),
+      clock,
+      expectedOwnerId: OWNER_ID,
+    });
+
+    const issued = await unconfirmed.issueChallenge();
+
+    expect(issued).toEqual({ kind: 'refused', reason: 'uncertain' });
+    const after = new FileOwnerStatePort(recordPath, OWNER_ID).read();
+    expect(after.kind).toBe('available');
+    const verifierAfter = after.kind === 'available' && after.state.phase === 'unpaired'
+      ? after.state.challenge?.verifier
+      : undefined;
+    // The replacement was RETAINED, not rolled back: the verifier really changed.
+    expect(verifierAfter).toBeDefined();
+    expect(verifierAfter).not.toBe(verifierBefore);
   });
 
   it('refuses to serve when the record cannot be read at all', async () => {

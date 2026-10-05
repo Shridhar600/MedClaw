@@ -11,6 +11,10 @@ and a serialized mutation queue that all writers funnel through.
   also the traversal guard.
 - `OwnerAdmissionService` — the ONLY authority for who may reach a clinical runtime. Reads the owner
   record fresh per decision; owns pairing, binding, throttling and destination authorization.
+  Publication truth comes from the port's typed result, never from an errno: `initialize()` reports
+  `created` only for a confirmed replacement and otherwise reports `exists` (record already there),
+  `unavailable` (existing record unreadable), `refused` (nothing published) or `uncertain` (possibly
+  published, confirmation incomplete).
 - `decodeOwnerState` / `encodeOwnerState` — the closed owner-record schema.
 - `WriteQueue` — per-profile serialized mutation queue: single promise-chain per profile.
   Every mutation (agent turn, dream, heartbeat, TTL sweep, ledger or memory write) goes

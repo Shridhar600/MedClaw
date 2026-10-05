@@ -17,6 +17,22 @@ export const PAIRING_CODE_LENGTH = 8;
 /** A submitted code is exactly this many symbols from the alphabet above. */
 export const PAIRING_CODE_EXPIRY_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * Shared byte budget for the persisted owner record.
+ *
+ * ONE number, declared here because policy, writer and reader must agree on it: a writer that may
+ * publish more bytes than the reader will accept is how one owner's own pairing traffic made the app's
+ * record unreadable after a restart (S1 C03/R11 — at the ordinary 256-candidate/three-attempt bounds a
+ * real day of traffic encodes to about 100 KiB, which the previous 64 KiB reader refused as
+ * `too-large`). Policy enforces it on the ENCODED write before publication, the reader enforces it on
+ * the bytes actually read, and Plan 15 §2.3 caps it at 256 KiB.
+ *
+ * It is a ceiling, not a promise: worst-case legal escaping still exceeds it (256 KiB holds every
+ * ASCII-legal record, not every pathological Unicode one). A record that cannot fit is refused before
+ * publication, with the previous readable bytes untouched — never truncated into a shorter lie.
+ */
+export const OWNER_RECORD_MAX_BYTES = 256 * 1024;
+
 /** Attempts allowed per private chat per UTC day. The fourth attempt is silent. */
 export const PAIRING_ATTEMPTS_PER_CHAT_PER_DAY = 3;
 /** Candidate chats retained for the current day before new candidates are refused. */
@@ -44,6 +60,32 @@ export type AdmissionReason =
 
 /** Why an owner record could not be read. Never an exception payload and never a path. */
 export type OwnerReadReason = 'unreadable' | 'too-large' | 'invalid-document' | 'owner-mismatch';
+
+// ── Publication ──────────────────────────────────────────────────────────────────────────
+//
+// Publication truth belongs HERE, at the seam that owns the rename, not in policy. Policy used to
+// guess it from an errno (`EACCES`/`EPERM`/`EROFS`/`ENOSPC`/`EIO` meant "definitely did not
+// happen"), which is unsound in both directions: those same codes are raised AFTER a rename has
+// landed, and any other code — including a lost acknowledgement — leaves the outcome unknown. Only
+// the adapter knows which side of the rename it failed on.
+
+/** Why a replacement was not confirmed published. A closed set: never an errno, message or path. */
+export type OwnerWriteReason = 'too-large' | 'write-failed' | 'flush-failed';
+
+export type OwnerStateWriteResult =
+  /** The replacement is published and its required flush is confirmed. */
+  | { status: 'committed' }
+  /**
+   * Published, or possibly published: a later step failed, so confirmation is incomplete. The NEW
+   * bytes are the file's content and are readable. Never restore, delete or deny them, and never
+   * claim the previous record is unchanged — reload authoritative state instead.
+   */
+  | { status: 'uncertain'; reason: OwnerWriteReason }
+  /**
+   * Not published, and known not to be. Existing bytes are unchanged and a missing record is still
+   * missing. Cleanup owns only this attempt's unpublished temp file.
+   */
+  | { status: 'failed'; reason: OwnerWriteReason };
 
 // ── Transport identity ────────────────────────────────────────────────────────────────────
 
@@ -146,8 +188,12 @@ export type OwnerStateRead =
 export interface OwnerStatePort {
   /** Fresh read every call. No mtime cache, no quarantine-to-empty. */
   read(): OwnerStateRead;
-  /** One atomic whole-record replacement (binding + challenge consumption together). */
-  replace(next: OwnerState): Promise<void>;
+  /**
+   * One atomic whole-record replacement (binding + challenge consumption together), reporting
+   * whether it actually published. Implementations MUST refuse before touching the filesystem when
+   * the encoded document exceeds `OWNER_RECORD_MAX_BYTES`.
+   */
+  replace(next: OwnerState): Promise<OwnerStateWriteResult>;
 }
 
 export interface PairingCodePort {

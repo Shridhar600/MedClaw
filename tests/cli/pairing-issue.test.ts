@@ -15,7 +15,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 import { runCli } from '../../src/cli';
+import { issuePairingCode } from '../../src/cli/admin';
 import { CryptoPairingCodePort, DirectoryLease, FileOwnerStatePort, readHolder } from '../../src/runtime/adapters';
+import type { OwnerRecordFileSync } from '../../src/runtime/adapters';
+import type { OwnerStateStoreFactory } from '../../src/runtime';
 import { OwnerAdmissionService } from '../../src/profiles';
 import { systemClock } from '../../src/ports/defaults';
 import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
@@ -171,6 +174,130 @@ describe('medclaw pairing issue', () => {
     // Nothing left behind: no lease directories at all.
     expect(fs.existsSync(fixture.workspaceLease)).toBe(false);
     expect(fs.existsSync(`${path.dirname(fixture.configPath)}/.redacted-config.lease`)).toBe(false);
+  });
+
+  // ── C03/R20 — the operator-facing text must match what actually happened ─────────────────────
+  //
+  // The one thing this command must never do is describe a record it cannot describe accurately. It
+  // used to answer every non-success refusal with "the previous record is unchanged", including the
+  // case where the replacement HAD landed and only its durability was unconfirmed — sending the owner
+  // to inspect a record that had changed, and away from a code that no longer matches.
+  //
+  // The record on disk is real in both cases; the only controlled input is one filesystem durability
+  // step of the real file adapter, injected through the command's own store seam.
+
+  function storeWith(sync: OwnerRecordFileSync): OwnerStateStoreFactory {
+    return (ownerRecordPath, ownerId) =>
+      new FileOwnerStatePort(ownerRecordPath, ownerId, undefined, sync);
+  }
+
+  const failingDirectoryFlush: OwnerRecordFileSync = {
+    syncFile: (fd: number): void => fs.fsyncSync(fd),
+    syncDir: (): void => {
+      const error: NodeJS.ErrnoException = new Error('injected directory flush failure');
+      error.code = 'EIO';
+      throw error;
+    },
+  };
+
+  const failingFileFlush: OwnerRecordFileSync = {
+    syncFile: (): void => {
+      const error: NodeJS.ErrnoException = new Error('injected file flush failure');
+      error.code = 'EIO';
+      throw error;
+    },
+    syncDir: (dir: string): void => {
+      const dfd = fs.openSync(dir, 'r');
+      try {
+        fs.fsyncSync(dfd);
+      } finally {
+        fs.closeSync(dfd);
+      }
+    },
+  };
+
+  it('never claims the record is unchanged when the replacement could not be confirmed', async () => {
+    const fixture = writeConfigFixture(root);
+    await seedUnpaired(fixture);
+    const before = fs.readFileSync(fixture.ownerRecord);
+
+    const output = await issuePairingCode({
+      configPath: fixture.configPath,
+      ownerStore: storeWith(failingDirectoryFlush),
+    });
+
+
+    // Distinct from BOTH failure shapes it used to share one message with, and — per the cold
+    // review's F1 — it asserts neither direction: `uncertain` also covers an acknowledgement lost
+    // before anything is known, so "was replaced" would be false there and "unchanged" false here.
+    expect(output).toMatch(/could not be confirmed as written/i);
+    expect(output).not.toMatch(/previous record is unchanged/i);
+    expect(output).not.toMatch(/was replaced/i);
+    // No code is shown: the plaintext is unrecoverable by design, so showing one would be a lie.
+    expect(output).not.toMatch(/\n\s{4}[A-Z2-9]{8}\s/);
+    expect(output).toMatch(/run .* again/i);
+
+    // The replacement was RETAINED and is readable; it was neither restored nor deleted.
+    expect(fs.readFileSync(fixture.ownerRecord)).not.toEqual(before);
+    expect(new FileOwnerStatePort(fixture.ownerRecord, fixture.ownerId).read().kind).toBe('available');
+    expect(fs.readdirSync(path.dirname(fixture.ownerRecord))).toEqual(['owner-access.json']);
+
+    // Both leases are still released, so the daemon can start and a reissue can run.
+    expect(fs.existsSync(fixture.workspaceLease)).toBe(false);
+    expect(fs.existsSync(`${path.dirname(fixture.configPath)}/.redacted-config.lease`)).toBe(false);
+  });
+
+  it('asserts nothing about the record when the outcome is genuinely unknown', async () => {
+    // F1, from the cold review. `uncertain` is also what a LOST acknowledgement produces: the port
+    // call never reported back and nothing is known about whether the record moved. The previous text
+    // said "was replaced", which is a definite claim about a record that never changed.
+    const fixture = writeConfigFixture(root);
+    await seedUnpaired(fixture);
+    const before = fs.readFileSync(fixture.ownerRecord);
+
+    const output = await issuePairingCode({
+      configPath: fixture.configPath,
+      ownerStore: (_recordPath, ownerId) => {
+        const real = new FileOwnerStatePort(
+          path.join(fixture.workspace, '.state', 'owner-access.json'),
+          ownerId,
+        );
+        return {
+          read: () => real.read(),
+          replace: async (): Promise<never> => {
+            throw new Error('synthetic lost acknowledgement');
+          },
+        };
+      },
+    });
+
+    // Says it could not be confirmed, and claims neither that it was replaced nor that it was not.
+    expect(output).toMatch(/could not be confirmed as written/i);
+    expect(output).not.toMatch(/was replaced/i);
+    expect(output).not.toMatch(/previous record is unchanged/i);
+    expect(output).not.toMatch(/\n\s{4}[A-Z2-9]{8}\s/);
+    // And the record on disk really is untouched, which is exactly what the old text denied.
+    expect(fs.readFileSync(fixture.ownerRecord)).toEqual(before);
+  });
+
+  it('reports a definite pre-publication refusal as unchanged, because it is', async (): Promise<void> => {
+    const fixture = writeConfigFixture(root);
+    await seedUnpaired(fixture);
+    const before = fs.readFileSync(fixture.ownerRecord);
+
+    const output = await issuePairingCode({
+      configPath: fixture.configPath,
+      ownerStore: storeWith(failingFileFlush),
+    });
+
+    expect(output).toMatch(/previous record is unchanged/i);
+    expect(output).not.toMatch(/\n\s{4}[A-Z2-9]{8}\s/);
+    // The closed write cause is reported, and it is NOT the read-failure word: "unavailable" is what
+    // an unreadable record looks like, and conflating the two sends the operator to the wrong place.
+    expect(output).toMatch(/Reason: flush-failed/);
+    expect(output).not.toMatch(/Reason: unavailable/);
+    // Byte-for-byte: this is the case where that sentence is actually true.
+    expect(fs.readFileSync(fixture.ownerRecord)).toEqual(before);
   });
 
   it('reports an unknown pairing subcommand instead of guessing', async () => {

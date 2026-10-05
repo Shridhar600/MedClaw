@@ -14,6 +14,7 @@ import type { ConfigFileSync } from '../runtime';
 import { DirectoryLease } from '../runtime/adapters/directory-lease';
 import { CryptoPairingCodePort, FileOwnerStatePort } from '../runtime/adapters';
 import { InstallationService, describeOwnershipRefusal } from '../runtime';
+import type { OwnerStateStoreFactory } from '../runtime';
 import { OwnerAdmissionService, isBoundOwnerState } from '../profiles';
 import { systemClock } from '../ports/defaults';
 import type { ResourceLeasePort } from '../ports/resource-lease';
@@ -29,6 +30,12 @@ export interface AdminPaths {
   configPath?: string;
   workspacePath?: string;
   storePath?: string;
+  /**
+   * Optional override for the owner-record store. Production leaves it undefined and gets the real
+   * file adapter; a caller that must observe an unconfirmed publication (a directory flush that could
+   * not be completed) supplies its own store so the operator-facing text is the real one.
+   */
+  ownerStore?: OwnerStateStoreFactory;
 }
 
 function summarizeMarkdown(text: string): string {
@@ -223,7 +230,9 @@ export async function issuePairingCode(options: AdminPaths = {}): Promise<string
   const { ownerId, ownerPaths, release } = result.ownership;
   try {
     const admission = new OwnerAdmissionService({
-      store: new FileOwnerStatePort(ownerPaths.ownerRecord, ownerId),
+      store: options.ownerStore
+        ? options.ownerStore(ownerPaths.ownerRecord, ownerId)
+        : new FileOwnerStatePort(ownerPaths.ownerRecord, ownerId),
       codes: new CryptoPairingCodePort(),
       clock: systemClock,
       expectedOwnerId: ownerId,
@@ -246,9 +255,23 @@ export async function issuePairingCode(options: AdminPaths = {}): Promise<string
         'Only a bounded, one-use code can be reissued while an owner is unpaired.',
       ].join('\n') + '\n';
     }
+    if (issued.reason === 'uncertain') {
+      // `uncertain` covers BOTH a post-rename flush that could not be confirmed AND an
+      // acknowledgement that was lost before anything is known. Only the record knows which, so this
+      // text must not assert either: "was replaced" is false when nothing was, and "unchanged" is
+      // false when the rename landed. Both directions of that claim were the R20 defect.
+      return [
+        'Refused to issue a pairing code: the owner record could not be confirmed as written.',
+        '',
+        'It may already hold the new code, whose plaintext is unrecoverable by design, so no code is shown here.',
+        'Run `medclaw config show` to inspect the record, then run this command again to get a usable code.',
+      ].join('\n') + '\n';
+    }
     return [
       'Refused to issue a pairing code: the owner record could not be updated.',
-      `Reason: ${issued.reason}. The previous record is unchanged; run \`medclaw config show\` to inspect it.`,
+      issued.writeReason === undefined
+        ? 'The owner record could not be read. Run `medclaw config show` to inspect it.'
+        : `Reason: ${issued.writeReason}. The previous record is unchanged; run \`medclaw config show\` to inspect it.`,
     ].join('\n') + '\n';
   } finally {
     await release();

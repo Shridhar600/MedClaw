@@ -473,6 +473,7 @@ function describeSetupRefusal(outcome: SetupResult): string {
     case 'unavailable':
       return `Setup refused: ${outcome.guidance}`;
     case 'not-fresh':
+    case 'incomplete':
       return outcome.message;
     default:
       // Unreachable: the caller returns on `committed` before reaching here. Stated rather than

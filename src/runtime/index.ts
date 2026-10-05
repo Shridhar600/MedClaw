@@ -46,8 +46,12 @@ export type {
   ConfigFileSync,
   ConfigWriteOutcome,
   InstallationOwnership,
+  InstallationServiceOptions,
   LoadedConfigDocument,
   OwnershipResult,
+  OwnerStateStoreFactory,
+  SetupInput,
+  SetupResult,
 } from './installation';
 
 export { composeOwnerAuthority } from './owner-authority';

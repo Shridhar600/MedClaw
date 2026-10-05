@@ -32,6 +32,7 @@ export {
 } from './owner-admission';
 export type {
   InstallationAdmission,
+  InitializeResult,
   IssueChallengeResult,
   OwnerAdmissionDeps,
 } from './owner-admission';
@@ -44,6 +45,8 @@ export type {
   OwnerState,
   OwnerStatePort,
   OwnerStateRead,
+  OwnerStateWriteResult,
+  OwnerWriteReason,
   PairingAttempts,
   PairingCandidateChat,
   PairingCodePort,
@@ -51,4 +54,4 @@ export type {
   PairingResultKind,
   TransportIdentity,
 } from '../ports/owner-state';
-export { isBoundOwnerState, isUnpairedOwnerState } from '../ports/owner-state';
+export { isBoundOwnerState, isUnpairedOwnerState, OWNER_RECORD_MAX_BYTES } from '../ports/owner-state';

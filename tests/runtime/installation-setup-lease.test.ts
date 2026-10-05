@@ -19,7 +19,11 @@ import { spawn, type ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { InstallationService } from '../../src/runtime/installation';
+import type { OwnerStateStoreFactory } from '../../src/runtime/installation';
 import { DirectoryLease, leasePathFor } from '../../src/runtime/adapters/directory-lease';
+import { FileOwnerStatePort } from '../../src/runtime/adapters/owner-state-file';
+import type { OwnerRecordFileSync } from '../../src/runtime/adapters/owner-state-file';
+import type { OwnerStateRead, OwnerStateWriteResult } from '../../src/ports/owner-state';
 import { canonicalizeConfigPath } from '../../src/runtime/adapters/config-file';
 import { loadRuntimeConfig } from '../../src/runtime/startup';
 import { resolveOwnerPaths, asProfileId } from '../../src/profiles';
@@ -253,6 +257,181 @@ describe('installation setup holds both leases across its commit', () => {
     expect(outcome.kind).toBe('not-fresh');
     expect(fs.readFileSync(configPath, 'utf8')).toBe('{"schemaVersion":2}');
     expect(fs.existsSync(ownerPaths.ownerRecord)).toBe(false);
+  });
+});
+
+// ── C03/R02 + R20 — setup truth at the owner-record publication boundary ─────────────────────
+//
+// The invariant: **setup reports success only when the required owner record was actually published
+// and confirmed.** Before this, `initialize()`'s replacement result was discarded, so a first run whose
+// record write failed committed the configuration document anyway and printed "setup complete" —
+// leaving a daemon that refuses to start on an installation that claims to be complete. And a
+// replacement that landed without a confirmable flush was reported as clean success.
+//
+// The fault is injected at the REAL adapter's durability seam, so the temp file is really written,
+// the rename really happens or really does not, and everything asserted here is on-disk bytes. The
+// leases, the freshness check, the workspace templates and the config writer are all the real ones.
+
+describe('setup tells the truth about the owner record it published', () => {
+  let root: string;
+  beforeEach(() => {
+    root = makeTestTemp('setup-owner-record-truth');
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  /** A real owner store whose only controlled fault is one filesystem durability step. */
+  function storeWith(sync: OwnerRecordFileSync): OwnerStateStoreFactory {
+    return (ownerRecordPath, ownerId) =>
+      new FileOwnerStatePort(ownerRecordPath, ownerId, undefined, sync);
+  }
+
+  const failingFileFlush: OwnerRecordFileSync = {
+    syncFile: (): void => {
+      const error: NodeJS.ErrnoException = new Error('injected file flush failure');
+      error.code = 'EIO';
+      throw error;
+    },
+    syncDir: (dir: string): void => {
+      const dfd = fs.openSync(dir, 'r');
+      try {
+        fs.fsyncSync(dfd);
+      } finally {
+        fs.closeSync(dfd);
+      }
+    },
+  };
+
+  const failingDirectoryFlush: OwnerRecordFileSync = {
+    syncFile: (fd: number): void => fs.fsyncSync(fd),
+    syncDir: (): void => {
+      const error: NodeJS.ErrnoException = new Error('injected directory flush failure');
+      error.code = 'EIO';
+      throw error;
+    },
+  };
+
+  /**
+   * A store whose replacement THROWS BEFORE TOUCHING THE FILESYSTEM — the lost-acknowledgement
+   * shape, where the outcome of the publication is genuinely unknown to the caller. Reads delegate to
+   * the real file adapter so the on-disk facts in each case below are real, not asserted.
+   *
+   * Admission is NOT mocked. `initialize()` sees a real `OwnerStatePort` and its own policy decides
+   * that a throw is `uncertain`; the question this suite asks is what `setup()` then tells the
+   * operator, and that is the consumer gap under test.
+   */
+  function storeThrowingBeforeWriting(): OwnerStateStoreFactory {
+    return (ownerRecordPath, ownerId) => {
+      const real = new FileOwnerStatePort(ownerRecordPath, ownerId);
+      return {
+        read: (): OwnerStateRead => real.read(),
+        replace: async (): Promise<OwnerStateWriteResult> => {
+          throw new Error('injected lost acknowledgement before any write');
+        },
+      };
+    };
+  }
+
+  it('never tells the operator it wrote a record whose publication was never established', async () => {
+    const { configPath, ownerId, config, ownerPaths } = prospectiveSetup(root);
+
+    const outcome = await new InstallationService(new DirectoryLease(), {
+      ownerStore: storeThrowingBeforeWriting(),
+    }).setup({ configPath, config, ownerId });
+
+    // Incomplete, not committed and not not-fresh: nothing pre-existing was refused here.
+    expect(outcome.kind).toBe('incomplete');
+    if (outcome.kind !== 'incomplete') return;
+    expect(outcome.message).not.toMatch(/setup complete/i);
+
+    // THE DEFECT: an unconfirmed publication is not a publication. Claiming a definite write is a
+    // false statement about the owner's durable identity, and it is the same lost-acknowledgement
+    // case that pairing issue no longer makes.
+    expect(outcome.message).not.toMatch(/wrote the owner record/i);
+    // Nor may it claim the opposite — an unreadable readback does not establish absence.
+    expect(outcome.message).not.toMatch(/no owner record|record was not created|record is missing/i);
+
+    // …and the branch actually taken must be the one the READBACK selects. This is the assertion that
+    // makes `attempt.readable` load-bearing: if setup decided readability from the write result alone,
+    // this store — which wrote nothing — would be reported as present and readable. A missing line
+    // here would let the readback gate be deleted and still pass.
+    expect(outcome.message).toMatch(/could not be read back/i);
+
+    // The real facts behind the wording, read through the real adapter: nothing was written, so the
+    // operator is told about a target that genuinely holds no record.
+    expect(new FileOwnerStatePort(ownerPaths.ownerRecord, ownerId).read().kind).toBe('missing');
+    expect(fs.existsSync(configPath)).toBe(false);
+
+    // Both leases released, so the refusal never strands a target as `busy`.
+    expect(fs.existsSync(leasePathFor(path.resolve(configPath)))).toBe(false);
+    expect(fs.existsSync(ownerPaths.workspaceLease)).toBe(false);
+
+    // The guidance must describe an action that will actually work. Setup never adopts or repairs a
+    // workspace it already created, so re-running into THIS target is refused — the message must not
+    // send the operator down that road.
+    const retry = await new InstallationService(new DirectoryLease()).setup({ configPath, config, ownerId });
+    expect(retry.kind).toBe('not-fresh');
+    expect(fs.existsSync(configPath)).toBe(false);
+    // Positively, not by exclusion: the guidance states the true outcome for THIS target and names a
+    // fresh one. An earlier version of this line used a negative lookahead that could never match the
+    // message and therefore asserted nothing at all.
+    expect(outcome.message).toMatch(/re-running (it|setup) into this target is refused/i);
+    expect(outcome.message).toMatch(/--state-root/);
+  });
+
+  it('publishes no configuration and reports incomplete when the record write is refused', async () => {
+    const { configPath, ownerId, config, ownerPaths } = prospectiveSetup(root);
+
+    const outcome = await new InstallationService(new DirectoryLease(), {
+      ownerStore: storeWith(failingFileFlush),
+    }).setup({ configPath, config, ownerId });
+
+    // NOT committed, and not `not-fresh` either: nothing pre-existing was refused here.
+    expect(outcome.kind).toBe('incomplete');
+    if (outcome.kind !== 'incomplete') return;
+    expect(outcome.message).not.toMatch(/setup complete/i);
+    // The required record is absent and no configuration document was published beside it.
+    expect(fs.existsSync(ownerPaths.ownerRecord)).toBe(false);
+    expect(fs.existsSync(configPath)).toBe(false);
+    // Both leases are released on the refusal path too, so no target is stranded as `busy` forever.
+    expect(fs.existsSync(leasePathFor(path.resolve(configPath)))).toBe(false);
+    expect(fs.existsSync(ownerPaths.workspaceLease)).toBe(false);
+    // Setup never adopts or repairs the workspace it already created, so a retry into the same target
+    // is refused rather than silently completing a half-written installation.
+    const retry = await new InstallationService(new DirectoryLease()).setup({ configPath, config, ownerId });
+    expect(retry.kind).toBe('not-fresh');
+    expect(fs.existsSync(configPath)).toBe(false);
+    expect(fs.existsSync(ownerPaths.ownerRecord)).toBe(false);
+  });
+
+  it('keeps a readable owner record, publishes no config, and reports incomplete when the flush is unconfirmed', async () => {
+    const { configPath, ownerId, config, ownerPaths } = prospectiveSetup(root);
+
+    const outcome = await new InstallationService(new DirectoryLease(), {
+      ownerStore: storeWith(failingDirectoryFlush),
+    }).setup({ configPath, config, ownerId });
+
+    expect(outcome.kind).toBe('incomplete');
+    if (outcome.kind !== 'incomplete') return;
+    // Honest about which half is known: the record is there and readable, its durability is not proven.
+    expect(outcome.message).toMatch(/present and readable/);
+    expect(outcome.message).toMatch(/No configuration document was written/);
+    expect(fs.existsSync(configPath)).toBe(false);
+
+    // The new record is RETAINED and readable — not restored, not deleted, not denied.
+    expect(new FileOwnerStatePort(ownerPaths.ownerRecord, ownerId).read().kind).toBe('available');
+    expect(modeOf(ownerPaths.ownerRecord)).toBe(0o600);
+
+    // Both leases are released on this path too.
+    expect(fs.existsSync(leasePathFor(path.resolve(configPath)))).toBe(false);
+    expect(fs.existsSync(ownerPaths.workspaceLease)).toBe(false);
+
+    // Re-running setup into the same target refuses as not-fresh: setup never overwrites or repairs,
+    // and it never silently adopts the half-published installation either.
+    const retry = await new InstallationService(new DirectoryLease()).setup({ configPath, config, ownerId });
+    expect(retry.kind).toBe('not-fresh');
+    expect(fs.existsSync(configPath)).toBe(false);
   });
 });
 

@@ -490,7 +490,11 @@ export async function runSetupWizard(
       break;
     } catch (error) {
       renderStatus(io, 'WARN', `Could not write setup files: ${error instanceof Error ? error.message : String(error)}`);
-      renderStatus(io, 'INFO', 'Adjust the workspace or config path and apply again.');
+      // True for every refusal the writer can produce, including a half-published setup: setup never
+      // overwrites existing owner evidence, so "apply again" into the SAME target is always refused.
+      // Saying only "apply again" walked the operator into a second installation beside the record
+      // the message above had just told them to inspect.
+      renderStatus(io, 'INFO', 'Apply again only with a fresh --state-root or --config target.');
     }
   }
 

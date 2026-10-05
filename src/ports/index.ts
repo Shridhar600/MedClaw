@@ -18,6 +18,8 @@ export type {
   OwnerState,
   OwnerStatePort,
   OwnerStateRead,
+  OwnerStateWriteResult,
+  OwnerWriteReason,
   PairingAttempts,
   PairingCandidateChat,
   PairingCodePort,
@@ -25,7 +27,7 @@ export type {
   PairingResultKind,
   TransportIdentity,
 } from './owner-state';
-export { isBoundOwnerState, isUnpairedOwnerState } from './owner-state';
+export { isBoundOwnerState, isUnpairedOwnerState, OWNER_RECORD_MAX_BYTES } from './owner-state';
 export type {
   DiagnosticEvent,
   DiagnosticSink,

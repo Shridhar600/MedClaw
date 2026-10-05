@@ -28,6 +28,7 @@ import {
   type AdmissionReason,
   type OwnerBinding,
   type OwnerReadReason,
+  type OwnerWriteReason,
   type OwnerState,
   type OwnerStatePort,
   type PairingCandidateChat,
@@ -126,7 +127,35 @@ export type InstallationAdmission =
 
 export type IssueChallengeResult =
   | { kind: 'issued'; plaintext: string; expiresAt: string }
-  | { kind: 'refused'; reason: 'already-bound' | 'unavailable' | 'uncertain' };
+  /**
+   * `writeReason` is present only when the record COULD be read and the replacement was refused
+   * before publication. It carries the closed `OwnerWriteReason` rather than collapsing into
+   * `unavailable`, which is the word for "the record could not be read" — a different fault the
+   * operator acts on differently.
+   */
+  | {
+      kind: 'refused';
+      reason: 'already-bound' | 'unavailable' | 'uncertain';
+      writeReason?: OwnerWriteReason;
+    };
+
+/**
+ * What `initialize()` actually achieved. Four different facts, never collapsed into two.
+ *
+ * - `created`: published AND confirmed.
+ * - `exists`: a readable record was already there, so nothing was written.
+ * - `unavailable`: an existing record could not be READ. That is owner evidence setup must refuse
+ *   rather than repair.
+ * - `refused`: nothing was published and nothing pre-existed. A write that demonstrably did not
+ *   happen is not "the record is unavailable", and reporting it as such sent the operator to choose a
+ *   fresh target for a target that was already fresh.
+ * - `uncertain`: it may be published, with confirmation incomplete.
+ *
+ * `created` used to be reported unconditionally from an ignored replacement result, so a first run
+ * whose record write failed printed "setup complete", committed the configuration document, and left a
+ * daemon that refused to start (S1 C03/R02).
+ */
+export type InitializeResult = 'created' | 'exists' | 'unavailable' | 'refused' | 'uncertain';
 
 // ── Transport identity validation ─────────────────────────────────────────────────────────
 
@@ -511,48 +540,64 @@ export class OwnerAdmissionService {
     if (committed.kind === 'committed') {
       return { kind: 'issued', plaintext: issued.plaintext, expiresAt };
     }
-    if (committed.kind === 'uncertain') {
-      const reread = this.deps.store.read();
-      if (
-        reread.kind === 'available'
-        && reread.state.phase === 'unpaired'
-        && reread.state.challenge !== undefined
-      ) {
-        // The stored challenge exists but its plaintext is unrecoverable by design. Say so
-        // rather than printing a code that does not match the record.
-        return { kind: 'refused', reason: 'uncertain' };
-      }
+    if (committed.kind === 'failed') {
+      // Nothing was published, so the record still holds the previous code. `unavailable`, NOT
+      // `uncertain`: reporting a definite refusal as unconfirmed would tell the operator to inspect a
+      // record that provably did not change, which is the false "the previous record is unchanged"
+      // claim this result exists to prevent. The specific cause travels as `writeReason`.
+      return { kind: 'refused', reason: 'unavailable', writeReason: committed.reason };
     }
+    // The stored challenge exists but its plaintext is unrecoverable by design, so say so rather than
+    // printing a code that does not match the record. Reissue to get a usable one.
     return { kind: 'refused', reason: 'uncertain' };
   }
 
-  /** Create the initial unpaired record when none exists. Used by setup only. */
-  async initialize(): Promise<'created' | 'exists' | 'unavailable'> {
+  /**
+   * Create the initial unpaired record when none exists. Used by setup only.
+   *
+   * `created` is reported ONLY for a confirmed publication. Every other outcome is propagated, because
+   * a caller that publishes a configuration document on top of a record that may not exist produces
+   * an installation that refuses to start and reports itself complete.
+   */
+  async initialize(): Promise<InitializeResult> {
     const read = this.deps.store.read();
     if (read.kind === 'available') return 'exists';
     if (read.kind === 'unavailable') return 'unavailable';
-    await this.replace(newUnpairedOwnerState(this.deps.expectedOwnerId, this.deps.clock.now()));
-    return 'created';
+    const published = await this.replace(newUnpairedOwnerState(this.deps.expectedOwnerId, this.deps.clock.now()));
+    if (published.kind === 'committed') return 'created';
+    if (published.kind === 'uncertain') return 'uncertain';
+    return 'refused';
   }
 
+  /**
+   * Publish a whole record and reduce the port's typed result to what policy needs.
+   *
+   * This used to infer the outcome from an errno — `EACCES`/`EPERM`/`EROFS`/`ENOSPC`/`EIO` were read
+   * as "the write demonstrably did not happen" and everything else as uncertain. That inference was
+   * wrong on the side that matters: those codes are raised after a rename has already landed, so a
+   * confirmed refusal could be reported for a record that was in fact replaced. The port now states
+   * which side of the rename failed, so policy only maps it.
+   *
+   * A THROW is still tolerated and mapped to `uncertain`, which is the only honest reading of an
+   * unacknowledged call, but it is no longer the mechanism publication truth depends on.
+   */
   private async replace(
     next: OwnerState,
   ): Promise<
     | { kind: 'committed'; state: OwnerState }
-    | { kind: 'failed' }
+    | { kind: 'failed'; reason: OwnerWriteReason }
     | { kind: 'uncertain' }
   > {
     try {
-      await this.deps.store.replace(next);
-      return { kind: 'committed', state: next };
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === 'EACCES' || code === 'EPERM' || code === 'EROFS' || code === 'ENOSPC' || code === 'EIO') {
-        // The write demonstrably did not happen.
-        this.log(`[admission] owner record write refused (${code})`);
-        return { kind: 'failed' };
+      const outcome = await this.deps.store.replace(next);
+      if (outcome.status === 'committed') return { kind: 'committed', state: next };
+      if (outcome.status === 'failed') {
+        this.log(`[admission] owner record write refused (${outcome.reason})`);
+        return { kind: 'failed', reason: outcome.reason };
       }
-      // Anything else: we do not know whether it landed. The caller must reload.
+      this.log(`[admission] owner record write unconfirmed (${outcome.reason})`);
+      return { kind: 'uncertain' };
+    } catch {
       this.log('[admission] owner record write outcome uncertain');
       return { kind: 'uncertain' };
     }
