@@ -265,6 +265,74 @@ function directoryHasEntries(directory: string): boolean {
   }
 }
 
+type StructuralScaffold = { ok: true } | { ok: false; reason: LeaseUnavailableReason; guidance: string };
+
+/**
+ * Create only the private structural directories on the way to `target`, at 0700.
+ *
+ * Deliberately NOT `secureMkdir`: that helper calls `tightenDir` on the leaf, so handing it an
+ * already-existing directory `chmod`s it. Scaffolding must never change the mode of a directory it
+ * did not create — an existing ancestor is somebody else's, possibly a symlink whose target lives
+ * outside this installation, and plan 15 §2.2/§7 give setup no authority over it.
+ *
+ * An already-existing component is left completely alone: not created, not `chmod`ed, not removed. An
+ * `EEXIST` from `mkdir` only proves that an entry is present — not that this process made it, and not
+ * that it is a usable directory — so it is accepted without further action and the lease's own
+ * parent-state check decides whether it works.
+ */
+function scaffoldStructuralParents(target: string): StructuralScaffold {
+  const missing: string[] = [];
+  let current = path.resolve(target);
+  for (;;) {
+    if (directoryExists(current)) break;
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    missing.unshift(current);
+    current = parent;
+  }
+
+  for (const directory of missing) {
+    try {
+      fs.mkdirSync(directory, { mode: 0o700 });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      // An entry is already there, so this component needs no creation, and its mode is not ours to
+      // change. Whether it is a usable directory is decided by the lease's own parent-state check,
+      // which refuses honestly if it is a file or a symlink to one.
+      if (code === 'EEXIST') continue;
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        return {
+          ok: false,
+          reason: 'unsafe-parent',
+          guidance:
+            'The configuration directory cannot be owned because a path component is not a directory. Choose a different --config or --state-root target.',
+        };
+      }
+      return {
+        ok: false,
+        reason: 'permission',
+        guidance:
+          'The configuration directory could not be created, so this installation cannot be owned. Check local permissions and retry.',
+      };
+    }
+    try {
+      fs.chmodSync(directory, 0o700);
+    } catch {
+      // `mkdir`'s mode is umask-affected and already owner-only in practice; a narrow directory is
+      // still private to this owner, and mode hardening must never fail setup.
+    }
+  }
+  return { ok: true };
+}
+
+function directoryExists(candidate: string): boolean {
+  try {
+    return fs.statSync(candidate).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Create the unpaired owner record. `initialize()` is a no-op when one already exists and refuses
  * when the existing record is unreadable — setup must not overwrite or repair an existing record.
@@ -409,6 +477,25 @@ export class InstallationService {
   async setup(input: SetupInput): Promise<SetupResult> {
     const { config: configToPersist, ownerId } = input;
     const { canonicalPath } = canonicalizeConfigPath(input.configPath);
+
+    // The structural parents the CONFIG lease needs, created before acquisition. The lease is a
+    // directory beside the document, so it cannot exist until its parent does, and real setup used
+    // to refuse here with "its parent directory is missing" — which made the advertised first run
+    // into `~/.redacted/config.json` impossible without the operator pre-creating a private folder.
+    //
+    // This creates STRUCTURE ONLY: empty private directories on the path to the document, nothing
+    // else. No template, no owner record, no config bytes, and no authority of any kind — plan 15 §7
+    // is explicit that creating the parents a lease needs grants nothing, and that a fresh target
+    // must be re-checked under both leases before anything is published into it.
+    const scaffolded = scaffoldStructuralParents(path.dirname(canonicalPath));
+    if (!scaffolded.ok) {
+      return {
+        kind: 'unavailable',
+        resource: 'config',
+        reason: scaffolded.reason,
+        guidance: scaffolded.guidance,
+      };
+    }
 
     const configLease = await this.leases.tryAcquire({ kind: 'config', canonicalPath });
     if (configLease.kind === 'busy') {

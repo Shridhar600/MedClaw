@@ -293,7 +293,26 @@ describe('installation resource ownership', () => {
     expect(results).toHaveLength(4);
     expect(owned).toHaveLength(1);
     expect(busy).toHaveLength(3);
-    expect(busy.every((r) => r.reason === 'held')).toBe(true);
+
+    // C02/R10 ASSERTION MIGRATION. This line used to demand `reason === 'held'` from every refusal.
+    // That was not a product contract; it encoded one implementation artifact. The old adapter built
+    // its lease in a staging directory and renamed it into place, so the holder record was already
+    // readable at the instant the claim became visible and a loser could never observe it missing.
+    // R10's repair removes that artifact, because a rename over an existing EMPTY directory is
+    // precisely the replacement that had to stop. A nonrecursive `mkdir` is the only no-replace
+    // directory claim Node exposes, so the claim is visible for one syscall before the holder record
+    // lands, and a loser inside that window truthfully reports `malformed-holder`: ownership cannot be
+    // verified, so it is refused and never taken. Both reasons are immediate `busy`.
+    expect(busy.every((r) => r.reason === 'held' || r.reason === 'malformed-holder')).toBe(true);
+
+    // The stronger contract that replaces the removed artifact. Nothing a losing process did left
+    // anything behind: no staged lease directory, no second claim, no rewritten document. Every
+    // contender released, so the config directory holds exactly the one document it started with.
+    expect(fs.readdirSync(tmpDir).sort()).toEqual(['config.json', 'go', 'release', 'state']);
+    const stored = JSON.parse(fs.readFileSync(fixture.configPath, 'utf8')) as {
+      profiles: { defaultProfileId: string };
+    };
+    expect(stored.profiles.defaultProfileId).toBe(fixture.ownerId);
   }, 60_000);
 
   it('a real config-set command refuses while another process holds the installation', async () => {
@@ -351,6 +370,23 @@ describe('installation resource ownership', () => {
       present: false,
       readable: false,
     });
+
+    // Inspection must agree with acquisition about an occupied claim path. A dangling symlink is one:
+    // `existsSync` follows it and reports the claim absent, which would tell an operator the
+    // installation is free while the daemon refuses it as busy. Present-but-unreadable is the honest
+    // answer, and the guidance that goes with it is the manual-inspection one.
+    const { DirectoryLease: RealLease } = await import('../../src/runtime/adapters/directory-lease');
+    fs.symlinkSync(path.join(tmpDir, 'no-such-target'), leasePathFor(fixture.configPath));
+    expect(describeLeaseForLocalInspection(fixture.configPath)).toEqual({
+      present: true,
+      readable: false,
+    });
+    const refused = await new RealLease().tryAcquire({
+      kind: 'config',
+      canonicalPath: fixture.configPath,
+    });
+    expect(refused.kind).toBe('busy');
+    fs.unlinkSync(leasePathFor(fixture.configPath));
 
     const services = new InstallationService(new DirectoryLease());
     const held = await services.acquireOwnership(fixture.configPath, tmpDir);
@@ -1122,4 +1158,142 @@ describe('ownership release requires quiescence', () => {
     await daemon.shutdown();
     expect(fs.existsSync(fixture.workspaceLease)).toBe(false);
   }, 60_000);
+});
+
+// ── C02/R10 — an existing lease is never replaced ──────────────────────────────────────────
+//
+// Acquisition published its lease by renaming a fully built directory into place. POSIX `rename`
+// REPLACES an existing destination that is an empty directory, so an unknown lease left at a claim
+// path — the exact shape a crash between claim and publication leaves behind — was silently deleted
+// and this process reported ownership of a resource it had never been given.
+//
+// Real collaborators throughout. The empty entry is created by the test and then asserted byte-,
+// inode- and type-identical after the refusal.
+
+describe('acquisition refuses every pre-existing lease entry without replacing it', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = makeTestTemp('socs-s1-unknown-lease-');
+  });
+
+  afterEach(() => {
+    killAllChildren();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('refuses an existing empty config lease and leaves the directory untouched', async () => {
+    const fixture = writeConfigFixture(tmpDir, {});
+    const leasePath = leasePathFor(fixture.configPath);
+    fs.mkdirSync(leasePath, { mode: 0o700 });
+    const before = fs.lstatSync(leasePath);
+
+    const services = new InstallationService(new DirectoryLease());
+    const result = await services.acquireOwnership(fixture.configPath, tmpDir);
+
+    expect(result.kind).toBe('busy');
+    if (result.kind !== 'busy') return;
+    expect(result.resource).toBe('config');
+    expect(result.lease.reason).toBe('malformed-holder');
+    expect(result.lease.holderState).toBe('malformed');
+    // Nothing was claimed, nothing was published, nothing was repaired.
+    expect(result.lease.guidance).toContain('never taken automatically');
+
+    const after = fs.lstatSync(leasePath);
+    expect(after.isDirectory()).toBe(true);
+    expect(after.ino).toBe(before.ino);
+    expect(after.mode & 0o777).toBe(before.mode & 0o777);
+    expect(fs.readdirSync(leasePath)).toEqual([]);
+    expect(fs.existsSync(path.join(leasePath, 'holder.json'))).toBe(false);
+    // The owner workspace lease was never reached, so nothing else was created either.
+    expect(fs.existsSync(fixture.workspaceLease)).toBe(false);
+  });
+
+  it('refuses an existing empty owner lease and releases only the config lease it took', async () => {
+    const fixture = writeConfigFixture(tmpDir, {});
+    fs.mkdirSync(fixture.workspaceLease, { recursive: true, mode: 0o700 });
+    const before = fs.lstatSync(fixture.workspaceLease);
+
+    const services = new InstallationService(new DirectoryLease());
+    const result = await services.acquireOwnership(fixture.configPath, tmpDir);
+
+    expect(result.kind).toBe('busy');
+    if (result.kind !== 'busy') return;
+    expect(result.resource).toBe('owner');
+    expect(result.lease.reason).toBe('malformed-holder');
+
+    const after = fs.lstatSync(fixture.workspaceLease);
+    expect(after.isDirectory()).toBe(true);
+    expect(after.ino).toBe(before.ino);
+    expect(fs.readdirSync(fixture.workspaceLease)).toEqual([]);
+    // The config lease this caller did acquire is given back; the unknown one is left in place.
+    expect(fs.existsSync(leasePathFor(fixture.configPath))).toBe(false);
+  });
+
+  it('claims and releases cleanly under a umask that strips owner bits', async () => {
+    // Cold-review M1. `mkdir`'s mode is umask-affected. An earlier ordering established the owner-only
+    // mode AFTER the holder write, so under a umask like 0700 the claim was created at 0000, the
+    // holder write failed EACCES, and the failed-attempt cleanup could not list the directory it had
+    // to remove. The claim survived as an artifact this process created, and every later acquisition
+    // returned `busy/malformed-holder` forever over a directory no operator could even read. Plan 15
+    // §2.2 forbids clearing it automatically. A crash leftover may legitimately stay busy; an artifact
+    // this attempt made and failed to clean may not.
+    //
+    // Scoped to the lease claim itself, which is the mechanism that regressed. The full
+    // `acquireOwnership` path cannot be used as the vehicle here: its PRE-EXISTING recursive
+    // `secureMkdir` for the owner workspace also fails EACCES under this umask, so that would measure
+    // an unrelated baseline limitation instead of the claim's mode handling. Reported separately.
+    const leaseDir = path.join(tmpDir, 'umask-claim');
+    fs.mkdirSync(path.dirname(leaseDir), { recursive: true, mode: 0o700 });
+
+    const previousUmask = process.umask(0o700);
+    let held;
+    try {
+      // Real adapter, real filesystem, no injected fault — only the process umask.
+      held = await new DirectoryLease().tryAcquire({ kind: 'config', canonicalPath: leaseDir });
+    } finally {
+      process.umask(previousUmask);
+    }
+
+    expect(held.kind).toBe('acquired');
+    if (held.kind !== 'acquired') return;
+
+    const claim = leasePathFor(leaseDir);
+    // Both modes are umask-affected at creation and must be established explicitly. The HOLDER RECORD
+    // is the load-bearing one: release is token-checked by reading it, so an unreadable record makes
+    // the caller's own lease impossible to release even after a successful acquisition.
+    expect(fs.statSync(claim).mode & 0o777).toBe(0o700);
+    expect(fs.statSync(path.join(claim, 'holder.json')).mode & 0o777).toBe(0o600);
+    expect(fs.readdirSync(claim)).toEqual(['holder.json']);
+    expect(readHolder(claim)?.pid).toBe(process.pid);
+
+    // Release really works under this umask: it must read the record and remove the claim.
+    await held.release();
+    expect(fs.existsSync(claim)).toBe(false);
+  });
+
+  it('treats a dangling symlink at the claim path as occupied, because the entry exists', async () => {
+    const fixture = writeConfigFixture(tmpDir, {});
+    const leasePath = leasePathFor(fixture.configPath);
+    const missingTarget = path.join(tmpDir, 'no-such-target');
+    fs.symlinkSync(missingTarget, leasePath);
+    // The link is dangling, so a stat-based existence check reports the claim path as free.
+    expect(fs.existsSync(leasePath)).toBe(false);
+
+    const services = new InstallationService(new DirectoryLease());
+    const result = await services.acquireOwnership(fixture.configPath, tmpDir);
+
+    // The entry EXISTS, so this is an occupied claim path that cannot be verified, not a local
+    // permission problem. (Before C02 the rename publication refused it too, but reported it as
+    // `unavailable/permission`, which sends the operator to check a permission that is not the
+    // issue.) It is never taken, cleared or repaired.
+    expect(result.kind).toBe('busy');
+    if (result.kind !== 'busy') return;
+    expect(result.resource).toBe('config');
+    expect(result.lease.reason).toBe('malformed-holder');
+    // The unsupported entry is still there for the operator; it was not replaced or followed.
+    expect(fs.lstatSync(leasePath).isSymbolicLink()).toBe(true);
+    expect(fs.readlinkSync(leasePath)).toBe(missingTarget);
+    expect(fs.existsSync(missingTarget)).toBe(false);
+  });
 });

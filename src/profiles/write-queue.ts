@@ -212,6 +212,7 @@ export class WriteQueue {
   private running = false;
   private drainWaiters: Array<() => void> = [];
   private idleReconcile?: Promise<void>;
+  private readonly idleReconciliations = new Set<Promise<void>>();
   private journalDegraded = false;
 
   constructor(options: WriteQueueOptions) {
@@ -236,10 +237,24 @@ export class WriteQueue {
     });
   }
 
-  /** Resolves after the queue is idle and its advisory journal reconciliation has completed. */
+  /** Resolves after the queue is idle and all advisory reconciliations have completed. */
   drain(): Promise<void> {
-    if (this.isIdle()) return this.idleReconcile ?? this.scheduleIdleReconcile();
-    return new Promise(resolve => this.drainWaiters.push(resolve));
+    return this.drainUntilIdle();
+  }
+
+  private async drainUntilIdle(): Promise<void> {
+    let finished = false;
+    while (!finished) {
+      if (!this.isIdle()) {
+        await new Promise<void>((resolve) => this.drainWaiters.push(resolve));
+        continue;
+      }
+
+      if (!this.idleReconcile) this.scheduleIdleReconcile();
+      const reconciliations = [...this.idleReconciliations];
+      if (reconciliations.length > 0) await Promise.all(reconciliations);
+      finished = this.isIdle() && this.idleReconciliations.size === 0;
+    }
   }
 
   private isIdle(): boolean {
@@ -313,6 +328,11 @@ export class WriteQueue {
         console.warn(`[write-queue] queue-idle reconciliation failed: ${summarizeErrorForLog(err)}`);
       });
     this.idleReconcile = run;
+    this.idleReconciliations.add(run);
+    void run.then(
+      () => { this.idleReconciliations.delete(run); },
+      () => { this.idleReconciliations.delete(run); },
+    );
     return run;
   }
 

@@ -89,9 +89,14 @@ export interface CanonicalPathResult {
 }
 
 /**
- * Resolve the path that actually holds the bytes. An existing path is canonicalized with
- * `realpath`, so a symlinked config resolves to its target. A fresh path keeps its
- * validated shape; its nearest existing ancestor must still be inside a usable directory.
+ * Resolve the path that actually holds the bytes.
+ *
+ * An existing path is canonicalized with `realpath`, so a symlinked config resolves to its target.
+ * A FRESH path — one with no document yet, which is exactly what first-run setup has — is resolved
+ * through its nearest existing ancestor instead of being taken on its lexical spelling: the ancestor
+ * is `realpath`ed and the remaining components are re-attached below it. That keeps the lease key, the
+ * reported canonical path and the bytes later written provably the same object even when new parents
+ * sit below a symlinked existing ancestor, instead of three strings that happen to agree today.
  */
 export function canonicalizeConfigPath(targetPath: string): CanonicalPathResult {
   const absolute = path.resolve(targetPath);
@@ -106,17 +111,42 @@ export function canonicalizeConfigPath(targetPath: string): CanonicalPathResult 
     if (code !== 'ENOENT') return { canonicalPath: absolute, refusal: 'unreadable' };
   }
 
-  // Fresh path: the parent chain must already exist as real directories.
-  const parent = path.dirname(absolute);
-  try {
-    const realParent = fs.realpathSync(parent);
-    const parentStat = fs.statSync(realParent);
-    if (!parentStat.isDirectory()) return { canonicalPath: absolute, refusal: 'unsafe-parent' };
-    return { canonicalPath: path.join(realParent, path.basename(absolute)) };
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT') return { canonicalPath: absolute, refusal: 'missing' };
-    return { canonicalPath: absolute, refusal: 'unsafe-parent' };
+  // Fresh path: it is absent, so `missing` is the truthful refusal — for the reader that means "no
+  // document selected", and it never blocks the writer, which only refuses hard links and
+  // non-regular targets.
+  return { canonicalPath: resolveFreshTarget(absolute) ?? absolute, refusal: 'missing' };
+}
+
+/**
+ * The path a not-yet-existing target will occupy: the `realpath` of its nearest existing ancestor
+ * directory plus the components below it.
+ *
+ * The remainder is validated by construction rather than by a filter. Every component comes from
+ * `path.basename` of an already-absolute, already-normalized path, so it can be neither a separator
+ * nor `.`/`..`, and the walk stops at the first ancestor that exists. `undefined` means no usable
+ * ancestor directory could be resolved at all, and the caller keeps the lexical path.
+ */
+function resolveFreshTarget(absolute: string): string | undefined {
+  const remainder: string[] = [];
+  let current = absolute;
+  for (;;) {
+    const parent = path.dirname(current);
+    if (parent === current) return undefined;
+    remainder.unshift(path.basename(current));
+
+    let realParent: string;
+    try {
+      realParent = fs.realpathSync(parent);
+    } catch {
+      current = parent;
+      continue;
+    }
+    try {
+      if (!fs.statSync(realParent).isDirectory()) return undefined;
+    } catch {
+      return undefined;
+    }
+    return path.join(realParent, ...remainder);
   }
 }
 

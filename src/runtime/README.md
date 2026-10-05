@@ -39,6 +39,32 @@ Fresh structural parents and this caller's own lease metadata do not make a fres
 non-empty, while genuinely unrelated prior content still refuses under both leases — otherwise setup can
 never run twice on a clean directory.
 
+## Acquisition preconditions (C02)
+
+A lease is a directory, so it cannot exist before its parent does, and a lease must be claimed before
+its resource can be read. Setup therefore does one thing before `acquireOwnership` asks for anything:
+
+```
+scaffold config parent dirs (structure only) ─▶ CONFIG lease ─▶ owner lease ─▶ freshness ─▶ publish
+```
+
+- **Scaffolding is structure only.** `InstallationService.setup` creates the missing directories on the
+  path to the selected document, at 0700, and nothing else — no template, no owner record, no document,
+  no authority. This is what makes the advertised first run into `~/.redacted/config.json` work
+  without the operator pre-creating a private folder by hand.
+- **Scaffolding never touches what it did not create.** An existing ancestor keeps its own mode; a
+  directory another process created concurrently is accepted as usable but never `chmod`ed.
+- **The config lease is keyed on the real target.** A not-yet-existing document resolves through its
+  nearest existing ancestor (`realpath`) plus the validated remainder, so the lease key, the reported
+  canonical path and the bytes later written are the same object even when new parents sit below a
+  symlinked existing ancestor.
+- **The lease claim is the `mkdir`, and it never replaces anything.** `DirectoryLease` claims with one
+  non-recursive `mkdir` at the lease path, which refuses with `EEXIST` for every existing entry shape
+  — empty or populated directory, regular file, symlink, and dangling symlink that `existsSync` reports
+  as absent. An existing entry is always `busy`, is never taken, cleared or repaired, and carries no TTL
+  or auto-unlock. A contender that reaches a claim whose holder record has not landed yet refuses
+  immediately as `malformed-holder` rather than waiting, stealing or repairing it.
+
 ## `adapters/` is deliberately not re-exported
 
 `adapters/` holds the concrete filesystem, crypto, lease and media implementations. They are reachable

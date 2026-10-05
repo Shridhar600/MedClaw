@@ -1,21 +1,39 @@
 // tests/runtime/installation-setup-lease.test.ts
 //
 // The protected invariant: **setup commits the owner record and the configuration document while
-// holding BOTH installation leases**, so it cannot race a running daemon or a second setup.
+// holding BOTH installation leases**, so it cannot race a running daemon or a second setup — and it
+// does so into a target whose private structural parents do not exist yet.
 //
 // Real collaborators throughout — the real `InstallationService`, the real `DirectoryLease`, real
-// owner-path derivation, the real owner-state adapter. Nothing here mocks the ownership model.
-// The mechanism under test is coordination, so a mocked lease would assert nothing: the whole
-// question is whether setup *asks* for the leases at all, which only a real contended lease proves.
+// owner-path derivation, the real owner-state adapter, the real config decoder. Nothing here mocks the
+// ownership model. The mechanism under test is coordination, so a mocked lease would assert nothing:
+// the whole question is whether setup *asks* for the leases at all, which only a real contended lease
+// proves.
+//
+// C02/R03: a real setup used to refuse before creating the missing config parent, so the advertised
+// first run (`~/.redacted/config.json`, with `~/.redacted` absent) could never commit. C02/R10: an
+// existing empty/unknown lease directory was replaced by this process's own lease. Both are exercised
+// here through the real service and the real CLI, and both must be behavioural.
 
+import { spawn, type ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { InstallationService } from '../../src/runtime/installation';
 import { DirectoryLease, leasePathFor } from '../../src/runtime/adapters/directory-lease';
+import { canonicalizeConfigPath } from '../../src/runtime/adapters/config-file';
+import { loadRuntimeConfig } from '../../src/runtime/startup';
 import { resolveOwnerPaths, asProfileId } from '../../src/profiles';
 import type { ProfileId } from '../../src/profiles';
 import type { EffectiveConfig } from '../../src/config';
 import { makeTestTemp } from '../helpers/test-temp';
+
+const DEFAULT_HOME_CONTENDER = path.join(__dirname, '..', 'helpers', 'setup-default-home-contender.ts');
+
+/**
+ * Every child this suite spawns, so a failing assertion can never leave one running and holding the
+ * Jest process open.
+ */
+const liveChildren = new Set<ChildProcess>();
 
 /**
  * A minimal valid STORED-shape document for a prospective install, plus the effective config the
@@ -44,6 +62,44 @@ function prospectiveSetup(rootDir: string): {
   } as unknown as EffectiveConfig;
 
   return { configPath, ownerId, config, ownerPaths };
+}
+
+/**
+ * The ADVERTISED first-run shape: a synthetic home whose private config parent has never been created.
+ *
+ * `resolveSetupValues` derives the state root from the selected config file's directory, so with the
+ * default target both the config parent and the workspace root are that one directory. Nothing about
+ * this shape is a test convenience — it is byte-for-byte the layout a first run is told to use.
+ */
+function absentParentSetup(
+  syntheticHome: string,
+  ownerId: ProfileId,
+  parentSegments: string[] = ['.redacted'],
+): {
+  configPath: string;
+  baseDir: string;
+  ownerId: ProfileId;
+  config: EffectiveConfig;
+  ownerPaths: ReturnType<typeof resolveOwnerPaths>;
+} {
+  const baseDir = path.join(syntheticHome, ...parentSegments);
+  const ownerPaths = resolveOwnerPaths(baseDir, ownerId);
+  const configPath = path.join(baseDir, 'config.json');
+
+  const config = {
+    schemaVersion: 2,
+    profiles: { baseDir, defaultProfileId: ownerId },
+    memory: { workspace: ownerPaths.workspace },
+    heartbeat: { storePath: ownerPaths.schedulerStore },
+    providers: { main: { type: 'ollama' } },
+    channels: { telegram: { enabled: false } },
+  } as unknown as EffectiveConfig;
+
+  return { configPath, baseDir, ownerId, config, ownerPaths };
+}
+
+function modeOf(target: string): number {
+  return fs.statSync(target).mode & 0o777;
 }
 
 describe('installation setup holds both leases across its commit', () => {
@@ -198,4 +254,302 @@ describe('installation setup holds both leases across its commit', () => {
     expect(fs.readFileSync(configPath, 'utf8')).toBe('{"schemaVersion":2}');
     expect(fs.existsSync(ownerPaths.ownerRecord)).toBe(false);
   });
+});
+
+// ── C02/R03 — structural acquisition preconditions ─────────────────────────────────────────
+//
+// Setup takes the CONFIG lease before it has a document to read, so the config parent must already be
+// a real directory or the lease cannot exist. Before this suite, nothing created it: the real CLI
+// refused with "its parent directory is missing", so the advertised first run into `~/.redacted`
+// could not commit without the operator pre-creating a private folder by hand.
+
+describe('setup acquires its leases into a target whose structural parents are absent', () => {
+  let root: string;
+  beforeEach(() => {
+    root = makeTestTemp('setup-absent-parent');
+  });
+  afterEach(() => {
+    for (const child of liveChildren) {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }
+    liveChildren.clear();
+    try {
+      fs.rmSync(root, { recursive: true, force: true });
+    } catch {
+      /* permissions restored by the case itself where relevant */
+    }
+  });
+
+  it('commits the advertised first run, reloads it through the real decoder, and re-owns it', async () => {
+    const syntheticHome = path.join(root, 'synthetic-home');
+    fs.mkdirSync(syntheticHome, { mode: 0o700 });
+    const ownerId = asProfileId('default') as ProfileId;
+    const { configPath, ownerPaths, config } = absentParentSetup(syntheticHome, ownerId);
+
+    // The precondition this protects: the private config parent really is absent.
+    expect(fs.existsSync(path.dirname(configPath))).toBe(false);
+    expect(fs.existsSync(ownerPaths.workspace)).toBe(false);
+
+    const outcome = await new InstallationService(new DirectoryLease()).setup({ configPath, config, ownerId });
+
+    if (outcome.kind !== 'committed') {
+      throw new Error(`expected committed, got ${outcome.kind}: ${JSON.stringify(outcome)}`);
+    }
+    expect(outcome.canonicalConfigPath).toBe(configPath);
+
+    // Everything setup publishes, actually on disk...
+    expect(fs.existsSync(configPath)).toBe(true);
+    expect(fs.existsSync(ownerPaths.ownerRecord)).toBe(true);
+    expect(fs.existsSync(path.join(ownerPaths.workspace, 'SOUL.md'))).toBe(true);
+    expect(fs.existsSync(path.join(ownerPaths.workspace, 'conditions'))).toBe(true);
+
+    // ...private, through the secure-fs contract, not inherited from the umask...
+    expect(modeOf(path.dirname(configPath))).toBe(0o700);
+    expect(modeOf(path.join(syntheticHome, '.redacted', 'profiles'))).toBe(0o700);
+    expect(modeOf(ownerPaths.workspace)).toBe(0o700);
+    expect(modeOf(configPath)).toBe(0o600);
+    expect(modeOf(ownerPaths.ownerRecord)).toBe(0o600);
+    expect(modeOf(path.join(ownerPaths.workspace, 'SOUL.md'))).toBe(0o600);
+
+    // ...and readable by the real decoder the daemon itself uses.
+    const reloaded = await loadRuntimeConfig({ configPath, homeDir: syntheticHome });
+    expect(reloaded.profiles.defaultProfileId).toBe(ownerId);
+    expect(reloaded.profiles.baseDir).toBe(path.dirname(configPath));
+    expect(reloaded.memory.workspace).toBe(ownerPaths.workspace);
+
+    // The installation it left behind is a real installation: it can be owned and released again.
+    const owned = await new InstallationService(new DirectoryLease()).acquireOwnership(configPath, syntheticHome);
+    expect(owned.kind).toBe('owned');
+    if (owned.kind !== 'owned') return;
+    expect(fs.existsSync(leasePathFor(configPath))).toBe(true);
+    expect(fs.existsSync(ownerPaths.workspaceLease)).toBe(true);
+    await owned.ownership.release();
+    expect(fs.existsSync(leasePathFor(configPath))).toBe(false);
+    expect(fs.existsSync(ownerPaths.workspaceLease)).toBe(false);
+  });
+
+  it('commits when an explicitly selected nested config parent is absent', async () => {
+    const syntheticHome = path.join(root, 'synthetic-home');
+    fs.mkdirSync(syntheticHome, { mode: 0o700 });
+    const ownerId = asProfileId('default') as ProfileId;
+    const { configPath, ownerPaths, config } = absentParentSetup(syntheticHome, ownerId, [
+      'state',
+      'nested',
+      'deeper',
+    ]);
+
+    expect(fs.existsSync(path.join(syntheticHome, 'state'))).toBe(false);
+
+    const outcome = await new InstallationService(new DirectoryLease()).setup({ configPath, config, ownerId });
+
+    if (outcome.kind !== 'committed') {
+      throw new Error(`expected committed, got ${outcome.kind}: ${JSON.stringify(outcome)}`);
+    }
+    // Every structural level it had to create is private, not just the leaf.
+    for (const created of ['state', 'state/nested', 'state/nested/deeper']) {
+      expect(modeOf(path.join(syntheticHome, created))).toBe(0o700);
+    }
+    expect(fs.existsSync(ownerPaths.ownerRecord)).toBe(true);
+    expect(modeOf(configPath)).toBe(0o600);
+  });
+
+  it('keys the config lease on the real target when new parents sit below a symlinked ancestor', async () => {
+    // The lease must identify the SELECTED target, not a lexical spelling of it. On this filesystem a
+    // symlinked ancestor resolves at the syscall level, so both spellings reach the same directory —
+    // but only a realpath-resolved key makes the reported canonical path, the lease and the bytes
+    // written provably the same object rather than two strings that happen to agree today.
+    const realAncestor = path.join(root, 'real-ancestor');
+    fs.mkdirSync(realAncestor, { mode: 0o700 });
+    const linkedAncestor = path.join(root, 'linked-ancestor');
+    fs.symlinkSync(realAncestor, linkedAncestor);
+
+    const ownerId = asProfileId('default') as ProfileId;
+    // The fresh parents sit one level BELOW the symlinked existing ancestor.
+    const freshBase = path.join(linkedAncestor, 'fresh');
+    const configAt = path.join(freshBase, 'config.json');
+    const ownerAt = resolveOwnerPaths(freshBase, ownerId);
+    const freshConfig = {
+      schemaVersion: 2,
+      profiles: { baseDir: freshBase, defaultProfileId: ownerId },
+      memory: { workspace: ownerAt.workspace },
+      heartbeat: { storePath: ownerAt.schedulerStore },
+      providers: { main: { type: 'ollama' } },
+      channels: { telegram: { enabled: false } },
+    } as unknown as EffectiveConfig;
+
+    expect(fs.existsSync(freshBase)).toBe(false);
+    expect(canonicalizeConfigPath(configAt).canonicalPath).toBe(path.join(realAncestor, 'fresh', 'config.json'));
+
+    const outcome = await new InstallationService(new DirectoryLease()).setup({
+      configPath: configAt,
+      config: freshConfig,
+      ownerId,
+    });
+
+    if (outcome.kind !== 'committed') {
+      throw new Error(`expected committed, got ${outcome.kind}: ${JSON.stringify(outcome)}`);
+    }
+    expect(outcome.canonicalConfigPath).toBe(path.join(realAncestor, 'fresh', 'config.json'));
+    expect(fs.existsSync(path.join(realAncestor, 'fresh', 'config.json'))).toBe(true);
+    expect(fs.existsSync(ownerAt.ownerRecord)).toBe(true);
+    // The symlinked ancestor itself was not rewritten into the new target's shape.
+    expect(fs.lstatSync(linkedAncestor).isSymbolicLink()).toBe(true);
+    expect(modeOf(freshBase)).toBe(0o700);
+
+    // A second writer reaching the SAME target through the real path contends on the SAME lease.
+    const throughAlias = await new DirectoryLease().tryAcquire({
+      kind: 'config',
+      canonicalPath: configAt,
+    });
+    expect(throughAlias.kind).toBe('acquired');
+    if (throughAlias.kind !== 'acquired') return;
+    try {
+      const throughReal = await new DirectoryLease().tryAcquire({
+        kind: 'config',
+        canonicalPath: path.join(realAncestor, 'fresh', 'config.json'),
+      });
+      expect(throughReal.kind).toBe('busy');
+    } finally {
+      await throughAlias.release();
+    }
+  });
+
+  it('refuses a non-directory config parent with a bounded message and creates nothing', async () => {
+    const syntheticHome = path.join(root, 'synthetic-home');
+    fs.mkdirSync(syntheticHome, { mode: 0o700 });
+    const blocker = path.join(syntheticHome, 'blocked');
+    fs.writeFileSync(blocker, 'synthetic non-directory', { mode: 0o600 });
+
+    const ownerId = asProfileId('default') as ProfileId;
+    const baseDir = path.join(blocker, 'nested');
+    const ownerPaths = resolveOwnerPaths(baseDir, ownerId);
+    const config = {
+      schemaVersion: 2,
+      profiles: { baseDir, defaultProfileId: ownerId },
+      memory: { workspace: ownerPaths.workspace },
+      heartbeat: { storePath: ownerPaths.schedulerStore },
+      providers: { main: { type: 'ollama' } },
+      channels: { telegram: { enabled: false } },
+    } as unknown as EffectiveConfig;
+
+    const outcome = await new InstallationService(new DirectoryLease()).setup({
+      configPath: path.join(baseDir, 'config.json'),
+      config,
+      ownerId,
+    });
+
+    // Refusal, not success and not an unhandled rejection escaping the service.
+    expect(outcome.kind).toBe('unavailable');
+    if (outcome.kind !== 'unavailable') return;
+    expect(outcome.reason).toBe('unsafe-parent');
+    // The refusal must be ACTIONABLE. "Create the installation directory" is impossible when the
+    // name is already taken by a file, so the guidance has to name the real obstacle instead.
+    expect(outcome.guidance).toContain('not a directory');
+    expect(outcome.guidance).toContain('Choose a different');
+    expect(outcome.guidance).not.toContain('Create the installation directory');
+    expect(fs.existsSync(baseDir)).toBe(false);
+    expect(fs.readFileSync(blocker, 'utf8')).toBe('synthetic non-directory');
+  });
+
+  it('refuses a config parent it cannot create, without leaving a lease behind', async () => {
+    const syntheticHome = path.join(root, 'synthetic-home');
+    fs.mkdirSync(syntheticHome, { mode: 0o700 });
+    const readOnlyParent = path.join(syntheticHome, 'read-only');
+    fs.mkdirSync(readOnlyParent, { mode: 0o500 });
+
+    const ownerId = asProfileId('default') as ProfileId;
+    const { config } = absentParentSetup(readOnlyParent, ownerId, []);
+    const configPath = path.join(readOnlyParent, 'private', 'config.json');
+
+    try {
+      const outcome = await new InstallationService(new DirectoryLease()).setup({ configPath, config, ownerId });
+
+      expect(outcome.kind).toBe('unavailable');
+      if (outcome.kind !== 'unavailable') return;
+      expect(fs.existsSync(configPath)).toBe(false);
+      // No stranded lease: the target is still usable once the filesystem allows the directory.
+      expect(fs.readdirSync(readOnlyParent)).toEqual([]);
+    } finally {
+      fs.chmodSync(readOnlyParent, 0o700);
+    }
+  });
+
+  it('leaves prior owner content untouched when setup refuses it as not fresh', async () => {
+    const syntheticHome = path.join(root, 'synthetic-home');
+    fs.mkdirSync(syntheticHome, { mode: 0o700 });
+    const ownerId = asProfileId('default') as ProfileId;
+    const { configPath, config, ownerPaths } = absentParentSetup(syntheticHome, ownerId);
+
+    // Prior owner evidence in a workspace whose whole parent chain is missing.
+    fs.mkdirSync(ownerPaths.workspace, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(ownerPaths.workspace, 'MEMORY.md'), 'synthetic prior owner content', { mode: 0o600 });
+
+    const outcome = await new InstallationService(new DirectoryLease()).setup({ configPath, config, ownerId });
+
+    expect(outcome.kind).toBe('not-fresh');
+    expect(fs.readFileSync(path.join(ownerPaths.workspace, 'MEMORY.md'), 'utf8')).toBe(
+      'synthetic prior owner content',
+    );
+    expect(fs.existsSync(configPath)).toBe(false);
+    expect(fs.existsSync(ownerPaths.ownerRecord)).toBe(false);
+    // Scaffolding is structural only: it never bootstraps templates into a refused target.
+    expect(fs.existsSync(path.join(ownerPaths.workspace, 'SOUL.md'))).toBe(false);
+  });
+
+  it('completes the real default first run when the home config parent has never existed', async () => {
+    const syntheticHome = path.join(root, 'synthetic-home');
+    fs.mkdirSync(syntheticHome, { mode: 0o700 });
+    const expectedConfigPath = path.join(syntheticHome, '.redacted', 'config.json');
+    expect(fs.existsSync(path.dirname(expectedConfigPath))).toBe(false);
+
+    const result = await new Promise<{
+      exit: number;
+      selectedPath: string;
+      stdoutClaimsSetupComplete: boolean;
+      stdout: string;
+      stderr: string;
+    }>((resolve, reject) => {
+      // A per-child HOME and REDACTED_CONFIG_PATH. The machine, the shell environment and the real
+      // home directory are untouched; only this child's environment is overridden.
+      const child = spawn(process.execPath, ['--import', 'tsx', DEFAULT_HOME_CONTENDER], {
+        cwd: path.join(__dirname, '..', '..'),
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, HOME: syntheticHome, REDACTED_CONFIG_PATH: '', TELEGRAM_BOT_TOKEN: '' },
+      });
+      liveChildren.add(child);
+      let out = '';
+      child.stdout.on('data', (chunk: Buffer) => { out += String(chunk); });
+      child.stderr.on('data', (chunk: Buffer) => { out += String(chunk); });
+      child.on('error', reject);
+      child.on('close', () => {
+        liveChildren.delete(child);
+        const line = out.split('\n').filter((l) => l.startsWith('{')).pop();
+        if (!line) return reject(new Error(`default-home contender produced no result: ${out}`));
+        resolve(JSON.parse(line));
+      });
+    });
+
+    // The default selection really is `<home>/.redacted/config.json`, and setup reported success
+    // rather than exiting zero after a refusal.
+    expect(result.selectedPath).toBe(expectedConfigPath);
+    expect(result.exit).toBe(0);
+    expect(result.stdoutClaimsSetupComplete).toBe(true);
+    expect(result.stderr).toBe('');
+
+    // The committed installation is real, private and reloadable — not a created empty folder.
+    const ownerPaths = resolveOwnerPaths(path.dirname(expectedConfigPath), 'default' as ProfileId);
+    expect(fs.existsSync(expectedConfigPath)).toBe(true);
+    expect(fs.existsSync(ownerPaths.ownerRecord)).toBe(true);
+    expect(fs.existsSync(path.join(ownerPaths.workspace, 'HEALTH_PROFILE.md'))).toBe(true);
+    expect(modeOf(path.dirname(expectedConfigPath))).toBe(0o700);
+    expect(modeOf(expectedConfigPath)).toBe(0o600);
+    expect(modeOf(ownerPaths.ownerRecord)).toBe(0o600);
+
+    const reloaded = await loadRuntimeConfig({ configPath: expectedConfigPath, homeDir: syntheticHome });
+    expect(reloaded.memory.workspace).toBe(ownerPaths.workspace);
+  }, 60_000);
 });

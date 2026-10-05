@@ -109,6 +109,112 @@ describe('WriteQueue per-line journal', () => {
   });
 });
 
+describe('WriteQueue drain reconciliation lifetime', () => {
+  it('waits for overlapping and follow-on idle journal callbacks before returning', async () => {
+    const gate = () => {
+      let release!: () => void;
+      const promise = new Promise<void>((resolve) => { release = resolve; });
+      return { promise, release };
+    };
+    const firstGate = gate();
+    const secondGate = gate();
+    const thirdGate = gate();
+    const firstStarted = gate();
+    const secondStarted = gate();
+    const thirdStarted = gate();
+    const firstFinished = gate();
+    const secondFinished = gate();
+    const thirdFinished = gate();
+    const reconciled: string[] = [];
+    let callbacksStarted = 0;
+    const q = new WriteQueue({
+      journalPath: jp,
+      onReconcile: async (record) => {
+        callbacksStarted += 1;
+        reconciled.push(record.label);
+        if (reconciled.length === 1) {
+          firstStarted.release();
+          await firstGate.promise;
+          firstFinished.release();
+        } else if (reconciled.length === 2) {
+          secondStarted.release();
+          await secondGate.promise;
+          secondFinished.release();
+        } else if (reconciled.length === 3) {
+          thirdStarted.release();
+          await thirdGate.promise;
+          thirdFinished.release();
+        }
+      },
+    });
+    let drain: Promise<void> | undefined;
+    let drainSettled = false;
+
+    try {
+      await expect(q.enqueue('turn', {
+        label: 'retained-unresolved-intent',
+        run: async () => { throw new Error('source write failed'); },
+      })).rejects.toThrow('source write failed');
+      await firstStarted.promise;
+
+      await expect(q.enqueue('turn', {
+        label: 'committed-write-two',
+        run: async () => 'second-result',
+      })).resolves.toBe('second-result');
+      await secondStarted.promise;
+
+      drain = q.drain();
+      void drain.then(() => { drainSettled = true; });
+
+      secondGate.release();
+      await secondFinished.promise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      // The second overlapping callback is finished, but the first callback from the same
+      // pre-drain snapshot is still held. Do not return after tracking only the latest callback.
+      expect(drainSettled).toBe(false);
+
+      await expect(q.enqueue('turn', {
+        label: 'committed-write-three',
+        run: async () => 'third-result',
+      })).resolves.toBe('third-result');
+      await thirdStarted.promise;
+
+      firstGate.release();
+      await firstFinished.promise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      // The initial drain snapshot has now settled, but this later idle callback remains held.
+      expect(drainSettled).toBe(false);
+
+      thirdGate.release();
+      await thirdFinished.promise;
+      await drain;
+      expect(drainSettled).toBe(true);
+      expect(reconciled).toEqual([
+        'retained-unresolved-intent',
+        'retained-unresolved-intent',
+        'retained-unresolved-intent',
+      ]);
+
+      const records = (await fs.promises.readFile(jp, 'utf-8')).trim().split('\n')
+        .map((line) => JSON.parse(line) as { phase: string; id: string; label?: string });
+      const failed = records.find((record) => record.phase === 'begin' && record.label === 'retained-unresolved-intent');
+      const commits = new Set(records.filter((record) => record.phase === 'commit').map((record) => record.id));
+      expect(failed).toBeDefined();
+      expect(commits.has(failed!.id)).toBe(false);
+      expect(records.filter((record) => record.phase === 'commit')).toHaveLength(2);
+    } finally {
+      firstGate.release();
+      secondGate.release();
+      thirdGate.release();
+      const finished = [firstFinished, secondFinished, thirdFinished]
+        .slice(0, callbacksStarted)
+        .map((signal) => signal.promise);
+      await Promise.all(finished);
+      await q.drain();
+    }
+  });
+});
+
 describe('replayJournal', () => {
   it('surfaces each residual line via onStuck, then clears the file', async () => {
     fs.mkdirSync(path.dirname(jp), { recursive: true });
