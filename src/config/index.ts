@@ -33,7 +33,7 @@ export {
   serializeStoredConfig,
 } from './config';
 export type { ConfigDecodeResult, DecodeOptions } from './config';
-export { DEFAULT_STORED_CONFIG, DEFAULT_SESSION_WINDOW, cloneStoredDefaults } from './defaults';
+export { DEFAULT_STORED_CONFIG, DEFAULT_SESSION_WINDOW, LOCAL_OLLAMA_BASE_URL, cloneStoredDefaults } from './defaults';
 export {
   OWNER_ID_PATTERN,
   PROTECTED_SET_PATHS,

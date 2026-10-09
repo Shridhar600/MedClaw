@@ -104,6 +104,60 @@ describe('cli router', () => {
     }
   });
 
+  it('never prints endpoint credentials in status output', async () => {
+    // Cold re-review: the readiness `configured: <url>` detail carried `user:password@` through to
+    // `medclaw status`. It is sanitized at the presentation boundary.
+    const home = createTempHome();
+    try {
+      const fixture = writeConfigFixture(home.tmpDir, {
+        apply: (stored) => {
+          stored.providers.main.baseUrl = 'https://url-user:url-password@proxy.example/v1';
+        },
+      });
+      const output: string[] = [];
+      const code = await runCli(['--config', fixture.configPath, 'status'], {
+        stdout: (text: string) => output.push(text),
+        stderr: (text: string) => output.push(text),
+        input: async () => '',
+      });
+
+      expect(code).toBe(0);
+      const printed = output.join('');
+      expect(printed).not.toContain('url-user');
+      expect(printed).not.toContain('url-password');
+      // The status line remains useful: the endpoint host is still shown.
+      expect(printed).toContain('proxy.example');
+    } finally {
+      home.restore();
+    }
+  });
+
+  it.each([
+    ['config with an option-shaped subcommand', ['config', '--api-key=sk-config-sub-secret']],
+    ['config set with an option-shaped path', ['config', 'set', '--api-key=sk-config-set-secret', 'x']],
+    ['config set with a single-dash path', ['config', 'set', '-sk-single-set-secret', 'x']],
+  ])('never echoes a secret-shaped token from %s', async (_label, argv) => {
+    // Cold re-review E3 residual: `config` is exempt from the stray-option gate, so its own
+    // subcommand/path echoes had to be sanitized at the router.
+    const home = createTempHome();
+    try {
+      const fixture = writeConfigFixture(home.tmpDir, {});
+      const output: string[] = [];
+      const code = await runCli(['--config', fixture.configPath, ...argv], {
+        stdout: (text: string) => output.push(text),
+        stderr: (text: string) => output.push(text),
+        input: async () => '',
+      });
+
+      expect(code).toBe(1);
+      expect(output.join('')).not.toContain('sk-config-sub-secret');
+      expect(output.join('')).not.toContain('sk-config-set-secret');
+      expect(output.join('')).not.toContain('sk-single-set-secret');
+    } finally {
+      home.restore();
+    }
+  });
+
   it('routes heartbeats list through the admin surface', async () => {
     const home = createTempHome();
     try {
@@ -133,12 +187,17 @@ describe('cli router', () => {
       // path; it now answers with a state root plus an owner id, and the resulting workspace is
       // asserted where relevant so the derivation is proved, not assumed.
       const stateRoot = path.join(home.tmpDir, 'state');
+      // C04 (R05): the wizard gained a separate EMBEDDING step, so this piped stream carries two
+      // more answers. Every earlier answer keeps its original meaning and no assertion below
+      // was changed.
       const input = [
         stateRoot,
         'default',
         'ollama',
         '',
         '',
+        '',
+        'ollama',
         '',
         '',
         'n',
@@ -209,12 +268,17 @@ describe('cli router', () => {
       // path; it now answers with a state root plus an owner id, and the resulting workspace is
       // asserted where relevant so the derivation is proved, not assumed.
       const stateRoot = path.join(home.tmpDir, 'state');
+      // C04 (R05): the wizard gained a separate EMBEDDING step, so this piped stream carries two
+      // more answers. Every earlier answer keeps its original meaning and no assertion below
+      // was changed.
       const input = [
         stateRoot,
         'default',
         'ollama',
         '',
         '',
+        '',
+        'ollama',
         '',
         '',
         'y',

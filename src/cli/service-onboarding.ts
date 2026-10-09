@@ -19,12 +19,12 @@ import {
   buildConfigFromArgs,
   collectSetupErrors,
   createInitialWizardState,
-  isSupportedOnboardingProvider,
+  ONBOARD_HELP_TEXT,
   parseArgs,
   persistSetupArtifacts,
+  requireOptionValue,
   resolveNonInteractiveArgs,
   resolveSetupValues,
-  SUPPORTED_ONBOARDING_PROVIDERS,
 } from './setup-config';
 
 export {
@@ -190,13 +190,41 @@ export async function runServiceOnboarding(
   dependencies: OnboardingDependencies = {},
 ): Promise<number> {
   try {
-    const args = parseArgs(argv);
-    if (args.provider && !isSupportedOnboardingProvider(args.provider)) {
-      io.stderr?.(
-        `Unsupported onboard provider: ${args.provider}. Supported choices: ${SUPPORTED_ONBOARDING_PROVIDERS.join(', ')}.\n`,
-      );
-      return 1;
+    // `onboard --help` must not be answered by the strict parser's "unknown option" refusal, so the
+    // help request is answered from the same module that owns the option list.
+    //
+    // Only a help token in the LEADING OPTION position counts. Scanning the whole argv (as this used
+    // to) also matched a help token sitting in another option's VALUE position, so
+    // `onboard --provider --help` printed help and exited 0 instead of refusing the missing value.
+    //
+    // `runCli` forwards `['--config', <resolved path>, ...commandArgs]`, so the selected target sits
+    // in front of the operator's own tokens; that exact injected pair is skipped before the position
+    // check. Direct service entry has no such pair and is unaffected.
+    //
+    // C04-P02: the pair is VALIDATED before it is skipped. The old predicate skipped any leading
+    // `--config` whose value merely did not start with `-`, which is also true of `''` and `'   '`, so
+    // `['--config', '', '--help']` skipped a pair that carried no path and answered the next token with
+    // usage at exit 0. Zero is a SUCCESS status, so malformed option input must never produce it.
+    // `requireOptionValue` is the parser's own missing/blank/option-shaped rule, reused here rather
+    // than reimplemented: one policy, and no second parser or help framework.
+    //
+    // This cannot affect the real CLI path: `selectConfigPath` already refuses a present-but-empty
+    // global `--config` and resolves a valid one to an absolute path, so the injected pair is always
+    // well-formed by the time it arrives here.
+    const hasLeadingConfigPair = argv[0] === '--config';
+    if (hasLeadingConfigPair) {
+      requireOptionValue('--config', argv[1]);
     }
+    const operatorArgs = hasLeadingConfigPair ? argv.slice(2) : argv;
+    if (operatorArgs[0] === '--help' || operatorArgs[0] === '-h') {
+      io.stdout?.(ONBOARD_HELP_TEXT);
+      return 0;
+    }
+
+    // STRICT PARSE FIRST (brief §8C). Every malformed-input refusal happens here, before the
+    // wizard, before any lease, directory, template, record or config write. `parseArgs` throws a
+    // controlled `Error` naming the field or reason; this catch turns it into exit 1.
+    const args = parseArgs(argv);
 
     if (!args.yes) {
       const initialState = createInitialWizardState(args);

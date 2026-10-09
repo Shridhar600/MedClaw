@@ -114,7 +114,15 @@ export function parseGlobalOptions(argv: ReadonlyArray<string>): GlobalOptionPar
         continue;
       }
       if (token.startsWith('-')) {
-        throw new ConfigSelectionError(`Unknown option: ${token}. Run \`medclaw --help\` for the supported options.`);
+        // Name only — never the text after '=', which is a value and may be a secret. A token that
+        // is not a long option is never a supported name, so it is not echoed at all.
+        if (!token.startsWith('--')) {
+          throw new ConfigSelectionError(
+            `Unknown option at position ${index + 1}. Run \`medclaw --help\` for the supported options.`,
+          );
+        }
+        const name = token.includes('=') ? token.slice(0, token.indexOf('=')) : token;
+        throw new ConfigSelectionError(`Unknown option: ${name}. Run \`medclaw --help\` for the supported options.`);
       }
       sawCommand = true;
     }

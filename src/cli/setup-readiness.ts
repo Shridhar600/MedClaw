@@ -1,4 +1,5 @@
 import { spawn, type SpawnOptions } from 'child_process';
+import { printableEndpoint } from './admin';
 import * as fs from 'fs';
 import type { EffectiveConfig } from '../config/types';
 import { validateConfig } from '../config/validation';
@@ -227,14 +228,17 @@ export async function preflightStartCheck(
       warnings.push(...ollama.warnings);
       blockers.push(...ollama.blockers);
       if (ollama.reachable && ollama.autoStarted) {
-        warnings.push(`Ollama was started automatically for ${baseUrl}.`);
+        // Presentational only: the configured endpoint can carry `user:password@`, so only its
+        // sanitized form may reach operator output. (Cold re-review E1 preflight path.)
+        warnings.push(`Ollama was started automatically for ${printableEndpoint(baseUrl, '(not set)')}.`);
       }
       reportedOllamaUrls.add(baseUrl);
     }
 
     if (ollama.reachable && !ollama.models.includes(provider.model)) {
       blockers.push(
-        `Missing Ollama model for ${label} at ${baseUrl}: ${provider.model}. Run \`ollama pull ${provider.model}\` against that endpoint.`,
+        `Missing Ollama model for ${label} at ${printableEndpoint(baseUrl, '(not set)')}: ${provider.model}.`
+        + ` Run \`ollama pull ${provider.model}\` against that endpoint.`,
       );
     }
   }

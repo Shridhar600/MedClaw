@@ -4,6 +4,7 @@ export type SetupStepId =
   | 'environment'
   | 'state'
   | 'provider'
+  | 'embeddings'
   | 'telegram'
   | 'preferences'
   | 'review';
@@ -12,6 +13,7 @@ export type ReviewAction =
   | 'apply'
   | 'state'
   | 'provider'
+  | 'embeddings'
   | 'telegram'
   | 'preferences'
   | 'cancel';
@@ -31,7 +33,16 @@ export interface SetupWizardState {
   provider: ProviderConfig['type'];
   mainModel: string;
   medicalModel: string;
+  /**
+   * The EMBEDDING role's own selection (plan 15 §2.4). Independent of `provider`: a cloud main
+   * provider must not silently move embeddings to cloud. Defaults to the local Ollama role.
+   */
+  embeddingProvider: ProviderConfig['type'];
   embeddingModel: string;
+  /** Explicit endpoint for the embedding role only. Never inherited from the main role. */
+  embeddingUrl?: string;
+  /** Explicit key for the embedding role only. Never copied from the main role's key. */
+  embeddingApiKey?: string;
   ollamaUrl?: string;
   apiKey?: string;
   telegramEnabled: boolean;
@@ -50,6 +61,7 @@ export const SETUP_STEP_ORDER: readonly SetupStepId[] = [
   'environment',
   'state',
   'provider',
+  'embeddings',
   'telegram',
   'preferences',
   'review',
@@ -59,6 +71,7 @@ export const REVIEW_ACTIONS: readonly ReviewAction[] = [
   'apply',
   'state',
   'provider',
+  'embeddings',
   'telegram',
   'preferences',
   'cancel',

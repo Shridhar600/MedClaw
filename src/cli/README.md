@@ -48,6 +48,59 @@ Consequences of the single resolution point:
 `tests/cli/config-selection.test.ts` proves this through the real `runCli` with two complete
 installations on disk.
 
+## Setup parsing is strict, and refuses before touching disk
+
+`parseArgs` (`setup-config.ts`) is the only parser for the setup command. It refuses, naming the
+field and the reason and never the supplied value:
+
+- an unknown option;
+- an unexpected bare token;
+- a missing, blank, or option-shaped value (`--config --yes`, a trailing `--config`);
+- an explicit provider outside `ollama|openai|openrouter`, an unparseable boolean, or a
+  non-http(s) endpoint.
+
+Every one of those refusals happens **before** the wizard, and before any lease, directory,
+template, record or config write. That is why `runServiceOnboarding` parses first and branches to
+the wizard second.
+
+A malformed later `--config` must refuse rather than clear the selection: the injected
+`--config <selected>` from `runCli` must never be overwritten with "absent", because
+`resolveSetupValues` would then fall back to the home default. A *valid* later `--config` is still
+honoured, so the last explicit occurrence wins.
+
+Global parsing throws, so `runCli` calls `parseGlobalOptions` and `selectConfigPath` **inside** its
+try/catch. Outside it, an operator typo produced an unhandled rejection instead of an exit code.
+
+## Provider roles are independent selections
+
+Main, medical and embeddings are three separate roles with separate provider, model, endpoint and
+key. The relevant rules, enforced in one place (`buildProviderRole` in `setup-config.ts`):
+
+- embeddings default to the **local Ollama** role even when main is cloud. They are not dragged
+  along by the chat provider;
+- each cloud role uses its own explicit key, then that provider's own environment variable. Main and
+  embeddings never share a key. The one exception is the MEDICAL role: opting it into a cloud provider
+  reuses the operator's `--api-key` (inherited forka #11 behavior, preserved by this slice and
+  reported as a known cross-provider key reuse rather than fixed here);
+- `--ollama-url` is the LOCAL role control. It never becomes a cloud role's endpoint;
+- an explicit `--embedding-url` wins for the embedding role; otherwise a local embedding role uses
+  `--ollama-url`/the local default and a cloud embedding role uses its own provider default;
+- OpenRouter's router endpoint is pinned for the MAIN and EMBEDDING roles when either selects
+  OpenRouter, because it has no SDK default of its own. The MEDICAL role does not pin it; the
+  adapter resolves the router URL itself at runtime, so a medical OpenRouter document simply omits
+  `baseUrl`.
+
+The wizard has a separate **Embedding role** step and a separate "Edit embeddings" review action, so
+choosing embeddings is never a side effect of answering the chat-provider step. Changing the main
+provider does not touch the embedding role; changing the embedding provider drops the previous
+role's endpoint and key so nothing role-incompatible survives.
+
+## Public exports added
+
+`src/providers/index.ts` exists solely to publish `OPENROUTER_DEFAULT_BASE_URL`. Setup needs the
+OpenRouter endpoint, and importing `providers/openai.ts` directly from the CLI pulled a private
+adapter module across a public boundary.
+
 ## Coordination
 
 Setup is additive and never overwrites. It refuses a pre-existing config document, owner record or

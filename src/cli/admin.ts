@@ -419,6 +419,38 @@ export async function listHeartbeats(paths: AdminPaths = {}): Promise<string> {
   return formatLines(jobs.map((job) => formatHeartbeatJob(job)));
 }
 
+/**
+ * An endpoint safe to print.
+ *
+ * A configured base URL may carry `user:password@` userinfo, which is a credential. `redactConfig`
+ * masks the `apiKey`/`botToken` KEYS but has no idea that a URL string can hold a secret, so a URL
+ * printed verbatim here would leak it into terminal scrollback and any captured log.
+ */
+export function printableEndpoint(baseUrl: string | undefined, fallback: string): string {
+  if (baseUrl === undefined || baseUrl.trim() === '') return fallback;
+  try {
+    const parsed = new URL(baseUrl);
+    if (parsed.username === '' && parsed.password === '') return baseUrl;
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+  } catch {
+    // Not parseable: it could not have come from the strict parser, so print it unchanged rather
+    // than invent a representation.
+    return baseUrl;
+  }
+}
+
+/**
+ * The honest remote-embedding statement (specs/13 amendment B1).
+ *
+ * Emitted from the ONE place every operator-facing summary is produced, so the warning cannot be
+ * present in one entry mode and missing in another — which is exactly the asymmetry the cold
+ * review found, where only the wizard warned. "Configured" is not "verified-ready".
+ */
+export function remoteEmbeddingWarning(): string {
+  return 'WARNING: embeddings are remote — your text is sent to a cloud endpoint. The recall latency'
+    + ' budget (p50<=300ms / p95<=800ms) assumes local embeddings. This is configured, not verified.';
+}
+
 export function showRedactedConfigSummary(config: EffectiveConfig): string {
   const redacted = redactConfig(config);
   const lines = [
@@ -426,13 +458,29 @@ export function showRedactedConfigSummary(config: EffectiveConfig): string {
     `provider: ${redacted.providers.main.type}`,
     `main model: ${redacted.providers.main.model}`,
     `medical model: ${redacted.providers.medical.model}`,
-    `embedding model: ${redacted.providers.embeddings.model}`,
   ];
 
   if (redacted.providers.main.type === 'ollama') {
-    lines.push(`ollama url: ${redacted.providers.main.baseUrl ?? '(not set)'}`);
+    lines.push(`ollama url: ${printableEndpoint(redacted.providers.main.baseUrl, '(not set)')}`);
   } else {
     lines.push(`provider api key: ${providerApiKeyConfigured(config.providers.main) ? 'configured' : 'not set'}`);
+  }
+
+  // R05: the embedding role is an independent selection, so the summary names its PROVIDER and
+  // ENDPOINT as well as its model. Printing only the model is what let a cloud chat provider
+  // silently take embeddings with it and still look correct in the setup output.
+  lines.push(`embedding provider: ${redacted.providers.embeddings.type}`);
+  lines.push(`embedding model: ${redacted.providers.embeddings.model}`);
+  lines.push(
+    `embedding url: ${printableEndpoint(redacted.providers.embeddings.baseUrl, redacted.providers.embeddings.type === 'ollama' ? '(not set)' : '(provider default)')}`,
+  );
+  if (redacted.providers.embeddings.type !== 'ollama') {
+    lines.push(
+      `embedding api key: ${providerApiKeyConfigured(config.providers.embeddings) ? 'configured' : 'not set'}`,
+    );
+  }
+  if (redacted.providers.embeddings.type !== 'ollama') {
+    lines.push(remoteEmbeddingWarning());
   }
 
   lines.push(`telegram: ${redacted.channels.telegram.enabled ? 'enabled' : 'disabled'}`);
@@ -443,6 +491,17 @@ export function showRedactedConfigSummary(config: EffectiveConfig): string {
   lines.push(`heartbeats: ${redacted.heartbeat.enabled ? 'enabled' : 'disabled'}`);
 
   return formatLines(lines);
+}
+
+/**
+ * Remove `user:password@` userinfo from any URL embedded in a readiness detail line.
+ *
+ * The provider healthcheck reports `configured: <url>`; that detail, and the review/status summary
+ * that prints it, must never carry operator credentials. This sanitizes at the PRESENTATION boundary,
+ * so the provider module keeps its transport behavior unchanged.
+ */
+function stripUrlCredentials(text: string): string {
+  return text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^@\s/]+@/gi, '$1');
 }
 
 export function buildReadinessSummaryLines(input: {
@@ -477,13 +536,13 @@ export function buildReadinessSummaryLines(input: {
       continue;
     }
     for (const detail of result.details) {
-      lines.push(`  ${result.label}: ${detail}`);
+      lines.push(`  ${result.label}: ${stripUrlCredentials(detail)}`);
     }
     for (const warning of result.warnings) {
-      lines.push(`  ${result.label}: ${warning}`);
+      lines.push(`  ${result.label}: ${stripUrlCredentials(warning)}`);
     }
     if (result.actionHint) {
-      lines.push(`  ${result.label} hint: ${result.actionHint}`);
+      lines.push(`  ${result.label} hint: ${stripUrlCredentials(result.actionHint)}`);
     }
   }
 

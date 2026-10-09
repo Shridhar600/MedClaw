@@ -32,7 +32,7 @@ import {
   type SessionsConfig,
   type StoredConfig,
 } from './types';
-import { cloneStoredDefaults } from './defaults';
+import { cloneStoredDefaults, LOCAL_OLLAMA_BASE_URL } from './defaults';
 import { BUILT_IN_EMERGENCY_KEYWORDS } from '../safety/emergency-detector';
 import { providerEnvVar } from './provider-env';
 
@@ -390,13 +390,78 @@ function readProvider(r: Reader, raw: unknown, field: string, fallback: Provider
   return provider;
 }
 
-/** A local provider type must carry its local base URL; a cloud type must not inherit one. */
-function checkProviderBaseUrl(r: Reader, provider: ProviderConfig, field: string): void {
-  if (provider.type === 'ollama' && !provider.baseUrl) {
-    r.issues.add('missing-secret', `${field}.baseUrl`, 'a local provider requires its base URL');
+/**
+ * Is this URL the known local Ollama endpoint, however it is spelled?
+ *
+ * An exact string comparison is too shallow a guard: `http://localhost:11434/v1/`,
+ * `HTTP://LOCALHOST:11434/v1` and `http://localhost:11434/v1` are the SAME endpoint, and a guard
+ * that refuses only one spelling is not a guard. This normalisation exists only to recognise that
+ * one known default. It is not a general endpoint policy: a private or loopback proxy at any other
+ * URL is still a legal operator choice (PD-8 — self-hosted paths are first-class).
+ */
+function isLocalOllamaBaseUrl(value: string): boolean {
+  const trimmed = value.trim();
+  if (trimmed === LOCAL_OLLAMA_BASE_URL) return true;
+  let parsed: URL;
+  let local: URL;
+  try {
+    parsed = new URL(trimmed);
+    local = new URL(LOCAL_OLLAMA_BASE_URL);
+  } catch {
+    return false;
   }
-  if (provider.type !== 'ollama' && provider.baseUrl) {
-    r.issues.add('invalid-url', `${field}.baseUrl`, 'a cloud provider must not carry a local base URL');
+  // A trailing dot is the same DNS name (`localhost.` === `localhost`). Userinfo does NOT make it a
+  // different endpoint — `http://user:pass@localhost:11434/v1` still points at the local Ollama
+  // endpoint, so it must be caught too. (Cold re-review: userinfo and trailing-dot spellings
+  // bypassed the guard.) The comparison intentionally ignores only these spelling differences; it
+  // does not treat 127.0.0.1 as the same name, so a proxy bound there stays a legal cloud endpoint
+  // under PD-8's self-hosted allowance.
+  const host = (url: URL): string => url.hostname.toLowerCase().replace(/\.+$/, '');
+  // Percent-escapes are an alternative spelling of the same path: `/%76%31` decodes to `/v1`, so a
+  // comparison on the raw pathname would let a disguised local endpoint through. A malformed escape
+  // is left as-is; the value still had to parse as a URL above.
+  const decodePath = (value: string): string => {
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return value;
+    }
+  };
+  const samePath = decodePath(parsed.pathname).replace(/\/+$/, '')
+    === decodePath(local.pathname).replace(/\/+$/, '');
+  return parsed.protocol === local.protocol
+    && host(parsed) === host(local)
+    && parsed.port === local.port
+    && samePath;
+}
+
+/**
+ * Per-role base URL policy.
+ *
+ * A LOCAL role must carry its local endpoint. A CLOUD role may carry an explicit endpoint —
+ * OpenRouter has no SDK default of its own, so setup writes its router URL and the document has
+ * to be able to keep it — but it must never carry the known local Ollama endpoint, which is the
+ * concrete inheritance mistake plan 15 §2.1 forbids ("cloud provider selection never inherits a
+ * local base URL").
+ *
+ * The rule is deliberately narrow. It is NOT a blanket ban on cloud base URLs (that blanket ban
+ * was finding R04: supported OpenRouter setup could not be saved or reloaded), and it is NOT an
+ * SSRF/endpoint policy platform. Structural validity of the URL is decided separately and earlier
+ * by `isValidHttpUrl`, which still refuses a non-http(s) scheme or an unparseable string.
+ */
+function checkProviderBaseUrl(r: Reader, provider: ProviderConfig, field: string): void {
+  if (provider.type === 'ollama') {
+    if (!provider.baseUrl) {
+      r.issues.add('missing-secret', `${field}.baseUrl`, 'a local provider requires its base URL');
+    }
+    return;
+  }
+  if (provider.baseUrl !== undefined && isLocalOllamaBaseUrl(provider.baseUrl)) {
+    r.issues.add(
+      'invalid-url',
+      `${field}.baseUrl`,
+      'a cloud provider must not carry the local Ollama base URL',
+    );
   }
 }
 

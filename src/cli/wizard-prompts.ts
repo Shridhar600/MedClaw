@@ -14,6 +14,7 @@ const REVIEW_MENU_OPTIONS: readonly MenuOption<ReviewAction>[] = [
   { value: 'apply', label: 'Apply setup' },
   { value: 'state', label: 'Edit workspace' },
   { value: 'provider', label: 'Edit provider' },
+  { value: 'embeddings', label: 'Edit embeddings' },
   { value: 'telegram', label: 'Edit Telegram' },
   { value: 'preferences', label: 'Edit preferences' },
   { value: 'cancel', label: 'Cancel setup' },

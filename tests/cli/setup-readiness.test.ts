@@ -71,6 +71,39 @@ describe('setup readiness', () => {
     );
   });
 
+  it('never prints endpoint credentials in a start-preflight blocker', async () => {
+    // Cold re-review E1 preflight path: the configured endpoint can carry `user:password@`, and the
+    // missing-model blocker interpolated it raw. The host must remain visible; the credentials must
+    // not.
+    const config = getDefaultConfig();
+    config.memory.workspace = workspacePath;
+    config.channels.telegram.enabled = false;
+    config.heartbeat.enabled = true;
+    config.providers.main.baseUrl = 'http://url-user:url-password@127.0.0.1:11434/v1';
+    config.providers.medical.baseUrl = 'http://url-user:url-password@127.0.0.1:11434/v1';
+    config.providers.embeddings.baseUrl = 'http://url-user:url-password@127.0.0.1:11434/v1';
+
+    const report = await preflightStartCheck(config, configPath, {
+      fetchImpl: jest.fn(async (url: string | URL) => {
+        const target = String(url);
+        if (target.endsWith('/api/version')) {
+          return jsonResponse({ version: '0.6.0' });
+        }
+        if (target.endsWith('/api/tags')) {
+          return jsonResponse({ models: [] });
+        }
+        throw new Error(`Unexpected URL: ${target}`);
+      }) as typeof fetch,
+      timeoutMs: 50,
+    });
+
+    expect(report.ready).toBe(false);
+    const printed = report.blockers.join('\n') + report.warnings.join('\n');
+    expect(printed).not.toContain('url-user');
+    expect(printed).not.toContain('url-password');
+    expect(printed).toContain('127.0.0.1:11434');
+  });
+
   it('blocks startup when an OpenAI provider has no inline or environment api key', async () => {
     delete process.env.OPENAI_API_KEY;
     const config = getDefaultConfig();

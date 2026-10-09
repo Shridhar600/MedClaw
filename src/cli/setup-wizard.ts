@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { buildReadinessSummaryLines, showRedactedConfigSummary } from './admin';
+import { buildReadinessSummaryLines, printableEndpoint, showRedactedConfigSummary } from './admin';
 import type { CliIO } from './prompts';
 import { askYesNo } from './prompts';
 import {
@@ -9,12 +9,15 @@ import {
   modelDefaultsForProvider,
   persistSetupArtifacts,
   providerLabel,
+  requireHttpEndpoint,
   SUPPORTED_ONBOARDING_PROVIDERS,
   requireOwnerId,
   resolveNonInteractiveArgs,
   resolveSetupPath,
   requiredCloudEnv,
 } from './setup-config';
+import { OPENROUTER_DEFAULT_BASE_URL } from '../providers';
+import { LOCAL_OLLAMA_BASE_URL } from '../config';
 import {
   getMissingOllamaModels,
   verifyTelegramRuntime,
@@ -88,7 +91,14 @@ function stateToArgs(state: SetupWizardState) {
     provider: state.provider,
     mainModel: state.mainModel,
     medicalModel: state.medicalModel,
+    // The whole R05 round trip: provider, endpoint and key travel with the state, so an explicit
+    // embedding selection survives resolution, build, serialization and reload. Before this,
+    // `stateToArgs` carried only `embeddingModel`, and the role's provider/endpoint/key were lost
+    // the moment the operator pressed Apply.
+    embeddingProvider: state.embeddingProvider,
     embeddingModel: state.embeddingModel,
+    embeddingUrl: state.embeddingUrl,
+    embeddingApiKey: state.embeddingApiKey,
     ollamaUrl: state.ollamaUrl,
     apiKey: state.apiKey,
     telegramEnabled: state.telegramEnabled,
@@ -161,6 +171,13 @@ async function runStateStep(io: CliIO, state: SetupWizardState): Promise<void> {
   renderStatus(io, 'INFO', `Template files: ${listWorkspaceTemplateFiles().join(', ')}`);
 }
 
+/**
+ * The MAIN role step.
+ *
+ * R05: a change to the MAIN provider no longer touches the embedding role at all. It used to
+ * overwrite `state.embeddingModel` from the main provider's cloud defaults, which silently moved
+ * embeddings to cloud behind the operator's back.
+ */
 async function runProviderStep(io: CliIO, state: SetupWizardState): Promise<void> {
   renderStepHeader(io, 3, TOTAL_STEPS, 'Provider Selection');
   const previousProvider = state.provider;
@@ -175,9 +192,9 @@ async function runProviderStep(io: CliIO, state: SetupWizardState): Promise<void
     const defaults = modelDefaultsForProvider(state.provider);
     state.mainModel = defaults.main;
     state.medicalModel = defaults.medical;
-    state.embeddingModel = defaults.embeddings;
+    // The embedding role is deliberately NOT touched here. It has its own step.
     if (state.provider === 'ollama') {
-      state.ollamaUrl = state.ollamaUrl ?? 'http://localhost:11434/v1';
+      state.ollamaUrl = state.ollamaUrl ?? LOCAL_OLLAMA_BASE_URL;
       state.apiKey = undefined;
     } else {
       state.ollamaUrl = undefined;
@@ -201,13 +218,145 @@ async function runProviderStep(io: CliIO, state: SetupWizardState): Promise<void
 
   state.mainModel = await askValue(io, 'Main model', state.mainModel);
   state.medicalModel = await askValue(io, 'Medical model', state.medicalModel);
-  state.embeddingModel = await askValue(io, 'Embedding model', state.embeddingModel);
 
   if (state.provider === 'ollama') {
-    state.ollamaUrl = await askValue(io, 'Ollama URL', state.ollamaUrl ?? 'http://localhost:11434/v1');
+    state.ollamaUrl = await askEndpointValue(
+      io,
+      'Ollama URL',
+      state.ollamaUrl,
+      LOCAL_OLLAMA_BASE_URL,
+    );
   }
 }
 
+/**
+ * Prompt for an endpoint without ever rendering credentials in the visible default.
+ *
+ * `askValue` prints its default value. When the current endpoint carries `user:password@`, showing
+ * that default would leak the secret into the terminal. This keeps the "Enter keeps the current
+ * value" behavior by capturing the pre-prompt value and restoring it when the operator just
+ * accepts the (sanitized) default.
+ */
+async function askEndpointValue(
+  io: CliIO,
+  prompt: string,
+  current: string | undefined,
+  fallback: string,
+): Promise<string> {
+  const source = current ?? fallback;
+  const visibleDefault = printableEndpoint(source, fallback);
+  const answer = await askValue(io, prompt, visibleDefault);
+  // Accepting the shown default keeps the SOURCE value. When `current` is undefined that source is
+  // the inherited fallback, so Enter must not silently replace a credentialed inherited endpoint
+  // with the sanitized display form. (Cold re-review E2 behavior note.)
+  if (answer === visibleDefault) {
+    return source;
+  }
+  return answer;
+}
+
+/**
+ * The EMBEDDING role step, independent of the main role.
+ *
+ * A change here resets only what is role-incompatible: switching provider moves the model default
+ * to that provider's embedding model and drops a key that belonged to the previous provider, so a
+ * stale credential can never survive into a different provider's role. Switching a local role to a
+ * remote one (or back) drops a now-incompatible endpoint, and the remote-embedding warning is shown
+ * honestly — configured is not verified-ready.
+ */
+async function runEmbeddingStep(io: CliIO, state: SetupWizardState): Promise<void> {
+  renderSectionHeader(io, 'Embedding role (independent of the chat provider)');
+  const previous = state.embeddingProvider;
+  state.embeddingProvider = await askChoice<ProviderConfig['type']>(
+    io,
+    'Embedding provider',
+    SUPPORTED_ONBOARDING_PROVIDERS,
+    state.embeddingProvider,
+  );
+
+  if (state.embeddingProvider !== previous) {
+    state.embeddingModel = modelDefaultsForProvider(state.embeddingProvider).embeddings;
+    // A key and an endpoint belonging to the previous provider must not leak into the new role.
+    state.embeddingApiKey = undefined;
+    state.embeddingUrl = undefined;
+  }
+
+  if (state.embeddingProvider === 'ollama') {
+    for (;;) {
+      const answer = await askEndpointValue(
+        io,
+        'Local embedding URL',
+        state.embeddingUrl,
+        state.ollamaUrl ?? LOCAL_OLLAMA_BASE_URL,
+      );
+      // The SAME endpoint rule the non-interactive parser applies, not a second copy of it. An
+      // invalid interactive answer re-prompts, which R06 explicitly allows.
+      try {
+        state.embeddingUrl = requireHttpEndpoint('Embedding URL', answer);
+        break;
+      } catch (error) {
+        renderStatus(io, 'WARN', error instanceof Error ? error.message : String(error));
+      }
+    }
+  } else {
+    const requiredEnv = requiredCloudEnv(state.embeddingProvider);
+    const providerDefault =
+      state.embeddingProvider === 'openrouter' ? OPENROUTER_DEFAULT_BASE_URL : '';
+    for (;;) {
+      const answer = await askEndpointValue(
+        io,
+        'Embedding endpoint',
+        state.embeddingUrl,
+        providerDefault,
+      );
+      try {
+        // An empty endpoint is allowed here and means "use the provider's own default".
+        state.embeddingUrl = answer.trim() === ''
+          ? undefined
+          : requireHttpEndpoint('Embedding endpoint', answer);
+        break;
+      } catch (error) {
+        renderStatus(io, 'WARN', error instanceof Error ? error.message : String(error));
+      }
+    }
+    if (!process.env[requiredEnv]?.trim()) {
+      for (;;) {
+        state.embeddingApiKey = await askSecret(
+          io,
+          `${providerLabel(state.embeddingProvider)} embedding API key`,
+          state.embeddingApiKey ?? '',
+        );
+        if (state.embeddingApiKey?.trim()) {
+          break;
+        }
+        renderStatus(io, 'WARN', `${requiredEnv} or a pasted embedding API key is required.`);
+      }
+    } else {
+      renderStatus(io, 'INFO', `Using ${requiredEnv} from the environment for embeddings.`);
+    }
+  }
+
+  state.embeddingModel = await askValue(io, 'Embedding model', state.embeddingModel);
+
+  if (state.embeddingProvider !== 'ollama') {
+    renderStatus(
+      io,
+      'WARN',
+      'Remote embeddings send your text to a cloud endpoint. The recall latency budget '
+      + '(p50<=300ms / p95<=800ms) assumes local embeddings, and this is configured, not verified.',
+    );
+  }
+}
+
+/**
+ * Live Ollama catalog check.
+ *
+ * Only checks the models that will ACTUALLY be served from this endpoint. It used to check the
+ * embedding model unconditionally, which after R05 is wrong: a cloud embedding role is not served
+ * from the local Ollama endpoint, so reporting its model as "missing" here would be a false
+ * warning. A local embedding role with a DIFFERENT explicit endpoint is skipped for the same
+ * reason and gets its own truth from the review/apply path.
+ */
 async function runProviderChecks(
   io: CliIO,
   state: SetupWizardState,
@@ -236,10 +385,16 @@ async function runProviderChecks(
   }
 
   renderStatus(io, 'OK', 'Ollama reachable.');
-  const missingModels = getMissingOllamaModels(
-    [state.mainModel, state.medicalModel, state.embeddingModel],
-    runtime.models,
-  );
+  const mainUrl = state.ollamaUrl ?? LOCAL_OLLAMA_BASE_URL;
+  const modelsServedHere = [state.mainModel, state.medicalModel];
+  if (
+    state.embeddingProvider === 'ollama'
+    && (state.embeddingUrl ?? state.ollamaUrl ?? LOCAL_OLLAMA_BASE_URL) === mainUrl
+  ) {
+    modelsServedHere.push(state.embeddingModel);
+  }
+
+  const missingModels = getMissingOllamaModels(modelsServedHere, runtime.models);
   if (missingModels.length === 0) {
     renderStatus(io, 'OK', 'Selected Ollama models are installed.');
     return;
@@ -320,7 +475,18 @@ async function runReviewStep(
     { label: 'Provider', value: review.config.providers.main.type },
     { label: 'Main model', value: review.config.providers.main.model },
     { label: 'Medical model', value: review.config.providers.medical.model },
+    // R05: the embedding role must be reviewable as its OWN selection. Showing only the model hid
+    // the very thing that went wrong — a cloud chat provider quietly taking embeddings with it.
+    { label: 'Embedding provider', value: review.config.providers.embeddings.type },
     { label: 'Embedding model', value: review.config.providers.embeddings.model },
+    {
+      label: 'Embedding endpoint',
+      // The SAME sanitizer the config summary uses. Printing the raw base URL here bypassed it and
+      // exposed `user:password@` userinfo. (Cold re-review D2.)
+      value: printableEndpoint(review.config.providers.embeddings.baseUrl, '(provider default)'),
+    },
+    // `secret: true` masks it through the shared renderer, so the embedding key is never echoed.
+    { label: 'Embedding key', value: review.config.providers.embeddings.apiKey ?? '', secret: true },
     { label: 'Telegram', value: review.config.channels.telegram.enabled ? 'enabled' : 'disabled' },
     { label: 'Telegram token', value: review.config.channels.telegram.botToken, secret: true },
     { label: 'Timezone', value: review.config.heartbeat.timezone },
@@ -356,6 +522,9 @@ async function rerunSelectedStep(io: CliIO, state: SetupWizardState, action: Rev
       return;
     case 'provider':
       await runProviderStep(io, state);
+      return;
+    case 'embeddings':
+      await runEmbeddingStep(io, state);
       return;
     case 'telegram':
       await runTelegramStep(io, state);
@@ -461,6 +630,9 @@ export async function runSetupWizard(
   await runStateStep(io, state);
   await runProviderStep(io, state);
   await runProviderChecks(io, state, options);
+  // R05: a distinct step, so choosing embeddings cannot be skipped by answering the chat provider
+  // step and so a later "Edit embeddings" re-entry has the same path as the first pass.
+  await runEmbeddingStep(io, state);
   await runTelegramStep(io, state);
   await runTelegramChecks(io, state, options);
   await runPreferencesStep(io, state);

@@ -2,6 +2,19 @@ import { BUILT_IN_EMERGENCY_KEYWORDS } from '../safety/emergency-detector';
 import { CONFIG_SCHEMA_VERSION, type StoredConfig } from './types';
 
 /**
+ * The known LOCAL Ollama endpoint, as a single authority.
+ *
+ * This value used to be written out in four places (`defaults.ts` three times,
+ * `setup-config.ONDEVICE_OLLAMA_URL`, plus literals in the wizard and the provider), so "the
+ * local default" was four separate authorities. The decoder now compares a cloud role's
+ * `baseUrl` against exactly this string to refuse the concrete inheritance mistake, which
+ * only works if there is one value to compare against.
+ *
+ * Declared BEFORE `DEFAULT_STORED_CONFIG`, which reads it at module evaluation time.
+ */
+export const LOCAL_OLLAMA_BASE_URL = 'http://localhost:11434/v1';
+
+/**
  * Stored defaults for `schemaVersion: 2`.
  *
  * Two properties matter here:
@@ -17,17 +30,17 @@ export const DEFAULT_STORED_CONFIG: StoredConfig = Object.freeze({
   providers: {
     main: {
       type: 'ollama',
-      baseUrl: 'http://localhost:11434/v1',
+      baseUrl: LOCAL_OLLAMA_BASE_URL,
       model: 'kimi-k2.5:cloud',
     },
     medical: {
       type: 'ollama',
-      baseUrl: 'http://localhost:11434/v1',
+      baseUrl: LOCAL_OLLAMA_BASE_URL,
       model: 'aadide/medgemma-1.5-4b-it-Q4_K_S:latest',
     },
     embeddings: {
       type: 'ollama',
-      baseUrl: 'http://localhost:11434/v1',
+      baseUrl: LOCAL_OLLAMA_BASE_URL,
       model: 'embeddinggemma:latest',
     },
   },
@@ -118,7 +131,9 @@ export const DEFAULT_STORED_CONFIG: StoredConfig = Object.freeze({
   },
 }) as StoredConfig;
 
-/** Deep copy so a caller can never mutate the shared defaults. */
+/**
+ * Deep copy so a caller can never mutate the shared defaults.
+ */
 export function cloneStoredDefaults(): StoredConfig {
   return structuredClone(DEFAULT_STORED_CONFIG);
 }

@@ -16,14 +16,15 @@
 import * as os from 'os';
 import * as path from 'path';
 import { getDefaultConfig } from '../config/config';
+import { LOCAL_OLLAMA_BASE_URL } from '../config/defaults';
 import { validateConfig } from '../config/validation';
 import { DirectoryLease } from '../runtime/adapters/directory-lease';
 import { InstallationService } from '../runtime/installation';
 import type { SetupResult } from '../runtime/installation';
 import { providerEnvVar } from '../config/provider-env';
 import type { EffectiveConfig, ProviderConfig } from '../config/types';
-import { OPENROUTER_DEFAULT_BASE_URL } from '../providers/openai';
-import { asProfileId, resolveOwnerPaths } from '../profiles';
+import { OPENROUTER_DEFAULT_BASE_URL } from '../providers';
+import { asProfileId, OWNER_ID_PATTERN, resolveOwnerPaths } from '../profiles';
 import type { ProfileId } from '../profiles';
 import type { SetupWizardState } from './wizard-types';
 
@@ -44,7 +45,12 @@ export interface ServiceOnboardingArgs {
   // defaults to on-device Ollama medgemma (privacy + health-specialized). Set
   // --medical-provider to opt into a cloud medical model.
   medicalProvider?: ProviderConfig['type'];
+  // R05 (plan 15 §2.4): embeddings are an INDEPENDENT selection. Defaults stay local Ollama even
+  // when main is cloud; an explicit embedding provider/model/url/key overrides only this role.
   embeddingModel?: string;
+  embeddingProvider?: ProviderConfig['type'];
+  embeddingUrl?: string;
+  embeddingApiKey?: string;
   ollamaUrl?: string;
   apiKey?: string;
   telegramToken?: string;
@@ -75,24 +81,127 @@ export const SUPPORTED_ONBOARDING_PROVIDERS: readonly ProviderConfig['type'][] =
 
 export function isSupportedOnboardingProvider(
   providerType: ProviderConfig['type'],
-): providerType is 'ollama' | 'openai' {
+): providerType is 'ollama' | 'openai' | 'openrouter' {
   return SUPPORTED_ONBOARDING_PROVIDERS.includes(providerType);
 }
 
-function parseBoolean(value: string | undefined): boolean | undefined {
-  if (value === undefined) return undefined;
-  const normalized = value.trim().toLowerCase();
-  if (['true', '1', 'yes', 'y', 'on'].includes(normalized)) return true;
-  if (['false', '0', 'no', 'n', 'off'].includes(normalized)) return false;
-  throw new Error(`Invalid boolean value: ${value}`);
+/**
+ * A required option value.
+ *
+ * Refuses a missing value, an empty/blank value, and a value that is itself an option — the three
+ * ways `--config --yes` or a trailing `--config` used to be accepted as a value. The FIELD NAME is
+ * reported, never the supplied text, because the value may be a secret (brief §8C).
+ *
+ * Exported so the setup ENTRY point applies the same rule to the config pair it forwards, instead of
+ * growing its own weaker check (C04-P02). One policy, one implementation.
+ */
+export function requireOptionValue(token: string, value: string | undefined): string {
+  if (value === undefined || value.startsWith('-')) {
+    throw new Error(`${token} requires a value. Usage: medclaw onboard ${token} <value>`);
+  }
+  if (value.trim() === '') {
+    throw new Error(`${token} requires a non-empty value. Usage: medclaw onboard ${token} <value>`);
+  }
+  return value;
 }
 
+/**
+ * An explicit provider selection must name a supported provider, at parse time.
+ *
+ * The refusal names the ROLE and the option that must change, and lists the supported choices. It
+ * never repeats the supplied value: a pasted key is a realistic `--provider` value, and printing it
+ * back writes a secret into the terminal and into any captured log (C04-P01).
+ *
+ * The message PREFIX for each role is unchanged from the pre-existing refusal, so the assertions
+ * already pinned to `Unsupported onboard provider` / `… medical provider` / `… embedding provider`
+ * keep holding; only the value interpolation is gone.
+ */
+function parseProviderOption(
+  token: '--provider' | '--medical-provider' | '--embedding-provider',
+  value: string | undefined,
+): ProviderConfig['type'] {
+  const raw = requireOptionValue(token, value);
+  if (!isSupportedOnboardingProvider(raw as ProviderConfig['type'])) {
+    const subject: Record<typeof token, string> = {
+      '--provider': 'onboard provider',
+      '--medical-provider': 'onboard medical provider',
+      '--embedding-provider': 'onboard embedding provider',
+    };
+    throw new Error(
+      `Unsupported ${subject[token]}: ${token} accepts only`
+      + ` ${SUPPORTED_ONBOARDING_PROVIDERS.join(', ')}.`,
+    );
+  }
+  return raw as ProviderConfig['type'];
+}
+
+/**
+ * An explicit endpoint must be an absolute http(s) URL.
+ *
+ * Exported because the wizard asks for the same endpoint interactively and must apply the SAME
+ * rule — a second copy of this check in the wizard would be a second policy for the same contract.
+ * Returns the accepted value, or throws a message naming only the option.
+ */
+export function requireHttpEndpoint(token: string, raw: string | undefined): string {
+  const value = raw?.trim() ?? '';
+  if (value === '') {
+    throw new Error(`${token} requires a non-empty value. Usage: medclaw onboard ${token} <value>`);
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`${token} must be an absolute http or https URL.`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`${token} must be an absolute http or https URL.`);
+  }
+  return value;
+}
+
+function parseEndpointOption(token: string, value: string | undefined): string {
+  return requireHttpEndpoint(token, requireOptionValue(token, value));
+}
+
+function parseBoolean(token: string, value: string | undefined): boolean {
+  const normalized = (value ?? '').trim().toLowerCase();
+  if (['true', '1', 'yes', 'y', 'on'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'n', 'off'].includes(normalized)) return false;
+  // Reports the option name only. The old message interpolated the supplied text, which is a
+  // secret-bearing path for `--telegram-enabled`-adjacent usage and violates the no-values rule.
+  throw new Error(`${token} requires one of: true, false, yes, no, on, off, 1, 0.`);
+}
+
+/**
+ * STRICT setup argument parsing.
+ *
+ * Every rejection here happens before the wizard, before any lease, directory, template, record or
+ * config write (brief §8C):
+ *  - an unknown option is refused instead of silently ignored (R06 / SOL-05);
+ *  - an unexpected bare token is refused;
+ *  - a missing, blank, or option-shaped value is refused, so a trailing `--config` can no longer
+ *    erase the globally selected target and silently fall back to the home default;
+ *  - a required value that is itself an option (`--config --yes`) is refused;
+ *  - explicit provider, boolean and URL values are validated here, not at first use.
+ *
+ * Errors name the FIELD or the reason only. A supplied value is never echoed, because
+ * `--api-key`, `--embedding-api-key` and `--telegram-token` are secret-bearing options.
+ */
 export function parseArgs(argv: string[]): ServiceOnboardingArgs {
   const args: ServiceOnboardingArgs = {};
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
-    if (!token.startsWith('--')) {
+    if (token === undefined) {
       continue;
+    }
+    if (!token.startsWith('--')) {
+      // Names the POSITION, never the text. An operator who forgets `--api-key` and pastes the key
+      // as a positional argument would otherwise have the secret written to stderr and into any
+      // captured log. (Cold-review finding 2 — this branch previously echoed the token verbatim.)
+      throw new Error(
+        `Unexpected argument at position ${index + 1}: setup takes options only.`
+        + ' Run `medclaw onboard --help`.',
+      );
     }
     const next = argv[index + 1];
     switch (token) {
@@ -100,15 +209,15 @@ export function parseArgs(argv: string[]): ServiceOnboardingArgs {
         args.yes = true;
         break;
       case '--config':
-        args.configPath = next;
+        args.configPath = requireOptionValue('--config', next);
         index += 1;
         break;
       case '--state-root':
-        args.stateRoot = next;
+        args.stateRoot = requireOptionValue('--state-root', next);
         index += 1;
         break;
       case '--owner-id':
-        args.ownerId = next;
+        args.ownerId = requireOptionValue('--owner-id', next);
         index += 1;
         break;
       // Retired on purpose (plan 15 §2.4). An old invocation is refused with guidance rather than
@@ -124,123 +233,248 @@ export function parseArgs(argv: string[]): ServiceOnboardingArgs {
           + 'choose a fresh --state-root / --config target instead. Existing credentials and evidence are never removed.',
         );
       case '--provider':
-        args.provider = next as ProviderConfig['type'];
+        args.provider = parseProviderOption('--provider', next);
         index += 1;
         break;
       case '--main-model':
-        args.mainModel = next;
+        args.mainModel = requireOptionValue('--main-model', next);
         index += 1;
         break;
       case '--medical-model':
-        args.medicalModel = next;
+        args.medicalModel = requireOptionValue('--medical-model', next);
         index += 1;
         break;
       case '--medical-provider':
-        args.medicalProvider = next as ProviderConfig['type'];
+        args.medicalProvider = parseProviderOption('--medical-provider', next);
+        index += 1;
+        break;
+      case '--embedding-provider':
+        args.embeddingProvider = parseProviderOption('--embedding-provider', next);
         index += 1;
         break;
       case '--embedding-model':
-        args.embeddingModel = next;
+        args.embeddingModel = requireOptionValue('--embedding-model', next);
+        index += 1;
+        break;
+      case '--embedding-url':
+        args.embeddingUrl = parseEndpointOption('--embedding-url', next);
+        index += 1;
+        break;
+      case '--embedding-api-key':
+        args.embeddingApiKey = requireOptionValue('--embedding-api-key', next);
         index += 1;
         break;
       case '--ollama-url':
-        args.ollamaUrl = next;
+        args.ollamaUrl = parseEndpointOption('--ollama-url', next);
         index += 1;
         break;
       case '--api-key':
       case '--openai-api-key':
-        args.apiKey = next;
+        args.apiKey = requireOptionValue('--api-key', next);
         index += 1;
         break;
       case '--telegram-token':
-        args.telegramToken = next;
+        args.telegramToken = requireOptionValue('--telegram-token', next);
         index += 1;
         break;
       case '--telegram-enabled':
-        args.telegramEnabled = parseBoolean(next);
+        args.telegramEnabled = parseBoolean('--telegram-enabled', next);
         index += 1;
         break;
       case '--timezone':
-        args.timezone = next;
+        args.timezone = requireOptionValue('--timezone', next);
         index += 1;
         break;
       case '--heartbeats-enabled':
-        args.heartbeatsEnabled = parseBoolean(next);
+        args.heartbeatsEnabled = parseBoolean('--heartbeats-enabled', next);
         index += 1;
         break;
-      default:
-        break;
+      default: {
+        // Report only the option NAME. An operator who wrote `--api-key=sk-...` must not have the
+        // secret echoed back: everything after the first '=' is a value. (Cold re-review D1.)
+        const name = token.includes('=') ? token.slice(0, token.indexOf('=')) : token;
+        throw new Error(
+          `Unknown option: ${name}. Run \`medclaw onboard --help\` for the supported options.`,
+        );
+      }
     }
   }
   return args;
 }
 
+/** Usage text for the setup command. Kept beside the parser so the names cannot drift apart. */
+export const ONBOARD_HELP_TEXT = [
+  'Usage: medclaw onboard [options]',
+  '',
+  'Identity and target:',
+  '  --config <path>          selected configuration document (also accepted globally, before `onboard`)',
+  '  --state-root <dir>       owner state root (defaults to the config file directory)',
+  '  --owner-id <id>          owner identity (default: default)',
+  '  --yes                    run non-interactively without the wizard',
+  '',
+  'Main role:',
+  '  --provider <ollama|openai|openrouter>',
+  '  --main-model <model>',
+  '  --api-key <secret>       explicit key for the MAIN role only',
+  '  --ollama-url <url>       LOCAL role endpoint; never applied to a cloud main role',
+  '',
+  'Medical role (independent of main):',
+  '  --medical-provider <ollama|openai|openrouter>',
+  '  --medical-model <model>',
+  '',
+  'Embedding role (independent of main; defaults to local Ollama):',
+  '  --embedding-provider <ollama|openai|openrouter>',
+  '  --embedding-model <model>',
+  '  --embedding-url <http(s)-url>',
+  '  --embedding-api-key <secret>',
+  '',
+  'Channels and preferences:',
+  '  --telegram-enabled <true|false>',
+  '  --telegram-token <secret>',
+  '  --timezone <IANA zone>',
+  '  --heartbeats-enabled <true|false>',
+].join('\n') + '\n';
+
 // forka #11: the default on-device medical model + Ollama URL, used whenever the
 // medical provider resolves to Ollama (which is the default, independent of the
 // main provider).
-const ONDEVICE_OLLAMA_URL = 'http://localhost:11434/v1';
 function defaultMedgemmaModel(): string {
   return getDefaultConfig().providers.medical.model;
 }
 
-function applyProvider(
+/** The default LOCAL endpoint for a local role. Resolved through the one config authority. */
+function localOllamaUrl(): string {
+  return getDefaultConfig().providers.main.baseUrl ?? LOCAL_OLLAMA_BASE_URL;
+}
+
+/**
+ * Build ONE provider role from its own explicit inputs.
+ *
+ * R05 replaced a single `applyProvider` that wrote main and embeddings together, which is what made
+ * cloud main silently move embeddings to cloud and copied `--api-key` into every role. Each role is
+ * now resolved from its own provider/model/endpoint/key, so nothing can leak sideways between them.
+ *
+ * Endpoint precedence, per role:
+ *  - an explicit role endpoint wins;
+ *  - otherwise a local role uses `--ollama-url` (or the local default) and a cloud role uses its
+ *    own provider default — never the local fallback, never another role's endpoint.
+ */
+function buildProviderRole(options: {
+  providerType: ProviderConfig['type'];
+  model?: string;
+  /** Explicit endpoint supplied for THIS role. */
+  explicitBaseUrl?: string;
+  /** The local-provider control (`--ollama-url`). Applies to local roles only. */
+  ollamaUrl?: string;
+  /**
+   * Explicit key supplied for THIS role.
+   *
+   * Main and embeddings pass their OWN key only. The medical call site is the one exception and it
+   * is deliberate, inherited forka #11 behaviour: opting the medical model into a cloud provider
+   * reuses the operator's single `--api-key`. That is a real cross-provider key reuse (an OpenAI
+   * key can reach an OpenRouter medical endpoint) and it is NOT fixed by C04, which the brief
+   * requires to preserve the existing independent medical behaviour. Reported, not silently
+   * re-specified here.
+   */
+  explicitApiKey?: string;
+  /** Model default for this role's provider. */
+  defaultModel: string;
+  /** Whether this provider needs its router endpoint pinned. */
+  pinsRouterEndpoint?: boolean;
+  /** Chat-only hint. Embeddings deliberately ignore it. */
+  reasoningEffort?: ProviderConfig['reasoningEffort'];
+}): ProviderConfig {
+  const {
+    providerType, model, explicitBaseUrl, ollamaUrl,
+    explicitApiKey, defaultModel, pinsRouterEndpoint, reasoningEffort,
+  } = options;
+
+  const role: ProviderConfig = {
+    type: providerType,
+    model: model ?? defaultModel,
+  };
+
+  // A blank endpoint means "not supplied", never "persist an empty string". The interactive wizard
+  // can produce one (an operator pressing Enter at the endpoint prompt), and persisting `""` wrote a
+  // meaningless field the decoder then dropped on reload.
+  const explicit = explicitBaseUrl?.trim() === '' ? undefined : explicitBaseUrl;
+
+  if (providerType === 'ollama') {
+    role.baseUrl = explicit ?? ollamaUrl ?? localOllamaUrl();
+  } else if (explicit !== undefined) {
+    role.baseUrl = explicit;
+  } else if (pinsRouterEndpoint) {
+    role.baseUrl = OPENROUTER_DEFAULT_BASE_URL;
+  }
+
+  const apiKey = explicitApiKey?.trim() ? explicitApiKey.trim() : undefined;
+  if (apiKey !== undefined && providerType !== 'ollama') {
+    role.apiKey = apiKey;
+  }
+  if (reasoningEffort !== undefined) {
+    role.reasoningEffort = reasoningEffort;
+  }
+  return role;
+}
+
+/** Resolve the embedding role's selection, defaulting to the existing LOCAL Ollama default. */
+export function resolveEmbeddingProvider(
+  args: ServiceOnboardingArgs,
+): ProviderConfig['type'] {
+  return args.embeddingProvider ?? getDefaultConfig().providers.embeddings.type;
+}
+
+/**
+ * Apply all three roles independently (plan 15 §2.4: "Main provider and embeddings are independent
+ * choices").
+ *
+ * Main keeps its existing defaults. Embeddings default to the local Ollama default even when main
+ * is cloud — that default is the R05 fix, not an omission. Medical stays on-device medgemma by
+ * default, independently of main (forka #11).
+ */
+function applyProviders(
   config: EffectiveConfig,
   providerType: ProviderConfig['type'],
   args: ServiceOnboardingArgs,
 ): void {
-  const ollamaUrl = args.ollamaUrl ?? config.providers.main.baseUrl ?? ONDEVICE_OLLAMA_URL;
+  const mainDefaults = modelDefaultsForProvider(providerType);
+  const embeddingType = resolveEmbeddingProvider(args);
+  const embeddingDefaults = modelDefaultsForProvider(embeddingType);
   const apiKey = args.apiKey?.trim() ? args.apiKey.trim() : undefined;
 
-  // Main + embeddings follow the chosen provider.
-  if (providerType === 'ollama') {
-    config.providers.main = {
-      type: 'ollama',
-      model: args.mainModel ?? config.providers.main.model,
-      baseUrl: ollamaUrl,
-    };
-    config.providers.embeddings = {
-      type: 'ollama',
-      model: args.embeddingModel ?? config.providers.embeddings.model,
-      baseUrl: ollamaUrl,
-    };
-  } else {
-    const cloudDefaults = modelDefaultsForProvider(providerType);
-    const isRouter = providerType === 'openrouter';
-    config.providers.main = {
-      type: providerType,
-      model: args.mainModel ?? cloudDefaults.main,
-      // OpenRouter has no SDK-default endpoint of its own — pin its router URL.
-      ...(isRouter ? { baseUrl: OPENROUTER_DEFAULT_BASE_URL, reasoningEffort: 'low' as const } : {}),
-      ...(args.ollamaUrl ? { baseUrl: args.ollamaUrl } : {}),
-      ...(apiKey ? { apiKey } : {}),
-    };
-    config.providers.embeddings = {
-      type: providerType,
-      model: args.embeddingModel ?? cloudDefaults.embeddings,
-      ...(isRouter ? { baseUrl: OPENROUTER_DEFAULT_BASE_URL } : {}),
-      ...(args.ollamaUrl ? { baseUrl: args.ollamaUrl } : {}),
-      ...(apiKey ? { apiKey } : {}),
-    };
-  }
+  // OpenRouter has no SDK-default endpoint of its own — pin its router URL for MAIN only.
+  config.providers.main = buildProviderRole({
+    providerType,
+    model: args.mainModel ?? mainDefaults.main,
+    explicitBaseUrl: args.ollamaUrl && providerType === 'ollama' ? args.ollamaUrl : undefined,
+    ollamaUrl: args.ollamaUrl,
+    explicitApiKey: apiKey,
+    defaultModel: mainDefaults.main,
+    pinsRouterEndpoint: providerType === 'openrouter',
+    reasoningEffort: providerType === 'openrouter' ? 'low' : undefined,
+  });
+
+  config.providers.embeddings = buildProviderRole({
+    providerType: embeddingType,
+    model: args.embeddingModel ?? embeddingDefaults.embeddings,
+    explicitBaseUrl: args.embeddingUrl,
+    ollamaUrl: args.ollamaUrl,
+    explicitApiKey: args.embeddingApiKey,
+    defaultModel: embeddingDefaults.embeddings,
+    pinsRouterEndpoint: embeddingType === 'openrouter',
+  });
 
   // forka #11: medical resolves INDEPENDENTLY of the main provider and defaults
   // to on-device Ollama medgemma — the health-specialized model, kept local for
   // the core privacy promise. Opt out with --medical-provider (+ --medical-model).
   const medicalType = args.medicalProvider ?? 'ollama';
-  if (medicalType === 'ollama') {
-    config.providers.medical = {
-      type: 'ollama',
-      model: args.medicalModel ?? defaultMedgemmaModel(),
-      baseUrl: args.ollamaUrl ?? ONDEVICE_OLLAMA_URL,
-    };
-  } else {
-    config.providers.medical = {
-      type: medicalType,
-      model: args.medicalModel ?? 'gpt-4o-mini',
-      ...(args.ollamaUrl ? { baseUrl: args.ollamaUrl } : {}),
-      ...(apiKey ? { apiKey } : {}),
-    };
-  }
+  config.providers.medical = buildProviderRole({
+    providerType: medicalType,
+    model: args.medicalModel ?? defaultMedgemmaModel(),
+    ollamaUrl: args.ollamaUrl,
+    explicitApiKey: apiKey,
+    defaultModel: medicalType === 'ollama' ? defaultMedgemmaModel() : 'gpt-4o-mini',
+  });
 }
 
 export function requiredCloudEnv(providerType: ProviderConfig['type']): string {
@@ -322,12 +556,18 @@ export function resolveSetupValues(args: ServiceOnboardingArgs): ResolvedSetupVa
 /**
  * Validate an owner ID with the same grammar the config decoder uses, so setup cannot write an
  * identity that would later be refused.
+ *
+ * The refusal names the option and the grammar it must satisfy, never the supplied text. An
+ * operator who pastes a credential instead of an id would otherwise have it printed back to the
+ * terminal and into any captured log (C04-P01).
  */
 export function requireOwnerId(raw: string): ProfileId {
   const ownerId = asProfileId(raw.trim());
   if (ownerId === undefined) {
+    // The grammar is rendered from the one authority the decoder uses, wrapped in slashes so the
+    // operator recognizes it as the regular expression it is.
     throw new Error(
-      `Invalid --owner-id: ${JSON.stringify(raw)}. It must match /^[a-z0-9][a-z0-9-]{0,63}$/.`,
+      `Invalid --owner-id: it must match /${OWNER_ID_PATTERN.source}/.`,
     );
   }
   return ownerId;
@@ -337,6 +577,11 @@ export function resolveNonInteractiveArgs(args: ServiceOnboardingArgs): ServiceO
   const defaults = getDefaultConfig();
   const values = resolveSetupValues(args);
   const providerDefaults = modelDefaultsForProvider(values.providerType);
+  // R05: the embedding role resolves from its OWN selection and its OWN provider defaults. It used
+  // to take `providerDefaults.embeddings` — the MAIN provider's cloud defaults — which is what made
+  // cloud main silently move embeddings to cloud.
+  const embeddingType = resolveEmbeddingProvider(args);
+  const embeddingDefaults = modelDefaultsForProvider(embeddingType);
 
   return {
     ...args,
@@ -346,7 +591,13 @@ export function resolveNonInteractiveArgs(args: ServiceOnboardingArgs): ServiceO
     provider: values.providerType,
     mainModel: args.mainModel ?? providerDefaults.main,
     medicalModel: args.medicalModel ?? providerDefaults.medical,
-    embeddingModel: args.embeddingModel ?? providerDefaults.embeddings,
+    embeddingProvider: embeddingType,
+    embeddingModel: args.embeddingModel ?? embeddingDefaults.embeddings,
+    // An explicit embedding endpoint survives resolution untouched. `--ollama-url` stays the LOCAL
+    // control and is applied inside `buildProviderRole`, never here, so a cloud embedding role can
+    // never inherit it.
+    embeddingUrl: args.embeddingUrl,
+    embeddingApiKey: args.embeddingApiKey?.trim() ? args.embeddingApiKey.trim() : undefined,
     ollamaUrl:
       args.ollamaUrl ?? (values.providerType === 'ollama' ? defaults.providers.main.baseUrl ?? '' : undefined),
     apiKey: args.apiKey?.trim() ? args.apiKey.trim() : undefined,
@@ -383,7 +634,7 @@ export function buildConfigFromArgs(inputArgs: ServiceOnboardingArgs): Effective
   config.channels.telegram.enabled = args.telegramEnabled ?? defaults.channels.telegram.enabled;
   config.channels.telegram.botToken = config.channels.telegram.enabled ? values.telegramToken : '';
 
-  applyProvider(config, values.providerType, args);
+  applyProviders(config, values.providerType, args);
 
   return config;
 }
@@ -403,7 +654,14 @@ export function createInitialWizardState(args: ServiceOnboardingArgs): SetupWiza
         : defaults.providers.main.type,
     mainModel: resolved.mainModel ?? defaults.providers.main.model,
     medicalModel: resolved.medicalModel ?? defaults.providers.medical.model,
+    // R05: seeded from the EMBEDDING role's own selection, defaulting to the local Ollama role.
+    embeddingProvider:
+      resolved.embeddingProvider && isSupportedOnboardingProvider(resolved.embeddingProvider)
+        ? resolved.embeddingProvider
+        : defaults.providers.embeddings.type,
     embeddingModel: resolved.embeddingModel ?? defaults.providers.embeddings.model,
+    embeddingUrl: resolved.embeddingUrl,
+    embeddingApiKey: resolved.embeddingApiKey,
     ollamaUrl: resolved.ollamaUrl,
     apiKey: resolved.apiKey,
     telegramEnabled: args.telegramEnabled ?? false,
@@ -417,12 +675,23 @@ export function collectSetupErrors(args: ServiceOnboardingArgs, config: Effectiv
   const values = resolveSetupValues(args);
   const errors: string[] = [];
 
-  if (
-    values.providerType !== 'ollama' &&
-    !args.apiKey?.trim() &&
-    !process.env[requiredCloudEnv(values.providerType)]?.trim()
-  ) {
-    errors.push(`${requiredCloudEnv(values.providerType)} or --api-key is required for provider ${values.providerType}.`);
+  // Per-role credential requirement. Each CLOUD role is satisfied by ITS OWN explicit key or ITS
+  // OWN provider's environment variable — never by the other role's key. R05 added the embedding
+  // role here; before it, only the main role was checked, so a cloud embedding role could be
+  // written with no key of its own.
+  const embeddingType = resolveEmbeddingProvider(args);
+  const requiredCloudRoles: Array<{ label: string; type: ProviderConfig['type']; explicitKey?: string }> = [
+    { label: 'provider', type: values.providerType, explicitKey: args.apiKey },
+    { label: 'embedding provider', type: embeddingType, explicitKey: args.embeddingApiKey },
+  ];
+  for (const role of requiredCloudRoles) {
+    if (role.type === 'ollama') continue;
+    if (role.explicitKey?.trim()) continue;
+    if (process.env[requiredCloudEnv(role.type)]?.trim()) continue;
+    errors.push(
+      `${requiredCloudEnv(role.type)} or --${role.label === 'provider' ? 'api-key' : 'embedding-api-key'}`
+      + ` is required for ${role.label} ${role.type}.`,
+    );
   }
 
   if (config.channels.telegram.enabled && !values.telegramToken.trim()) {
