@@ -112,8 +112,19 @@ refusal text out. No writer logic belongs in this module. Both callers need it â
 prints the refusal, and `setup-wizard`'s retry loop catches it, reports it and lets the operator
 adjust the target.
 
-`config set` and `pairing issue` take the config/owner leases the same way, so a running daemon
-refuses the command rather than two writers racing on the same document.
+`config set` holds the canonical config lease across read/validate/replace. Its write set is config only;
+shared validated path protection refuses owner/derived/retired fields, including ancestor replacement.
+`pairing issue` also holds owner ownership. A running daemon holds the config lease and refuses both.
+
+## Heartbeat inspection
+
+`heartbeats list` and `status` read the selected owner store through `scheduler.inspectHeartbeats`.
+They never construct the recovering runtime store. Missing store, valid empty array, populated jobs,
+malformed JSON/formatter fields and unavailable IO/size have distinct output. A zero-byte document is
+corrupt. Reads use an opened descriptor, a 256 KiB budget plus one sentinel byte, and close in finally;
+they do not create, quarantine, rename, repair or change permissions. Only the existing absent
+delivery-state default is applied to the inspection projection. Explicit path overrides remain caller
+seams; the CLI always supplies its selected config.
 
 Setup publishes the configuration document LAST and only after the required owner record was confirmed
 created. A record outcome that is not a confirmed `created` stops setup with no config document and no

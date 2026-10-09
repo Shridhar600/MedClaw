@@ -28,12 +28,27 @@ so stores stay path-agnostic and no module re-derives a path.
   owner paths resolved by the caller.
 - `serializeStoredConfig(stored): string` — the single persisted form.
 - `validateConfig(config)`, `redactConfig(value)`, `toStoredView(config)`,
-  `protectedSetReason(dottedPath)`, `formatConfigIssue(issue)`, `expandHomePath(value, homeDir)`.
+  `parseConfigSetPath(input)`, `protectedSetReason(validatedPath)`, `formatConfigIssue(issue)`,
+  `expandHomePath(value, homeDir)`.
 - `cloneStoredDefaults()`, `DEFAULT_STORED_CONFIG`, `DEFAULT_SESSION_WINDOW`.
 
 **One rule set:** `decodeStoredConfig` (shape) and `semanticIssues` (cross-field) are the only
 validators. `validateConfig` runs the same semantic rules so the wizard, `config set` and the
 start preflight cannot disagree with what startup accepts.
+
+`config set` trims dotted segments once. It rejects empty segments, brackets and prototype keys.
+Protection and mutation consume the same validated segments. Protected fields include ancestors
+and descendants: replacing `sessions` cannot change a retired reset setting indirectly. Declared
+nonidentity descendants remain writable. The full decoder still refuses unknown fields/invalid values.
+
+Heartbeat default cron first passes a private resource preflight: at most1024 UTF16 input units and
+512 reserved range values across five/six fields. It matches installed name/wildcard normalization,
+checks overlapping range endpoints within field domains and reserves the full domain per hyphen.
+This bounds conversion before installed `node-cron.validate` decides semantics. Normal names, lists,
+reversed ranges, steps and weekday aliases remain supported; highly redundant ranges may exceed the
+conservative budget. Both enabled and disabled defaults use this policy. Refusal identifies the
+field/reason without the submitted expression. Syntax acceptance does not promise a future calendar
+occurrence; this is not a calendar or recurrence engine.
 
 **Provider endpoints:** a LOCAL role must carry its local base URL. A CLOUD role may carry an
 explicit endpoint — OpenRouter has no SDK default, so setup writes its router URL and the document
@@ -43,7 +58,7 @@ Structural URL validity is decided separately and earlier: a non-http(s) scheme,
 string or a wrongly typed value is still refused. The rule is deliberately not an SSRF policy and
 does not ban private or loopback endpoints at other URLs.
 
-**Dependencies:** node builtins (`os`, `path`), `json5` (via the IO adapter), and
+**Dependencies:** node builtins (`os`, `path`), installed `node-cron` for scheduler-equivalent cron semantics, and
 `src/safety/emergency-detector` for the built-in emergency keyword constant.
 
 **Extraction notes:** copy `src/config/` plus `src/profiles/paths.ts` and `src/safety/`.

@@ -86,6 +86,7 @@ describe('PHI file modes', () => {
     it('secureMkdir tightens a pre-existing 0o755 leaf to 0o700', () => {
       const d = path.join(root, 'loose');
       fs.mkdirSync(d, 0o755);
+      fs.chmodSync(d, 0o755); // Establish the loose fixture even under a restrictive process umask.
       expect(modeOf(d)).toBe(0o755);
       secureMkdir(d);
       expect(modeOf(d)).toBe(DIR);
@@ -100,6 +101,7 @@ describe('PHI file modes', () => {
     it('secureWrite tightens a pre-existing 0o644 file to 0o600', () => {
       const f = path.join(root, 'b.txt');
       fs.writeFileSync(f, 'old', { mode: 0o644 });
+      fs.chmodSync(f, 0o644);
       expect(modeOf(f)).toBe(0o644);
       secureWrite(f, 'new');
       expectFileMode(f);
@@ -114,6 +116,7 @@ describe('PHI file modes', () => {
     it('secureWriteViaTmp tightens a pre-existing loose target', () => {
       const f = path.join(root, 'd.txt');
       fs.writeFileSync(f, 'loose', { mode: 0o644 });
+      fs.chmodSync(f, 0o644);
       secureWriteViaTmp(f, 'replaced');
       expectFileMode(f);
     });
@@ -127,6 +130,7 @@ describe('PHI file modes', () => {
     it('secureAppend tightens an existing 0o644 file on first touch', () => {
       const f = path.join(root, 'f.txt');
       fs.writeFileSync(f, 'loose\n', { mode: 0o644 });
+      fs.chmodSync(f, 0o644);
       expect(modeOf(f)).toBe(0o644);
       secureAppend(f, 'more\n');
       expectFileMode(f);
@@ -141,6 +145,7 @@ describe('PHI file modes', () => {
       const dest = path.join(root, 'copy.txt');
       // Warm a loose destination to prove copy then restricts it.
       fs.writeFileSync(dest, 'stale', { mode: 0o644 });
+      fs.chmodSync(dest, 0o644);
       secureCopyFile(src, dest);
       expectFileMode(dest);
       expect(fs.readFileSync(dest, 'utf8')).toBe('payload');
@@ -152,6 +157,8 @@ describe('PHI file modes', () => {
       fs.mkdirSync(path.join(base, 'sub'), 0o755);
       fs.writeFileSync(path.join(base, 'x.md'), 'x', { mode: 0o644 });
       fs.writeFileSync(path.join(base, 'sub', 'y.md'), 'y', { mode: 0o644 });
+      for (const directory of [base, path.join(base, 'sub')]) fs.chmodSync(directory, 0o755);
+      for (const file of [path.join(base, 'x.md'), path.join(base, 'sub', 'y.md')]) fs.chmodSync(file, 0o644);
       secureChmodTree(base);
       expectDirMode(base);
       expectDirMode(path.join(base, 'sub'));
@@ -178,6 +185,7 @@ describe('PHI file modes', () => {
       // Pre-create a loose PHI file the way a (hypothetical) legacy writer would.
       fs.mkdirSync(path.join(ws, 'medications'), { recursive: true });
       fs.writeFileSync(path.join(ws, 'medications', 'metformin.md'), 'old\n', { mode: 0o644 });
+      fs.chmodSync(path.join(ws, 'medications', 'metformin.md'), 0o644);
       expect(modeOf(path.join(ws, 'medications', 'metformin.md'))).toBe(0o644);
 
       await engine.appendToFile('medications/metformin.md', 'new dose\n');
@@ -220,8 +228,10 @@ describe('PHI file modes', () => {
     it('append to a pre-existing loose day file tightens it to 0o600', async () => {
       const sessionsPath = path.join(root, 'sessions3');
       fs.mkdirSync(sessionsPath, 0o755);
+      fs.chmodSync(sessionsPath, 0o755);
       const day = path.join(sessionsPath, new Date().toISOString().slice(0, 10) + '.jsonl');
       fs.writeFileSync(day, '{"timestamp":"t","role":"user","content":"x","chatId":"789"}\n', { mode: 0o644 });
+      fs.chmodSync(day, 0o644);
       expect(modeOf(day)).toBe(0o644);
 
       const sm = new SessionManager(60, 1440, sessionsPath, undefined, undefined, undefined, 'default');
@@ -276,6 +286,7 @@ describe('PHI file modes', () => {
       const logPath = path.join(root, '.state2', 'audit.jsonl');
       fs.mkdirSync(path.dirname(logPath), { recursive: true });
       fs.writeFileSync(logPath, '', { mode: 0o644 });
+      fs.chmodSync(logPath, 0o644);
       expect(modeOf(logPath)).toBe(0o644);
       const log = new SchedulerAuditLog(logPath, 'default');
       await log.append({

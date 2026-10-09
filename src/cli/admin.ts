@@ -2,7 +2,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import JSON5 from 'json5';
-import { decodeConfigDocument } from '../config';
+import { decodeConfigDocument, parseConfigSetPath, redactConfig, validateConfig, protectedSetReason, providerEnvVar } from '../config';
+import type { ConfigSetPath, EffectiveConfig, StoredConfig, ProviderConfig } from '../config';
 import {
   canonicalizeConfigPath,
   effectiveConfigFor,
@@ -11,20 +12,15 @@ import {
   writeConfigDocument,
 } from '../runtime';
 import type { ConfigFileSync } from '../runtime';
-import { DirectoryLease } from '../runtime/adapters/directory-lease';
-import { CryptoPairingCodePort, FileOwnerStatePort } from '../runtime/adapters';
-import { InstallationService, describeOwnershipRefusal } from '../runtime';
+import { DirectoryLease, CryptoPairingCodePort, FileOwnerStatePort, InstallationService, describeOwnershipRefusal } from '../runtime';
 import type { OwnerStateStoreFactory } from '../runtime';
 import { OwnerAdmissionService, isBoundOwnerState } from '../profiles';
 import { systemClock } from '../ports/defaults';
 import type { ResourceLeasePort } from '../ports/resource-lease';
 import { selectConfigPath } from '../runtime';
-import { redactConfig, validateConfig, protectedSetReason } from '../config/validation';
-import type { EffectiveConfig, StoredConfig } from '../config/types';
-import { providerEnvVar } from '../config/provider-env';
-import { HeartbeatStore } from '../scheduler/store';
+import { inspectHeartbeats, MAX_HEARTBEAT_INSPECTION_BYTES } from '../scheduler';
+import type { HeartbeatInspection, InspectedHeartbeatJob } from '../scheduler';
 import { checkSystemReadiness } from '../providers/healthcheck';
-import type { ProviderConfig } from '../config/types';
 
 export interface AdminPaths {
   configPath?: string;
@@ -85,17 +81,7 @@ function parseConfigValue(raw: string): unknown {
   }
 }
 
-function setPathValue(target: Record<string, unknown>, dottedPath: string, value: unknown): void {
-  const parts = dottedPath.split('.').map((part) => part.trim()).filter(Boolean);
-  if (parts.length === 0) {
-    throw new Error('Config path is required.');
-  }
-  for (const part of parts) {
-    if (part === '__proto__' || part === 'prototype' || part === 'constructor') {
-      throw new Error(`Unsafe config path segment: ${part}`);
-    }
-  }
-
+function setPathValue(target: Record<string, unknown>, parts: readonly string[], value: unknown): void {
   let cursor: Record<string, unknown> = target;
   for (let index = 0; index < parts.length - 1; index += 1) {
     const key = parts[index];
@@ -133,10 +119,13 @@ export async function setConfigValue(
   rawValue: string,
   options: { sync?: ConfigFileSync; leases?: ResourceLeasePort } = {},
 ): Promise<string> {
-  const protectedReason = protectedSetReason(dottedPath);
+  const parsedPath = parseConfigSetPath(dottedPath);
+  if (parsedPath.kind === 'invalid') throw new Error(parsedPath.reason);
+  const configSetPath = parsedPath.path;
+  const protectedReason = protectedSetReason(configSetPath);
   if (protectedReason) {
     throw new Error(
-      `Cannot set ${dottedPath}: ${protectedReason}. Edit the configuration through setup instead.`,
+      `Cannot set ${configSetPath.canonical}: ${protectedReason}. Edit the configuration through setup instead.`,
     );
   }
 
@@ -146,17 +135,16 @@ export async function setConfigValue(
   const { canonicalPath: canonicalForLease } = canonicalizeConfigPath(configPath);
   const configLease = await leases.tryAcquire({ kind: 'config', canonicalPath: canonicalForLease });
   if (configLease.kind === 'busy') {
-    throw new Error(`Cannot set ${dottedPath}: ${configLease.guidance}`);
+    throw new Error(`Cannot set config: ${configLease.guidance}`);
   }
   if (configLease.kind === 'unavailable') {
-    throw new Error(`Cannot set ${dottedPath}: ${configLease.guidance}`);
+    throw new Error(`Cannot set config: ${configLease.guidance}`);
   }
 
   try {
     return await applyConfigValueUnderLease(
-      configLease.release,
       configPath,
-      dottedPath,
+      configSetPath,
       rawValue,
       options.sync,
     );
@@ -172,22 +160,22 @@ export async function setConfigValue(
  * happens in exactly one place.
  */
 async function applyConfigValueUnderLease(
-  release: () => Promise<void>,
   configPath: string,
-  dottedPath: string,
+  configSetPath: ConfigSetPath,
   rawValue: string,
   sync: ConfigFileSync | undefined,
 ): Promise<string> {
+  const dottedPath = configSetPath.canonical;
   const { stored, canonicalPath } = readConfigDocument(configPath, os.homedir());
   const next = structuredClone(stored) as unknown as Record<string, unknown>;
-  setPathValue(next, dottedPath, parseConfigValue(rawValue));
+  setPathValue(next, configSetPath.segments, parseConfigValue(rawValue));
 
   // Validate the whole document through the same decoder startup uses, so a `config set`
   // can never persist a value that refuses to serve.
   const decoded = decodeConfigDocument(next, { homeDir: os.homedir() });
   if (decoded.kind === 'invalid') {
-    const detail = decoded.issues.map((issue) => `${issue.field}: ${issue.detail} [${issue.code}]`).join('; ');
-    throw new Error(`Refused ${dottedPath}: the resulting configuration would not load. ${detail}`);
+    const detail = decoded.issues.map((issue) => `${issue.code === 'unknown-field' ? '(unknown setting)' : issue.field}: ${issue.detail} [${issue.code}]`).join('; ');
+    throw new Error(`Refused config update: the resulting configuration would not load. ${detail}`);
   }
 
   const outcome = writeConfigDocument(canonicalPath, decoded.config as StoredConfig, { sync });
@@ -381,16 +369,7 @@ export async function showUserSummary(paths: AdminPaths = {}): Promise<string> {
   ]);
 }
 
-function formatHeartbeatJob(job: {
-  id: string;
-  title: string;
-  chatId: string;
-  cron: string;
-  timezone: string;
-  enabled: boolean;
-  deliveryState: string;
-  prompt: string;
-}): string {
+function formatHeartbeatJob(job: InspectedHeartbeatJob): string {
   return [
     `id: ${job.id}`,
     `title: ${job.title}`,
@@ -405,18 +384,19 @@ function formatHeartbeatJob(job: {
 
 export async function listHeartbeats(paths: AdminPaths = {}): Promise<string> {
   const storePath = paths.storePath ?? selectedOwnerPaths(paths.configPath).storePath;
-  const probe = readInspectionFile(storePath);
-  if (probe.kind === 'unavailable') {
-    return `Heartbeat store unavailable: ${probe.detail}.\n`;
-  }
-  const store = new HeartbeatStore(storePath);
-  const jobs = await store.list();
-  if (jobs.length === 0) {
-    return probe.kind === 'absent'
-      ? 'No heartbeat jobs configured (the selected owner has no scheduler store yet).\n'
-      : 'No heartbeat jobs configured.\n';
-  }
-  return formatLines(jobs.map((job) => formatHeartbeatJob(job)));
+  const inspection = inspectHeartbeats(storePath);
+  if (inspection.kind === 'missing') return 'No heartbeat jobs configured (the selected owner has no scheduler store yet).\n';
+  if (inspection.kind !== 'ok') return `${heartbeatInspectionProblem(inspection)}\n`;
+  if (inspection.jobs.length === 0) return 'No heartbeat jobs configured.\n';
+  return formatLines(inspection.jobs.map(formatHeartbeatJob));
+}
+
+function heartbeatInspectionProblem(inspection: Extract<HeartbeatInspection, { kind: 'corrupt' | 'unavailable' }>): string {
+  if (inspection.kind === 'corrupt') return 'Heartbeat store corrupt: expected a JSON array of valid job records. No changes were made.';
+  const detail = inspection.reason === 'too-large'
+    ? `the file exceeds the ${MAX_HEARTBEAT_INSPECTION_BYTES} byte local inspection limit`
+    : inspection.reason === 'not-a-regular-file' ? 'the path is not a regular file' : 'the file could not be read';
+  return `Heartbeat store unavailable: ${detail}.`;
 }
 
 /**
@@ -565,7 +545,8 @@ export async function showStatus(paths: AdminPaths = {}): Promise<string> {
   const workspacePath = paths.workspacePath ?? config.memory.workspace;
   const storePath = paths.storePath ?? config.heartbeat.storePath;
   const health = await checkSystemReadiness(config, { allowNetworkChecks: false });
-  const heartbeatCount = (await new HeartbeatStore(storePath).list()).length;
+  const inspection = inspectHeartbeats(storePath);
+  const heartbeatCount = inspection.kind === 'ok' ? inspection.jobs.length : inspection.kind === 'missing' ? 0 : undefined;
   const validation = validateConfig(config);
   const lines = buildReadinessSummaryLines({
     configPath: paths.configPath,
@@ -574,6 +555,10 @@ export async function showStatus(paths: AdminPaths = {}): Promise<string> {
     readiness: health,
     heartbeatCount,
   });
+  if (inspection.kind === 'corrupt' || inspection.kind === 'unavailable') {
+    lines[0] = 'status: degraded';
+    lines.push(`heartbeat jobs: unavailable — ${heartbeatInspectionProblem(inspection)}`);
+  }
   // Pairing-pending is reported separately from readiness: a healthy provider and a valid
   // document still cannot serve a stranger until the owner is bound.
   lines.push(describePairingState(

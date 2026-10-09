@@ -11,6 +11,7 @@ owner authority composition.
 - Config documents: `readConfigDocument`, `writeConfigDocument`, `effectiveConfigFor`,
   `readConfigFile`, `writeConfigFile`, `canonicalizeConfigPath`, `ConfigFileSync`, `ConfigWriteOutcome`.
 - Owner authority: `composeOwnerAuthority`, `OwnerAuthority`, `OwnerAuthoritySource`.
+- Local composition edges: `DirectoryLease`, `FileOwnerStatePort`, `CryptoPairingCodePort`.
 
 **Dependencies:** `../ports`, `../profiles`, `../config`, `../security`, and `./adapters`. No `gateway/`,
 no `channels/`, no core module.
@@ -65,12 +66,12 @@ scaffold config parent dirs (structure only) ─▶ CONFIG lease ─▶ owner le
   or auto-unlock. A contender that reaches a claim whose holder record has not landed yet refuses
   immediately as `malformed-holder` rather than waiting, stealing or repairing it.
 
-## `adapters/` is deliberately not re-exported
+## Concrete composition edges
 
 `adapters/` holds the concrete filesystem, crypto, lease and media implementations. They are reachable
-from app wiring and test fixtures but intentionally absent from this barrel, so that production
-composition stays visible in `src/index.ts` instead of hiding behind an import. `OwnerAuthority` is the
-one exception: composing owner authority *is* this module's job.
+through the public surface when local administration composes them. Media adapters retain their
+existing app wiring. Owner policy still lives behind injected ports; exporting a concrete edge does
+not make it a singleton or move its construction into a store.
 
 ## Config write durability boundary
 
@@ -78,6 +79,10 @@ A failed validation or refusal leaves the original bytes untouched — that is t
 But once a rename has **committed**, a later flush or acknowledgement failure must not restore the old
 bytes or claim they survived: the writer inspects current validated state and reports committed vs
 uncertain honestly. Durability is never claimed without flush evidence.
+
+Config-temp cleanup tracks successful exclusive creation separately from an open descriptor. A refused
+`wx` creation leaves the exact colliding entry alone; owned write/flush/rename failures close and remove
+only their own temp. Ownership survives the descriptor close before rename. No temp sweep or restore.
 
 ## Extraction notes
 

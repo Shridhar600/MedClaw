@@ -355,6 +355,7 @@ describe('GatewayMessageRouter media lifecycle', () => {
     const realReports = path.join(root, 'real-reports');
     const stagedPath = path.join(staging, 'symlink-report.pdf');
     fs.mkdirSync(realReports, { recursive: true, mode: 0o755 });
+    fs.chmodSync(realReports, 0o755); // The symlink target starts loose regardless of the process umask.
     fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
     fs.writeFileSync(stagedPath, 'report bytes', { mode: 0o600 });
     fs.symlinkSync(realReports, path.join(workspace, 'reports'), 'dir');

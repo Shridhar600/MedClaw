@@ -233,13 +233,15 @@ export function writeConfigFile(
   }
 
   let fd: number | undefined;
+  let ownsTmp = false;
   try {
     fd = fs.openSync(tmpPath, 'wx', 0o600);
+    ownsTmp = true;
     fs.writeFileSync(fd, contents, { encoding: 'utf8' });
     try {
       sync.syncFile(fd);
     } catch {
-      cleanupTmp(tmpPath, fd);
+      cleanupTmp(tmpPath, fd, ownsTmp);
       return { status: 'failed', originalBytesPreserved: true, reason: 'flush-failed' };
     }
     try {
@@ -249,14 +251,14 @@ export function writeConfigFile(
     }
     fd = undefined;
   } catch {
-    cleanupTmp(tmpPath, fd);
+    cleanupTmp(tmpPath, fd, ownsTmp);
     return { status: 'failed', originalBytesPreserved: true, reason: 'write-failed' };
   }
 
   try {
     fs.renameSync(tmpPath, canonicalPath);
   } catch {
-    cleanupTmp(tmpPath, undefined);
+    cleanupTmp(tmpPath, undefined, ownsTmp);
     return { status: 'failed', originalBytesPreserved: true, reason: 'write-failed' };
   }
 
@@ -278,7 +280,7 @@ export function writeConfigFile(
   return { status: 'committed', originalBytesPreserved: false };
 }
 
-function cleanupTmp(tmpPath: string, fd: number | undefined): void {
+function cleanupTmp(tmpPath: string, fd: number | undefined, ownsTmp: boolean): void {
   if (fd !== undefined) {
     try {
       fs.closeSync(fd);
@@ -286,6 +288,8 @@ function cleanupTmp(tmpPath: string, fd: number | undefined): void {
       // ignore secondary close failure
     }
   }
+  // Exclusive-open refusal owns nothing. Ownership survives descriptor close before rename.
+  if (!ownsTmp) return;
   try {
     if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
   } catch {

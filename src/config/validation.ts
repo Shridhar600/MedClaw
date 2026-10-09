@@ -24,6 +24,7 @@
 // Pure: no filesystem access. `homeDir` is injected so `~/` expansion is testable.
 
 import * as path from 'path';
+import * as cron from 'node-cron';
 import {
   CONFIG_SCHEMA_VERSION,
   type EffectiveConfig,
@@ -35,6 +36,8 @@ import {
 import { cloneStoredDefaults, LOCAL_OLLAMA_BASE_URL } from './defaults';
 import { BUILT_IN_EMERGENCY_KEYWORDS } from '../safety/emergency-detector';
 import { providerEnvVar } from './provider-env';
+import type { ConfigSetPath } from './set-path';
+import { isCronValidationWorkBounded } from './cron-resource-policy';
 
 export const OWNER_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
@@ -127,14 +130,6 @@ const REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high'] as const;
 const PROTOTYPE_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 
 const CLOCK_TIME = /^([01]\d|2[0-3]):[0-5]\d$/;
-const CRON_FIELD = /^(\*|\d+|\*\/\d+|\d+-\d+)(,(\*|\d+|\*\/\d+|\d+-\d+))*$/;
-
-/** Cheap structural cron check. Field-count/range correctness is `node-cron`'s job at use time. */
-function looksLikeCron(value: string): boolean {
-  const fields = value.trim().split(/\s+/);
-  if (fields.length !== 5 && fields.length !== 6) return false;
-  return fields.every((field) => CRON_FIELD.test(field));
-}
 
 function isValidTimezone(value: string): boolean {
   if (value.trim() === '') return false;
@@ -527,9 +522,6 @@ function readHeartbeat(r: Reader, raw: unknown): StoredConfig['heartbeat'] {
     const jobRaw = readObject(defaultsRaw?.[key], field, ['enabled', 'cron', 'prompt'], r.issues);
     const fallback = d.policy.defaults[key];
     const cron = optString(r, jobRaw, 'cron', `${field}.cron`, fallback.cron);
-    if (!looksLikeCron(cron)) {
-      r.issues.add('invalid-cron', `${field}.cron`, 'expected a 5- or 6-field cron expression');
-    }
     return {
       enabled: reqBool(r, jobRaw, 'enabled', `${field}.enabled`, fallback.enabled),
       cron,
@@ -613,6 +605,17 @@ function semanticIssues(stored: StoredConfig): ConfigIssue[] {
 
   if (!isValidTimezone(stored.heartbeat.timezone)) {
     r.issues.add('invalid-timezone', 'heartbeat.timezone', 'expected an IANA time zone such as Asia/Kolkata');
+  }
+
+  // Bound conversion before the scheduler's expanding validator. Both defaults are checked,
+  // including disabled ones and already-constructed configs passed to validateConfig.
+  for (const key of ['morningCheckIn', 'eveningSummary'] as const) {
+    const expression = stored.heartbeat.policy.defaults[key].cron;
+    if (!isCronValidationWorkBounded(expression)) {
+      r.issues.add('invalid-cron', `heartbeat.policy.defaults.${key}.cron`, 'cron expression exceeds safe validation limits');
+    } else if (!cron.validate(expression)) {
+      r.issues.add('invalid-cron', `heartbeat.policy.defaults.${key}.cron`, 'expected a cron expression supported by the scheduler');
+    }
   }
 
   return r.issues.issues;
@@ -845,10 +848,11 @@ export function toStoredView(config: EffectiveConfig): StoredConfig {
 }
 
 /** The documented `config set` protected-path policy. Returns `undefined` when the path is allowed. */
-export function protectedSetReason(dottedPath: string): string | undefined {
-  const normalized = dottedPath.replace(/\[\d+\]/g, '');
+export function protectedSetReason(configPath: ConfigSetPath): string | undefined {
+  const normalized = configPath.segments.join('.');
   const hit = PROTECTED_SET_PATHS.find(
-    (entry) => normalized === entry.prefix || normalized.startsWith(`${entry.prefix}.`),
+    (entry) => normalized === entry.prefix || normalized.startsWith(`${entry.prefix}.`)
+      || entry.prefix.startsWith(`${normalized}.`),
   );
   return hit?.reason;
 }

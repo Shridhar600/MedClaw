@@ -11,10 +11,8 @@
 // so composing authority cannot touch an unowned tree.
 //
 // `adapters/` holds the concrete filesystem, crypto, lease and media implementations. They are
-// deliberately NOT re-exported here: a consumer that needs a concrete adapter should import it from
-// app wiring or a test fixture, so that production composition stays visible in `src/index.ts` rather
-// than being hidden behind a barrel. `OwnerAuthority` is the exception, because composing owner
-// authority IS the runtime module's job.
+// exposed only where concrete local composition consumes them. Local admin composes the config lease
+// and owner authority through this public surface; media composition keeps its existing app wiring.
 
 export {
   defaultRuntimeConfigPath,
@@ -56,3 +54,5 @@ export type {
 
 export { composeOwnerAuthority } from './owner-authority';
 export type { OwnerAuthority, OwnerAuthoritySource } from './owner-authority';
+// Existing local-admin composition consumers use these concrete edges through the public surface.
+export { DirectoryLease, FileOwnerStatePort, CryptoPairingCodePort } from './adapters';

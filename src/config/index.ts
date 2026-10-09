@@ -52,3 +52,5 @@ export type {
   ConfigValidationResult,
 } from './validation';
 export { providerEnvVar } from './provider-env';
+export { parseConfigSetPath } from './set-path';
+export type { ConfigSetPath, ConfigSetPathResult } from './set-path';

@@ -209,8 +209,7 @@ export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
     if (command === 'heartbeats') {
       const [subcommand] = commandArgs;
       if (subcommand === 'list') {
-        const config = await selectedConfig(selectedConfigPath);
-        mergedIO.stdout?.(await listHeartbeats({ storePath: config.heartbeat.storePath }));
+        mergedIO.stdout?.(await listHeartbeats({ configPath: selectedConfigPath }));
         return 0;
       }
       mergedIO.stderr?.(`Unknown heartbeats command: ${subcommand ?? '(missing)'}\n`);
