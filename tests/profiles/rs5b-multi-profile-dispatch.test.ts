@@ -236,25 +236,20 @@ describe('RR-STRUCT R-S5b: live multi-profile dispatch (C-01 close)', () => {
     expect(meds.some((f) => f.entity === 'default-only-med')).toBe(true);
   });
 
-  it('OLD->NEW an emergency in an UNBOUND chat is refused and persisted nowhere', async () => {
-    // OLD -> NEW: previously an emergency in the secondary chat produced the canned EMERGENCY_RESPONSE and
-    // was recorded in the SECONDARY session. S1 refuses an unbound chat at admission, BEFORE the emergency
-    // check. That ordering is a FOUNDER DECISION (2026-10-03): Shridhar is the only user of this system,
-    // multi-profile is parked, and no crisis guidance or rate limiting is wanted for unauthorized senders.
-    //
-    // The safety property that still matters is asserted here and is unchanged: the OWNER's own emergency
-    // text IS answered and recorded (covered by the owner-admission routing suite). What this test now
-    // proves is that an unauthorized chat cannot cause a persisted clinical trace in the owner's runtime.
-    const { defaultRuntime } = await bootOwnerGateway();
+  it('gives an UNBOUND chat canned emergency guidance and persists nothing', async () => {
+    // Plan15/spec13 require canned raw-emergency guidance without granting health authority.
+    // The former founder attribution had no canonical evidence. Preserve the isolation checks.
+    const { defaultRuntime, defaultAgent } = await bootOwnerGateway();
 
     const reply = await gateway!.handleTestMessage(SECONDARY_CHAT, 'severe chest pain right now');
 
-    expect(reply).toMatch(/not connected to this assistant/i);
-    expect(reply).not.toBe(EMERGENCY_RESPONSE);
+    expect(reply).toBe(EMERGENCY_RESPONSE);
+    expect(defaultAgent).not.toHaveBeenCalled();
     // Nothing persisted in the owner's runtime, and no health text reached the owner's workspace.
     expect(defaultRuntime.sessions!.getHistory(SECONDARY_CHAT)).toEqual([]);
     expect(defaultRuntime.sessions!.getHistory(DEFAULT_CHAT)).toEqual([]);
     expect(grepTree(defaultRuntime.workspace, 'severe chest pain')).toEqual([]);
+    expect(await defaultRuntime.ledgerStore!.listAllOfType('medication')).toEqual([]);
   });
 
   it('staged media in an UNBOUND chat is REFUSED and deleted — never adopted into any reports directory', async () => {

@@ -16,6 +16,7 @@ import type { OwnerAdmissionService } from '../../src/profiles';
 import { TurnQueueFullError } from '../../src/gateway/turn-coordinator';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 import { makeTestTemp } from '../helpers/test-temp';
+import { EMERGENCY_RESPONSE } from '../../src/safety/emergency-detector';
 
 function deferred<T = void>() {
   let resolve!: (value?: T | PromiseLike<T>) => void;
@@ -425,21 +426,16 @@ describe('GatewayMessageRouter routing decisions', () => {
       chatId: 'new-chat',
     }, egress);
 
-    // OLD -> NEW. OLD expected the canned EMERGENCY guidance for this first-contact stranger, and the
-    // test's whole point was that the emergency check runs BEFORE pairing. NEW: admission runs BEFORE the
-    // emergency detector, so a stranger to a BOUND owner receives the generic refusal and no clinical or
-    // crisis text at all. That ordering is the FOUNDER DECISION recorded 2026-10-03 (M11): Shridhar is the
-    // only user, multi-profile is parked, and unauthorized senders get refusal-first with no extra crisis
-    // machinery or rate limiting. PRESERVED and still asserted here: no pairing is consumed, no staged
-    // media is adopted, and no turn is recorded.
-    expect(reply).toMatch(/not connected to this assistant/i);
-    expect(reply).not.toMatch(/emergency/i);
+    // Plan15 §2.3: denied raw emergencies get canned guidance without health authority.
+    // The former M11 attribution had no canonical founder evidence. Preserve every no-effect check.
+    expect(reply).toBe(EMERGENCY_RESPONSE);
     // OLD -> NEW: was `registry.getProfileForChat('new-chat')` — "no pairing was created". The registry
     // is gone; the owner RECORD is the only binding, so assert it never named that chat.
     expect(admission.ownsDestination('new-chat')).toBe(false);
     expect(fs.existsSync(stagedPath)).toBe(false);
     expect(fs.existsSync(path.join(workspace, 'reports'))).toBe(false);
     expect(runtime.sessions.recordTurn).not.toHaveBeenCalled();
+    expect(runtime.turnCoordinator.runUser).not.toHaveBeenCalled();
     expect(egress).toHaveBeenCalledWith(reply);
   });
 
@@ -629,11 +625,8 @@ describe('GatewayMessageRouter emergency raw-input boundary (RR2-A2)', () => {
       egress,
     );
 
-    // OLD -> NEW: the same M11 ordering as above — a raw-label crisis message from a stranger to a bound
-    // owner is refused before the emergency detector runs. What this test still uniquely proves is that the
-    // RAW LABEL is never treated as clinical content and never reaches the coordinator.
-    expect(reply).toMatch(/not connected to this assistant/i);
-    expect(reply).not.toMatch(/emergency/i);
+    // User-authored metadata-looking lines remain raw text (spec13 D3); guidance grants no access.
+    expect(reply).toBe(EMERGENCY_RESPONSE);
     // OLD -> NEW: was `registry.getProfileForChat('new-chat')` — "no pairing was created". The registry
     // is gone; the owner RECORD is the only binding, so assert it never named that chat.
     expect(admission.ownsDestination('new-chat')).toBe(false);

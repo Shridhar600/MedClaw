@@ -791,13 +791,13 @@ export class Gateway {
    * Single-flight: two messages arriving together must not both build a runtime.
    */
   private async ensureOwnerServing(incoming: IncomingMessage): Promise<void> {
-    if (!this.unpairedOnly) return;
-    if (!this.admission) return;
+    if (!this.unpairedOnly || this.stopping) return;
+    // Eligibility precedes claiming OR joining the flight. A stranger's no-op must never occupy
+    // the slot that the owner's first narrative needs to construct its serving runtime.
+    if (this.admission.inspect(transportIdentityOf(incoming)).kind !== 'owner') return;
 
-    this.pairingTransition ??= (async () => {
+    const transition = this.pairingTransition ??= (async () => {
       try {
-        // Fresh read, same authority the router will use. Only a genuine owner identity promotes.
-        if (this.admission!.inspect(transportIdentityOf(incoming)).kind !== 'owner') return;
         if (this.stopping) return;
         console.log('[gateway] Owner paired. Building the owner runtime.');
         await this.serveOwner({ connectChannel: false, runHealthchecks: false });
@@ -809,9 +809,10 @@ export class Gateway {
     })();
 
     try {
-      await this.pairingTransition;
+      await transition;
     } finally {
-      this.pairingTransition = undefined;
+      // A settled waiter owns cleanup only for the flight it actually awaited.
+      if (this.pairingTransition === transition) this.pairingTransition = undefined;
     }
   }
 

@@ -515,10 +515,12 @@ describe('owner enrollment: the attempt allowance is durable, reserved first, an
     expect(harness.unpairedRecord()?.attempts.chats).toHaveLength(PAIRING_MAX_CANDIDATE_CHATS);
 
     // The 257th is refused outright; nothing already tracked is dropped.
+    const saturatedRecord = harness.rawBytes();
     expect(await harness.reopen().handlePairing(
       identity({ chatId: 'chat-overflow', userId: 'user-overflow', eventId: 'e-overflow' }),
       'hello',
-    )).toEqual({ kind: 'limited' });
+    )).toEqual({ kind: 'refused' });
+    expect(harness.rawBytes()).toEqual(saturatedRecord);
     expect(harness.unpairedRecord()?.attempts.chats).toHaveLength(PAIRING_MAX_CANDIDATE_CHATS);
   });
 

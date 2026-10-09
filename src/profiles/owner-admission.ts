@@ -410,6 +410,11 @@ export class OwnerAdmissionService {
 
     const candidate = attempts.chats.find((chat) => chat.chatId === identity.chatId);
 
+    if ((candidate?.attempts ?? 0) >= PAIRING_ATTEMPTS_PER_CHAT_PER_DAY) {
+      // Spent allowance also silences failed-event replay; replay cannot reopen the prompt channel.
+      return this.finish('limited', identity, undefined, 'daily-allowance-spent');
+    }
+
     // A redelivered transport event is the same attempt, not a new one.
     if (candidate?.eventIds.includes(identity.eventId)) {
       // No reserve, no verification, no binding. The outcome class of the original attempt is
@@ -421,13 +426,8 @@ export class OwnerAdmissionService {
     const isNewCandidate = candidate === undefined;
     if (isNewCandidate && attempts.chats.length >= PAIRING_MAX_CANDIDATE_CHATS) {
       // Saturation refuses rather than evicting, because eviction would reset live limits.
-      return this.finish('limited', identity, undefined, 'daily-allowance-spent');
-    }
-
-    const allowanceLeft = (candidate?.attempts ?? 0) < PAIRING_ATTEMPTS_PER_CHAT_PER_DAY;
-    if (!allowanceLeft) {
-      // Fourth attempt: silent, even when the code is correct.
-      return this.finish('limited', identity, undefined, 'daily-allowance-spent');
+      // Only an already-spent chat is silent; a new candidate receives the generic refusal.
+      return this.finish('refused', identity, undefined, 'daily-allowance-spent');
     }
 
     const now = this.deps.clock.now();

@@ -262,6 +262,7 @@ describe('owner record budget: a saturated day of real traffic stays readable', 
     expect(serviceFor().inspectInstallation()).toEqual({ kind: 'unpaired' });
 
     // A 257th candidate is still refused. Saturation must not be relieved to make this flow pass.
+    const saturatedBytes = fs.readFileSync(recordPath);
     expect(await serviceFor().handlePairing(
       {
         channel: 'telegram',
@@ -271,7 +272,8 @@ describe('owner record budget: a saturated day of real traffic stays readable', 
         eventId: 'telegram:-1001234567000256:1000002048',
       },
       'AAAAAAAA',
-    )).toEqual({ kind: 'limited' });
+    )).toEqual({ kind: 'refused' });
+    expect(fs.readFileSync(recordPath)).toEqual(saturatedBytes);
 
     // Local reissue still works after a saturated day, and it does NOT reset today's allowance.
     const reissued = await serviceFor().issueChallenge();

@@ -8,7 +8,6 @@ import {
   PAIRING_COMPLETE_TEXT,
   PAIRING_EXPIRED_TEXT,
   PAIRING_INVALID_TEXT,
-  PAIRING_LIMITED_TEXT,
   PAIRING_PROMPT_TEXT,
   PAIRING_UNAVAILABLE_TEXT,
   refusalTextFor,
@@ -80,13 +79,13 @@ export interface GatewayMessageRouterDeps {
 }
 
 /** Canned pairing replies. Pairing is never a health answer. */
-const PAIRING_RESULT_TEXT: Record<PairingResult['kind'], string> = {
+const PAIRING_RESULT_TEXT: Record<PairingResult['kind'], string | undefined> = {
   paired: PAIRING_COMPLETE_TEXT,
   'already-paired': PAIRING_COMPLETE_TEXT,
   prompt: PAIRING_PROMPT_TEXT,
   invalid: PAIRING_INVALID_TEXT,
   expired: PAIRING_EXPIRED_TEXT,
-  limited: PAIRING_LIMITED_TEXT,
+  limited: undefined,
   refused: UNRECOGNIZED_CHAT_RESPONSE,
   unavailable: PAIRING_UNAVAILABLE_TEXT,
 };
@@ -159,7 +158,7 @@ export class GatewayMessageRouter {
       this.deleteStagedMedia(incoming.mediaPath);
       return this.emitSafely(
         egress,
-        refusalTextFor(decision.reason),
+        this.emergencyResponse(text) ?? refusalTextFor(decision.reason),
         'Failed to send admission refusal',
       );
     }
@@ -242,7 +241,7 @@ export class GatewayMessageRouter {
     incoming: AdmittedMessage,
     egress: TurnEgress,
     identity: TransportIdentity,
-  ): Promise<string> {
+  ): Promise<string | undefined> {
     this.deleteStagedMedia(incoming.mediaPath);
 
     const emergency = this.emergencyResponse(incoming.text);
@@ -253,7 +252,9 @@ export class GatewayMessageRouter {
     // A message that is not a well-formed code gets the generic prompt; it still consumes the
     // same daily allowance, so there is no free unlimited prompt channel.
     const result = await this.deps.admission.handlePairing(identity, incoming.text);
-    return this.emitSafely(egress, PAIRING_RESULT_TEXT[result.kind], 'Failed to send pairing response');
+    const reply = PAIRING_RESULT_TEXT[result.kind];
+    if (reply === undefined) return undefined;
+    return this.emitSafely(egress, reply, 'Failed to send pairing response');
   }
 
   private emergencyResponse(input: string): string | undefined {
@@ -326,8 +327,8 @@ export class GatewayMessageRouter {
     admittedOwnerId?: ProfileId,
   ): Promise<string> {
     // An emergency from an ADMITTED owner records into the owner runtime. An emergency from an
-    // unadmitted chat never reaches here: `route()` refuses it at admission, before the emergency
-    // detector runs, so it stays unpersisted canned guidance.
+    // unadmitted chat never reaches here: `route()` sends provider-free canned guidance at the
+    // refusal boundary without resolving a runtime or persisting a turn.
     //
     // OLD -> NEW: this used to fall back to `getExistingProfileForChat(chatId)`, i.e. it consulted the
     // registry to decide whether an emergency belonged to a profile. There is no registry and no
