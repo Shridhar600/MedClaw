@@ -52,11 +52,11 @@ jest.mock('grammy', () => ({
 
 // Imported after the mock so the channel picks up the fake Bot.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-import { Gateway } from '../../src/gateway/gateway';
-import { TelegramMediaSource } from '../../src/channels/telegram-media-source';
-import { composeOwnerAuthority } from '../../src/runtime/owner-authority';
+import { Gateway } from '../../src/gateway';
+import { TelegramMediaSource } from '../../src/channels';
+import { composeOwnerAuthority } from '../../src/runtime';
 import { asProfileId } from '../../src/profiles';
-import { loadRuntimeConfig } from '../../src/runtime/startup';
+import { loadRuntimeConfig } from '../../src/runtime';
 import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 import { writeConfigFixture } from '../helpers/config-fixture';
 
@@ -143,7 +143,12 @@ describe('a real Telegram attachment reaches the owner runtime (transport -> cor
     removeTestTemp(root);
   });
 
-  async function boot(options: { telegram?: boolean; fetchSize?: number } = {}) {
+  async function boot(options: {
+    telegram?: boolean;
+    fetchSize?: number;
+    getFileImpl?: (id: string, signal?: AbortSignal) => Promise<{ file_path?: string; file_size?: number }>;
+    fetchImpl?: (signal: AbortSignal) => Promise<Response>;
+  } = {}) {
     const fixture = writeConfigFixture(root, { telegramEnabled: options.telegram ?? true, telegramToken: '123:fixture-token' });
 
     const authority = composeOwnerAuthority({
@@ -162,13 +167,15 @@ describe('a real Telegram attachment reaches the owner runtime (transport -> cor
     const mediaSource = new TelegramMediaSource({
       token: '123:fixture-token',
       api: {
-        getFile: async (fileId: string) => {
+        getFile: async (fileId: string, signal?: AbortSignal) => {
           mockGetFile(fileId);
+          if (options.getFileImpl) return options.getFileImpl(fileId, signal);
           return { file_path: 'files/lab.pdf', file_size: options.fetchSize ?? 1024 };
         },
       },
-      fetchImpl: async () => {
+      fetchImpl: async (_url, signal) => {
         fetchCount += 1;
+        if (options.fetchImpl) return options.fetchImpl(signal);
         return new Response(bodyOf(options.fetchSize ?? 1024), { status: 200 });
       },
     });
@@ -274,6 +281,74 @@ describe('a real Telegram attachment reaches the owner runtime (transport -> cor
 
       expect(logs.join('\n')).not.toContain(PHI);
     } finally {
+      await gateway.stop();
+    }
+  }, 90_000);
+
+  it('stop during entered metadata prevents late fetch/write/turn; restart adopts a streamed retry in the same installation (C07)', async () => {
+    let resolveMetadata!: (file: { file_path: string }) => void;
+    const metadata = new Promise<{ file_path: string }>(resolve => { resolveMetadata = resolve; });
+    let entered!: () => void;
+    const entry = new Promise<void>(resolve => { entered = resolve; });
+    let heldSignal: AbortSignal | undefined;
+    const fetchSignals: AbortSignal[] = [];
+    const fetchEntryStates: boolean[] = [];
+    const { fixture, gateway, prompts } = await boot({
+      getFileImpl: async (id, signal) => {
+        if (id !== 'held') return { file_path: 'files/allowed', file_size: 1024 };
+        heldSignal = signal;
+        entered();
+        return metadata;
+      },
+      fetchImpl: async signal => {
+        fetchEntryStates.push(signal.aborted);
+        fetchSignals.push(signal);
+        return new Response(bodyOf(1024));
+      },
+    });
+    const entries = (dir: string): string[] => fs.existsSync(dir) ? fs.readdirSync(dir).sort() : [];
+    const reports = path.join(fixture.workspace, 'reports');
+    await gateway.start();
+    try {
+      await handlerFor('message:text')(textUpdate('skip'));
+      await handlerFor('message:document')(documentUpdate({ fileId: 'allowed' }));
+      const beforeReports = entries(reports);
+      expect(beforeReports).toHaveLength(1);
+      const firstBytes = fs.readFileSync(path.join(reports, beforeReports[0]));
+      expect(firstBytes).toEqual(Buffer.alloc(1024, 66));
+      const beforePrompts = prompts.length;
+      const beforeFetches = fetchSignals.length;
+      const inFlight = handlerFor('message:document')(documentUpdate({ fileId: 'held' }));
+      await entry;
+      expect(gateway.shutdownWorkInFlight().turns).toBeGreaterThan(0);
+      await gateway.stop();
+      await inFlight;
+      expect(gateway.getShutdownDisposition()).toBe('quiescent');
+      resolveMetadata({ file_path: 'files/late' });
+      for (let i = 0; i < 20; i += 1) await Promise.resolve();
+      const lateFetchStates = fetchEntryStates.slice(beforeFetches);
+      expect(entries(fixture.mediaStaging)).toEqual([]);
+      expect(entries(reports)).toEqual(beforeReports);
+      expect(fs.readFileSync(path.join(reports, beforeReports[0]))).toEqual(firstBytes);
+      expect(prompts).toHaveLength(beforePrompts);
+
+      // Same source, cached stager, record and filesystem: a real restart must re-arm intake.
+      await gateway.start();
+      await handlerFor('message:document')(documentUpdate({ fileId: 'retry' }));
+      const afterReports = entries(reports);
+      expect(afterReports).toHaveLength(2);
+      for (const name of afterReports) {
+        const artifact = path.join(reports, name);
+        expect(fs.readFileSync(artifact)).toEqual(Buffer.alloc(1024, 66));
+        expect(fs.statSync(artifact).mode & 0o777).toBe(0o600);
+      }
+      expect(fs.statSync(fixture.mediaStaging).mode & 0o777).toBe(0o700);
+      expect(entries(fixture.mediaStaging)).toEqual([]);
+      expect(prompts.length).toBeGreaterThan(beforePrompts);
+      expect(lateFetchStates).toEqual([]);
+      expect(heldSignal?.aborted).toBe(true);
+    } finally {
+      resolveMetadata({ file_path: 'files/late' });
       await gateway.stop();
     }
   }, 90_000);

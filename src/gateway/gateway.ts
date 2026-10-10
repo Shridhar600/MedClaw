@@ -26,7 +26,7 @@ import {
 import { ProfileRuntime } from './runtime';
 import { ProfileRuntimeManager } from './manager';
 import { GatewayMessageRouter, sweepStagedMedia, transportIdentityOf } from './router';
-import { FsMediaStager } from '../runtime/adapters/media-stager';
+import { FsMediaStager } from '../runtime';
 import type { MediaSourcePort } from '../ports/media-source';
 import type { DiagnosticEvent, DiagnosticSink } from '../ports/diagnostics';
 import { SILENT_DIAGNOSTIC_SINK, guardedDiagnosticSink } from '../ports/diagnostics';

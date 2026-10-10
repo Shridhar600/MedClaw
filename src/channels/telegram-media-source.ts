@@ -19,9 +19,10 @@
 // 3. **It carries no authority.** The `fileId` is treated as opaque. It is never logged, never placed
 //    in a path, and never used to build a filename.
 
-import type { MediaReference, MediaSourcePort, OpenedMedia } from '../ports/media-source';
-import { MEDIA_MAX_FILE_BYTES } from '../ports/media-source';
+import type { MediaReference, MediaSourcePort, OpenedMedia } from '../ports';
+import { MEDIA_MAX_FILE_BYTES, MEDIA_INTAKE_TIMEOUT_MS } from '../ports';
 import { summarizeErrorForLog } from '../security';
+import type { Api } from 'grammy';
 
 /**
  * The narrow slice of grammY's API this adapter needs. Keeps the adapter testable without a bot.
@@ -32,7 +33,9 @@ import { summarizeErrorForLog } from '../security';
  */
 export interface TelegramFileApi {
   /** Resolve a transport file id to its Bot API path plus the transport's size claim. */
-  getFile(fileId: string): Promise<{ file_path?: string; file_size?: number }>;
+  // grammY's Node declarations use its abort-controller shim. Its runtime consumes the standard
+  // abort state/listener methods, so both that API and native-signal injected edges fit this seam.
+  getFile(fileId: string, signal?: AbortSignal | Parameters<Api['getFile']>[1]): Promise<{ file_path?: string; file_size?: number }>;
 }
 
 /** Fetches one attachment body. Injectable so tests never touch the network. */
@@ -47,8 +50,6 @@ export interface TelegramMediaSourceOptions {
   timeoutMs?: number;
 }
 
-const DEFAULT_TIMEOUT_MS = 30_000;
-
 export class TelegramMediaSource implements MediaSourcePort {
   private readonly token: string;
   private readonly api: TelegramFileApi;
@@ -59,10 +60,11 @@ export class TelegramMediaSource implements MediaSourcePort {
     this.token = options.token;
     this.api = options.api;
     this.fetchImpl = options.fetchImpl ?? ((url, signal) => fetch(url, { signal }));
-    this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.timeoutMs = options.timeoutMs ?? MEDIA_INTAKE_TIMEOUT_MS;
   }
 
   async open(ref: MediaReference, signal: AbortSignal): Promise<OpenedMedia> {
+    throwIfAborted(signal);
     if (ref.channel !== 'telegram') {
       throw new Error(`unsupported media channel: ${ref.channel}`);
     }
@@ -74,73 +76,75 @@ export class TelegramMediaSource implements MediaSourcePort {
       throw new OversizedMediaError();
     }
 
-    const file = await this.api.getFile(ref.fileId);
-    if (typeof file.file_path !== 'string' || file.file_path.length === 0) {
-      throw new Error('telegram media lookup returned no file path');
-    }
-    const apiSize = typeof file.file_size === 'number' ? file.file_size : undefined;
-    const effectiveAdvertised = apiSize ?? advertised;
-    if (typeof effectiveAdvertised === 'number' && effectiveAdvertised > MEDIA_MAX_FILE_BYTES) {
-      throw new OversizedMediaError();
-    }
-
     const controller = new AbortController();
-    const onAbort = (): void => controller.abort();
-    signal.addEventListener('abort', onAbort, { once: true });
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-    // Never hold the event loop open for a pending download.
-    timer.unref?.();
-
-    const url = `https://api.telegram.org/file/bot${this.token}/${file.file_path}`;
-
-    let response: Response;
-    try {
-      response = await this.fetchImpl(url, controller.signal);
-    } catch (error) {
-      this.release(controller, signal, onAbort, timer);
-      if (controller.signal.aborted) throw error;
-      throw new Error(`telegram media fetch failed: ${summarizeErrorForLog(error)}`);
-    }
-
-    if (!response.ok || !response.body) {
-      this.release(controller, signal, onAbort, timer);
-      throw new Error(`telegram media fetch returned an unusable response (status ${response.status})`);
-    }
-
-    const body = response.body;
-    const iterator = streamToChunks(body, controller.signal);
-
-    return {
-      advertisedBytes: effectiveAdvertised,
-      chunks: iterator,
-      cancel: async (): Promise<void> => {
-        this.release(controller, signal, onAbort, timer);
-        // Cancelling must also stop the transfer, not just our bookkeeping.
-        try {
-          await body.cancel();
-        } catch {
-          // The body may already be closed; cancelling is best-effort and must not throw into admission.
-        }
-      },
+    let body: ReadableStream<Uint8Array> | undefined;
+    const release = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
     };
-  }
+    const onAbort = (): void => {
+      if (!controller.signal.aborted) {
+        controller.abort();
+        // A locked body is owned by streamToChunks, whose abort listener cancels its reader.
+        if (body && !body.locked) void body.cancel().catch(() => undefined);
+      }
+      release();
+    };
+    // This one timer covers metadata, body start and consumption. The caller's core timer also
+    // includes queue wait, so this adapter can shorten the lifetime but can never extend it.
+    const timer = setTimeout(onAbort, this.timeoutMs);
+    timer.unref?.();
+    signal.addEventListener('abort', onAbort, { once: true });
 
-  private release(
-    controller: AbortController,
-    signal: AbortSignal,
-    onAbort: () => void,
-    timer: ReturnType<typeof setTimeout>,
-  ): void {
-    clearTimeout(timer);
-    signal.removeEventListener('abort', onAbort);
-    if (!controller.signal.aborted) controller.abort();
+    try {
+      if (signal.aborted) onAbort();
+      throwIfAborted(controller.signal);
+      const file = await withinLifetime(this.api.getFile(ref.fileId, controller.signal), controller.signal);
+      throwIfAborted(controller.signal);
+      if (typeof file.file_path !== 'string' || file.file_path.length === 0) {
+        throw new Error('telegram media lookup returned no file path');
+      }
+      const apiSize = typeof file.file_size === 'number' ? file.file_size : undefined;
+      const effectiveAdvertised = apiSize ?? advertised;
+      if (typeof effectiveAdvertised === 'number' && effectiveAdvertised > MEDIA_MAX_FILE_BYTES) {
+        throw new OversizedMediaError();
+      }
+      const url = `https://api.telegram.org/file/bot${this.token}/${file.file_path}`;
+      const fetching = this.fetchImpl(url, controller.signal).then(response => {
+        // An injected fetch may ignore cancellation. Observe its loser and release a late body
+        // without acquiring a reader, even after open() has already refused.
+        if (controller.signal.aborted) {
+          if (response.body) void response.body.cancel().catch(() => undefined);
+          throwIfAborted(controller.signal);
+        }
+        return response;
+      });
+      const response = await withinLifetime(fetching, controller.signal);
+      body = response.body ?? undefined;
+      throwIfAborted(controller.signal);
+      if (!response.ok || !body) {
+        throw new Error('telegram media fetch returned an unusable response');
+      }
+      return {
+        advertisedBytes: effectiveAdvertised,
+        chunks: streamToChunks(body, controller.signal, release),
+        // Cancellation is requested synchronously; an uncooperative external cancel promise is
+        // observed, not allowed to hold the core's intake slot indefinitely.
+        cancel: async (): Promise<void> => { onAbort(); },
+      };
+    } catch (error) {
+      onAbort();
+      if (error instanceof OversizedMediaError) throw error;
+      throw new Error(`telegram media retrieval failed: ${summarizeErrorForLog(error)}`);
+    }
   }
 }
 
 /**
  * A refused-too-large advertisement, distinguishable from a transport failure without parsing a message.
  *
- * `FsMediaStager` maps a thrown `OverCapError` to `too-large`; anything else becomes `source-failed`.
+ * The core checks the reference advertisement and actual streamed bytes separately. A failed
+ * transport metadata lookup (including an unusable size claim) remains a source failure there.
  */
 export class OversizedMediaError extends Error {
   constructor() {
@@ -159,20 +163,53 @@ export class OversizedMediaError extends Error {
 async function* streamToChunks(
   body: ReadableStream<Uint8Array>,
   signal: AbortSignal,
+  release: () => void,
 ): AsyncGenerator<Uint8Array, void, undefined> {
+  throwIfAborted(signal);
   const reader = body.getReader();
+  let completed = false;
+  let cancelled = false;
   const onAbort = (): void => {
-    void reader.cancel().catch(() => undefined);
+    if (!cancelled) {
+      cancelled = true;
+      void reader.cancel().catch(() => undefined);
+    }
   };
   signal.addEventListener('abort', onAbort, { once: true });
   try {
     for (;;) {
+      throwIfAborted(signal);
       const { done, value } = await reader.read();
-      if (done) return;
+      // reader.cancel() resolves a pending read as done. That is an aborted upload, not EOF.
+      throwIfAborted(signal);
+      if (done) { completed = true; return; }
       if (value && value.byteLength > 0) yield value;
     }
   } finally {
     signal.removeEventListener('abort', onAbort);
+    if (!completed) onAbort();
     reader.releaseLock();
+    release();
   }
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (!signal.aborted) return;
+  const error = new Error('telegram media retrieval aborted');
+  error.name = 'AbortError';
+  throw error;
+}
+
+/** Observe external losers and detach our listener when either outcome settles. */
+async function withinLifetime<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = (): void => {
+      try { throwIfAborted(signal); } catch (error) { reject(error); }
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+  try { return await Promise.race([work, aborted]); }
+  finally { signal.removeEventListener('abort', onAbort); }
 }

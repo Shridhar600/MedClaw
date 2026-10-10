@@ -28,12 +28,12 @@ import type {
   MediaStageReason,
   MediaStageResult,
   OpenedMedia,
-} from '../../ports/media-source';
-import { DEFAULT_MEDIA_LIMITS } from '../../ports/media-source';
-import type { Clock } from '../../ports/clock';
-import { systemClock } from '../../ports/defaults';
-import type { DiagnosticEvent, DiagnosticSink } from '../../ports/diagnostics';
-import { SILENT_DIAGNOSTIC_SINK, guardedDiagnosticSink } from '../../ports/diagnostics';
+} from '../../ports';
+import { DEFAULT_MEDIA_LIMITS } from '../../ports';
+import type { Clock } from '../../ports';
+import { systemClock } from '../../ports';
+import type { DiagnosticEvent, DiagnosticSink } from '../../ports';
+import { SILENT_DIAGNOSTIC_SINK, guardedDiagnosticSink } from '../../ports';
 
 /**
  * Suffix marking THIS operation's in-progress partial file. Cleanup targets exactly this suffix, so
@@ -97,6 +97,7 @@ export class FsMediaStager {
       return this.refuse('unsupported', undefined, startedAt);
     }
     const limits = this.options.limits ?? DEFAULT_MEDIA_LIMITS;
+    if (signal.aborted) return this.refuse('aborted', undefined, startedAt);
 
     // The advertised size is a claim. If it already exceeds the cap we can refuse without opening a
     // stream at all — no network, no file.
@@ -176,7 +177,7 @@ export class FsMediaStager {
           return handle;
         });
         try {
-          opened = await Promise.race([openPromise, abortRejection(timeout.signal)]);
+          opened = await withinIntake(openPromise, timeout.signal);
         } catch (error) {
           abandoned = true;
           throw error;
@@ -184,7 +185,7 @@ export class FsMediaStager {
       } catch (error) {
         // A source that fails to open is a source failure, not a timeout — unless the abort that
         // fired is the one that explains it.
-        return this.refuse(timeout.signal.aborted && !signal.aborted ? 'timeout' : 'source-failed', error, startedAt);
+        return this.refuse(signal.aborted ? 'aborted' : timeout.signal.aborted ? 'timeout' : 'source-failed', error, startedAt);
       }
 
       // The wait may have expired while the source was opening. A late completion must not stream.
@@ -217,23 +218,29 @@ export class FsMediaStager {
       const counter = new ByteCap(limits.maxFileBytes);
       const sink = fs.createWriteStream(partialPath, { mode: 0o600, flags: 'wx' });
       sink.on('error', () => undefined);
+      const sinkClosed = new Promise<void>(resolve => { sink.once('close', resolve); });
 
       try {
         // The signal is raced EXPLICITLY as well as handed to `pipeline`. A source whose iterator
         // never settles cannot be interrupted by an abort signal alone, so relying on the signal
         // alone would let a hung source keep the intake wait open forever.
-        await Promise.race([
-          pipeline(readableFrom(opened), counter, sink, { signal: timeout.signal }),
-          abortRejection(timeout.signal),
-        ]);
+        await withinIntake(pipeline(readableFrom(opened), counter, sink, { signal: timeout.signal }), timeout.signal);
       } catch (error) {
         await this.cancelOnce(opened);
+        // Closing our sink precedes unlink: a pending exclusive open must not create a new partial
+        // after cleanup has already looked for it. We do not await an uncooperative source iterator.
+        sink.destroy();
+        await sinkClosed;
         this.unlinkQuietly(partialPath);
         partialPath = undefined;
         if (counter.exceeded) return this.refuse('too-large', undefined, startedAt);
         if (signal.aborted) return this.refuse('aborted', undefined, startedAt);
         if (timeout.signal.aborted) return this.refuse('timeout', undefined, startedAt);
         return this.refuse('source-failed', error, startedAt);
+      }
+
+      if (timeout.signal.aborted || signal.aborted) {
+        return this.refuse(signal.aborted ? 'aborted' : 'timeout', undefined, startedAt);
       }
 
       if (counter.bytes === 0) {
@@ -272,6 +279,7 @@ export class FsMediaStager {
   /** Wait for an active slot, bounded by the intake signal so a waiter cannot hang forever. */
   private awaitSlot(signal: AbortSignal): Promise<void> {
     return new Promise<void>((resolve, reject) => {
+      if (signal.aborted) { reject(abortError()); return; }
       const onAbort = (): void => {
         const index = this.slotWaiters.indexOf(wake);
         if (index >= 0) this.slotWaiters.splice(index, 1);
@@ -320,8 +328,10 @@ export class FsMediaStager {
     if (!target) return;
     try {
       fs.unlinkSync(target);
-    } catch {
-      // best effort: a leftover partial is owner-scoped and never readable as an adopted file
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        this.options.log?.(`[media] partial cleanup failed: ${summarizeErrorForLog(error)}`);
+      }
     }
   }
 }
@@ -359,14 +369,16 @@ function readableFrom(opened: OpenedMedia): AsyncIterable<Uint8Array> {
  * Rejects as soon as `signal` aborts, and otherwise never settles. Racing this against `pipeline`
  * makes a bounded intake wait a real bound even when the source ignores its signal.
  */
-function abortRejection(signal: AbortSignal): Promise<never> {
-  return new Promise<never>((_resolve, reject) => {
-    if (signal.aborted) {
-      reject(abortError());
-      return;
-    }
-    signal.addEventListener('abort', () => reject(abortError()), { once: true });
+async function withinIntake<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  const onAbort = (): void => rejectAbort(abortError());
+  let rejectAbort!: (error: Error) => void;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject;
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
   });
+  try { return await Promise.race([work, aborted]); }
+  finally { signal.removeEventListener('abort', onAbort); }
 }
 
 /** True for the abort rejection produced by `abortError()`. Keeps a catch from swallowing a bug. */

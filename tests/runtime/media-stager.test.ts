@@ -12,15 +12,19 @@
 // what the owner's staging directory is left containing.
 
 import * as fs from 'fs';
+import fsModule from 'fs';
 import * as path from 'path';
+import { getEventListeners } from 'events';
 
-import { FsMediaStager } from '../../src/runtime/adapters';
+import { FsMediaStager } from '../../src/runtime';
+import { TelegramMediaSource } from '../../src/channels';
 import type {
   MediaReference,
   MediaSourcePort,
   MediaStageResult,
   OpenedMedia,
 } from '../../src/ports/media-source';
+import { DEFAULT_MEDIA_LIMITS } from '../../src/ports/media-source';
 import type { DiagnosticEvent } from '../../src/ports/diagnostics';
 import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 
@@ -450,5 +454,331 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
     expect(joined).not.toContain('SECRET');
     expect(joined).not.toContain('api.telegram.org');
     expect(joined).toContain('source-failed');
+  });
+});
+
+/** Controlled external waits; production source, queue, pipeline and filesystem remain real. */
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: Error) => void } {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+async function settleContinuations(): Promise<void> {
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+}
+
+function responseWithBytes(text = 'allowed streamed bytes'): Response {
+  const bytes = Buffer.from(text);
+  return new Response(new ReadableStream<Uint8Array>({
+    start(controller): void {
+      controller.enqueue(bytes.subarray(0, 7));
+      controller.enqueue(bytes.subarray(7));
+      controller.close();
+    },
+  }));
+}
+
+describe('Telegram retrieval and real disk staging share one lifetime (C07)', () => {
+  let root: string;
+  let staging: string;
+
+  beforeEach(() => {
+    root = makeTestTemp('c07-telegram-lifetime');
+    staging = path.join(root, 'media-staging');
+    fs.mkdirSync(staging, { mode: 0o700 });
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+    removeTestTemp(root);
+  });
+
+  async function savedControl(stager: FsMediaStager): Promise<string[]> {
+    const before = listStaging(staging);
+    const saved = await stager.stage(reference({ fileId: 'retry' }), new AbortController().signal);
+    expect(saved.kind).toBe('saved');
+    if (saved.kind !== 'saved') throw new Error('positive control refused');
+    expect(fs.readFileSync(saved.absolutePath, 'utf8')).toBe('allowed streamed bytes');
+    expect(fs.statSync(saved.absolutePath).mode & 0o777).toBe(0o600);
+    expect(fs.statSync(staging).mode & 0o777).toBe(0o700);
+    expect(listStaging(staging)).toEqual([...before, path.basename(saved.absolutePath)].sort());
+    return listStaging(staging);
+  }
+
+  it.each(['deadline', 'caller'] as const)('late metadata after %s cannot start a body fetch; the same lane retries', async (cause) => {
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
+    jest.setSystemTime(new Date('2026-10-10T00:00:00Z'));
+    const metadata = deferred<{ file_path: string }>();
+    const entered = deferred<void>();
+    const metadataSignals: (AbortSignal | undefined)[] = [];
+    const fetchSignals: AbortSignal[] = [];
+    const fetchEntryStates: boolean[] = [];
+    const outcomes: DiagnosticEvent[] = [];
+    const source = new TelegramMediaSource({
+      token: 'synthetic-token',
+      api: { getFile: async (id: string, signal?: AbortSignal): Promise<{ file_path: string }> => {
+        metadataSignals.push(signal);
+        if (id === 'retry') return { file_path: 'files/retry' };
+        entered.resolve();
+        return metadata.promise;
+      } },
+      fetchImpl: async (_url, signal): Promise<Response> => {
+        fetchEntryStates.push(signal.aborted);
+        fetchSignals.push(signal);
+        return responseWithBytes();
+      },
+    });
+    const stager = new FsMediaStager(source, staging, {
+      limits: { ...DEFAULT_MEDIA_LIMITS, intakeTimeoutMs: 25 },
+      diagnostics: { emit: (event): void => { outcomes.push(event); } },
+    });
+    const caller = new AbortController();
+    const pending = stager.stage(reference(), caller.signal);
+    await entered.promise;
+    expect(stager.inFlight).toEqual({ active: 1, waiting: 0 });
+    expect(fetchSignals).toHaveLength(0);
+    if (cause === 'deadline') await jest.advanceTimersByTimeAsync(25);
+    else caller.abort();
+    const refused = await pending;
+    expect(stager.inFlight).toEqual({ active: 0, waiting: 0 });
+    expect(listStaging(staging)).toEqual([]);
+    metadata.resolve({ file_path: 'files/late' });
+    await settleContinuations();
+    const lateFetchStates = [...fetchEntryStates];
+    expect(listStaging(staging)).toEqual([]);
+    jest.useRealTimers();
+    await savedControl(stager);
+    // Decisive RED: received source starts one fetch with a fresh, non-aborted signal.
+    expect(lateFetchStates).toEqual([]);
+    expect(metadataSignals[0]?.aborted).toBe(true);
+    expect(getEventListeners(caller.signal, 'abort')).toEqual([]);
+    expect(getEventListeners(metadataSignals[0]!, 'abort')).toEqual([]);
+    expect(refused).toEqual({ kind: 'refused', reason: cause === 'deadline' ? 'timeout' : 'aborted' });
+    expect(outcomes).toHaveLength(2);
+    if (cause === 'deadline') expect(outcomes[0]).toMatchObject({ durationMs: 25 });
+  });
+
+  it('pre-aborted intake and standalone open perform no metadata/body/write, followed by a saved control', async () => {
+    const getFile = jest.fn(async () => ({ file_path: 'files/allowed' }));
+    const fetchImpl = jest.fn(async () => responseWithBytes());
+    const source = new TelegramMediaSource({ token: 'synthetic-token', api: { getFile }, fetchImpl });
+    const stager = new FsMediaStager(source, staging);
+    const caller = new AbortController();
+    caller.abort();
+    const refused = await stager.stage(reference(), caller.signal);
+    const opened = await source.open(reference(), caller.signal).catch(() => undefined);
+    await opened?.cancel();
+    const metadataCalls = getFile.mock.calls.length;
+    const fetchCalls = fetchImpl.mock.calls.length;
+    const entries = listStaging(staging);
+    await savedControl(stager);
+    expect(metadataCalls).toBe(0);
+    expect(fetchCalls).toBe(0);
+    expect(entries).toEqual([]);
+    expect(opened).toBeUndefined();
+    expect(refused).toEqual({ kind: 'refused', reason: 'aborted' });
+  });
+
+  it('a late fetch response is cancelled without opening a reader or writing; retry still streams', async () => {
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
+    jest.setSystemTime(new Date('2026-10-10T00:00:00Z'));
+    const fetched = deferred<Response>();
+    const entered = deferred<void>();
+    const cancelled = jest.fn();
+    const body = new ReadableStream<Uint8Array>({ cancel: cancelled });
+    const reader = jest.spyOn(body, 'getReader');
+    let attempts = 0;
+    const source = new TelegramMediaSource({
+      token: 'synthetic-token', api: { getFile: async (): Promise<{ file_path: string }> => ({ file_path: 'files/held' }) },
+      fetchImpl: async (): Promise<Response> => {
+        attempts += 1;
+        if (attempts > 1) return responseWithBytes();
+        entered.resolve();
+        return fetched.promise;
+      },
+    });
+    const stager = new FsMediaStager(source, staging, { limits: { ...DEFAULT_MEDIA_LIMITS, intakeTimeoutMs: 25 } });
+    const pending = stager.stage(reference(), new AbortController().signal);
+    await entered.promise;
+    await jest.advanceTimersByTimeAsync(25);
+    expect(await pending).toEqual({ kind: 'refused', reason: 'timeout' });
+    fetched.resolve(new Response(body));
+    await settleContinuations();
+    expect(cancelled).toHaveBeenCalledTimes(1);
+    expect(reader).not.toHaveBeenCalled();
+    expect(body.locked).toBe(false);
+    expect(listStaging(staging)).toEqual([]);
+    jest.useRealTimers();
+    await savedControl(stager);
+  });
+
+  it('source timeout during a real held reader refuses truncated bytes and releases the reader, then retries', async () => {
+    const reading = deferred<void>();
+    const releaseBody = deferred<void>();
+    const cancelled = jest.fn(() => { releaseBody.resolve(); });
+    let pulls = 0;
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller): Promise<void> {
+        pulls += 1;
+        if (pulls === 1) controller.enqueue(Buffer.from('partial'));
+        else { reading.resolve(); await releaseBody.promise; }
+      },
+      cancel: cancelled,
+    });
+    let attempts = 0;
+    const source = new TelegramMediaSource({
+      token: 'synthetic-token', timeoutMs: 100_000,
+      api: { getFile: async (): Promise<{ file_path: string }> => ({ file_path: 'files/held' }) },
+      fetchImpl: async (): Promise<Response> => ++attempts === 1 ? new Response(body) : responseWithBytes(),
+    });
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
+    jest.setSystemTime(new Date('2026-10-10T00:00:00Z'));
+    const stager = new FsMediaStager(source, staging, { limits: { ...DEFAULT_MEDIA_LIMITS, intakeTimeoutMs: 200_000 } });
+    const pending = stager.stage(reference(), new AbortController().signal);
+    await reading.promise;
+    expect(body.locked).toBe(true);
+    await jest.advanceTimersByTimeAsync(100_000);
+    const result = await pending;
+    const entries = listStaging(staging);
+    expect(cancelled).toHaveBeenCalledTimes(1);
+    expect(body.locked).toBe(false);
+    jest.useRealTimers();
+    await savedControl(stager);
+    expect(result).toEqual({ kind: 'refused', reason: 'source-failed' });
+    expect(entries).toEqual([]);
+  });
+
+  it('one active/four waiting retain queue time in their deadline, settle late rejection, and accept a retry', async () => {
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
+    jest.setSystemTime(new Date('2026-10-10T00:00:00Z'));
+    const metadata = deferred<{ file_path: string }>();
+    const opens: string[] = [];
+    const fetches = jest.fn(async () => responseWithBytes());
+    const outcomes: DiagnosticEvent[] = [];
+    const source = new TelegramMediaSource({ token: 'synthetic-token',
+      api: { getFile: async (id): Promise<{ file_path: string }> => {
+        opens.push(id);
+        return id === 'retry' ? { file_path: 'files/retry' } : metadata.promise;
+      } }, fetchImpl: fetches,
+    });
+    const stager = new FsMediaStager(source, staging, {
+      limits: { ...DEFAULT_MEDIA_LIMITS, intakeTimeoutMs: 25 },
+      diagnostics: { emit: (event): void => { outcomes.push(event); } },
+    });
+    const active = stager.stage(reference({ fileId: 'active' }), new AbortController().signal);
+    expect(opens).toEqual(['active']);
+    await jest.advanceTimersByTimeAsync(10);
+    const waiting = Array.from({ length: 4 }, (_unused, i) =>
+      stager.stage(reference({ fileId: `waiting-${i}` }), new AbortController().signal));
+    expect(stager.inFlight).toEqual({ active: 1, waiting: 4 });
+    expect(await stager.stage(reference({ fileId: 'overflow' }), new AbortController().signal))
+      .toEqual({ kind: 'refused', reason: 'queue-full' });
+    expect(opens).toEqual(['active']);
+    await jest.advanceTimersByTimeAsync(15);
+    expect(await active).toEqual({ kind: 'refused', reason: 'timeout' });
+    expect(opens).toEqual(['active', 'waiting-0']);
+    expect(stager.inFlight).toEqual({ active: 1, waiting: 3 });
+    await jest.advanceTimersByTimeAsync(10);
+    expect(await Promise.all(waiting)).toEqual(Array.from({ length: 4 }, () => ({ kind: 'refused', reason: 'timeout' })));
+    expect(stager.inFlight).toEqual({ active: 0, waiting: 0 });
+    // A rejecting external loser is observed too; it cannot become an unhandled rejection.
+    metadata.reject(new Error('synthetic external failure'));
+    await settleContinuations();
+    expect(fetches).not.toHaveBeenCalled();
+    expect(listStaging(staging)).toEqual([]);
+    expect(outcomes.filter(event => event.stage === 'media-intake' && event.outcome === 'refused' && event.reason === 'timeout'))
+      .toEqual(Array.from({ length: 5 }, () => ({ stage: 'media-intake', outcome: 'refused', reason: 'timeout', durationMs: 25 })));
+    expect(jest.getTimerCount()).toBe(0);
+    jest.useRealTimers();
+    await savedControl(stager);
+    expect(outcomes).toHaveLength(7);
+  });
+
+  it('the source budget starts before metadata and is not reset for body consumption', async () => {
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
+    jest.setSystemTime(new Date('2026-10-10T00:00:00Z'));
+    const metadata = deferred<{ file_path: string }>();
+    const reading = deferred<void>();
+    const releaseBody = deferred<void>();
+    let attempts = 0;
+    let retrievalSignal: AbortSignal | undefined;
+    const source = new TelegramMediaSource({ token: 'synthetic-token', timeoutMs: 25,
+      api: { getFile: async (id): Promise<{ file_path: string }> => id === 'retry' ? { file_path: 'files/retry' } : metadata.promise },
+      fetchImpl: async (_url, signal): Promise<Response> => {
+        retrievalSignal = signal;
+        if (++attempts > 1) return responseWithBytes();
+        let pulls = 0;
+        return new Response(new ReadableStream<Uint8Array>({
+          async pull(controller): Promise<void> {
+            if (++pulls === 1) controller.enqueue(Buffer.from('partial'));
+            else { reading.resolve(); await releaseBody.promise; }
+          },
+          cancel(): void { releaseBody.resolve(); },
+        }));
+      },
+    });
+    const stager = new FsMediaStager(source, staging, { limits: { ...DEFAULT_MEDIA_LIMITS, intakeTimeoutMs: 100 } });
+    const pending = stager.stage(reference(), new AbortController().signal);
+    await jest.advanceTimersByTimeAsync(15);
+    metadata.resolve({ file_path: 'files/held' });
+    await reading.promise;
+    await jest.advanceTimersByTimeAsync(10);
+    const abortedAtDeadline = retrievalSignal?.aborted;
+    // Settle the controlled loser even on an inverse, so failure is an assertion, not a timeout.
+    await jest.advanceTimersByTimeAsync(75);
+    const result = await pending;
+    releaseBody.resolve();
+    const entries = listStaging(staging);
+    jest.useRealTimers();
+    await savedControl(stager);
+    expect(abortedAtDeadline).toBe(true);
+    expect(result).toEqual({ kind: 'refused', reason: 'source-failed' });
+    expect(entries).toEqual([]);
+  });
+
+  it('abort retains the intake slot until its held filesystem open closes and its partial is removed', async () => {
+    const opening = deferred<void>();
+    const closed = deferred<void>();
+    let finishOpen!: () => void;
+    const createWriteStream = fsModule.createWriteStream;
+    jest.spyOn(fsModule, 'createWriteStream').mockImplementationOnce((target, options) => {
+      if (typeof options === 'string') throw new Error('unexpected encoding option');
+      const stream = createWriteStream(target, { ...options, fs: {
+        ...fsModule,
+        open: ((...args: unknown[]) => {
+          finishOpen = (): void => { Reflect.apply(fsModule.open, fsModule, args); };
+          opening.resolve();
+        }) as typeof fsModule.open,
+      } });
+      stream.once('close', () => { closed.resolve(); });
+      return stream;
+    });
+    let attempts = 0;
+    const source = new TelegramMediaSource({ token: 'synthetic-token',
+      api: { getFile: async (): Promise<{ file_path: string }> => ({ file_path: 'files/held' }) },
+      fetchImpl: async (): Promise<Response> => ++attempts === 1
+        ? new Response(new ReadableStream<Uint8Array>()) : responseWithBytes(),
+    });
+    const stager = new FsMediaStager(source, staging);
+    const caller = new AbortController();
+    let settled = false;
+    const pending = stager.stage(reference(), caller.signal).then(result => { settled = true; return result; });
+    await opening.promise;
+    caller.abort();
+    await settleContinuations();
+    const settledBeforeOwnedClose = settled;
+    const inFlightBeforeOwnedClose = stager.inFlight;
+    finishOpen();
+    const result = await pending;
+    await closed.promise;
+    const entries = listStaging(staging);
+    await savedControl(stager);
+    expect(entries).toEqual([]);
+    expect(settledBeforeOwnedClose).toBe(false);
+    expect(inFlightBeforeOwnedClose).toEqual({ active: 1, waiting: 0 });
+    expect(result).toEqual({ kind: 'refused', reason: 'aborted' });
   });
 });

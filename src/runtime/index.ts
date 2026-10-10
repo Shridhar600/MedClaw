@@ -53,6 +53,8 @@ export type {
 } from './installation';
 
 export { composeOwnerAuthority } from './owner-authority';
+export { FsMediaStager } from './adapters';
+export type { MediaStagerOptions } from './adapters';
 export type { OwnerAuthority, OwnerAuthoritySource } from './owner-authority';
 // Existing local-admin composition consumers use these concrete edges through the public surface.
 export { DirectoryLease, FileOwnerStatePort, CryptoPairingCodePort } from './adapters';

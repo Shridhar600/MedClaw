@@ -9,6 +9,7 @@ exists at all.
   shapes. A channel MUST NOT leak transport-specific fields into them.
 - `TelegramChannel`, `TELEGRAM_CHANNEL_NAME`, `telegramEventId`, `telegramChatType`.
 - `TelegramMediaSource` — the `MediaSourcePort` adapter for Telegram file downloads.
+- `TelegramFileApi` / `TelegramFileFetcher` / `TelegramMediaSourceOptions` — injected transport IO.
 
 **Dependencies:** `../security` (for `summarizeErrorForLog`), `grammy`, `../ports`. No core module, no
 `gateway/`, no `memory/`, no filesystem policy.
@@ -32,6 +33,13 @@ before anyone had established who was asking.
 and a URL in the core would be a request the core issued on a stranger's say-so.
 
 ## Transport identity
+
+Retrieval connects caller cancellation and its one standalone timer before metadata lookup. The same
+signal reaches getFile, fetch and reader consumption. Core's queue-inclusive deadline remains the intake
+limit. Pre-aborted or late metadata starts no body request; a late response is cancelled without a reader.
+Reader cancellation refuses partial bytes instead of treating cancellation as successful EOF. Completion
+and cancellation dispose owned timers/listeners/readers. Uncooperative external promises remain observed;
+an abort request does not guarantee external acknowledgement or force those promises to settle.
 
 `telegramEventId` and `telegramChatType` normalize transport identity so the core sees one shape.
 `eventId` must be stable across redelivery (`telegram:<chatId>:<messageId>`) so a redelivered pairing
