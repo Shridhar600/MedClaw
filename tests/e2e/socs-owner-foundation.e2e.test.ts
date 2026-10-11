@@ -16,6 +16,10 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { Api, Bot } from 'grammy';
+import type { Chat, Message as TelegramMessage, Update, User } from 'grammy/types';
+import { TelegramMediaSource } from '../../src/channels';
+import * as healthcheck from '../../src/providers/healthcheck';
 
 import { runCli } from '../../src/cli';
 import { startDaemon, type DaemonHandle } from '../../src/index';
@@ -38,10 +42,10 @@ import { EMERGENCY_RESPONSE } from '../../src/safety/emergency-detector';
 // Only external readiness IO is replaced. Real provider completion uses the scripted provider.
 jest.mock('../../src/providers/healthcheck', () => ({
   ...jest.requireActual('../../src/providers/healthcheck'),
-  checkSystemReadiness: async () => ({
+  checkSystemReadiness: jest.fn(async () => ({
     providers: ['main provider', 'medical provider', 'embeddings provider'].map(label => ({ label, ready: true, checked: true, status: 'ok', details: [], warnings: [] })),
     telegram: { label: 'telegram', ready: true, checked: true, status: 'ok', details: [], warnings: [] },
-  }),
+  })),
 }));
 
 /** A scripted provider. Deterministic, in-process, and never touches the network. */
@@ -172,7 +176,7 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
   }
 
   /** The real non-interactive setup an operator would run. */
-  function setup(): Promise<{ code: number; output: string }> {
+  function setup(telegramToken?: string): Promise<{ code: number; output: string }> {
     return cli([
       'onboard',
       '--yes',
@@ -180,7 +184,8 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
       '--state-root', fixture.baseDir,
       '--owner-id', fixture.ownerId,
       '--provider', 'ollama',
-      '--telegram-enabled', 'false',
+      '--telegram-enabled', telegramToken ? 'true' : 'false',
+      ...(telegramToken ? ['--telegram-token', telegramToken] : []),
       '--timezone', 'UTC',
       '--heartbeats-enabled', 'false',
     ]);
@@ -221,6 +226,223 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
       },
     });
   }
+
+  it('C10 actual Telegram updates pair, capture once, restart, consume owner media and refuse foreign effects through the default daemon', async () => {
+    // A handler->Router bypass loses the adopted media; staging before admission fetches denied media.
+    // Keep real Bot registration, filters and Context dispatch. Only polling/API/provider IO is fake.
+    const token = '123456789:C10_synthetic_bot_token';
+    expect((await setup(token)).code).toBe(0);
+    const issued = await cli(['--config', fixture.configPath, 'pairing', 'issue']);
+    expect(issued.code).toBe(0);
+    const code = issued.output.match(/\b[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}\b/)?.[0];
+    if (!code) throw new Error('CLI did not display the synthetic pairing code');
+    const configBytes = fs.readFileSync(fixture.configPath);
+    expect(JSON.parse(configBytes.toString())).toMatchObject({
+      schemaVersion: 2, profiles: { baseDir: fixture.baseDir, defaultProfileId: 'default' },
+      channels: { telegram: { enabled: true, botToken: token } },
+    });
+    expect(JSON.parse(fs.readFileSync(fixture.ownerRecord, 'utf8'))).toMatchObject({ ownerId: 'default', phase: 'unpaired' });
+    const configLease = `${fixture.configPath}.lease`;
+    for (const file of [fixture.configPath, fixture.ownerRecord]) expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+    for (const dir of [fixture.workspace, path.dirname(fixture.ownerRecord)]) expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
+    for (const lease of [configLease, fixture.workspaceLease]) expect(fs.existsSync(lease)).toBe(false);
+
+    const ownerChat = 731001234, ownerUser = 731005678;
+    const narrative = 'C10_first_health_marker I slept badly last night';
+    const caption = 'C10_media_caption_marker Please keep this attachment with my sleep notes';
+    const body = Buffer.from('C10_streamed_attachment_marker\nsynthetic sleep notes\n');
+    const output: unknown[][] = [];
+    const spies = (['log', 'info', 'warn', 'error'] as const).map(method => jest.spyOn(console, method).mockImplementation((...args: unknown[]) => { output.push(args); }));
+    const bots: Bot[] = [];
+    const polling = new Map<Bot, { promise: Promise<void>; release: () => void }>();
+    const registrations = jest.spyOn(Bot.prototype, 'on'); // Call through actual middleware registration.
+    const start = jest.spyOn(Bot.prototype, 'start').mockImplementation(function (this: Bot): Promise<void> {
+      this.botInfo = { id: 731009999, is_bot: true, first_name: 'Synthetic', username: 'synthetic_bot', can_join_groups: false, can_read_all_group_messages: false, supports_inline_queries: false, can_connect_to_business: false, has_main_web_app: false, can_manage_bots: false, has_topics_enabled: false, allows_users_to_create_topics: false };
+      // grammY uses node-fetch too: refuse unexpected methods at its own API boundary, before sockets.
+      this.api.config.use(async () => { throw new Error('Unexpected C10 Telegram API call'); });
+      const lifecycle = heldEvent();
+      polling.set(this, lifecycle); bots.push(this);
+      return lifecycle.promise;
+    });
+    const stop = jest.spyOn(Bot.prototype, 'stop').mockImplementation(async function (this: Bot): Promise<void> {
+      const lifecycle = polling.get(this);
+      if (!lifecycle) throw new Error('Stopped an unstarted C10 bot');
+      lifecycle.release(); polling.delete(this);
+    });
+    const replies: { chat: string; text: string }[] = [];
+    const send = jest.spyOn(Api.prototype, 'sendMessage').mockImplementation(async (chatId, text): Promise<TelegramMessage.TextMessage> => {
+      replies.push({ chat: String(chatId), text });
+      return { message_id: replies.length, date: 1780000000, chat: { id: Number(chatId), type: 'private', first_name: 'Synthetic' }, text };
+    });
+    const readiness = jest.mocked(healthcheck.checkSystemReadiness);
+    readiness.mockClear();
+    const prompts: string[] = [];
+    let builds = 0, embeddings = 0, bodyReads = 0;
+    const provider: LLMProvider = {
+      modelName: 'C10-scripted',
+      chat: async messages => { prompts.push(JSON.stringify(messages)); return textResponse('C10 accepted owner turn.'); },
+      embed: async () => { embeddings += 1; return new Array(768).fill(0); },
+    };
+    const getFile = jest.fn(async (_id: string, signal?: AbortSignal) => {
+      expect(signal?.aborted).toBe(false);
+      return { file_path: 'files/C10_transport_path_marker.txt', file_size: body.length };
+    });
+    const fetchBody = jest.fn(async (url: string, signal: AbortSignal): Promise<Response> => {
+      expect(url).toBe(`https://api.telegram.org/file/bot${token}/files/C10_transport_path_marker.txt`);
+      expect(signal.aborted).toBe(false);
+      let offset = 0;
+      return new Response(new ReadableStream<Uint8Array>({
+        pull(controller): void {
+          if (offset === body.length) { controller.close(); return; }
+          const next = Math.min(offset + 7, body.length);
+          bodyReads += 1; controller.enqueue(body.subarray(offset, next)); offset = next;
+        },
+      }));
+    });
+    const source = new TelegramMediaSource({ token, api: { getFile }, fetchImpl: fetchBody });
+    const boot = (): Promise<DaemonHandle> => startDaemon({ configPath: fixture.configPath, homeDir: root, externalIO: {
+      createProvider: () => { builds += 1; return provider; }, mediaSource: source,
+    } });
+    let daemon: DaemonHandle | undefined;
+    let messageId = 0;
+    function update(payload: { text: string } | { caption: string; document: TelegramMessage.DocumentMessage['document'] } | { caption: string; photo: TelegramMessage.PhotoMessage['photo'] }, identity: { chat?: number; user?: number | null; group?: boolean } = {}): Update {
+      messageId += 1;
+      const chat: Chat = identity.group
+        ? { id: identity.chat ?? ownerChat, type: 'group', title: 'Synthetic group' }
+        : { id: identity.chat ?? ownerChat, type: 'private', first_name: 'Synthetic' };
+      const from: User = { id: identity.user ?? ownerUser, is_bot: false, first_name: 'Synthetic' };
+      const wire: Update = { update_id: messageId, message: { message_id: messageId, date: 1780000000, chat, from, ...payload } };
+      if (identity.user !== null) return wire;
+      // Intentionally malformed transport input: grammY's private-message type requires a sender.
+      const withoutSender: Partial<TelegramMessage> = { ...wire.message! };
+      delete withoutSender.from;
+      return { update_id: wire.update_id, message: withoutSender } as Update;
+    }
+    const document = (fileId: string): TelegramMessage.DocumentMessage['document'] => ({ file_id: fileId, file_unique_id: `${fileId}-unique`, file_name: 'C10_display_name_marker.txt', mime_type: 'text/plain', file_size: body.length });
+    const dispatch = async (bot: Bot, wire: Update): Promise<{ chat: string; text: string }[]> => {
+      const before = replies.length;
+      await bot.handleUpdate(wire);
+      return replies.slice(before);
+    };
+    const drain = async (): Promise<void> => {
+      const runtime = daemon?.gateway.runtimeInstance;
+      if (!runtime?.writeQueue || !runtime.sessions) throw new Error('Expected real owner runtime/stores');
+      await runtime.drainBackgroundOperations(); await runtime.writeQueue.drain();
+    };
+    const calls = (): number[] => [builds, prompts.length, embeddings, getFile.mock.calls.length, fetchBody.mock.calls.length, bodyReads, readiness.mock.calls.length];
+    const assertRegistered = (bot: Bot): void => {
+      for (const event of ['message:text', 'message:document', 'message:photo']) {
+        const found = registrations.mock.calls.some((args, index) => registrations.mock.contexts[index] === bot && args[0] === event && typeof args[1] === 'function');
+        if (!found) throw new Error(`Actual channel did not register ${event}`);
+      }
+    };
+    try {
+      daemon = await boot();
+      expect(bots).toHaveLength(1); const firstBot = bots[0]; assertRegistered(firstBot);
+      expect(daemon.gateway.servesPairingOnly).toBe(true);
+      expect(daemon.gateway.runtimeInstance).toBeUndefined();
+      for (const lease of [configLease, fixture.workspaceLease]) expect(fs.statSync(lease).mode & 0o777).toBe(0o700);
+      const beforeStranger = syntheticBytes(fixture.workspace), beforeCalls = calls();
+      const stranger = await dispatch(firstBot, update({ text: 'C10_unpaired_stranger_marker hello' }, { chat: 731002222, user: 731003333 }));
+      expect(stranger).toHaveLength(1); expect(stranger[0].chat).toBe('731002222');
+      expect(stranger[0].text).toMatch(/pairing code/i);
+      // Pairing reserves an attempt in authority only; it must create no clinical state.
+      const afterStranger = syntheticBytes(fixture.workspace);
+      delete beforeStranger['.state/owner-access.json']; delete afterStranger['.state/owner-access.json'];
+      expect(afterStranger).toEqual(beforeStranger); expect(calls()).toEqual(beforeCalls);
+      expect(builds).toBe(0); expect(daemon.gateway.runtimeInstance).toBeUndefined();
+
+      expect(await dispatch(firstBot, update({ text: code }))).toEqual([{ chat: String(ownerChat), text: 'Pairing complete. This chat is now connected to the owner.' }]);
+      const binding = fs.readFileSync(fixture.ownerRecord);
+      expect(JSON.parse(binding.toString())).toMatchObject({ ownerId: 'default', phase: 'bound', binding: { channel: 'telegram', chatId: String(ownerChat), senderId: String(ownerUser), pairingEventId: `telegram:${ownerChat}:2` } });
+      expect(binding.toString()).not.toContain(code);
+      expect(daemon.gateway.runtimeInstance).toBeUndefined(); expect(calls()).toEqual(beforeCalls);
+      const first = await dispatch(firstBot, update({ text: narrative }));
+      expect(first).toHaveLength(1); expect(first[0].chat).toBe(String(ownerChat));
+      expect(first[0].text).toMatch(/personal health companion|before we start/i);
+      expect(daemon.gateway.servesPairingOnly).toBe(false);
+      expect(daemon.gateway.runtimeInstance!.workspace).toBe(fixture.workspace);
+      expect((await dispatch(firstBot, update({ text: 'skip' })))[0].text).toMatch(/skipped|onboarding/i);
+      const turn = await dispatch(firstBot, update({ text: 'C10_after_onboarding_marker I walked today' }));
+      expect(turn).toHaveLength(1); expect(turn[0]).toMatchObject({ chat: String(ownerChat), text: expect.stringContaining('C10 accepted owner turn.') });
+      expect(prompts.length).toBeGreaterThan(0); await drain();
+      const saved = syntheticBytes(fixture.workspace);
+      const narrativeFiles = Object.entries(saved).filter(([file]) => file.startsWith('memory/') && file.endsWith('.md'));
+      const archives = Object.entries(saved).filter(([file]) => file.includes('sessions/') && file.endsWith('.jsonl'));
+      expect(narrativeFiles.map(([, hex]) => Buffer.from(hex, 'hex').toString()).join('\n').split(narrative)).toHaveLength(2);
+      const userArchive = archives.flatMap(([, hex]) => Buffer.from(hex, 'hex').toString().trim().split('\n').map(line => JSON.parse(line))).filter(entry => entry.role === 'user');
+      expect(userArchive.filter(entry => entry.content === narrative)).toHaveLength(1);
+      for (const [file] of [...narrativeFiles, ...archives]) expect(fs.statSync(path.join(fixture.workspace, file)).mode & 0o777).toBe(0o600);
+      const capturedText = [...narrativeFiles, ...archives].map(([, hex]) => Buffer.from(hex, 'hex').toString()).join('\n');
+      expect(capturedText).not.toContain(code); expect(prompts.join('\n')).not.toContain(code);
+      await daemon.shutdown(); daemon = undefined;
+      expect(polling.size).toBe(0); expect(stop).toHaveBeenCalledTimes(1);
+      for (const lease of [configLease, fixture.workspaceLease]) expect(fs.existsSync(lease)).toBe(false);
+
+      daemon = await boot();
+      expect(bots).toHaveLength(2); const rebootBot = bots[1]; expect(rebootBot).not.toBe(firstBot); assertRegistered(rebootBot);
+      expect(daemon.gateway.servesPairingOnly).toBe(false);
+      expect(daemon.gateway.runtimeInstance!.sessions!.getHistory(String(ownerChat))).toContainEqual({ role: 'user', content: narrative });
+      expect(fs.readFileSync(fixture.ownerRecord)).toEqual(binding);
+      for (const [file, hex] of narrativeFiles) expect(fs.readFileSync(path.join(fixture.workspace, file)).toString('hex')).toBe(hex);
+      const priorPrompts = prompts.length;
+      const mediaReply = await dispatch(rebootBot, update({ caption, document: document('C10_owner_file_marker') }));
+      await drain();
+      expect(getFile).toHaveBeenCalledTimes(1); expect(getFile.mock.calls[0][0]).toBe('C10_owner_file_marker');
+      expect(fetchBody).toHaveBeenCalledTimes(1); expect(bodyReads).toBeGreaterThan(1);
+      expect(prompts.length).toBeGreaterThan(priorPrompts);
+      const mediaPrompt = prompts.slice(priorPrompts).join('\n');
+      expect(mediaPrompt).toContain(caption);
+      const relative = /Uploaded media path \(relative to workspace\): (reports\/[^\s"\\]+)/.exec(mediaPrompt)?.[1];
+      if (!relative) throw new Error('Accepted media did not reach the real provider with an adopted path');
+      const adopted = path.resolve(fixture.workspace, relative);
+      expect(adopted.startsWith(path.join(fixture.workspace, 'reports') + path.sep)).toBe(true);
+      expect(fs.readFileSync(adopted)).toEqual(body); expect(fs.statSync(adopted).mode & 0o777).toBe(0o600);
+      expect(mediaReply).toHaveLength(1); expect(mediaReply[0]).toMatchObject({ chat: String(ownerChat), text: expect.stringContaining('C10 accepted owner turn.') });
+      expect(daemon.gateway.runtimeInstance!.sessions!.getHistory(String(ownerChat))).toContainEqual({ role: 'user', content: expect.stringContaining(`${caption}\n\nUploaded media path (relative to workspace): ${relative}`) });
+      const staging = path.join(fixture.workspace, '.state', 'media-staging');
+      expect(fs.statSync(staging).mode & 0o777).toBe(0o700); expect(fs.readdirSync(staging)).toEqual([]);
+      expect(fs.readdirSync(path.join(fixture.workspace, 'reports'))).toEqual([path.basename(adopted)]);
+
+      const denied = [
+        update({ caption: 'C10_denied_sender_marker', document: document('C10_denied_file_marker') }, { user: 731004444 }),
+        update({ caption: 'C10_denied_group_marker', photo: [{ file_id: 'C10_denied_photo_marker', file_unique_id: 'photo-unique', width: 10, height: 10, file_size: body.length }] }, { group: true }),
+        update({ caption: 'C10_missing_sender_marker', document: document('C10_missing_file_marker') }, { user: null }),
+        update({ caption: 'C10_denied_emergency_marker I cannot breathe', document: document('C10_emergency_file_marker') }, { chat: 731002222, user: 731003333 }),
+      ];
+      for (const wire of denied) {
+        const before = syntheticBytes(fixture.workspace), counts = calls();
+        const reply = await dispatch(rebootBot, wire); await drain();
+        expect(calls()).toEqual(counts); expect(syntheticBytes(fixture.workspace)).toEqual(before);
+        expect(fs.readFileSync(fixture.ownerRecord)).toEqual(binding);
+        expect(reply).toHaveLength(1); expect(reply[0].chat).toBe(String(wire.message!.chat.id));
+        if (wire === denied[3]) expect(reply[0].text).toBe(EMERGENCY_RESPONSE);
+        else expect(reply[0].text).not.toContain('C10 accepted owner turn.');
+      }
+      // Current, damaged disk authority refuses with history present, without resetting the record.
+      fs.writeFileSync(fixture.ownerRecord, '{C10_damaged_binding_marker', { mode: 0o600 });
+      const damagedBytes = syntheticBytes(fixture.workspace), damagedCalls = calls();
+      const damaged = await dispatch(rebootBot, update({ caption: 'I cannot breathe', document: document('C10_damaged_file_marker') }));
+      await drain(); expect(damaged).toEqual([{ chat: String(ownerChat), text: EMERGENCY_RESPONSE }]);
+      expect(calls()).toEqual(damagedCalls); expect(syntheticBytes(fixture.workspace)).toEqual(damagedBytes);
+      fs.writeFileSync(fixture.ownerRecord, binding, { mode: 0o600 });
+      await daemon.shutdown(); daemon = undefined;
+      expect(start).toHaveBeenCalledTimes(2); expect(stop).toHaveBeenCalledTimes(2); expect(polling.size).toBe(0);
+      for (const lease of [configLease, fixture.workspaceLease]) expect(fs.existsSync(lease)).toBe(false);
+      expect(fs.readFileSync(fixture.configPath)).toEqual(configBytes); expect(fs.readFileSync(fixture.ownerRecord)).toEqual(binding);
+      expect(send.mock.calls.length).toBe(replies.length);
+      const logs = JSON.stringify(output);
+      for (const marker of [code, token, root, String(ownerChat), String(ownerUser), '731002222', '731003333', '731004444', 'C10_first_health_marker', 'C10_unpaired_stranger_marker', 'C10_after_onboarding_marker', 'C10_media_caption_marker', 'C10_streamed_attachment_marker', 'C10_display_name_marker', 'C10_transport_path_marker', 'C10_owner_file_marker', 'C10_denied_', 'C10_missing_', 'C10_emergency_', 'C10_damaged_']) expect(logs).not.toContain(marker);
+      expect(logs).toContain('stage=pairing outcome=paired');
+      expect(logs).toContain(`stage=media-intake outcome=saved bytes=${body.length}`);
+      expect(logs).toContain('reason=already-bound'); expect(logs).toContain('reason=non-private-chat');
+      expect(logs).toContain('operation=stop outcome=stopped');
+    } finally {
+      await daemon?.shutdown();
+      for (const lifecycle of polling.values()) lifecycle.release();
+      [registrations, start, stop, send, ...spies].forEach(spy => spy.mockRestore());
+    }
+  }, 120_000);
 
   it.each(['later event', 'spent failed-event replay'])('C06 R12 keeps %s silent across restart/reissue, with UTC rollover and emergency controls', async (attempt) => {
     expect((await setup()).code).toBe(0);
