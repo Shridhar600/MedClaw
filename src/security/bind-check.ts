@@ -13,16 +13,17 @@ export function checkProviderBindAddresses(config: { providers: Record<string, {
   };
   for (const [name, provider] of Object.entries(config.providers)) {
     if (!provider.baseUrl) continue;
+    const role = name === 'main' || name === 'medical' || name === 'embeddings' ? name : 'configured';
     try {
       const url = new URL(provider.baseUrl);
       const host = url.hostname.replace(/^\[(.+)\]$/, '$1');
       if (host === '0.0.0.0') {
-        warnings.push(`${name} provider (${provider.baseUrl}) binds all interfaces (0.0.0.0) — NOT localhost-only; health data may be exposed to the network`);
+        warnings.push(`${role} provider binds all interfaces (0.0.0.0) — NOT localhost-only; health data may be exposed to the network`);
       } else if (!isLocalhost(host)) {
-        warnings.push(`${name} provider (${provider.baseUrl}) is not localhost — health data may leave the machine`);
+        warnings.push(`${role} provider is not localhost — health data may leave the machine`);
       }
     } catch {
-      warnings.push(`${name} provider has invalid baseUrl`);
+      warnings.push(`${role} provider has invalid baseUrl`);
     }
   }
   return { localhostOnly: warnings.length === 0, warnings };

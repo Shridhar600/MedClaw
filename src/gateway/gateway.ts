@@ -83,8 +83,7 @@ export interface GatewayAdmissionDeps {
   mediaSource?: MediaSourcePort;
   /**
    * The closed diagnostic contract, covering admission, pairing, media intake and start/stop.
-   * Silent by default: the brief requires outcomes to be EMITTABLE and requires local explicit
-   * output to be a separate surface, so production does not print.
+   * Silent for reusable direct construction. The daemon root explicitly selects its output adapter.
    */
   diagnostics?: DiagnosticSink;
   /** Optional: defaults to the system clock. Injected in tests so durations are real measurements. */
@@ -144,6 +143,7 @@ function readinessLabel(result: ReadinessResult): 'OK' | 'FAIL' | 'PENDING' {
  * path data — the message is fixed operator guidance.
  */
 class PreviousWorkUnsettledError extends Error {}
+class AdmissionRefusedError extends Error {}
 
 export class Gateway {
   private config: EffectiveConfig;
@@ -322,7 +322,7 @@ export class Gateway {
   async start(): Promise<void> {
     const startedAt = this.clock.now().getTime();
     try {
-      await this.startServing(startedAt);
+      await this.startServing();
     } catch (error) {
       // C01 follow-up (R01): the replacement refusal gets its OWN truthful outcome. Reporting
       // `failed`/`build-failed` for it would be a lie twice over — nothing was built, and the refusal
@@ -332,13 +332,17 @@ export class Gateway {
       if (error instanceof PreviousWorkUnsettledError) {
         this.sink.emit({
           stage: 'start-stop',
+          operation: 'start',
           outcome: 'refused',
           reason: 'previous-work-unsettled',
           durationMs: this.elapsedSince(startedAt),
         });
+      } else if (error instanceof AdmissionRefusedError) {
+        this.emit({ stage: 'start-stop', operation: 'start', outcome: 'refused', reason: 'admission-refused', durationMs: this.elapsedSince(startedAt) });
       } else {
         this.sink.emit({
           stage: 'start-stop',
+          operation: 'start',
           outcome: 'failed',
           reason: 'build-failed',
           durationMs: this.elapsedSince(startedAt),
@@ -346,7 +350,7 @@ export class Gateway {
       }
       throw error;
     }
-    this.sink.emit({ stage: 'start-stop', outcome: 'started', durationMs: this.elapsedSince(startedAt) });
+    this.sink.emit({ stage: 'start-stop', operation: 'start', outcome: 'started', durationMs: this.elapsedSince(startedAt) });
   }
 
   /** Emit helpers. The sink is guarded in the constructor, so no emit can throw into a boot. */
@@ -359,7 +363,7 @@ export class Gateway {
     return elapsed > 0 ? elapsed : 0;
   }
 
-  private async startServing(startedAt: number): Promise<void> {
+  private async startServing(): Promise<void> {
     const { config } = this;
     this.stopping = false;
     this.stopped = false;
@@ -383,15 +387,8 @@ export class Gateway {
 
     const admissionState = this.admission.inspectInstallation();
     if (admissionState.kind === 'refused') {
-      // Emitted here rather than in the catch: the cause is an admission refusal, not a build
-      // failure, and the precise `AdmissionReason` is already recorded by the admission module.
-      this.emit({
-        stage: 'start-stop',
-        outcome: 'refused',
-        reason: 'admission-refused',
-        durationMs: this.elapsedSince(startedAt),
-      });
-      throw new Error(
+      // start() owns the one terminal result. Admission has already emitted the precise reason.
+      throw new AdmissionRefusedError(
         `Refusing to serve: the owner record is ${admissionState.reason}. `
         + 'Re-run setup on this computer, then start the daemon again.',
       );
@@ -799,14 +796,20 @@ export class Gateway {
     if (this.admission.inspect(transportIdentityOf(incoming)).kind !== 'owner') return;
 
     const transition = this.pairingTransition ??= (async () => {
+      const startedAt = this.clock.now().getTime();
       try {
-        if (this.stopping) return;
         console.log('[gateway] Owner paired. Building the owner runtime.');
         await this.serveOwner({ connectChannel: false, runHealthchecks: false });
+        this.emit(this.unpairedOnly
+          ? { stage: 'start-stop', operation: 'promotion', outcome: 'refused', reason: 'shutdown-in-progress', durationMs: this.elapsedSince(startedAt) }
+          : { stage: 'start-stop', operation: 'promotion', outcome: 'started', durationMs: this.elapsedSince(startedAt) });
       } catch (error) {
         // A failed promotion must not take the daemon down, and must not leave `unpairedOnly`
         // cleared: the next owner message retries rather than silently serving nothing.
         console.error('[gateway] Could not start serving after pairing:', summarizeErrorForLog(error));
+        this.emit(error instanceof PreviousWorkUnsettledError
+          ? { stage: 'start-stop', operation: 'promotion', outcome: 'refused', reason: 'previous-work-unsettled', durationMs: this.elapsedSince(startedAt) }
+          : { stage: 'start-stop', operation: 'promotion', outcome: 'failed', reason: 'build-failed', durationMs: this.elapsedSince(startedAt) });
       }
     })();
 
@@ -954,13 +957,14 @@ export class Gateway {
     this.runtime?.beginStopping();
     const shared = this.stopResources()
       .then(() => {
-        this.emit({ stage: 'start-stop', outcome: 'stopped', durationMs: this.elapsedSince(startedAt) });
+        this.emit({ stage: 'start-stop', operation: 'stop', outcome: 'stopped', durationMs: this.elapsedSince(startedAt) });
       })
       .catch((error: unknown) => {
         this.emit({
           stage: 'start-stop',
           outcome: 'failed',
           reason: 'release-failed',
+          operation: 'stop',
           durationMs: this.elapsedSince(startedAt),
         });
         throw error;

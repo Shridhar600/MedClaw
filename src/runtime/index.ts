@@ -53,7 +53,7 @@ export type {
 } from './installation';
 
 export { composeOwnerAuthority } from './owner-authority';
-export { FsMediaStager } from './adapters';
+export { FsMediaStager, ConsoleDiagnosticSink } from './adapters';
 export { createMediaArtifactName, isMediaStagingArtifact, MEDIA_PARTIAL_SUFFIX } from './media-artifact';
 export type { MediaStagerOptions } from './adapters';
 export type { OwnerAuthority, OwnerAuthoritySource } from './owner-authority';

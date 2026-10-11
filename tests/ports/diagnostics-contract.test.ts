@@ -21,7 +21,7 @@
 
 import { DiagnosticSink, guardedDiagnosticSink } from '../../src/ports/diagnostics';
 import type { DiagnosticEvent } from '../../src/ports/diagnostics';
-import { CryptoPairingCodePort, FileOwnerStatePort } from '../../src/runtime/adapters';
+import { CryptoPairingCodePort, FileOwnerStatePort, ConsoleDiagnosticSink } from '../../src/runtime';
 import { OwnerAdmissionService } from '../../src/profiles';
 import type { Clock } from '../../src/ports/clock';
 import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
@@ -34,6 +34,52 @@ const PAIRING_CODE = 'K7MQRTVX';
 // Distinctive on purpose: an earlier version of this file used OWNER_ID, which is a substring of the
 // STAGE name 'owner-admission' and so could never have detected an owner-id leak.
 const OWNER_ID = 'sentry-owner-7f4c2a';
+
+describe('C09 console diagnostic edge', () => {
+  it('checks runtime vocabulary/numeric bounds without copying unchecked fields, and never throws', () => {
+    // Distinct invariant: runtime values can defeat TypeScript. Flow tests cannot supply forged
+    // events without replacing the policy under test. Check the adapter's actual output boundary.
+    const lines: string[] = [];
+    const sink = new ConsoleDiagnosticSink(line => { lines.push(line); });
+    const valid = { stage: 'pairing', outcome: 'limited', reason: 'daily-allowance-spent', attempts: 3, durationMs: 7 };
+    sink.emit({ ...valid, path: 'C09_unchecked_secret', error: new Error('C09_unchecked_secret') } as DiagnosticEvent);
+    expect(lines).toEqual(['[diagnostic] stage=pairing outcome=limited reason=daily-allowance-spent attempts=3 durationMs=7']);
+    for (const forged of [
+      { ...valid, stage: 'C09_unchecked_secret' }, { ...valid, outcome: 'C09_unchecked_secret' },
+      { ...valid, reason: 'C09_unchecked_secret' }, { ...valid, attempts: 4 },
+      { ...valid, attempts: -1 }, { ...valid, durationMs: Infinity }, { ...valid, durationMs: -1 },
+      { stage: 'media-intake', outcome: 'saved', bytes: 10 * 1024 * 1024 + 1, durationMs: 1 },
+      { stage: 'start-stop', operation: 'C09_unchecked_secret', outcome: 'started', durationMs: 1 },
+    ]) sink.emit(forged as DiagnosticEvent);
+    expect(lines).toHaveLength(1);
+    // Snapshot each checked field once: a getter must not change the value after validation.
+    const changingCases: Array<[Record<string, unknown>, string, string]> = [
+      [{ stage: 'owner-admission', outcome: 'refused', reason: 'unavailable', durationMs: 1 }, 'reason',
+        '[diagnostic] stage=owner-admission outcome=refused reason=unavailable durationMs=1'],
+      [{ stage: 'pairing', outcome: 'limited', reason: 'daily-allowance-spent', attempts: 3, durationMs: 1 }, 'reason',
+        '[diagnostic] stage=pairing outcome=limited reason=daily-allowance-spent attempts=3 durationMs=1'],
+      [{ stage: 'media-intake', outcome: 'refused', reason: 'source-failed', durationMs: 1 }, 'reason',
+        '[diagnostic] stage=media-intake outcome=refused reason=source-failed durationMs=1'],
+      [{ stage: 'start-stop', operation: 'start', outcome: 'failed', reason: 'build-failed', durationMs: 1 }, 'reason',
+        '[diagnostic] stage=start-stop operation=start outcome=failed reason=build-failed durationMs=1'],
+      [{ stage: 'media-intake', outcome: 'saved', bytes: 0, durationMs: 1 }, 'bytes',
+        '[diagnostic] stage=media-intake outcome=saved bytes=0 durationMs=1'],
+      [{ stage: 'pairing', outcome: 'limited', reason: 'daily-allowance-spent', attempts: 3, durationMs: 1 }, 'attempts',
+        '[diagnostic] stage=pairing outcome=limited reason=daily-allowance-spent attempts=3 durationMs=1'],
+    ];
+    for (const [event, field, expected] of changingCases) {
+      const first = event[field];
+      let reads = 0;
+      Object.defineProperty(event, field, { get: () => ++reads === 1 ? first : 'C09_changing_getter_secret' });
+      const captured: string[] = [];
+      new ConsoleDiagnosticSink(line => { captured.push(line); }).emit(event as unknown as DiagnosticEvent);
+      expect(captured).toEqual([expected]);
+      expect(reads).toBe(1);
+    }
+    const broken = new ConsoleDiagnosticSink(() => { throw new Error('C09_writer_error_secret'); });
+    expect(() => broken.emit({ stage: 'owner-admission', outcome: 'admitted', durationMs: 1 })).not.toThrow();
+  });
+});
 
 /** An adapter that always fails, the way a real one does: ENOSPC, a full disk, a bad log target. */
 function throwingSink(seen: DiagnosticEvent[] = []): DiagnosticSink {
@@ -256,7 +302,7 @@ describe('diagnostic sink contract', () => {
 
       // No throw escapes: this is the whole contract.
       expect(() =>
-        guard.emit({ stage: 'start-stop', outcome: 'started', durationMs: 1 }),
+        guard.emit({ stage: 'start-stop', operation: 'start', outcome: 'started', durationMs: 1 }),
       ).not.toThrow();
     });
 

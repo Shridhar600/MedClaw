@@ -61,6 +61,8 @@ export type StartStopReason =
    * specific fact. Constant string; no identifier, path or payload.
    */
   | 'previous-work-unsettled'
+  /** Owner promotion stopped before a serving runtime became available. */
+  | 'shutdown-in-progress'
   /** Releasing a resource during stop failed. */
   | 'release-failed';
 
@@ -90,6 +92,8 @@ export type PairingDiagnosticReason =
   | 'code-expired'
   /** Today's attempt allowance for this chat is spent. */
   | 'daily-allowance-spent'
+  /** Today's bounded candidate table is full; this chat has spent no attempts. */
+  | 'candidate-capacity-reached'
   /** The owner record could not be read, or a write finished with an unknown outcome. */
   | 'record-unavailable';
 
@@ -153,10 +157,12 @@ export type DiagnosticEvent = DiagnosticDuration &
       }
     | {
         stage: 'start-stop';
+        operation: 'start' | 'promotion' | 'stop';
         outcome: 'started' | 'stopped';
       }
     | {
         stage: 'start-stop';
+        operation: 'start' | 'promotion' | 'stop';
         outcome: 'refused' | 'failed';
         reason: StartStopReason;
       }
@@ -172,9 +178,8 @@ export interface DiagnosticSink {
 
 /**
  * The default for a call site that has no sink. Also the honest answer for "who is this for?": the
- * brief requires useful admission/pairing/intake/start-stop OUTCOMES to be emittable, and requires
- * local explicit inspection to be a different surface. Silence is the correct default precisely so
- * that a sink that IS wired up is a deliberate choice.
+ * Reusable modules default to silence. Application composition deliberately selects a sink; the
+ * normal daemon uses a value-free console adapter. Local explicit inspection is a separate surface.
  */
 export const SILENT_DIAGNOSTIC_SINK: DiagnosticSink = {
   emit: () => {},

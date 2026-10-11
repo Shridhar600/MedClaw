@@ -49,6 +49,7 @@ What each variant may carry:
 | Field | Meaning |
 |---|---|
 | `stage` | Which bounded operation produced the event. |
+| `operation` | Start-stop only: `start`, `promotion` or `stop`. One terminal result per attempt/flight. |
 | `outcome` | Allowlisted. `admitted` / `pairing-only` / `refused` for admission; progress vs refusal for pairing; `saved` / `refused` for intake; `started` / `stopped` / `refused` / `failed` for start-stop. |
 | `reason` | **Required** on every refusal variant, never optional. "Refused, but nobody said why" is unrepresentable. |
 | `durationMs` | Measured span, always present. |
@@ -65,5 +66,7 @@ which is the same outcome as having no sink — so observability can never chang
 `OwnerAdmissionService` and `FsMediaStager` each guard once in their constructor, so no call site can
 forget.
 
-Production supplies **no sink** and therefore prints nothing: the brief requires outcomes to be
-*emittable* through this contract and requires local explicit output to be a separate surface.
+Reusable constructors default to silence. The daemon root deliberately selects `ConsoleDiagnosticSink`
+from `../runtime` and shares it with admission/Gateway/staging. Local admin inspection stays separate.
+Candidate-table saturation is `candidate-capacity-reached`, without a fabricated attempts count.
+`stopped` describes Gateway stop completion; it does not assert root leases released or full quiescence.

@@ -103,14 +103,8 @@ interface TrustedDirectory {
 export class GatewayMessageRouter {
   constructor(private readonly deps: GatewayMessageRouterDeps) {}
 
-  async route(incoming: AdmittedMessage, egress: TurnEgress, logIncoming = true): Promise<string | undefined> {
-    const { chatId, text } = incoming;
-    if (logIncoming) {
-      console.log(
-        `[gateway] Message from ${chatId}: ${text.length} chars${incoming.mediaPath ? ', media attached' : ''}`,
-      );
-    }
-
+  async route(incoming: AdmittedMessage, egress: TurnEgress): Promise<string | undefined> {
+    const { text } = incoming;
     // S1 admission runs BEFORE anything else, including before the empty-message check, so a
     // request from a chat that is not the owner cannot consume a reply slot at all.
     const admission = this.deps.admission;

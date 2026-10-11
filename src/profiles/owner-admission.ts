@@ -426,8 +426,8 @@ export class OwnerAdmissionService {
     const isNewCandidate = candidate === undefined;
     if (isNewCandidate && attempts.chats.length >= PAIRING_MAX_CANDIDATE_CHATS) {
       // Saturation refuses rather than evicting, because eviction would reset live limits.
-      // Only an already-spent chat is silent; a new candidate receives the generic refusal.
-      return this.finish('refused', identity, undefined, 'daily-allowance-spent');
+      // This new chat has spent no attempts; only an already-spent chat is silent.
+      return this.finish('refused', identity, undefined, 'candidate-capacity-reached');
     }
 
     const now = this.deps.clock.now();

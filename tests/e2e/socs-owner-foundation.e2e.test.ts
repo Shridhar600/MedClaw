@@ -23,7 +23,7 @@ import { Gateway } from '../../src/gateway';
 import type { DiagnosticEvent, DiagnosticSink } from '../../src/ports/diagnostics';
 import type { LLMProvider, LLMResponse } from '../../src/providers/types';
 import type { IncomingMessage } from '../../src/channels/types';
-import { CryptoPairingCodePort, FileOwnerStatePort, DirectoryLease, FsMediaStager } from '../../src/runtime';
+import { CryptoPairingCodePort, FileOwnerStatePort, DirectoryLease, FsMediaStager, writeConfigDocument } from '../../src/runtime';
 import { InstallationService } from '../../src/runtime/installation';
 import { OwnerAdmissionService, asProfileId } from '../../src/profiles';
 import { PAIRING_MAX_CANDIDATE_CHATS, type TransportIdentity } from '../../src/ports/owner-state';
@@ -34,6 +34,15 @@ import { resolveOwnerPaths } from '../../src/profiles';
 import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 import type { Clock, PairingCodePort } from '../../src/ports';
 import { EMERGENCY_RESPONSE } from '../../src/safety/emergency-detector';
+
+// Only external readiness IO is replaced. Real provider completion uses the scripted provider.
+jest.mock('../../src/providers/healthcheck', () => ({
+  ...jest.requireActual('../../src/providers/healthcheck'),
+  checkSystemReadiness: async () => ({
+    providers: ['main provider', 'medical provider', 'embeddings provider'].map(label => ({ label, ready: true, checked: true, status: 'ok', details: [], warnings: [] })),
+    telegram: { label: 'telegram', ready: true, checked: true, status: 'ok', details: [], warnings: [] },
+  }),
+}));
 
 /** A scripted provider. Deterministic, in-process, and never touches the network. */
 class ScriptedProvider implements LLMProvider {
@@ -277,7 +286,7 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
     } finally { await daemon.shutdown(); }
   });
 
-  it('C06 R12 refuses a new saturated candidate without evicting limits, while spent chats stay silent', async () => {
+  it('C09 C06 R12 reports candidate capacity without evicting limits, while spent chats stay silent', async () => {
     expect((await setup()).code).toBe(0);
     const clock: Clock = { now: () => new Date('2026-10-09T09:00:00.000Z') };
     const codes = new CryptoPairingCodePort();
@@ -294,7 +303,8 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
     }
     const provider = new ScriptedProvider([textResponse('Noted.')]);
     let builds = 0;
-    const daemon = await bootDaemon(provider, undefined, undefined, {
+    const events: DiagnosticEvent[] = [];
+    const daemon = await bootDaemon(provider, { emit: event => { events.push(event); } }, undefined, {
       clock, codes, createProvider: () => { builds += 1; return provider; },
     });
     const sent: string[] = [];
@@ -331,6 +341,9 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
       expect(JSON.parse(fs.readFileSync(fixture.ownerRecord, 'utf8')).phase).toBe('bound');
       expect(builds).toBe(0);
       expect(provider.chatCalls).toHaveLength(0);
+      const overflow = events.filter(event => event.stage === 'pairing' && event.outcome === 'refused');
+      expect(overflow).toEqual([expect.objectContaining({ reason: 'candidate-capacity-reached' })]);
+      expect(overflow[0]).not.toHaveProperty('attempts');
     } finally { await daemon.shutdown(); }
   });
 
@@ -370,7 +383,7 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
     } finally { await daemon.shutdown(); }
   });
 
-  it('C06 R13 shares a held real owner construction and retries a failed promotion', async () => {
+  it('C09 C06 R13 shares a held real owner construction and reports failed promotion and retry once', async () => {
     expect((await setup()).code).toBe(0);
     const issued = await admissionFor().issueChallenge();
     if (issued.kind !== 'issued') throw new Error('challenge not issued');
@@ -380,7 +393,8 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
       modelName: 'held-external-io', chat: async () => textResponse('Noted.'),
       embed: async () => { embeddings += 1; if (embeddings === 1) { entered.release(); await gate.promise; } return new Array(768).fill(0); },
     };
-    const daemon = await bootDaemon(provider, undefined, undefined, {
+    const events: DiagnosticEvent[] = [];
+    const daemon = await bootDaemon(provider, { emit: event => { events.push(event); } }, undefined, {
       createProvider: () => { builds += 1; if (fail) { fail = false; throw new Error('synthetic provider construction failure'); } return provider; },
     });
     const replies: string[] = [];
@@ -405,8 +419,96 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
       const history = daemon.gateway.runtimeInstance!.sessions!.getHistory(OWNER_CHAT).filter(m => m.role === 'user');
       for (const text of ['I slept badly last night', 'I walked today']) expect(history.filter(m => m.content === text)).toHaveLength(1);
       expect(replies).toHaveLength(4); // Pair, failed-build refusal, and both eligible messages.
+      expect(events.filter(event => event.stage === 'start-stop' && 'operation' in event && event.operation === 'promotion')).toEqual([
+        expect.objectContaining({ outcome: 'failed', reason: 'build-failed' }),
+        expect.objectContaining({ outcome: 'started' }),
+      ]);
     } finally { gate.release(); await Promise.all([first, second]); await daemon.shutdown(); }
   });
+
+  it('C09 distinguishes a promotion blocked by real unsettled work and keeps settlement restart usable', async () => {
+    expect((await setup()).code).toBe(0);
+    const issued = await admissionFor().issueChallenge();
+    if (issued.kind !== 'issued') throw new Error('challenge fixture failed');
+    const unpaired = fs.readFileSync(fixture.ownerRecord);
+    const entered = heldEvent(), gate = heldEvent();
+    let hold = false, builds = 0;
+    const provider: LLMProvider = {
+      modelName: 'C09-held-reindex', chat: async () => textResponse('Noted.'),
+      embed: async () => { if (hold) { entered.release(); await gate.promise; } return new Array(768).fill(0); },
+    };
+    const events: DiagnosticEvent[] = [];
+    const daemon = await bootDaemon(provider, { emit: event => { events.push(event); } }, undefined, { createProvider: () => { builds += 1; return provider; } });
+    const send = (id: string, text: string): Promise<void> => daemon.gateway.deliverMessage(telegramMessage(OWNER_CHAT, OWNER_USER, id, text), async () => {});
+    let held: Promise<void> | undefined;
+    try {
+      await send('pair', issued.plaintext); await send('first', 'C09 initial narrative');
+      const runtime = daemon.gateway.runtimeInstance!;
+      await runtime.drainBackgroundOperations(); await runtime.writeQueue!.drain();
+      const binding = fs.readFileSync(fixture.ownerRecord);
+      hold = true; held = send('held', 'C09 pending narrative'); await entered.promise;
+      expect(runtime.getShutdownDisposition()).toBe('pending');
+      // Real file replacement fault re-enters pairing mode without hiding the old manager. No
+      // private field or fake pending result. Restore binding before the eligible promotion attempt.
+      fs.writeFileSync(fixture.ownerRecord, unpaired, { mode: 0o600 });
+      await daemon.gateway.start();
+      fs.writeFileSync(fixture.ownerRecord, binding, { mode: 0o600 });
+      events.length = 0; const before = builds;
+      await send('blocked', '/status');
+      expect(daemon.gateway.runtimeInstance).toBe(runtime);
+      expect(daemon.gateway.getShutdownDisposition()).toBe('pending');
+      expect(builds).toBe(before);
+      const refused = events.filter(event => event.stage === 'start-stop');
+      hold = false; gate.release(); await held;
+      await runtime.drainBackgroundOperations(); await runtime.writeQueue!.drain();
+      // Settle the old generation's real drain too. The C01 post-drain guard may otherwise
+      // truthfully refuse continuations created by that drain; it is not a build failure.
+      await runtime.drainAndClose();
+      for (let index = 0; index < 100 && daemon.gateway.getShutdownDisposition() === 'pending'; index += 1) {
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+      expect(daemon.gateway.getShutdownDisposition()).toBe('quiescent');
+      // Restart does not register itself on the retired runtime. Inbound retry after this
+      // synthetic record replacement self-registers there; that independent recovery gap is reported.
+      await daemon.gateway.start();
+      expect(daemon.gateway.servesPairingOnly).toBe(false);
+      expect(daemon.gateway.runtimeInstance).not.toBe(runtime);
+      expect(builds).toBe(before + 4);
+      expect(fs.readFileSync(fixture.ownerRecord)).toEqual(binding);
+      expect(refused).toEqual([expect.objectContaining({ operation: 'promotion', outcome: 'refused', reason: 'previous-work-unsettled' })]);
+      expect(events.filter(event => event.stage === 'start-stop')).toEqual([
+        expect.objectContaining({ operation: 'promotion', outcome: 'refused', reason: 'previous-work-unsettled' }),
+        expect.objectContaining({ operation: 'start', outcome: 'started' }),
+      ]);
+    } finally { hold = false; gate.release(); await held; await daemon.shutdown(); }
+  }, 120_000);
+
+  it('C09 reports a held promotion interrupted by shutdown as refused rather than started', async () => {
+    expect((await setup()).code).toBe(0);
+    const issued = await admissionFor().issueChallenge();
+    if (issued.kind !== 'issued') throw new Error('challenge fixture failed');
+    const entered = heldEvent(), gate = heldEvent();
+    const provider: LLMProvider = {
+      modelName: 'C09-held-build', chat: async () => textResponse('Noted.'),
+      embed: async () => { entered.release(); await gate.promise; return new Array(768).fill(0); },
+    };
+    const events: DiagnosticEvent[] = [];
+    const daemon = await bootDaemon(provider, { emit: event => { events.push(event); } });
+    let turn: Promise<void> | undefined;
+    try {
+      await daemon.gateway.deliverMessage(telegramMessage(OWNER_CHAT, OWNER_USER, 'pair', issued.plaintext), async () => {});
+      const binding = fs.readFileSync(fixture.ownerRecord);
+      turn = daemon.gateway.deliverMessage(telegramMessage(OWNER_CHAT, OWNER_USER, 'held', 'C09 shutdown narrative'), async () => {});
+      await entered.promise;
+      const stopping = daemon.shutdown(); gate.release(); await Promise.all([stopping, turn]);
+      expect(fs.readFileSync(fixture.ownerRecord)).toEqual(binding);
+      expect(fs.existsSync(fixture.workspaceLease)).toBe(false);
+      expect(events.filter(event => event.stage === 'start-stop' && event.operation === 'promotion')).toEqual([
+        expect.objectContaining({ outcome: 'refused', reason: 'shutdown-in-progress' }),
+      ]);
+      expect(events.filter(event => event.stage === 'start-stop' && event.operation === 'stop')).toHaveLength(1);
+    } finally { gate.release(); await turn; await daemon.shutdown(); }
+  }, 120_000);
 
   it('C06 R17 gives denied raw emergencies guidance with no construction, fetch or writes, preserving the owner emergency flow', async () => {
     expect((await setup()).code).toBe(0);
@@ -674,12 +776,8 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
     expect(fs.existsSync(fixture.workspaceLease)).toBe(false);
   }, 120_000);
 
-  it('reports useful outcomes through the closed diagnostic contract during a real boot', async () => {
-    // Why this earns its place: the contract is only worth having if the REAL composition root emits
-    // through it. A unit test on a hand-built sink cannot catch a wiring gap — an adapter that is never
-    // passed to `new Gateway(...)`, or an admission service built without it, emits nothing at all and
-    // every contract test still passes. This boots the real daemon, pairs the owner, serves a turn and
-    // stops, and asserts on what was actually emitted.
+  it('reports useful outcomes through an explicitly supplied diagnostic sink during a real boot', async () => {
+    // This protects the injectable contract. The default-root test below separately proves wiring.
     expect((await setup()).code).toBe(0);
 
     const events: DiagnosticEvent[] = [];
@@ -745,6 +843,100 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
       expect(Number.isFinite(event.durationMs)).toBe(true);
       expect(event.durationMs).toBeGreaterThanOrEqual(0);
     }
+  }, 120_000);
+
+  it.each([false, true])('C09 default daemon preserves the owner flow and private output with writer failure=%s', async (writerFails) => {
+    expect((await setup()).code).toBe(0);
+    const issued = await cli(['--config', fixture.configPath, 'pairing', 'issue']);
+    expect(issued.code).toBe(0);
+    const code = issued.output.match(/\b[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}\b/)?.[0];
+    if (!code) throw new Error('challenge fixture failed');
+    const stored = JSON.parse(fs.readFileSync(fixture.configPath, 'utf8'));
+    stored.providers.main.baseUrl = 'https://C09_bind_user:C09_bind_password@example.invalid/C09_bind_path?token=C09_bind_query';
+    expect(writeConfigDocument(fixture.configPath, stored).status).toBe('committed');
+    const captured: unknown[][] = [];
+    const spies = (['log', 'info', 'warn', 'error'] as const).map(method => jest.spyOn(console, method).mockImplementation((...args: unknown[]) => {
+      captured.push(args);
+      if (writerFails && method === 'info') throw new Error('C09_writer_error_secret');
+    }));
+    const provider = new ScriptedProvider([textResponse('Noted.')]);
+    let opens = 0;
+    const body = 'C09_media_body_secret';
+    const source: MediaSourcePort = { open: async ref => {
+      opens += 1;
+      if (ref.fileId === 'C09_bad_file_id') throw new Error('C09_source_error_secret');
+      return { chunks: (async function* (): AsyncGenerator<Uint8Array, void, unknown> { yield Buffer.from(body); })(), cancel: async () => {} };
+    } };
+    const boot = (): Promise<DaemonHandle> => startDaemon({ configPath: fixture.configPath, homeDir: root, externalIO: { createProvider: () => provider, mediaSource: source } });
+    const chat = 'C09_owner_identity', user = 'C09_owner_user';
+    const narrative = 'C09_health_secret I slept badly last night';
+    let daemon: DaemonHandle | undefined;
+    const send = async (message: IncomingMessage): Promise<string[]> => {
+      const replies: string[] = [];
+      await daemon!.gateway.deliverMessage(message, async text => { replies.push(text); });
+      return replies;
+    };
+    try {
+      daemon = await boot(); // No custom Gateway, admission or sink.
+      expect(daemon.gateway.servesPairingOnly).toBe(true);
+      expect(await send(telegramMessage(chat, user, 'C09_pair_event', code))).toEqual(['Pairing complete. This chat is now connected to the owner.']);
+      const binding = fs.readFileSync(fixture.ownerRecord);
+      const first = await send(telegramMessage(chat, user, 'C09_narrative_event', narrative));
+      expect(first).toHaveLength(1);
+      expect((await send(telegramMessage(chat, user, 'C09_skip_event', 'skip'))).join(' ')).toMatch(/skipped|onboarding/i);
+      expect((await send(telegramMessage(chat, user, 'C09_turn_event', 'C09_second_health_secret'))).join(' ')).toContain('Noted.');
+      const runtime = daemon.gateway.runtimeInstance!;
+      await runtime.drainBackgroundOperations(); await runtime.writeQueue!.drain();
+      expect(runtime.sessions!.getHistory(chat).filter(message => message.role === 'user' && message.content === narrative)).toHaveLength(1);
+      const memory = Object.entries(syntheticBytes(fixture.workspace)).filter(([file]) => file.startsWith('memory/') && file.endsWith('.md')).map(([, hex]) => Buffer.from(hex, 'hex').toString()).join('\n');
+      expect(memory).toContain(narrative);
+      for (const [id, suffix] of [['C09_good_file_id', 'good'], ['C09_bad_file_id', 'bad']]) {
+        const replies = await send({ ...telegramMessage(chat, user, `C09_media_${suffix}`, suffix === 'good' ? '/status' : 'C09_failed_media_health_secret'), media: { channel: 'telegram', fileId: id, kind: 'document', displayName: 'C09_media_name_secret.pdf' } });
+        expect(replies).toHaveLength(1);
+        if (suffix === 'bad') expect(replies[0]).toMatch(/Failed to retrieve/);
+      }
+      expect(opens).toBe(2);
+      const reports = path.join(fixture.workspace, 'reports');
+      expect(fs.readdirSync(reports).filter(file => fs.readFileSync(path.join(reports, file), 'utf8') === body)).toHaveLength(1);
+      await runtime.drainBackgroundOperations(); await runtime.writeQueue!.drain();
+      for (const message of [
+        telegramMessage('C09_stranger_identity', 'C09_stranger_user', 'C09_stranger_event', 'C09_stranger_text I cannot breathe'),
+        { ...telegramMessage('C09_group_identity', 'C09_group_user', 'C09_group_event', 'C09_group_text I cannot breathe'), chatType: 'group' as const },
+      ]) {
+        const before = syntheticBytes(fixture.workspace), calls = provider.chatCalls.length;
+        const untrusted = { ...message, mediaPath: path.join(root, 'C09_media_path_secret'), media: { channel: 'telegram', fileId: 'C09_denied_file_id', kind: 'document' as const } };
+        expect(await send(untrusted)).toEqual([EMERGENCY_RESPONSE]);
+        expect(syntheticBytes(fixture.workspace)).toEqual(before);
+        expect(provider.chatCalls).toHaveLength(calls); expect(opens).toBe(2);
+      }
+      expect(fs.readFileSync(fixture.ownerRecord)).toEqual(binding);
+      await daemon.shutdown(); daemon = undefined;
+      expect(fs.existsSync(fixture.workspaceLease)).toBe(false);
+      daemon = await boot();
+      expect(daemon.gateway.servesPairingOnly).toBe(false);
+      expect(daemon.gateway.runtimeInstance!.sessions!.getHistory(chat)).toContainEqual({ role: 'user', content: narrative });
+      expect(fs.readFileSync(fixture.ownerRecord)).toEqual(binding);
+      await daemon.shutdown(); daemon = undefined;
+      const output = JSON.stringify(captured);
+      for (const marker of [chat, user, code, root, narrative, 'C09_second_health_secret', 'C09_failed_media_health_secret', body, 'C09_media_name_secret', 'C09_media_path_secret', 'C09_source_error_secret', 'C09_writer_error_secret', 'C09_stranger', 'C09_group', 'C09_pair_event', 'C09_denied_file_id', 'C09_bind_', 'example.invalid']) expect(output).not.toContain(marker);
+      expect(output).toContain('main provider is not localhost');
+      const lines = captured.flat().filter((arg): arg is string => typeof arg === 'string' && arg.startsWith('[diagnostic]'));
+      for (const prefix of [
+        'stage=owner-admission outcome=pairing-only', 'stage=pairing outcome=paired',
+        'stage=start-stop operation=promotion outcome=started', 'stage=owner-admission outcome=admitted',
+        `stage=media-intake outcome=saved bytes=${Buffer.byteLength(body)}`,
+        'stage=media-intake outcome=refused reason=source-failed',
+        'stage=owner-admission outcome=refused reason=already-bound',
+        'stage=owner-admission outcome=refused reason=non-private-chat',
+      ]) expect(lines).toContainEqual(expect.stringContaining(`[diagnostic] ${prefix} `));
+      expect(lines.filter(line => line.includes('operation=start outcome=started'))).toHaveLength(2);
+      expect(lines.filter(line => line.includes('operation=promotion outcome=started'))).toHaveLength(1);
+      expect(lines.filter(line => line.includes('operation=stop outcome=stopped'))).toHaveLength(2);
+      for (const line of lines) {
+        expect(line).toMatch(/^\[diagnostic\] stage=[a-z-]+ (?:operation=(?:start|promotion|stop) )?outcome=[a-z-]+(?: reason=[a-z-]+)?(?: (?:attempts|bytes)=\d+)? durationMs=\d+(?:\.\d+)?$/);
+        expect(Number(line.split('durationMs=')[1])).toBeGreaterThanOrEqual(0);
+      }
+    } finally { await daemon?.shutdown(); spies.forEach(spy => spy.mockRestore()); }
   }, 120_000);
 
   it.each(['leaf', 'ancestor'])('C08 R15 refuses a static %s staging alias before source or filesystem effects', async (alias) => {

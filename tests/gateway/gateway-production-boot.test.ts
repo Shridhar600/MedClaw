@@ -114,6 +114,30 @@ describe('production boot composes owner authority', () => {
     }
   }, 120_000);
 
+  it('C09 default output reports pairing and stop without raw incoming identities', async () => {
+    const fixture = writeConfigFixture(root, { telegramEnabled: false });
+    const code = await seedUnpairedOwner(fixture);
+    const captured: unknown[][] = [];
+    const logs = ['log', 'info', 'warn', 'error'] as const;
+    const spies = logs.map(method => jest.spyOn(console, method).mockImplementation((...args: unknown[]) => { captured.push(args); }));
+    try {
+      const handle = await startDaemon({ homeDir: root, configPath: fixture.configPath });
+      try {
+        expect(await handle.gateway.handleTestMessage('C09_raw_identity', code, 'C09_event')).toMatch(/pairing complete/i);
+        expect(JSON.parse(fs.readFileSync(fixture.ownerRecord, 'utf8')).phase).toBe('bound');
+        expect(handle.gateway.runtimeInstance).toBeUndefined();
+      } finally { await handle.shutdown(); }
+      expect(fs.existsSync(fixture.workspaceLease)).toBe(false);
+      const output = JSON.stringify(captured);
+      expect(output).not.toContain('C09_raw_identity');
+      expect(output).not.toContain(code);
+      expect(output).not.toContain(fixture.ownerRecord);
+      expect(output).toContain('[diagnostic] stage=owner-admission outcome=pairing-only');
+      expect(output).toContain('[diagnostic] stage=pairing outcome=paired');
+      expect(output).toContain('[diagnostic] stage=start-stop operation=stop outcome=stopped');
+    } finally { spies.forEach(spy => spy.mockRestore()); }
+  }, 120_000);
+
   it('refuses to start at all when the owner record is missing, naming local setup guidance', async () => {
     // Config selects an owner; no record was ever committed. This is an interrupted setup, and the
     // daemon must refuse rather than serve as if it were a fresh install.

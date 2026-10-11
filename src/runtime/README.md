@@ -12,6 +12,11 @@ owner authority composition.
   `readConfigFile`, `writeConfigFile`, `canonicalizeConfigPath`, `ConfigFileSync`, `ConfigWriteOutcome`.
 - Owner authority: `composeOwnerAuthority`, `OwnerAuthority`, `OwnerAuthoritySource`.
 - Local composition edges: `DirectoryLease`, `FileOwnerStatePort`, `CryptoPairingCodePort`.
+- Daemon diagnostics: `ConsoleDiagnosticSink` implements `DiagnosticSink`. It writes one compact line
+  with closed stage/operation/outcome/reason and checked duration/counts. Unknown runtime vocabulary,
+  invalid numbers and writer failures degrade to silence. No buffering or filesystem/network IO.
+  Constructor accepts an optional line writer; its default uses `console.info`. The daemon selects
+  one instance and shares it with authority/Gateway/staging; reusable modules stay silent by default.
 - Media staging: `FsMediaStager`, `MediaStagerOptions` — injected source, explicit `trustedBaseDir`
   (selected owner workspace), lane and typed limits. Missing or unsafe authority refuses before IO.
 - Artifact namespace: `createMediaArtifactName`, `isMediaStagingArtifact`, `MEDIA_PARTIAL_SUFFIX`.
@@ -105,3 +110,5 @@ only their own temp. Ownership survives the descriptor close before rename. No t
 Copy `src/runtime/` plus `../ports`, `../profiles`, `../config` and the `../security` helpers it uses. The
 lease and ownership machinery is self-contained and filesystem-only; a different storage backend would
 supply its own `ResourceLeasePort` adapter and change nothing here.
+`ConsoleDiagnosticSink` can be extracted with `../ports` alone. It depends only on that public contract
+and its numeric limits; a different output backend supplies a line writer without policy changes.

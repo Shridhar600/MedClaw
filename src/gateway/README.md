@@ -62,9 +62,10 @@ address can activate against owner state.
 
 `Gateway` accepts an optional `DiagnosticSink` and guards it in its constructor. `emit` sits on the
 critical path of `start()` and of media intake, so an adapter that throws would be reachable from a
-stranger's message; the guard makes a throwing sink degrade to silence instead. Production supplies no
-sink for structured diagnostics — see `../ports/README.md`. Existing console output is separate;
-default-sink and raw-identity review remain C09 work.
+stranger's message; the guard makes a throwing sink degrade to silence instead. The daemon root supplies
+one `ConsoleDiagnosticSink` to authority/Gateway/staging. Direct constructors remain silent. Router has
+no raw incoming-message log. Start and promotion each emit one terminal result per attempt/flight,
+distinguished by closed `operation`; Gateway stop completion does not prove root ownership release.
 
 ## Boot-time sweep
 

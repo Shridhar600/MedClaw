@@ -21,3 +21,4 @@ export type { OwnerRecordFileSync } from './owner-state-file';
 export { CryptoPairingCodePort } from './pairing-code';
 export { FsMediaStager } from './media-stager';
 export type { MediaStagerOptions } from './media-stager';
+export { ConsoleDiagnosticSink } from './console-diagnostics';

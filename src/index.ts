@@ -4,6 +4,7 @@
 // rather than disappearing behind an import.
 import {
   InstallationService,
+  ConsoleDiagnosticSink,
   composeOwnerAuthority,
   describeOwnershipRefusal,
   effectiveConfigFor,
@@ -13,6 +14,7 @@ import {
 import type { InstallationOwnership } from './runtime';
 import { DirectoryLease, describeLeaseForLocalInspection } from './runtime/adapters/directory-lease';
 import { Gateway } from './gateway';
+import type { GatewayAdmissionDeps } from './gateway';
 import { TelegramMediaSource } from './channels';
 import { Bot } from 'grammy';
 import { summarizeErrorForLog } from './security';
@@ -93,6 +95,8 @@ export async function startDaemon(
     createGateway?: (config: Awaited<ReturnType<typeof loadRuntimeConfig>>) => Gateway;
     homeDir?: string;
     configPath?: string;
+    /** Substitute external provider/media IO while keeping normal authority/Gateway/diagnostics. */
+    externalIO?: Pick<GatewayAdmissionDeps, 'createProvider' | 'mediaSource'>;
   } = {},
 ): Promise<DaemonHandle> {
   const services = deps.services ?? new InstallationService(new DirectoryLease());
@@ -110,20 +114,23 @@ export async function startDaemon(
     // the production boot built a Gateway with no admission at all, so the S1 refusal policy and the
     // unpaired-only boot rule never ran on a real daemon: a stranger's first DM still auto-paired and
     // reached the owner's runtime. Plan 15 §5 requires the daemon root to gate its own build APIs.
-    const authority = composeOwnerAuthority(owned.ownership);
+    const diagnostics = new ConsoleDiagnosticSink();
+    const authority = composeOwnerAuthority(owned.ownership, diagnostics);
     // The media source is only ever consulted AFTER admission returns `owner` (see
     // `Gateway.admitAndStage`). Nothing in the transport calls it. It is built here, at the composition
     // root, because only composition knows the bot token.
-    const mediaSource = config.channels.telegram.enabled && config.channels.telegram.botToken
+    const mediaSource = deps.externalIO?.mediaSource ?? (config.channels.telegram.enabled && config.channels.telegram.botToken
       ? new TelegramMediaSource({
         token: config.channels.telegram.botToken,
         api: new Bot(config.channels.telegram.botToken).api,
       })
-      : undefined;
+      : undefined);
     const gateway = (deps.createGateway ?? ((c) => new Gateway(c, {
       admission: authority.admission,
       ownerId: authority.ownerId,
       mediaSource,
+      diagnostics,
+      createProvider: deps.externalIO?.createProvider,
     })))(config);
     await gateway.start();
 

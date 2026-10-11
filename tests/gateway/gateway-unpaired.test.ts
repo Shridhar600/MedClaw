@@ -15,6 +15,7 @@ import { CryptoPairingCodePort, FileOwnerStatePort } from '../../src/runtime/ada
 import { OwnerAdmissionService, asProfileId } from '../../src/profiles';
 import type { OwnerStatePort } from '../../src/ports/owner-state';
 import type { Clock } from '../../src/ports/clock';
+import type { DiagnosticEvent } from '../../src/ports/diagnostics';
 import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 import { writeConfigFixture } from '../helpers/config-fixture';
 
@@ -83,7 +84,7 @@ describe('unpaired daemon boot', () => {
     }
   }, 60_000);
 
-  it('refuses to boot at all when the owner record is missing, naming the reason', async () => {
+  it('C09 refuses a missing owner record with one terminal boot result', async () => {
     const fixture = writeConfigFixture(root, { telegramEnabled: false });
     // No record written at all.
     const store: OwnerStatePort = new FileOwnerStatePort(fixture.ownerRecord, fixture.ownerId);
@@ -96,9 +97,14 @@ describe('unpaired daemon boot', () => {
 
     const { loadRuntimeConfig } = await import('../../src/runtime/startup');
     const loaded = await loadRuntimeConfig({ configPath: fixture.configPath });
-    const gateway = new Gateway(loaded, { admission, ownerId: asProfileId(fixture.ownerId)! });
+    const events: DiagnosticEvent[] = [];
+    const gateway = new Gateway(loaded, { admission, ownerId: asProfileId(fixture.ownerId)!, diagnostics: { emit: event => { events.push(event); } } });
 
     await expect(gateway.start()).rejects.toThrow(/Refusing to serve.*unavailable.*Re-run setup/is);
+    expect(gateway.runtimeInstance).toBeUndefined();
+    expect(events.filter(event => event.stage === 'start-stop')).toEqual([
+      expect.objectContaining({ outcome: 'refused', reason: 'admission-refused' }),
+    ]);
   }, 60_000);
 
   it('refuses to boot when the record on disk belongs to another owner', async () => {
