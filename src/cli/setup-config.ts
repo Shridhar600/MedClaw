@@ -15,14 +15,10 @@
 
 import * as os from 'os';
 import * as path from 'path';
-import { getDefaultConfig } from '../config/config';
-import { LOCAL_OLLAMA_BASE_URL } from '../config/defaults';
-import { validateConfig } from '../config/validation';
-import { DirectoryLease } from '../runtime/adapters/directory-lease';
-import { InstallationService } from '../runtime/installation';
-import type { SetupResult } from '../runtime/installation';
-import { providerEnvVar } from '../config/provider-env';
-import type { EffectiveConfig, ProviderConfig } from '../config/types';
+import { getDefaultConfig, LOCAL_OLLAMA_BASE_URL, validateConfig, providerEnvVar } from '../config';
+import type { EffectiveConfig, ProviderConfig } from '../config';
+import { DirectoryLease, InstallationService } from '../runtime';
+import type { SetupResult } from '../runtime';
 import { OPENROUTER_DEFAULT_BASE_URL } from '../providers';
 import { asProfileId, OWNER_ID_PATTERN, resolveOwnerPaths } from '../profiles';
 import type { ProfileId } from '../profiles';
@@ -45,6 +41,8 @@ export interface ServiceOnboardingArgs {
   // defaults to on-device Ollama medgemma (privacy + health-specialized). Set
   // --medical-provider to opt into a cloud medical model.
   medicalProvider?: ProviderConfig['type'];
+  /** Medical role only; never inherited from the main key. */
+  medicalApiKey?: string;
   // R05 (plan 15 §2.4): embeddings are an INDEPENDENT selection. Defaults stay local Ollama even
   // when main is cloud; an explicit embedding provider/model/url/key overrides only this role.
   embeddingModel?: string;
@@ -185,7 +183,7 @@ function parseBoolean(token: string, value: string | undefined): boolean {
  *  - explicit provider, boolean and URL values are validated here, not at first use.
  *
  * Errors name the FIELD or the reason only. A supplied value is never echoed, because
- * `--api-key`, `--embedding-api-key` and `--telegram-token` are secret-bearing options.
+ * `--api-key`, `--medical-api-key`, `--embedding-api-key` and `--telegram-token` are secret-bearing options.
  */
 export function parseArgs(argv: string[]): ServiceOnboardingArgs {
   const args: ServiceOnboardingArgs = {};
@@ -246,6 +244,10 @@ export function parseArgs(argv: string[]): ServiceOnboardingArgs {
         break;
       case '--medical-provider':
         args.medicalProvider = parseProviderOption('--medical-provider', next);
+        index += 1;
+        break;
+      case '--medical-api-key':
+        args.medicalApiKey = requireOptionValue('--medical-api-key', next);
         index += 1;
         break;
       case '--embedding-provider':
@@ -321,6 +323,7 @@ export const ONBOARD_HELP_TEXT = [
   'Medical role (independent of main):',
   '  --medical-provider <ollama|openai|openrouter>',
   '  --medical-model <model>',
+  '  --medical-api-key <secret>  explicit key for the MEDICAL role only',
   '',
   'Embedding role (independent of main; defaults to local Ollama):',
   '  --embedding-provider <ollama|openai|openrouter>',
@@ -366,16 +369,7 @@ function buildProviderRole(options: {
   explicitBaseUrl?: string;
   /** The local-provider control (`--ollama-url`). Applies to local roles only. */
   ollamaUrl?: string;
-  /**
-   * Explicit key supplied for THIS role.
-   *
-   * Main and embeddings pass their OWN key only. The medical call site is the one exception and it
-   * is deliberate, inherited forka #11 behaviour: opting the medical model into a cloud provider
-   * reuses the operator's single `--api-key`. That is a real cross-provider key reuse (an OpenAI
-   * key can reach an OpenRouter medical endpoint) and it is NOT fixed by C04, which the brief
-   * requires to preserve the existing independent medical behaviour. Reported, not silently
-   * re-specified here.
-   */
+  /** Explicit key for THIS role. If absent, the adapter uses only this provider's environment. */
   explicitApiKey?: string;
   /** Model default for this role's provider. */
   defaultModel: string;
@@ -442,7 +436,7 @@ function applyProviders(
   const embeddingDefaults = modelDefaultsForProvider(embeddingType);
   const apiKey = args.apiKey?.trim() ? args.apiKey.trim() : undefined;
 
-  // OpenRouter has no SDK-default endpoint of its own — pin its router URL for MAIN only.
+  // OpenRouter has no SDK-default endpoint of its own; pin the selected role's router URL.
   config.providers.main = buildProviderRole({
     providerType,
     model: args.mainModel ?? mainDefaults.main,
@@ -470,10 +464,11 @@ function applyProviders(
   const medicalType = args.medicalProvider ?? 'ollama';
   config.providers.medical = buildProviderRole({
     providerType: medicalType,
-    model: args.medicalModel ?? defaultMedgemmaModel(),
+    model: args.medicalModel,
     ollamaUrl: args.ollamaUrl,
-    explicitApiKey: apiKey,
-    defaultModel: medicalType === 'ollama' ? defaultMedgemmaModel() : 'gpt-4o-mini',
+    explicitApiKey: args.medicalApiKey,
+    defaultModel: medicalType === 'ollama' ? defaultMedgemmaModel() : '',
+    pinsRouterEndpoint: medicalType === 'openrouter',
   });
 }
 
@@ -590,7 +585,9 @@ export function resolveNonInteractiveArgs(args: ServiceOnboardingArgs): ServiceO
     ownerId: values.ownerId,
     provider: values.providerType,
     mainModel: args.mainModel ?? providerDefaults.main,
-    medicalModel: args.medicalModel ?? providerDefaults.medical,
+    // A cloud medical model is an explicit user choice, not the local MedGemma default.
+    medicalModel: args.medicalModel ?? ((args.medicalProvider ?? 'ollama') === 'ollama' ? providerDefaults.medical : ''),
+    medicalApiKey: args.medicalApiKey?.trim() ? args.medicalApiKey.trim() : undefined,
     embeddingProvider: embeddingType,
     embeddingModel: args.embeddingModel ?? embeddingDefaults.embeddings,
     // An explicit embedding endpoint survives resolution untouched. `--ollama-url` stays the LOCAL
@@ -654,6 +651,8 @@ export function createInitialWizardState(args: ServiceOnboardingArgs): SetupWiza
         : defaults.providers.main.type,
     mainModel: resolved.mainModel ?? defaults.providers.main.model,
     medicalModel: resolved.medicalModel ?? defaults.providers.medical.model,
+    medicalProvider: resolved.medicalProvider ?? 'ollama',
+    medicalApiKey: resolved.medicalApiKey,
     // R05: seeded from the EMBEDDING role's own selection, defaulting to the local Ollama role.
     embeddingProvider:
       resolved.embeddingProvider && isSupportedOnboardingProvider(resolved.embeddingProvider)
@@ -675,22 +674,25 @@ export function collectSetupErrors(args: ServiceOnboardingArgs, config: Effectiv
   const values = resolveSetupValues(args);
   const errors: string[] = [];
 
+  if ((args.medicalProvider ?? 'ollama') !== 'ollama' && !config.providers.medical.model.trim()) {
+    errors.push('--medical-model is required for a cloud medical provider. Select a model supported by that provider.');
+  }
+
   // Per-role credential requirement. Each CLOUD role is satisfied by ITS OWN explicit key or ITS
-  // OWN provider's environment variable — never by the other role's key. R05 added the embedding
-  // role here; before it, only the main role was checked, so a cloud embedding role could be
-  // written with no key of its own.
+  // OWN provider's environment variable — never by the other role's explicit key.
   const embeddingType = resolveEmbeddingProvider(args);
-  const requiredCloudRoles: Array<{ label: string; type: ProviderConfig['type']; explicitKey?: string }> = [
-    { label: 'provider', type: values.providerType, explicitKey: args.apiKey },
-    { label: 'embedding provider', type: embeddingType, explicitKey: args.embeddingApiKey },
+  const requiredCloudRoles: Array<{ label: string; type: ProviderConfig['type']; explicitKey?: string; flag: string }> = [
+    { label: 'provider', type: values.providerType, explicitKey: args.apiKey, flag: 'api-key' },
+    { label: 'embedding provider', type: embeddingType, explicitKey: args.embeddingApiKey, flag: 'embedding-api-key' },
+    { label: 'medical provider', type: args.medicalProvider ?? 'ollama', explicitKey: args.medicalApiKey, flag: 'medical-api-key' },
   ];
   for (const role of requiredCloudRoles) {
     if (role.type === 'ollama') continue;
     if (role.explicitKey?.trim()) continue;
     if (process.env[requiredCloudEnv(role.type)]?.trim()) continue;
     errors.push(
-      `${requiredCloudEnv(role.type)} or --${role.label === 'provider' ? 'api-key' : 'embedding-api-key'}`
-      + ` is required for ${role.label} ${role.type}.`,
+      `${requiredCloudEnv(role.type)} or --${role.flag}`
+      + ` is required for ${role.label} ${isSupportedOnboardingProvider(role.type) ? role.type : '(unsupported)'}.`,
     );
   }
 

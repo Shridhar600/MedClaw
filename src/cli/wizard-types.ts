@@ -1,4 +1,4 @@
-import type { ProviderConfig } from '../config/types';
+import type { ProviderConfig } from '../config';
 
 export type SetupStepId =
   | 'environment'
@@ -33,6 +33,9 @@ export interface SetupWizardState {
   provider: ProviderConfig['type'];
   mainModel: string;
   medicalModel: string;
+  /** Explicit medical selection survives the wizard; absent means the local default. */
+  medicalProvider?: ProviderConfig['type'];
+  medicalApiKey?: string;
   /**
    * The EMBEDDING role's own selection (plan 15 §2.4). Independent of `provider`: a cloud main
    * provider must not silently move embeddings to cloud. Defaults to the local Ollama role.

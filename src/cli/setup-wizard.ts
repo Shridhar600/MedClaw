@@ -17,7 +17,7 @@ import {
   requiredCloudEnv,
 } from './setup-config';
 import { OPENROUTER_DEFAULT_BASE_URL } from '../providers';
-import { LOCAL_OLLAMA_BASE_URL } from '../config';
+import { LOCAL_OLLAMA_BASE_URL, validateConfig } from '../config';
 import {
   getMissingOllamaModels,
   verifyTelegramRuntime,
@@ -36,8 +36,8 @@ import {
 import type { SetupWizardState, CompletionAction, ReviewAction } from './wizard-types';
 import { checkSystemReadiness } from '../providers/healthcheck';
 import { probeOllamaCatalog } from '../providers/healthcheck';
-import { validateConfig } from '../config/validation';
-import type { EffectiveConfig, ProviderConfig } from '../config/types';
+import type { EffectiveConfig, ProviderConfig } from '../config';
+import type { ServiceOnboardingArgs } from './setup-config';
 import { listWorkspaceTemplateFiles } from '../workspace/bootstrap';
 import { resolveOwnerPaths } from '../profiles';
 
@@ -83,7 +83,7 @@ function validateWritablePath(targetPath: string, kind: 'state' | 'config'): str
   return errors;
 }
 
-function stateToArgs(state: SetupWizardState) {
+function stateToArgs(state: SetupWizardState): ServiceOnboardingArgs {
   return resolveNonInteractiveArgs({
     configPath: state.configPath,
     stateRoot: state.stateRoot,
@@ -91,6 +91,8 @@ function stateToArgs(state: SetupWizardState) {
     provider: state.provider,
     mainModel: state.mainModel,
     medicalModel: state.medicalModel,
+    medicalProvider: state.medicalProvider,
+    medicalApiKey: state.medicalApiKey,
     // The whole R05 round trip: provider, endpoint and key travel with the state, so an explicit
     // embedding selection survives resolution, build, serialization and reload. Before this,
     // `stateToArgs` carried only `embeddingModel`, and the role's provider/endpoint/key were lost
@@ -191,11 +193,10 @@ async function runProviderStep(io: CliIO, state: SetupWizardState): Promise<void
   if (state.provider !== previousProvider) {
     const defaults = modelDefaultsForProvider(state.provider);
     state.mainModel = defaults.main;
-    state.medicalModel = defaults.medical;
-    // The embedding role is deliberately NOT touched here. It has its own step.
+    state.apiKey = undefined;
+    // Medical and embedding selections are independent of a main-provider edit.
     if (state.provider === 'ollama') {
       state.ollamaUrl = state.ollamaUrl ?? LOCAL_OLLAMA_BASE_URL;
-      state.apiKey = undefined;
     } else {
       state.ollamaUrl = undefined;
     }
@@ -218,6 +219,20 @@ async function runProviderStep(io: CliIO, state: SetupWizardState): Promise<void
 
   state.mainModel = await askValue(io, 'Main model', state.mainModel);
   state.medicalModel = await askValue(io, 'Medical model', state.medicalModel);
+
+  const medicalProvider = state.medicalProvider ?? 'ollama';
+  if (medicalProvider !== 'ollama') {
+    const requiredEnv = requiredCloudEnv(medicalProvider);
+    if (!state.medicalApiKey?.trim() && process.env[requiredEnv]?.trim()) {
+      renderStatus(io, 'INFO', `Using ${requiredEnv} from the environment for medical.`);
+    } else {
+      for (;;) {
+        state.medicalApiKey = await askSecret(io, `${providerLabel(medicalProvider)} medical API key`, state.medicalApiKey ?? '');
+        if (state.medicalApiKey?.trim()) break;
+        renderStatus(io, 'WARN', `${requiredEnv} or a pasted medical API key is required.`);
+      }
+    }
+  }
 
   if (state.provider === 'ollama') {
     state.ollamaUrl = await askEndpointValue(
@@ -355,7 +370,8 @@ async function runEmbeddingStep(io: CliIO, state: SetupWizardState): Promise<voi
  * embedding model unconditionally, which after R05 is wrong: a cloud embedding role is not served
  * from the local Ollama endpoint, so reporting its model as "missing" here would be a false
  * warning. A local embedding role with a DIFFERENT explicit endpoint is skipped for the same
- * reason and gets its own truth from the review/apply path.
+ * reason and gets its own truth from the review/apply path. Medical is included only when local;
+ * a preserved cloud medical selection must never produce an Ollama pull instruction.
  */
 async function runProviderChecks(
   io: CliIO,
@@ -386,7 +402,10 @@ async function runProviderChecks(
 
   renderStatus(io, 'OK', 'Ollama reachable.');
   const mainUrl = state.ollamaUrl ?? LOCAL_OLLAMA_BASE_URL;
-  const modelsServedHere = [state.mainModel, state.medicalModel];
+  const modelsServedHere = [state.mainModel];
+  if ((state.medicalProvider ?? 'ollama') === 'ollama') {
+    modelsServedHere.push(state.medicalModel);
+  }
   if (
     state.embeddingProvider === 'ollama'
     && (state.embeddingUrl ?? state.ollamaUrl ?? LOCAL_OLLAMA_BASE_URL) === mainUrl
@@ -474,7 +493,9 @@ async function runReviewStep(
     { label: 'Workspace', value: review.config.memory.workspace },
     { label: 'Provider', value: review.config.providers.main.type },
     { label: 'Main model', value: review.config.providers.main.model },
+    { label: 'Medical provider', value: review.config.providers.medical.type },
     { label: 'Medical model', value: review.config.providers.medical.model },
+    { label: 'Medical key', value: review.config.providers.medical.apiKey ?? '', secret: true },
     // R05: the embedding role must be reviewable as its OWN selection. Showing only the model hid
     // the very thing that went wrong — a cloud chat provider quietly taking embeddings with it.
     { label: 'Embedding provider', value: review.config.providers.embeddings.type },

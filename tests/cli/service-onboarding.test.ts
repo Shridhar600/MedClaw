@@ -6,6 +6,9 @@ import { buildConfigFromArgs, modelDefaultsForProvider, SUPPORTED_ONBOARDING_PRO
 import { runServiceOnboarding, startDaemon } from '../../src/cli/service-onboarding';
 import { fixtureOwner } from '../helpers/test-config';
 import { makeTestTemp } from '../helpers/test-temp';
+import { observeProviderWire } from '../helpers/provider-wire';
+
+jest.mock('openai', () => jest.requireActual('../helpers/provider-wire').offlineOpenAIFactory());
 
 describe('service onboarding init', () => {
   let tmpDir: string;
@@ -433,17 +436,118 @@ describe('service onboarding init', () => {
     });
   });
 
+  it('M02 refuses an omitted cloud medical model before publication, then retries the same target with an explicit model', async () => {
+    for (const medical of ['openai', 'openrouter']) {
+      const target = path.join(tmpDir, `model-retry-${medical}`, 'config.json');
+      const output: string[] = [];
+      const io = {
+        stdout: (text: string): void => { output.push(text); }, stderr: (text: string): void => { output.push(text); },
+        input: async (): Promise<string> => { throw Error('Noninteractive refusal must not prompt'); },
+      };
+      const args = ['--yes', '--config', target, '--medical-provider', medical, '--medical-api-key', 'synthetic-own-key'];
+      expect(await runServiceOnboarding(args, io)).toBe(1);
+      expect(fs.existsSync(path.dirname(target))).toBe(false);
+      expect(output.join('')).toContain('--medical-model');
+      expect(output.join('')).not.toContain('synthetic-own-key');
+      expect(await runServiceOnboarding([...args, '--medical-model', 'synthetic/chosen-model'], io)).toBe(0);
+      const loaded = await loadRuntimeConfig({ configPath: target });
+      expect(loaded.providers.medical).toMatchObject({ type: medical, model: 'synthetic/chosen-model' });
+      expect(loaded.providers.main.type).toBe('ollama');
+      expect(loaded.providers.embeddings.type).toBe('ollama');
+      const wire = await observeProviderWire(loaded.providers.medical);
+      expect(wire.requests).toEqual([{
+        url: medical === 'openai' ? 'https://api.openai.com/v1/chat/completions' : 'https://openrouter.ai/api/v1/chat/completions',
+        authorization: 'Bearer synthetic-own-key', model: 'synthetic/chosen-model',
+      }]);
+      expect(wire.reply).toMatchObject({ type: 'text', text: 'Synthetic reply' });
+    }
+  });
+
+  it('M01 refuses missing medical credentials without writes, then retries using only the medical provider environment', async () => {
+    const before = { openai: process.env.OPENAI_API_KEY, router: process.env.OPENROUTER_API_KEY };
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    try {
+      for (const medical of ['openrouter', 'openai']) {
+        delete process.env.OPENAI_API_KEY;
+        delete process.env.OPENROUTER_API_KEY;
+        const output: string[] = [];
+        const io = { stdout: (text: string): void => { output.push(text); }, stderr: (text: string): void => { output.push(text); }, input: async (): Promise<string> => { throw Error('No prompts in noninteractive setup'); } };
+        const target = path.join(tmpDir, `medical-retry-${medical}`, 'config.json');
+        const args = ['--yes', '--config', target, '--provider', 'openai', '--api-key', 'synthetic-main-key', '--medical-provider', medical, '--medical-model', 'synthetic/medical', '--telegram-enabled', 'false'];
+        const inventory = fs.readdirSync(tmpDir);
+        expect(await runServiceOnboarding(args, io)).toBe(1);
+        expect(fs.readdirSync(tmpDir)).toEqual(inventory); // no structural parent, lease, record or config
+        expect(output.join('')).toContain('--medical-api-key');
+        expect(output.join('')).not.toContain('synthetic-main-key');
+        process.env[medical === 'openrouter' ? 'OPENROUTER_API_KEY' : 'OPENAI_API_KEY'] = 'synthetic-medical-env';
+        expect(await runServiceOnboarding(args, io)).toBe(0);
+        const loaded = await loadRuntimeConfig({ configPath: target });
+        expect(loaded.providers.main).toMatchObject({ type: 'openai', apiKey: 'synthetic-main-key' });
+        expect(loaded.providers.medical).toMatchObject({ type: medical, model: 'synthetic/medical' });
+        expect(loaded.providers.medical.apiKey).toBeUndefined(); // environment credential is not persisted
+        expect(loaded.providers.embeddings.type).toBe('ollama');
+        const wire = await observeProviderWire(loaded.providers.medical);
+        expect(wire.requests).toEqual([{ url: medical === 'openrouter' ? 'https://openrouter.ai/api/v1/chat/completions' : 'https://api.openai.com/v1/chat/completions', authorization: 'Bearer synthetic-medical-env', model: 'synthetic/medical' }]);
+        expect(wire.reply).toMatchObject({ type: 'text', text: 'Synthetic reply' });
+        expect(output.join('')).not.toContain('synthetic-medical-env');
+      }
+    } finally {
+      if (before.openai === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = before.openai;
+      if (before.router === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = before.router;
+    }
+  });
+
+  it('M01 publishes and reloads an explicit medical key without cross-role copying, with strict zero-write flag refusals', async () => {
+    const before = { openai: process.env.OPENAI_API_KEY, router: process.env.OPENROUTER_API_KEY };
+    process.env.OPENAI_API_KEY = 'synthetic-openai-env';
+    process.env.OPENROUTER_API_KEY = 'synthetic-router-env';
+    try {
+      for (const [main, medical] of [['openai', 'openrouter'], ['openrouter', 'openai'], ['openai', 'openai']]) {
+        const target = path.join(tmpDir, `${main}-${medical}`, 'config.json');
+        const output: string[] = [];
+        const io = { stdout: (text: string): void => { output.push(text); }, stderr: (text: string): void => { output.push(text); }, input: async (): Promise<string> => { throw Error('Unexpected prompt'); } };
+        const args = ['--yes', '--config', target, '--provider', main, '--api-key', 'synthetic-main-explicit', '--medical-provider', medical, '--medical-model', 'synthetic-medical-model', '--medical-api-key', '  synthetic-medical-explicit  ', '--telegram-enabled', 'false'];
+        expect(await runServiceOnboarding(args, io)).toBe(0);
+        const loaded = await loadRuntimeConfig({ configPath: target });
+        expect(loaded.providers.main.apiKey).toBe('synthetic-main-explicit');
+        expect(loaded.providers.medical).toMatchObject({ type: medical, model: 'synthetic-medical-model', apiKey: 'synthetic-medical-explicit' });
+        expect(loaded.providers.embeddings).toEqual({ type: 'ollama', model: 'embeddinggemma:latest', baseUrl: 'http://localhost:11434/v1' });
+        const wire = await observeProviderWire(loaded.providers.medical);
+        expect(wire.requests).toEqual([{ url: medical === 'openrouter' ? 'https://openrouter.ai/api/v1/chat/completions' : 'https://api.openai.com/v1/chat/completions', authorization: 'Bearer synthetic-medical-explicit', model: 'synthetic-medical-model' }]);
+        expect(wire.reply).toMatchObject({ type: 'text', text: 'Synthetic reply' });
+        expect(fs.statSync(target).mode & 0o777).toBe(0o600);
+        for (const marker of ['synthetic-main-explicit', 'synthetic-medical-explicit', 'synthetic-openai-env', 'synthetic-router-env']) expect(output.join('')).not.toContain(marker);
+      }
+      for (const value of [undefined, '', '   ', '--yes']) {
+        const output: string[] = [];
+        const target = path.join(tmpDir, 'refused-option', 'config.json');
+        const args = ['--config', target, '--medical-api-key', ...(value === undefined ? [] : [value])];
+        const inventory = fs.readdirSync(tmpDir);
+        expect(await runServiceOnboarding(args, { stdout: (text: string): void => { output.push(text); }, stderr: (text: string): void => { output.push(text); }, input: async (): Promise<string> => { throw Error('Parser refusal must not prompt'); } })).toBe(1);
+        expect(output.join('')).toContain('--medical-api-key');
+        expect(output.join('')).not.toContain('must not prompt');
+        expect(fs.readdirSync(tmpDir)).toEqual(inventory);
+      }
+    } finally {
+      if (before.openai === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = before.openai;
+      if (before.router === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = before.router;
+    }
+  });
+
   it('opt-out: --medical-provider routes the medical model to the cloud (forka #11)', () => {
     const config = buildConfigFromArgs({
       provider: 'openai',
       apiKey: 'sk-x',
       medicalProvider: 'openai',
+      // M01 migration: explicit role-owned credentials replace the rejected implicit main-key copy.
+      medicalApiKey: 'sk-medical',
       medicalModel: 'gpt-4o',
       configPath: '/tmp/forka11b/config.json',
     });
     expect(config.providers.medical.type).toBe('openai');
     expect(config.providers.medical.model).toBe('gpt-4o');
-    expect(config.providers.medical.apiKey).toBe('sk-x');
+    expect(config.providers.medical.apiKey).toBe('sk-medical');
   });
 
   it('uses cloud defaults for anthropic and google but medical stays on-device medgemma (forka #11)', () => {

@@ -12,6 +12,9 @@ import {
   startDaemon,
 } from '../../src/cli/service-onboarding';
 import { makeTestTemp } from '../helpers/test-temp';
+import { observeProviderWire } from '../helpers/provider-wire';
+
+jest.mock('openai', () => jest.requireActual('../helpers/provider-wire').offlineOpenAIFactory());
 
 describe('setup wizard', () => {
   let tmpDir: string;
@@ -170,7 +173,186 @@ describe('setup wizard', () => {
     expect(config.channels.telegram.botToken).toBe('123456:test-token');
   });
 
+  it('M02 uses only the newly selected main-provider credential after review edits, but preserves unchanged selection', async () => {
+    const before = { openai: process.env.OPENAI_API_KEY, router: process.env.OPENROUTER_API_KEY };
+    try {
+      for (const [from, to, source] of [
+        ['openai', 'openrouter', 'environment'], ['openrouter', 'openai', 'environment'],
+        ['openai', 'openrouter', 'hidden'], ['openrouter', 'openai', 'hidden'],
+        ['openai', 'openai', 'unchanged'],
+      ]) {
+        delete process.env.OPENAI_API_KEY;
+        delete process.env.OPENROUTER_API_KEY;
+        const ownKey = source === 'environment' ? 'synthetic-new-env' : 'synthetic-new-hidden';
+        if (source === 'environment') process.env[to === 'openai' ? 'OPENAI_API_KEY' : 'OPENROUTER_API_KEY'] = ownKey;
+        const target = path.join(tmpDir, `${from}-${to}-${source}`, 'config.json');
+        const output: string[] = [], prompts: string[] = [], secrets: string[] = [];
+        let selections = 0, reviews = 0;
+        expect(await runServiceOnboarding([
+          '--config', target, '--provider', from, '--api-key', 'synthetic-old-main',
+        ], {
+          stdout: (text: string): void => { output.push(text); }, stderr: (text: string): void => { output.push(text); },
+          input: async (prompt: string): Promise<string> => {
+            prompts.push(prompt);
+            if (prompts.length > 80) throw Error('M02 answer bound exceeded');
+            if (prompt.includes('Provider type\n')) return ++selections === 1 ? from : to;
+            if (prompt.includes('Review action\n')) return ++reviews === 1 ? 'provider' : 'apply';
+            return prompt.includes('Next action\n') ? 'exit' : '';
+          },
+          secretInput: async (prompt: string): Promise<string> => {
+            secrets.push(prompt);
+            if (secrets.length > 8) throw Error('M02 secret bound exceeded');
+            return selections === 1 || source === 'unchanged' ? '' : ownKey;
+          },
+        })).toBe(0);
+        expect(selections).toBe(2);
+        const loaded = await loadRuntimeConfig({ configPath: target });
+        const expectedKey = source === 'unchanged' ? 'synthetic-old-main' : ownKey;
+        expect(loaded.providers.main.type).toBe(to);
+        expect(loaded.providers.main.apiKey).toBe(source === 'environment' ? undefined : expectedKey);
+        const wire = await observeProviderWire(loaded.providers.main);
+        expect(wire.requests).toEqual([{
+          url: to === 'openai' ? 'https://api.openai.com/v1/chat/completions' : 'https://openrouter.ai/api/v1/chat/completions',
+          authorization: `Bearer ${expectedKey}`, model: loaded.providers.main.model,
+        }]);
+        expect(wire.reply).toMatchObject({ type: 'text', text: 'Synthetic reply' });
+        expect(loaded.providers.medical.type).toBe('ollama');
+        expect(loaded.providers.embeddings.type).toBe('ollama');
+        for (const key of ['synthetic-old-main', ownKey]) expect(output.join('') + prompts.join('') + secrets.join('')).not.toContain(key);
+      }
+    } finally {
+      if (before.openai === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = before.openai;
+      if (before.router === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = before.router;
+    }
+  });
+
+  it('M02 refuses a blank cloud medical model in review, then applies the explicitly selected model without a local default', async () => {
+    const target = path.join(tmpDir, 'medical-model-wizard', 'config.json');
+    const output: string[] = [], modelPrompts: string[] = [];
+    let reviews = 0, prompts = 0;
+    expect(await runServiceOnboarding([
+      '--config', target, '--provider', 'openai', '--api-key', 'synthetic-main',
+      '--medical-provider', 'openrouter', '--medical-api-key', 'synthetic-medical',
+    ], {
+      stdout: (text: string): void => { output.push(text); }, stderr: (text: string): void => { output.push(text); },
+      input: async (prompt: string): Promise<string> => {
+        if (++prompts > 80) throw Error('M02 model answer bound exceeded');
+        if (prompt.includes('Medical model\n')) {
+          modelPrompts.push(prompt);
+          return modelPrompts.length === 1 ? '' : 'synthetic/chosen-medical';
+        }
+        if (prompt.includes('Review action\n')) {
+          if (++reviews === 2) {
+            expect(fs.existsSync(path.dirname(target))).toBe(false);
+            return 'provider';
+          }
+          return 'apply';
+        }
+        return prompt.includes('Next action\n') ? 'exit' : '';
+      },
+      secretInput: async (): Promise<string> => '',
+    })).toBe(0);
+    expect(reviews).toBe(3);
+    expect(modelPrompts.length).toBe(2);
+    expect(modelPrompts[0]).not.toContain('medgemma');
+    const loaded = await loadRuntimeConfig({ configPath: target });
+    expect(loaded.providers.medical).toMatchObject({ type: 'openrouter', model: 'synthetic/chosen-medical', apiKey: 'synthetic-medical' });
+    expect((await observeProviderWire(loaded.providers.medical)).requests).toEqual([{
+      url: 'https://openrouter.ai/api/v1/chat/completions', authorization: 'Bearer synthetic-medical', model: 'synthetic/chosen-medical',
+    }]);
+    expect(output.join('')).toContain('--medical-model');
+    expect(output.join('')).not.toContain('synthetic-medical');
+  });
+
   // ── R05 through the INTERACTIVE path (brief §8B) ───────────────────────────────────────────
+
+  it('M01 preserves the medical role and its own credential through main-provider review edits and real apply/reload', async () => {
+    const before = { openai: process.env.OPENAI_API_KEY, router: process.env.OPENROUTER_API_KEY };
+    delete process.env.OPENAI_API_KEY;
+    try {
+      for (const source of ['environment', 'explicit', 'hidden-input']) {
+        if (source === 'environment') process.env.OPENROUTER_API_KEY = 'synthetic-medical-environment';
+        else delete process.env.OPENROUTER_API_KEY;
+        const target = path.join(tmpDir, source, 'config.json');
+        const output: string[] = [], prompts: string[] = [], secrets: string[] = [];
+        let providerSteps = 0, reviews = 0;
+        const args = ['--config', target, '--state-root', path.join(tmpDir, source, 'state'), '--provider', 'openai', '--api-key', 'synthetic-main-only', '--medical-provider', 'openrouter', '--medical-model', 'synthetic/medical', ...(source === 'explicit' ? ['--medical-api-key', 'synthetic-medical-explicit'] : [])];
+        const code = await runServiceOnboarding(args, {
+          stdout: (text: string): void => { output.push(text); }, stderr: (text: string): void => { output.push(text); },
+          input: async (prompt: string): Promise<string> => {
+            prompts.push(prompt);
+            if (prompts.length > 80) throw Error('Wizard exceeded bounded answer script');
+            if (prompt.includes('Provider type\n')) return ++providerSteps === 1 ? 'openai' : 'ollama';
+            if (prompt.includes('Review action\n')) return ++reviews === 1 ? 'provider' : 'apply';
+            if (prompt.includes('Next action\n')) return 'exit';
+            return '';
+          },
+          secretInput: async (prompt: string): Promise<string> => {
+            secrets.push(prompt);
+            if (secrets.length > 8) throw Error('Wizard exceeded bounded secret script');
+            return source === 'hidden-input' && prompt.includes('medical') ? 'synthetic-medical-hidden' : '';
+          },
+        });
+        expect(code).toBe(0);
+        expect(providerSteps).toBe(2);
+        const loaded = await loadRuntimeConfig({ configPath: target });
+        expect(loaded.providers.main.type).toBe('ollama');
+        expect(loaded.providers.main.apiKey).toBeUndefined();
+        expect(loaded.providers.medical).toMatchObject({ type: 'openrouter', model: 'synthetic/medical' });
+        const ownKey = source === 'environment' ? 'synthetic-medical-environment' : source === 'explicit' ? 'synthetic-medical-explicit' : 'synthetic-medical-hidden';
+        expect(loaded.providers.medical.apiKey).toBe(source === 'environment' ? undefined : ownKey);
+        expect(loaded.providers.embeddings.type).toBe('ollama');
+        const wire = await observeProviderWire(loaded.providers.medical);
+        expect(wire.requests).toEqual([{ url: 'https://openrouter.ai/api/v1/chat/completions', authorization: `Bearer ${ownKey}`, model: 'synthetic/medical' }]);
+        expect(wire.reply).toMatchObject({ type: 'text', text: 'Synthetic reply' });
+        const shown = output.join('') + prompts.join('') + secrets.join('');
+        expect(shown).not.toContain('synthetic-main-only');
+        expect(shown).not.toContain(ownKey);
+        expect(output.join('')).toContain('Medical provider');
+        if (source === 'hidden-input') expect(secrets.some(prompt => prompt.includes('medical'))).toBe(true);
+        if (source === 'environment') expect(secrets.some(prompt => prompt.includes('medical'))).toBe(false);
+      }
+    } finally {
+      if (before.openai === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = before.openai;
+      if (before.router === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = before.router;
+    }
+  });
+  it('M01 checks only local medical models in the real wizard catalog flow and cancels without publication', async () => {
+    for (const medical of ['openrouter', 'ollama']) {
+      const output: string[] = [], requests: string[] = [];
+      const target = path.join(tmpDir, `catalog-${medical}`, 'config.json');
+      const model = medical === 'ollama' ? 'synthetic-local-medical-missing' : 'synthetic/cloud-medical';
+      let prompts = 0;
+      const code = await runServiceOnboarding([
+        '--config', target, '--provider', 'ollama', '--main-model', 'synthetic-local-main',
+        '--medical-provider', medical, '--medical-model', model,
+        ...(medical === 'openrouter' ? ['--medical-api-key', 'synthetic-medical-key'] : []),
+      ], {
+        stdout: (text: string): void => { output.push(text); }, stderr: (text: string): void => { output.push(text); },
+        input: async (prompt: string): Promise<string> => {
+          if (++prompts > 40) throw Error('Catalog flow exceeded bounded script');
+          return prompt.includes('Review action\n') ? 'cancel' : '';
+        },
+        secretInput: async (): Promise<string> => '',
+      }, {
+        fetchImpl: async (url): Promise<Response> => {
+          requests.push(String(url));
+          if (!['http://localhost:11434/api/tags', 'http://localhost:11434/api/version'].includes(String(url))) throw Error('Unscripted catalog URL refused');
+          const body = String(url).endsWith('/api/version') ? { version: 'synthetic' } : { models: [{ name: 'synthetic-local-main' }, { name: 'embeddinggemma:latest' }] };
+          return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+        },
+      });
+      expect(code).toBe(0);
+      expect(requests.length).toBeGreaterThan(0);
+      expect(requests.every(url => ['http://localhost:11434/api/tags', 'http://localhost:11434/api/version'].includes(url))).toBe(true);
+      expect(output.join('')).toContain('Ollama reachable.');
+      if (medical === 'ollama') expect(output.join('')).toContain(`Missing Ollama model: ${model}. Run \`ollama pull ${model}\`.`);
+      else expect(output.join('')).not.toContain(`ollama pull ${model}`);
+      expect(output.join('')).not.toContain('synthetic-medical-key');
+      expect(output.join('')).toContain('Setup cancelled. No files were written.');
+      expect(fs.existsSync(path.dirname(target))).toBe(false);
+    }
+  });
   //
   // The noninteractive half is covered in tests/cli/service-onboarding.test.ts. These cases drive
   // the real wizard answer stream, through review, apply, the real writer and the real loader, so

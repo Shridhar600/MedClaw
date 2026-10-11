@@ -78,22 +78,25 @@ key. The relevant rules, enforced in one place (`buildProviderRole` in `setup-co
 
 - embeddings default to the **local Ollama** role even when main is cloud. They are not dragged
   along by the chat provider;
-- each cloud role uses its own explicit key, then that provider's own environment variable. Main and
-  embeddings never share a key. The one exception is the MEDICAL role: opting it into a cloud provider
-  reuses the operator's `--api-key` (inherited forka #11 behavior, preserved by this slice and
-  reported as a known cross-provider key reuse rather than fixed here);
+- each cloud role uses its own explicit key (`--api-key`, `--medical-api-key`, `--embedding-api-key`),
+  then that provider's own environment variable. No explicit key is copied between roles, even when
+  their provider types match. Missing cloud-role credentials refuse setup before publication;
 - `--ollama-url` is the LOCAL role control. It never becomes a cloud role's endpoint;
 - an explicit `--embedding-url` wins for the embedding role; otherwise a local embedding role uses
   `--ollama-url`/the local default and a cloud embedding role uses its own provider default;
-- OpenRouter's router endpoint is pinned for the MAIN and EMBEDDING roles when either selects
-  OpenRouter, because it has no SDK default of its own. The MEDICAL role does not pin it; the
-  adapter resolves the router URL itself at runtime, so a medical OpenRouter document simply omits
-  `baseUrl`.
+- OpenRouter's router endpoint is pinned for each role that selects it, because it has no SDK default
+  of its own. Other provider endpoints and the local medical default stay unchanged.
 
 The wizard has a separate **Embedding role** step and a separate "Edit embeddings" review action, so
 choosing embeddings is never a side effect of answering the chat-provider step. Changing the main
 provider does not touch the embedding role; changing the embedding provider drops the previous
-role's endpoint and key so nothing role-incompatible survives.
+role's endpoint and key so nothing role-incompatible survives. An explicit `--medical-provider` /
+`--medical-model` selection and `--medical-api-key` survive review/apply and main-provider edits.
+Cloud medical setup uses hidden key input if neither an own explicit key nor its provider environment
+is available. Its review shows the provider and masks the key; local medical adds no secret prompt.
+Changing the main provider discards its previous explicit key, including cloud-to-cloud edits; leaving
+the provider unchanged preserves it. Cloud medical setup requires an explicit `--medical-model` or
+wizard model answer. Missing selection refuses before publication; it never inherits local MedGemma.
 
 ## Public exports added
 
