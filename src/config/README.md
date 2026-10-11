@@ -31,6 +31,8 @@ so stores stay path-agnostic and no module re-derives a path.
   `parseConfigSetPath(input)`, `protectedSetReason(validatedPath)`, `formatConfigIssue(issue)`,
   `expandHomePath(value, homeDir)`.
 - `cloneStoredDefaults()`, `DEFAULT_STORED_CONFIG`, `DEFAULT_SESSION_WINDOW`.
+- `isCronValidationWorkBounded(input)` — pure resource preflight shared with scheduler registration/recovery;
+  it does not decide cron syntax or promise a future occurrence.
 
 **One rule set:** `decodeStoredConfig` (shape) and `semanticIssues` (cross-field) are the only
 validators. `validateConfig` runs the same semantic rules so the wizard, `config set` and the
@@ -41,7 +43,7 @@ Protection and mutation consume the same validated segments. Protected fields in
 and descendants: replacing `sessions` cannot change a retired reset setting indirectly. Declared
 nonidentity descendants remain writable. The full decoder still refuses unknown fields/invalid values.
 
-Heartbeat default cron first passes a private resource preflight: at most1024 UTF16 input units and
+Heartbeat default cron first passes the shared resource preflight: at most1024 UTF16 input units and
 512 reserved range values across five/six fields. It matches installed name/wildcard normalization,
 checks overlapping range endpoints within field domains and reserves the full domain per hyphen.
 This bounds conversion before installed `node-cron.validate` decides semantics. Normal names, lists,

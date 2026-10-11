@@ -13,6 +13,7 @@ import { findMostRecentMissedRun } from './recovery';
 import { determineRetryAction } from './retry-policy';
 import { HeartbeatStore } from './store';
 import { summarizeErrorForLog } from '../security';
+import { isCronValidationWorkBounded } from '../config';
 
 type HeartbeatTrigger = (job: HeartbeatJob) => Promise<void>;
 
@@ -302,8 +303,8 @@ export class HeartbeatScheduler {
   }
 
   private validateCron(expression: string): void {
-    if (!cron.validate(expression)) {
-      throw new Error(`Invalid cron: ${expression}`);
+    if (!isCronValidationWorkBounded(expression) || !cron.validate(expression)) {
+      throw new Error('Invalid cron: unsupported expression or validation resource limit exceeded.');
     }
   }
 

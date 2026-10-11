@@ -1,4 +1,5 @@
 import type { HeartbeatJob } from './types';
+import { isCronValidationWorkBounded } from '../config';
 
 // `node-cron` ships its matcher as CommonJS-only internal code. Reusing it keeps
 // recovery aligned with the same cron interpretation used by the live scheduler.
@@ -23,6 +24,10 @@ export function findMostRecentMissedRun(
   if (!job.enabled || input.windowMinutes <= 0 || job.deliveryState !== 'ready') {
     return undefined;
   }
+
+  // A failed startup disable can leave an unsafe record enabled on disk. TimeMatcher
+  // expands before validating too; do not rely on registration to have filtered it.
+  if (!isCronValidationWorkBounded(job.cron)) return undefined;
 
   const matcher = new TimeMatcher(job.cron, job.timezone);
   const latestCandidate = new Date(toMinute(input.now).getTime() - (60 * 1000));
