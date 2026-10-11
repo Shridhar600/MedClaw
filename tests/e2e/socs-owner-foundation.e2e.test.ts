@@ -23,11 +23,11 @@ import { Gateway } from '../../src/gateway';
 import type { DiagnosticEvent, DiagnosticSink } from '../../src/ports/diagnostics';
 import type { LLMProvider, LLMResponse } from '../../src/providers/types';
 import type { IncomingMessage } from '../../src/channels/types';
-import { CryptoPairingCodePort, FileOwnerStatePort, DirectoryLease } from '../../src/runtime/adapters';
+import { CryptoPairingCodePort, FileOwnerStatePort, DirectoryLease, FsMediaStager } from '../../src/runtime';
 import { InstallationService } from '../../src/runtime/installation';
 import { OwnerAdmissionService, asProfileId } from '../../src/profiles';
 import { PAIRING_MAX_CANDIDATE_CHATS, type TransportIdentity } from '../../src/ports/owner-state';
-import type { MediaSourcePort } from '../../src/ports/media-source';
+import type { MediaSourcePort, MediaStageResult } from '../../src/ports/media-source';
 import { systemClock } from '../../src/ports/defaults';
 import { loadRuntimeConfig } from '../../src/runtime/startup';
 import { resolveOwnerPaths } from '../../src/profiles';
@@ -747,6 +747,74 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
     }
   }, 120_000);
 
+  it.each(['leaf', 'ancestor'])('C08 R15 refuses a static %s staging alias before source or filesystem effects', async (alias) => {
+    expect((await setup()).code).toBe(0);
+    const issued = await admissionFor().issueChallenge();
+    if (issued.kind !== 'issued') throw new Error('challenge fixture failed');
+    await admissionFor().handlePairing(identityFor(OWNER_CHAT, OWNER_USER, 'alias-pair'), issued.plaintext);
+    const binding = fs.readFileSync(fixture.ownerRecord);
+    const events: DiagnosticEvent[] = [];
+    let opens = 0;
+    const mediaSource: MediaSourcePort = {
+      open: async () => {
+        opens += 1;
+        return { chunks: (async function* (): AsyncGenerator<Uint8Array, void, unknown> { yield Buffer.from('C08 synthetic upload'); })(), cancel: async (): Promise<void> => {} };
+      },
+    };
+    const daemon = await bootDaemon(new ScriptedProvider([textResponse('Noted.')]), { emit: event => { events.push(event); } }, mediaSource);
+    const state = path.join(fixture.workspace, '.state');
+    const staging = path.join(state, 'media-staging');
+    const outside = path.join(root, 'synthetic-outside');
+    fs.mkdirSync(outside, { mode: 0o700 });
+    const relocatedState = path.join(outside, 'state');
+    if (alias === 'ancestor') {
+      fs.renameSync(state, relocatedState);
+      fs.symlinkSync(relocatedState, state, 'dir');
+    }
+    const target = alias === 'ancestor' ? path.join(relocatedState, 'media-staging') : path.join(outside, 'media-staging');
+    fs.mkdirSync(target, { mode: 0o700 });
+    fs.chmodSync(target, 0o750); // Synthetic permission sentinel, intentionally wider.
+    const sentinel = path.join(target, 'sentinel.txt');
+    fs.writeFileSync(sentinel, 'outside sentinel', { mode: 0o600 });
+    if (alias === 'leaf') fs.symlinkSync(target, staging, 'dir');
+    const snapshot = (): { names: string[]; mode: number; sentinel: string } => ({ names: fs.readdirSync(target).sort(), mode: fs.statSync(target).mode & 0o777, sentinel: fs.readFileSync(sentinel, 'utf8') });
+    const before = snapshot();
+    const message = { ...telegramMessage(OWNER_CHAT, OWNER_USER, 'alias-media', '/status'), media: { channel: 'telegram', fileId: 'synthetic-alias', kind: 'document' as const, displayName: 'report.pdf' } };
+    try {
+      await daemon.gateway.deliverMessage(message, async () => {});
+      const after = snapshot();
+      const refusedOpens = opens;
+      const intake = events.filter(event => event.stage === 'media-intake');
+      console.info(JSON.stringify({ case: `C08-R15-${alias}`, sourceOpens: refusedOpens, outsideAdded: after.names.length - before.names.length, beforeMode: before.mode, afterMode: after.mode, sentinelUnchanged: after.sentinel === before.sentinel }));
+      // Restore the synthetic alias before the same-fixture write-capable positive control.
+      if (alias === 'leaf') fs.unlinkSync(staging);
+      else {
+        fs.unlinkSync(state);
+        fs.renameSync(relocatedState, state);
+        // The outside sentinel lane is fixture data, not the supported upload lane.
+        fs.renameSync(staging, path.join(outside, 'preserved-lane'));
+      }
+      await daemon.gateway.deliverMessage({ ...message, eventId: 'telegram:owner-chat:allowed-media' }, async () => {});
+      const reports = path.join(fixture.workspace, 'reports');
+      const saved = fs.readdirSync(reports).filter(name => fs.readFileSync(path.join(reports, name), 'utf8') === 'C08 synthetic upload');
+      expect(saved).toHaveLength(1);
+      expect(fs.statSync(path.join(reports, saved[0])).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(staging).mode & 0o777).toBe(0o700);
+      expect(opens).toBe(refusedOpens + 1);
+      expect(events).toContainEqual(expect.objectContaining({ stage: 'media-intake', outcome: 'saved' }));
+      expect(fs.readFileSync(fixture.ownerRecord)).toEqual(binding);
+      expect(after).toEqual(before);
+      expect(refusedOpens).toBe(0);
+      expect(intake).toEqual([expect.objectContaining({ outcome: 'refused', reason: 'source-failed' })]);
+      const textReplies: string[] = [];
+      await daemon.gateway.deliverMessage(telegramMessage(OWNER_CHAT, OWNER_USER, 'after-alias-text', 'hello'), async text => { textReplies.push(text); });
+      expect(textReplies.join(' ')).not.toMatch(/temporarily unavailable/i);
+    } finally {
+      if (fs.lstatSync(state).isSymbolicLink()) { fs.unlinkSync(state); fs.renameSync(relocatedState, state); }
+      await daemon.shutdown();
+    }
+  }, 120_000);
+
   it('S1-R-01: a restart sweeps the owner\'s crash-left staging and touches nothing else', async () => {
     // ── Why this shape ──────────────────────────────────────────────────────────────────
     // Plan 15 §8 requires this proof in the REAL installation/Telegram E2E, not a helper test, because
@@ -764,6 +832,25 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
     expect(await admissionFor().handlePairing(identityFor(OWNER_CHAT, OWNER_USER, 'bind-1'), pairingCode))
       .toMatchObject({ kind: 'paired' });
 
+    // First real owned boot adopts bytes, then releases both leases. Seed interruption fixtures only
+    // between clean stops; this is restart evidence, not a hard-crash simulation.
+    const first = await bootDaemon(new ScriptedProvider([textResponse('first boot')]), undefined, {
+      open: async () => ({ chunks: (async function* (): AsyncGenerator<Uint8Array, void, unknown> { yield Buffer.from('adopted before restart'); })(), cancel: async (): Promise<void> => {} }),
+    });
+    let previouslyAdopted = '';
+    try {
+      expect(first.kind).toBe('owned');
+      expect(fs.existsSync(fixture.workspaceLease)).toBe(true);
+      await first.gateway.deliverMessage({ ...telegramMessage(OWNER_CHAT, OWNER_USER, 'before-restart-media', '/status'),
+        media: { channel: 'telegram', fileId: 'synthetic-before-restart', kind: 'document', displayName: 'earlier.pdf' } }, async () => {});
+      const reports = path.join(fixture.workspace, 'reports');
+      const adopted = fs.readdirSync(reports).filter(name => fs.readFileSync(path.join(reports, name), 'utf8') === 'adopted before restart');
+      expect(adopted).toHaveLength(1);
+      previouslyAdopted = path.join(reports, adopted[0]);
+      expect(fs.statSync(previouslyAdopted).mode & 0o777).toBe(0o600);
+    } finally { await first.shutdown(); }
+    expect(fs.existsSync(fixture.workspaceLease)).toBe(false);
+
     // ── The selected owner's staging lane, plus sentinels everywhere else ───────────────
     const ownerStaging = resolveOwnerPaths(fixture.baseDir, asProfileId(fixture.ownerId)!).mediaStaging;
     // A SECONDARY owner's lane: a different identity must never share a staging directory, and a
@@ -771,16 +858,24 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
     const secondaryStaging = resolveOwnerPaths(fixture.baseDir, 'secondary-owner' as never).mediaStaging;
 
     // Artifacts the sweep is expected to remove: an unadopted final name and an in-progress partial.
-    const orphanUnadopted = path.join(ownerStaging, 'orphan-report.pdf');
-    const orphanPartial = path.join(ownerStaging, 'interrupted-upload.pdf.part');
+    const orphanSource: MediaSourcePort = {
+      open: async () => ({ chunks: (async function* (): AsyncGenerator<Uint8Array, void, unknown> { yield Buffer.from('staged bytes never adopted'); })(), cancel: async (): Promise<void> => {} }),
+    };
+    const orphanStager = new FsMediaStager(orphanSource, ownerStaging, { trustedBaseDir: fixture.workspace });
+    const stageOrphan = (): Promise<MediaStageResult> => orphanStager.stage({ channel: 'telegram', fileId: 'synthetic-orphan', kind: 'document', displayName: 'orphan.pdf' }, new AbortController().signal);
+    const firstOrphan = await stageOrphan();
+    const secondOrphan = await stageOrphan();
+    if (firstOrphan.kind !== 'saved' || secondOrphan.kind !== 'saved') throw new Error('orphan fixture did not stage');
+    const orphanUnadopted = firstOrphan.absolutePath;
+    const orphanPartial = `${secondOrphan.absolutePath}.part`;
+    fs.renameSync(secondOrphan.absolutePath, orphanPartial);
+    fs.writeFileSync(orphanPartial, 'partial bytes', { mode: 0o600 });
     // An ADOPTED report: already handed to the clinical pipeline, so it must survive untouched.
     const adoptedReport = path.join(fixture.workspace, 'reports', '2026-10-02-sleep.md');
 
     fs.mkdirSync(ownerStaging, { recursive: true, mode: 0o700 });
     fs.mkdirSync(path.dirname(adoptedReport), { recursive: true, mode: 0o700 });
     fs.mkdirSync(secondaryStaging, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(orphanUnadopted, 'staged bytes never adopted', { mode: 0o600 });
-    fs.writeFileSync(orphanPartial, 'partial bytes', { mode: 0o600 });
     fs.writeFileSync(adoptedReport, '# Sleep log\n\nSlept badly.\n', { mode: 0o600 });
 
     // Sentinels OUTSIDE the swept lane.
@@ -790,6 +885,20 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
     fs.writeFileSync(outsideSibling, 'not media', { mode: 0o600 });
     fs.writeFileSync(secondaryOrphan, 'a real second owner\'s staged media', { mode: 0o600 });
     fs.writeFileSync(outsideWorkspace, 'unrelated state', { mode: 0o600 });
+    const unrelated = path.join(ownerStaging, 'unrelated.txt');
+    const lookalike = path.join(ownerStaging, 'medclaw-media-not-a-uuid-upload.pdf.part');
+    const linkArtifact = await stageOrphan();
+    const directoryArtifact = await stageOrphan();
+    if (linkArtifact.kind !== 'saved' || directoryArtifact.kind !== 'saved') throw new Error('preserved fixture did not stage');
+    const link = linkArtifact.absolutePath;
+    const directory = directoryArtifact.absolutePath;
+    fs.unlinkSync(link);
+    fs.unlinkSync(directory);
+    fs.writeFileSync(unrelated, 'in-lane sentinel', { mode: 0o600 });
+    fs.writeFileSync(lookalike, 'lookalike partial', { mode: 0o600 });
+    fs.symlinkSync(outsideWorkspace, link);
+    fs.mkdirSync(directory, { mode: 0o700 });
+    const bindingBefore = fs.readFileSync(fixture.ownerRecord);
 
     // ── Restart through PRODUCTION boot composition ────────────────────────────────────
     const provider = new ScriptedProvider([textResponse('Noted.'), textResponse('Got it.')]);
@@ -807,13 +916,24 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
     const daemon = await bootDaemon(provider, undefined, mediaSource);
     try {
       expect(daemon.kind).toBe('owned');
+      expect(fs.existsSync(fixture.workspaceLease)).toBe(true);
+      expect(daemon.gateway.stagingCleanupResult).toEqual({ kind: 'complete', inspected: 6, removed: 2 });
 
       // The selected owner's crash-left artifacts are gone.
       expect(fs.existsSync(orphanUnadopted)).toBe(false);
       expect(fs.existsSync(orphanPartial)).toBe(false);
+      expect(fs.existsSync(unrelated)).toBe(true);
+      expect(fs.readFileSync(unrelated, 'utf8')).toBe('in-lane sentinel');
+      expect(fs.readFileSync(lookalike, 'utf8')).toBe('lookalike partial');
+      expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+      expect(fs.readlinkSync(link)).toBe(outsideWorkspace);
+      expect(fs.lstatSync(directory).isDirectory()).toBe(true);
+      expect(fs.readFileSync(fixture.ownerRecord)).toEqual(bindingBefore);
 
       // The adopted report is untouched.
       expect(fs.readFileSync(adoptedReport, 'utf8')).toBe('# Sleep log\n\nSlept badly.\n');
+      expect(fs.readFileSync(previouslyAdopted, 'utf8')).toBe('adopted before restart');
+      expect(fs.statSync(previouslyAdopted).mode & 0o777).toBe(0o600);
 
       // Every sentinel outside the lane is untouched — including a second owner's staging, which is
       // the sharpest test that the sweep did not widen its paths.
@@ -846,15 +966,16 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
       );
       expect(mediaReplies.join('\n')).not.toMatch(/temporarily unavailable/i);
       // The owner's media was staged AND ADOPTED after this boot's sweep. Adoption MOVES the file out
-      // of staging into the owner's reports directory, so staging being empty afterwards is correct —
-      // the evidence that intake still works is that our bytes arrived there. Asserting on a lingering
-      // staging file would have tested the wrong thing and passed for the wrong reason.
+      // of staging into reports. Unrelated staging entries remain; the upload evidence is adopted bytes.
       const reportsDir = path.join(fixture.workspace, 'reports');
       const adopted = fs.readdirSync(reportsDir).filter((name) => {
         const full = path.join(reportsDir, name);
         return fs.statSync(full).isFile() && fs.readFileSync(full, 'utf8').includes('post-sweep owner media');
       });
       expect(adopted.length).toBeGreaterThan(0);
+      for (const name of adopted) expect(fs.statSync(path.join(reportsDir, name)).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(ownerStaging).mode & 0o777).toBe(0o700);
+      expect(fs.readFileSync(fixture.ownerRecord)).toEqual(bindingBefore);
       // …and a second owner's in-flight media was still not disturbed by our intake.
       expect(fs.existsSync(secondaryOrphan)).toBe(true);
     } finally {

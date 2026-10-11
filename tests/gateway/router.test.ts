@@ -10,7 +10,8 @@ import type { EffectiveConfig } from '../../src/config/types';
 import type { AdmittedMessage } from '../../src/channels/types';
 import type { ProfileRuntime } from '../../src/gateway/runtime';
 import type { ProfileId } from '../../src/profiles/types';
-import { GatewayMessageRouter, sweepStagedMedia } from '../../src/gateway/router';
+import { GatewayMessageRouter, sweepStagedMedia } from '../../src/gateway';
+import { stageMediaFixture } from '../helpers/media-artifact-fixture';
 import { bindOwnerFixture, TEST_OWNER_CHAT } from '../helpers/owner-authority-fixture';
 import type { OwnerAdmissionService } from '../../src/profiles';
 import { TurnQueueFullError } from '../../src/gateway/turn-coordinator';
@@ -316,7 +317,7 @@ describe('GatewayMessageRouter media lifecycle', () => {
     fs.writeFileSync(orphan, 'orphan', { mode: 0o600 });
     fs.symlinkSync(realStaging, staging);
 
-    sweepStagedMedia(staging);
+    sweepStagedMedia(staging, root);
 
     expect(fs.existsSync(orphan)).toBe(true);
   });
@@ -378,12 +379,11 @@ describe('GatewayMessageRouter media lifecycle', () => {
     expect(fs.existsSync(stagedPath)).toBe(false);
   });
 
-  it('sweeps orphaned staged files at boot', () => {
-    const orphan = path.join(staging, 'orphan.bin');
+  it('sweeps orphaned staged files at boot', async () => {
     fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(orphan, 'orphan', { mode: 0o600 });
+    const orphan = await stageMediaFixture(root, staging, 'orphan');
 
-    sweepStagedMedia(staging);
+    expect(sweepStagedMedia(staging, root)).toEqual({ kind: 'complete', inspected: 1, removed: 1 });
 
     expect(fs.existsSync(orphan)).toBe(false);
   });

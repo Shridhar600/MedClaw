@@ -19,7 +19,11 @@ import { createMemoryTools } from '../../src/tools/memory-tools';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import type { LLMProvider } from '../../src/providers/types';
 import type { Tool } from '../../src/tools/types';
-import { sweepStagedMedia } from '../../src/gateway/router';
+import { Gateway } from '../../src/gateway';
+import { composeOwnerAuthority, loadRuntimeConfig } from '../../src/runtime';
+import { asProfileId } from '../../src/profiles';
+import { writeConfigFixture } from '../helpers/config-fixture';
+import { stageMediaFixture } from '../helpers/media-artifact-fixture';
 import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 
 const PHI = 'glucose-PHI-marker-142857';
@@ -174,40 +178,44 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
   });
 
   // ── destructive fs op on owner data logs a sanitized frame, never the PHI-bearing error.
-  it('staged-media sweep unlink failure logs a sanitized frame, never the PHI-bearing fs error', () => {
+  it('staged-media unlink failure reaches the real boot consumer with only closed fields', async () => {
     // OLD -> NEW. This drove `ProfileRegistry.deleteProfile`, which renamed a PHI subtree to `.trash` and
     // logged through `summarizeErrorForLog` when the rename failed. The registry is deleted. The INVARIANT
     // is not: a destructive filesystem operation on owner data must never put the underlying error — which
     // carries a path and whatever the OS appended — into a log line.
     //
-    // The surviving analogue is the boot sweep of the owner's staging lane (`sweepStagedMedia`), which
-    // unlinks owner-scoped files and logs the same sanitized frame on failure. Same boundary, same
-    // `summarizeErrorForLog`, and it is the one that actually runs on a real boot.
+    // The surviving analogue is real boot cleanup. The consumer reports closed fields, so even a
+    // filename-bearing filesystem error never reaches operator output.
     const errorSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const fsReal = jest.requireActual<typeof import('fs')>('fs');
     // Workspace-local (gitignored `.test-tmp/`), never `os.tmpdir()` — `os.tmpdir()` is a symlink on
     // macOS, which routes the sweep down its symlink branch instead of the unlink path under test.
     const staging = makeTestTemp('phi-staging');
+    const fixture = writeConfigFixture(staging);
+    const authority = composeOwnerAuthority({ ownerId: asProfileId(fixture.ownerId)!, ownerPaths: { ownerRecord: fixture.ownerRecord } });
+    await authority.admission.initialize();
+    const artifact = await stageMediaFixture(fixture.workspace, fixture.mediaStaging, 'data');
+    const gateway = new Gateway(await loadRuntimeConfig({ configPath: fixture.configPath }), authority);
     try {
-      fs.writeFileSync(path.join(staging, 'orphan.pdf'), 'data');
       const unlinkSpy = jest.spyOn(fsReal, 'unlinkSync').mockImplementation(() => {
         throw new Error(`unlink fs failure: ${PHI}`);
       });
 
-      // One-argument form: the sweep resolves the lane itself, which is how production calls it.
-      sweepStagedMedia(staging);
+      await gateway.start();
       unlinkSpy.mockRestore();
 
       const warnText = errorSpy.mock.calls.flat().map(String).join('\n');
       // The PHI marker and the raw message never appear…
       expect(warnText).not.toContain(PHI);
       expect(warnText).not.toContain('unlink fs failure');
-      // …but the operator still learns what failed and where, which is the point of a sanitized frame.
-      expect(warnText).toContain('sweep');
-      expect(warnText).toContain('Error');
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(warnText).toBe('[gateway] Media staging cleanup partial: reason=io-failed inspected=1 removed=0');
+      expect(gateway.stagingCleanupResult).toEqual({ kind: 'partial', reason: 'io-failed', inspected: 1, removed: 0 });
+      expect(fs.readFileSync(artifact, 'utf8')).toBe('data');
       // …and no filesystem path leaked either: the frame names the code location, not the owner's tree.
       expect(warnText).not.toContain(staging);
     } finally {
+      await gateway.stop();
       removeTestTemp(staging);
       errorSpy.mockRestore();
     }

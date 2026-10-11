@@ -100,44 +100,6 @@ interface TrustedDirectory {
   real: string;
 }
 
-/** Remove files left in the profile-agnostic media staging lane after a crash. */
-export function sweepStagedMedia(stagingDir: string, stagingBaseDir?: string): void {
-  try {
-    const root = trustedDirectory(stagingDir, stagingBaseDir);
-    if (!root) return;
-    secureMkdir(root.lexical);
-    const entries = fs.readdirSync(root.real);
-    for (const entry of entries) {
-      let candidate: string;
-      try {
-        candidate = resolveContainedPath(root.real, entry);
-      } catch (error) {
-        // A symlink is safe to unlink as a link, but never follow it.
-        const raw = path.join(root.real, entry);
-        try {
-          if (fs.lstatSync(raw).isSymbolicLink()) fs.unlinkSync(raw);
-        } catch (unlinkError) {
-          console.warn('[gateway] Failed to sweep staged media entry:', summarizeErrorForLog(unlinkError));
-        }
-        if (!(error instanceof PathContainmentError)) {
-          console.warn('[gateway] Failed to inspect staged media entry:', summarizeErrorForLog(error));
-        }
-        continue;
-      }
-      try {
-        const stat = fs.lstatSync(candidate);
-        if (stat.isFile() || stat.isSymbolicLink()) {
-          fs.unlinkSync(candidate);
-        }
-      } catch (error) {
-        console.warn('[gateway] Failed to sweep staged media entry:', summarizeErrorForLog(error));
-      }
-    }
-  } catch (error) {
-    console.warn('[gateway] Media staging sweep failed; continuing:', summarizeErrorForLog(error));
-  }
-}
-
 export class GatewayMessageRouter {
   constructor(private readonly deps: GatewayMessageRouterDeps) {}
 

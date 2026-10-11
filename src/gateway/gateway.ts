@@ -25,7 +25,8 @@ import {
 } from '../security';
 import { ProfileRuntime } from './runtime';
 import { ProfileRuntimeManager } from './manager';
-import { GatewayMessageRouter, sweepStagedMedia, transportIdentityOf } from './router';
+import { GatewayMessageRouter, transportIdentityOf } from './router';
+import { sweepStagedMedia, type MediaSweepResult } from './media-sweep';
 import { FsMediaStager } from '../runtime';
 import type { MediaSourcePort } from '../ports/media-source';
 import type { DiagnosticEvent, DiagnosticSink } from '../ports/diagnostics';
@@ -217,8 +218,9 @@ export class Gateway {
   private mediaIntake = new AbortController();
   /** In-flight unpaired -> bound promotion, so concurrent messages cannot both build a runtime. */
   private pairingTransition?: Promise<void>;
-  /** Boot cleanup runs once per process; see `sweepOwnerStagingLane`. */
-  private bootSwept = false;
+  /** An attempt is not successful completion. Never retry during promotion or live intake. */
+  private bootSweepAttempted = false;
+  private bootSweepResult?: MediaSweepResult;
   /**
    * One media stager per Gateway. Its active/waiting counters implement the intake concurrency bound,
    * so it must NOT be rebuilt per message — see `mediaStager()`.
@@ -242,6 +244,11 @@ export class Gateway {
 
   get runtimeInstance(): ProfileRuntime | undefined {
     return this.runtime;
+  }
+
+  /** Actual boot cleanup outcome, including bounded partial/unavailable disposition. */
+  get stagingCleanupResult(): MediaSweepResult | undefined {
+    return this.bootSweepResult ? { ...this.bootSweepResult } : undefined;
   }
 
   /** Test/diagnostic seam (mirrors `runtimeInstance`): the manager owning every built profile's
@@ -435,23 +442,18 @@ export class Gateway {
    * answered with the canned "profile temporarily unavailable" until the operator restarted. The
    * restart was never documented anywhere.
    */
-  /**
-   * Remove this owner's crash-left media staging contents, once per process, at boot.
-   *
-   * Split out from `startServing` so the single call site and the "boot only" rule are visible
-   * together, and so `bootSwept` can make a second sweep impossible even if a future caller is
-   * added by mistake. The sweep deletes every entry in the owner's own lane, so running it while
-   * intake is live would destroy a real upload — the invariant `tests/gateway/gateway-boot-sweep.test.ts`
-   * protects.
-   */
+  /** Attempt once before intake. Failure preserves authority and never triggers a promotion retry. */
   private sweepOwnerStagingLane(): void {
-    if (this.bootSwept) return;
-    this.bootSwept = true;
+    if (this.bootSweepAttempted) return;
+    this.bootSweepAttempted = true;
     const ownerStaging = this.mediaStagingDir();
-    // Scoped to THIS owner's lane and swept only while this process owns the installation, so a
-    // crash-left orphan cannot be cleaned up by — or clean up over — another owner. Bounded
-    // iteration inside; never a global or recursive scan, and never a symlink traversal.
-    if (ownerStaging) sweepStagedMedia(ownerStaging, this.ownerStagingBase());
+    const result: MediaSweepResult = ownerStaging
+      ? sweepStagedMedia(ownerStaging, this.ownerStagingBase())
+      : { kind: 'unavailable', inspected: 0, removed: 0, reason: 'invalid-root' };
+    this.bootSweepResult = result;
+    if (result.kind !== 'complete') {
+      console.warn(`[gateway] Media staging cleanup ${result.kind}: reason=${result.reason} inspected=${result.inspected} removed=${result.removed}`);
+    }
   }
 
   /**
@@ -1638,6 +1640,7 @@ export class Gateway {
     const stagingDir = this.mediaStagingDir();
     if (!this.mediaSource || !stagingDir) return undefined;
     this.mediaStagerCache ??= new FsMediaStager(this.mediaSource, stagingDir, {
+      trustedBaseDir: this.ownerStagingBase(),
       diagnostics: this.sink,
     });
     return this.mediaStagerCache;

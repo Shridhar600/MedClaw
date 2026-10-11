@@ -29,7 +29,9 @@ export type { BuildRuntimeFor } from './manager';
 export { ProfileRuntime } from './runtime';
 export type { ProfileRuntimeDeps } from './runtime';
 
-export { GatewayMessageRouter, sweepStagedMedia, transportIdentityOf } from './router';
+export { GatewayMessageRouter, transportIdentityOf } from './router';
+export { sweepStagedMedia, MEDIA_SWEEP_ENTRY_LIMIT } from './media-sweep';
+export type { MediaSweepResult } from './media-sweep';
 export type { GatewayMessageRouterDeps } from './router';
 
 export { TurnCoordinator, TurnQueueFullError, heartbeatTurnId } from './turn-coordinator';

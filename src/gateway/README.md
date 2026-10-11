@@ -6,7 +6,9 @@ through a channel, is admitted, becomes a turn, and reaches the owner's runtime 
 **Public API (`index.ts` — the only import surface):**
 - `Gateway`, `GatewayAdmissionDeps` — process-level composition: the admission gate, owner `OwnerPaths`,
   provider construction, the media stager, start/stop, quiescence reporting.
-- `GatewayMessageRouter`, `GatewayMessageRouterDeps`, `transportIdentityOf`, `sweepStagedMedia`.
+- `GatewayMessageRouter`, `GatewayMessageRouterDeps`, `transportIdentityOf`.
+- `sweepStagedMedia`, `MediaSweepResult`, `MEDIA_SWEEP_ENTRY_LIMIT`; actual consumer outcome is available
+  as `Gateway.stagingCleanupResult`.
 - `ProfileRuntime`, `ProfileRuntimeDeps`, `ProfileRuntimeManager`, `BuildRuntimeFor`.
   `ProfileRuntime.getShutdownDisposition()` reports `'pending'` while any continuation that can touch
   owner resources is still unsettled — including a `drainAndClose()` phase abandoned at the shared
@@ -61,14 +63,24 @@ address can activate against owner state.
 `Gateway` accepts an optional `DiagnosticSink` and guards it in its constructor. `emit` sits on the
 critical path of `start()` and of media intake, so an adapter that throws would be reachable from a
 stranger's message; the guard makes a throwing sink degrade to silence instead. Production supplies no
-sink and therefore prints nothing — see `../ports/README.md`.
+sink for structured diagnostics — see `../ports/README.md`. Existing console output is separate;
+default-sink and raw-identity review remain C09 work.
 
 ## Boot-time sweep
 
 `sweepStagedMedia` is exported because boot must call it, and boot is the only safe moment: after the
 workspace lease is acquired (so it cannot delete a live contender's media) and before intake is
-accepted. It uses bounded directory iteration, never a recursive or global scan, and never follows a
-symlink. Accepted as S1-R-01; proven through the real installation E2E.
+accepted, including unpaired boot. One attempt visits at most256 entries through a directory handle;
+unrelated files, directories and links consume that budget. It removes only regular files in the shared
+`medclaw-media-`/UUIDv4 namespace (including `.part`), preserving all links and other content. A safe
+missing lane completes with zero work and creates nothing.
+
+`complete`, `partial` and `unavailable` report actual inspected/removed counts. Reaching the cap without
+observed EOF is partial. IO/close failures cannot complete. Gateway retains the actual result and emits
+at most one closed-field warning for an incomplete attempt. It never retries during promotion or live
+intake; a fresh Gateway boot can revisit leftovers. Cleanup does not erase authority or block owner text.
+This bounds userland work, not IO elapsed time, and provides static containment rather than atomic
+protection against hostile same-UID replacement races. Clinical inbox retention is separate.
 
 ## Extraction notes
 

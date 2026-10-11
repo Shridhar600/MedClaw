@@ -13,6 +13,7 @@
 
 import * as fs from 'fs';
 import fsModule from 'fs';
+import crypto from 'crypto';
 import * as path from 'path';
 import { getEventListeners } from 'events';
 
@@ -108,7 +109,7 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
 
   it('streams an upload to a unique 0600 file and reports the real byte count', async () => {
     const { source } = streamingSource(300 * 1024);
-    const stager = new FsMediaStager(source, staging);
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root });
 
     const result = await stager.stage(reference(), new AbortController().signal);
 
@@ -123,7 +124,7 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
 
   it('never lets a transport-supplied name become a path', async () => {
     const { source } = streamingSource(1024, 1024);
-    const stager = new FsMediaStager(source, staging);
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root });
 
     const result = await stager.stage(
       reference({ displayName: '../../../../etc/passwd' }),
@@ -138,9 +139,79 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
     expect(path.basename(result.absolutePath)).not.toContain('..');
   });
 
+  it.each(['missing-authority', 'outside', 'non-directory'] as const)('refuses %s before source or filesystem effects, then stages a valid upload', async (shape) => {
+    const stream = streamingSource(32, 8);
+    const outside = path.join(root, 'outside');
+    fs.mkdirSync(outside, { mode: 0o750 });
+    fs.chmodSync(outside, 0o750); // Synthetic outside permission fixture.
+    const sentinel = path.join(outside, 'sentinel');
+    fs.writeFileSync(sentinel, 'outside bytes', { mode: 0o600 });
+    const trusted = path.join(root, 'owner');
+    fs.mkdirSync(trusted, { mode: 0o700 });
+    const lane = shape === 'outside' ? path.join(outside, 'media-staging') : path.join(trusted, '.state', 'media-staging');
+    if (shape === 'non-directory') fs.writeFileSync(path.join(trusted, '.state'), 'component bytes', { mode: 0o600 });
+    const stager = new FsMediaStager(stream.source, lane, { trustedBaseDir: shape === 'missing-authority' ? undefined : trusted });
+    const refused = await stager.stage(reference(), new AbortController().signal);
+    const beforeControlOpens = stream.opens;
+    const outsideEntries = fs.readdirSync(outside);
+    const outsideMode = fs.statSync(outside).mode & 0o777;
+    expect(fs.readFileSync(sentinel, 'utf8')).toBe('outside bytes');
+    expect(fs.existsSync(lane)).toBe(false);
+    if (shape === 'non-directory') expect(fs.readFileSync(path.join(trusted, '.state'), 'utf8')).toBe('component bytes');
+    const allowed = await new FsMediaStager(stream.source, path.join(trusted, 'safe', 'media-staging'), { trustedBaseDir: trusted })
+      .stage(reference(), new AbortController().signal);
+    expect(allowed.kind).toBe('saved');
+    if (allowed.kind !== 'saved') throw new Error('positive control refused');
+    expect(fs.readFileSync(allowed.absolutePath)).toEqual(Buffer.alloc(32, 65));
+    expect(fs.statSync(allowed.absolutePath).mode & 0o777).toBe(0o600);
+    expect(fs.statSync(path.dirname(allowed.absolutePath)).mode & 0o777).toBe(0o700);
+    expect(beforeControlOpens).toBe(0);
+    expect(outsideEntries).toEqual(['sentinel']);
+    expect(outsideMode).toBe(0o750);
+    expect(refused).toEqual({ kind: 'refused', reason: 'source-failed' });
+  });
+
+  it('rechecks an alias installed during asynchronous source open before any write, then retries the same lane', async () => {
+    const entered = deferred<void>();
+    const opening = deferred<OpenedMedia>();
+    const stream = streamingSource(32, 8);
+    let opens = 0;
+    let cancels = 0;
+    const source: MediaSourcePort = { open: async (ref, signal) => {
+      if (++opens === 1) { entered.resolve(); return opening.promise; }
+      return stream.source.open(ref, signal);
+    } };
+    const outside = path.join(root, 'outside');
+    fs.mkdirSync(outside, { mode: 0o750 });
+    fs.chmodSync(outside, 0o750); // Synthetic outside permission fixture.
+    fs.writeFileSync(path.join(outside, 'sentinel'), 'outside bytes', { mode: 0o600 });
+    fs.mkdirSync(path.dirname(staging), { recursive: true, mode: 0o700 });
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root });
+    const pending = stager.stage(reference(), new AbortController().signal);
+    await entered.promise;
+    fs.symlinkSync(outside, staging);
+    opening.resolve({ chunks: (async function* (): AsyncGenerator<Uint8Array, void, unknown> { yield Buffer.from('refused bytes'); })(), cancel: async () => { cancels += 1; } });
+    const result = await pending;
+    const entries = fs.readdirSync(outside);
+    const mode = fs.statSync(outside).mode & 0o777;
+    fs.unlinkSync(staging);
+    const allowed = await stager.stage(reference(), new AbortController().signal);
+    expect(allowed.kind).toBe('saved');
+    if (allowed.kind !== 'saved') throw new Error('positive control refused');
+    expect(fs.readFileSync(allowed.absolutePath)).toEqual(Buffer.alloc(32, 65));
+    expect(fs.statSync(allowed.absolutePath).mode & 0o777).toBe(0o600);
+    expect(fs.statSync(staging).mode & 0o777).toBe(0o700);
+    expect(opens).toBe(2);
+    expect(cancels).toBe(1);
+    expect(fs.readFileSync(path.join(outside, 'sentinel'), 'utf8')).toBe('outside bytes');
+    expect(entries).toEqual(['sentinel']);
+    expect(mode).toBe(0o750);
+    expect(result).toEqual({ kind: 'refused', reason: 'source-failed' });
+  });
+
   it('refuses an advertised oversize upload without opening a stream at all', async () => {
     const { source, opens } = streamingSource(1024);
-    const stager = new FsMediaStager(source, staging, {
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root,
       limits: { maxFileBytes: 1024, intakeTimeoutMs: 5_000, maxActive: 1, maxWaiting: 4 },
     });
 
@@ -157,7 +228,7 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
   it('refuses an upload that lies about its size, once the real bytes exceed the cap', async () => {
     // The advertised size claims 100 bytes; the stream is 50 KiB. A trusted claim would pass this.
     const { source } = streamingSource(50 * 1024, 4096);
-    const stager = new FsMediaStager(source, staging, {
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root,
       limits: { maxFileBytes: 8 * 1024, intakeTimeoutMs: 5_000, maxActive: 1, maxWaiting: 4 },
     });
 
@@ -173,7 +244,7 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
 
   it('refuses an empty stream rather than handing a zero-byte file onward', async () => {
     const { source } = streamingSource(0);
-    const stager = new FsMediaStager(source, staging);
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root });
 
     expect(await stager.stage(reference(), new AbortController().signal)).toEqual({
       kind: 'refused',
@@ -184,7 +255,7 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
 
   it('refuses a media kind it does not admit', async () => {
     const { source, opens } = streamingSource(1024);
-    const stager = new FsMediaStager(source, staging);
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root });
 
     const unsupported = await stager.stage(
       { ...reference(), kind: 'video' as unknown as MediaReference['kind'] },
@@ -199,7 +270,7 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
 
   it('refuses a queued upload when the waiting room is full, before opening a stream', async () => {
     const blocker = blockingSource();
-    const stager = new FsMediaStager(blocker.source, staging, {
+    const stager = new FsMediaStager(blocker.source, staging, { trustedBaseDir: root,
       limits: { maxFileBytes: 1024, intakeTimeoutMs: 60_000, maxActive: 1, maxWaiting: 1 },
     });
 
@@ -224,7 +295,7 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
     // queue-drain shape. The stager never rejects here, and this is the regression guard for the
     // sibling case below: it must keep passing after the fix.
     const blocker = blockingSource();
-    const stager = new FsMediaStager(blocker.source, staging, {
+    const stager = new FsMediaStager(blocker.source, staging, { trustedBaseDir: root,
       limits: { maxFileBytes: 1024, intakeTimeoutMs: 40, maxActive: 1, maxWaiting: 2 },
     });
 
@@ -264,7 +335,7 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
         throw new Error('unreachable');
       },
     };
-    const stager = new FsMediaStager(wedged, staging, {
+    const stager = new FsMediaStager(wedged, staging, { trustedBaseDir: root,
       limits: { maxFileBytes: 1024, intakeTimeoutMs: 40, maxActive: 1, maxWaiting: 2 },
     });
 
@@ -306,7 +377,7 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
     // This matters in production because `Gateway.stop()` aborts the intake controller — so every
     // queued attempt in flight at shutdown took this path, and the rejection escaped `stage()`.
     const blocker = blockingSource();
-    const stager = new FsMediaStager(blocker.source, staging, {
+    const stager = new FsMediaStager(blocker.source, staging, { trustedBaseDir: root,
       limits: { maxFileBytes: 1024, intakeTimeoutMs: 60_000, maxActive: 1, maxWaiting: 2 },
     });
 
@@ -331,7 +402,7 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
 
   it('cannot write a file when the intake wait expires mid-stream', async () => {
     const blocker = blockingSource();
-    const stager = new FsMediaStager(blocker.source, staging, {
+    const stager = new FsMediaStager(blocker.source, staging, { trustedBaseDir: root,
       limits: { maxFileBytes: 1024, intakeTimeoutMs: 40, maxActive: 1, maxWaiting: 1 },
     });
 
@@ -345,7 +416,7 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
 
   it('cannot write a file when the caller aborts intake', async () => {
     const blocker = blockingSource();
-    const stager = new FsMediaStager(blocker.source, staging, {
+    const stager = new FsMediaStager(blocker.source, staging, { trustedBaseDir: root,
       limits: { maxFileBytes: 1024, intakeTimeoutMs: 60_000, maxActive: 1, maxWaiting: 1 },
     });
 
@@ -380,7 +451,7 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
         };
       },
     };
-    const stager = new FsMediaStager(slowSource, staging, {
+    const stager = new FsMediaStager(slowSource, staging, { trustedBaseDir: root,
       limits: { maxFileBytes: 1024, intakeTimeoutMs: 30, maxActive: 1, maxWaiting: 1 },
     });
 
@@ -406,7 +477,7 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
     const sibling = path.join(staging, 'earlier-operation-report.pdf');
     fs.writeFileSync(sibling, 'kept', { mode: 0o600 });
 
-    const stager = new FsMediaStager(slowSource, staging, {
+    const stager = new FsMediaStager(slowSource, staging, { trustedBaseDir: root,
       limits: { maxFileBytes: 8, intakeTimeoutMs: 5_000, maxActive: 1, maxWaiting: 1 },
     });
     const result = await stager.stage(reference(), new AbortController().signal);
@@ -416,10 +487,38 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
     expect(fs.readFileSync(sibling, 'utf8')).toBe('kept');
   });
 
+  it.each(['partial', 'final'] as const)('a refused exclusive %s collision preserves earlier bytes and allows a later upload', async (shape) => {
+    const stream = streamingSource(32, 8);
+    const stager = new FsMediaStager(stream.source, staging, { trustedBaseDir: root });
+    const identity = jest.spyOn(crypto, 'randomUUID').mockReturnValue('12345678-1234-4234-8234-123456789abc');
+    try {
+      const first = await stager.stage(reference(), new AbortController().signal);
+      if (first.kind !== 'saved') throw new Error('collision fixture did not stage');
+      const existing = shape === 'partial' ? `${first.absolutePath}.part` : first.absolutePath;
+      if (shape === 'partial') fs.renameSync(first.absolutePath, existing);
+      fs.writeFileSync(existing, 'earlier owned bytes', { mode: 0o600 });
+      const refused = await stager.stage(reference(), new AbortController().signal);
+      const preserved = fs.existsSync(existing) ? fs.readFileSync(existing, 'utf8') : undefined;
+      identity.mockRestore();
+      const allowed = await stager.stage(reference(), new AbortController().signal);
+      expect(allowed.kind).toBe('saved');
+      if (allowed.kind !== 'saved') throw new Error('positive control refused');
+      expect(fs.readFileSync(allowed.absolutePath)).toEqual(Buffer.alloc(32, 65));
+      expect(fs.statSync(allowed.absolutePath).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(staging).mode & 0o777).toBe(0o700);
+      expect(stream.opens).toBe(3);
+      expect(preserved).toBe('earlier owned bytes');
+      expect(refused).toEqual({ kind: 'refused', reason: 'source-failed' });
+      expect(listStaging(staging)).toEqual([path.basename(existing), path.basename(allowed.absolutePath)].sort());
+    } finally {
+      identity.mockRestore();
+    }
+  });
+
   it('reports a bounded, identifier-free diagnostic per attempt', async () => {
     const outcomes: DiagnosticEvent[] = [];
     const { source } = streamingSource(1024);
-    const stager = new FsMediaStager(source, staging, {
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root,
       diagnostics: { emit: (event) => outcomes.push(event) },
     });
 
@@ -445,7 +544,7 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
         throw new Error('GET https://api.telegram.org/file/bot123:SECRET/documents/a.pdf failed');
       },
     };
-    const stager = new FsMediaStager(leakySource, staging, { log: (message) => logs.push(message) });
+    const stager = new FsMediaStager(leakySource, staging, { trustedBaseDir: root, log: (message) => logs.push(message) });
 
     const result: MediaStageResult = await stager.stage(reference(), new AbortController().signal);
 
@@ -531,7 +630,7 @@ describe('Telegram retrieval and real disk staging share one lifetime (C07)', ()
         return responseWithBytes();
       },
     });
-    const stager = new FsMediaStager(source, staging, {
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root,
       limits: { ...DEFAULT_MEDIA_LIMITS, intakeTimeoutMs: 25 },
       diagnostics: { emit: (event): void => { outcomes.push(event); } },
     });
@@ -565,7 +664,7 @@ describe('Telegram retrieval and real disk staging share one lifetime (C07)', ()
     const getFile = jest.fn(async () => ({ file_path: 'files/allowed' }));
     const fetchImpl = jest.fn(async () => responseWithBytes());
     const source = new TelegramMediaSource({ token: 'synthetic-token', api: { getFile }, fetchImpl });
-    const stager = new FsMediaStager(source, staging);
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root });
     const caller = new AbortController();
     caller.abort();
     const refused = await stager.stage(reference(), caller.signal);
@@ -600,7 +699,7 @@ describe('Telegram retrieval and real disk staging share one lifetime (C07)', ()
         return fetched.promise;
       },
     });
-    const stager = new FsMediaStager(source, staging, { limits: { ...DEFAULT_MEDIA_LIMITS, intakeTimeoutMs: 25 } });
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root, limits: { ...DEFAULT_MEDIA_LIMITS, intakeTimeoutMs: 25 } });
     const pending = stager.stage(reference(), new AbortController().signal);
     await entered.promise;
     await jest.advanceTimersByTimeAsync(25);
@@ -636,7 +735,7 @@ describe('Telegram retrieval and real disk staging share one lifetime (C07)', ()
     });
     jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
     jest.setSystemTime(new Date('2026-10-10T00:00:00Z'));
-    const stager = new FsMediaStager(source, staging, { limits: { ...DEFAULT_MEDIA_LIMITS, intakeTimeoutMs: 200_000 } });
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root, limits: { ...DEFAULT_MEDIA_LIMITS, intakeTimeoutMs: 200_000 } });
     const pending = stager.stage(reference(), new AbortController().signal);
     await reading.promise;
     expect(body.locked).toBe(true);
@@ -664,7 +763,7 @@ describe('Telegram retrieval and real disk staging share one lifetime (C07)', ()
         return id === 'retry' ? { file_path: 'files/retry' } : metadata.promise;
       } }, fetchImpl: fetches,
     });
-    const stager = new FsMediaStager(source, staging, {
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root,
       limits: { ...DEFAULT_MEDIA_LIMITS, intakeTimeoutMs: 25 },
       diagnostics: { emit: (event): void => { outcomes.push(event); } },
     });
@@ -703,6 +802,19 @@ describe('Telegram retrieval and real disk staging share one lifetime (C07)', ()
     const metadata = deferred<{ file_path: string }>();
     const reading = deferred<void>();
     const releaseBody = deferred<void>();
+    const opening = deferred<void>();
+    let finishOpen!: () => void;
+    const createWriteStream = fsModule.createWriteStream;
+    jest.spyOn(fsModule, 'createWriteStream').mockImplementationOnce((target, options) => {
+      if (typeof options === 'string') throw new Error('unexpected encoding option');
+      return createWriteStream(target, { ...options, fs: {
+        ...fsModule,
+        open: ((...args: unknown[]) => {
+          finishOpen = (): void => { Reflect.apply(fsModule.open, fsModule, args); };
+          opening.resolve();
+        }) as typeof fsModule.open,
+      } });
+    });
     let attempts = 0;
     let retrievalSignal: AbortSignal | undefined;
     const source = new TelegramMediaSource({ token: 'synthetic-token', timeoutMs: 25,
@@ -714,23 +826,28 @@ describe('Telegram retrieval and real disk staging share one lifetime (C07)', ()
         return new Response(new ReadableStream<Uint8Array>({
           async pull(controller): Promise<void> {
             if (++pulls === 1) controller.enqueue(Buffer.from('partial'));
-            else { reading.resolve(); await releaseBody.promise; }
+            else {
+              reading.resolve();
+              await releaseBody.promise;
+              if (!retrievalSignal?.aborted) controller.close();
+            }
           },
           cancel(): void { releaseBody.resolve(); },
         }));
       },
     });
-    const stager = new FsMediaStager(source, staging, { limits: { ...DEFAULT_MEDIA_LIMITS, intakeTimeoutMs: 100 } });
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root, limits: { ...DEFAULT_MEDIA_LIMITS, intakeTimeoutMs: 100 } });
     const pending = stager.stage(reference(), new AbortController().signal);
     await jest.advanceTimersByTimeAsync(15);
     metadata.resolve({ file_path: 'files/held' });
     await reading.promise;
+    await opening.promise;
     await jest.advanceTimersByTimeAsync(10);
     const abortedAtDeadline = retrievalSignal?.aborted;
-    // Settle the controlled loser even on an inverse, so failure is an assertion, not a timeout.
-    await jest.advanceTimersByTimeAsync(75);
-    const result = await pending;
+    // Settle a non-aborted inverse without advancing a competing core deadline over real disk IO.
     releaseBody.resolve();
+    finishOpen();
+    const result = await pending;
     const entries = listStaging(staging);
     jest.useRealTimers();
     await savedControl(stager);
@@ -762,7 +879,7 @@ describe('Telegram retrieval and real disk staging share one lifetime (C07)', ()
       fetchImpl: async (): Promise<Response> => ++attempts === 1
         ? new Response(new ReadableStream<Uint8Array>()) : responseWithBytes(),
     });
-    const stager = new FsMediaStager(source, staging);
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root });
     const caller = new AbortController();
     let settled = false;
     const pending = stager.stage(reference(), caller.signal).then(result => { settled = true; return result; });

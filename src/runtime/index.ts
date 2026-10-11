@@ -54,6 +54,7 @@ export type {
 
 export { composeOwnerAuthority } from './owner-authority';
 export { FsMediaStager } from './adapters';
+export { createMediaArtifactName, isMediaStagingArtifact, MEDIA_PARTIAL_SUFFIX } from './media-artifact';
 export type { MediaStagerOptions } from './adapters';
 export type { OwnerAuthority, OwnerAuthoritySource } from './owner-authority';
 // Existing local-admin composition consumers use these concrete edges through the public surface.

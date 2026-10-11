@@ -11,8 +11,10 @@
 //     chunks array that grows without bound.
 //   * intake is bounded: one active, four waiting, and a 30-second total wait. A refusal happens
 //     BEFORE a stream is opened where the answer is already known.
-//   * a timeout or abort CANNOT write a file. If the wait expired while the source was still
-//     opening, a late completion is cancelled rather than streamed.
+//   * a timeout or abort can occur after an owned partial is opened. Refusal cleanup waits for
+//     source cancellation and the owned writable to close before removing that partial. Cancellation
+//     requests do not prove acknowledgement within the intake deadline. A source that finishes
+//     opening after the attempt ends is asked to cancel rather than streamed.
 //   * cleanup is scoped to THIS operation's own partial file. Another operation's staged file, and
 //     anything else in the directory, is untouched.
 
@@ -20,7 +22,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { pipeline } from 'stream/promises';
 import { Transform } from 'stream';
-import { secureMkdir, summarizeErrorForLog } from '../../security';
+import { inspectContainedDirectory, createContainedDirectory, summarizeErrorForLog } from '../../security';
+import { createMediaArtifactName, MEDIA_PARTIAL_SUFFIX } from '../media-artifact';
 import type {
   MediaLimits,
   MediaReference,
@@ -35,13 +38,9 @@ import { systemClock } from '../../ports';
 import type { DiagnosticEvent, DiagnosticSink } from '../../ports';
 import { SILENT_DIAGNOSTIC_SINK, guardedDiagnosticSink } from '../../ports';
 
-/**
- * Suffix marking THIS operation's in-progress partial file. Cleanup targets exactly this suffix, so
- * it can never touch a sibling operation's staged file. Final names deliberately do NOT carry it.
- */
-const PARTIAL_SUFFIX = '.part';
-
 export interface MediaStagerOptions {
+  /** Explicit selected owner workspace. Missing/unsafe authority refuses before source or IO effects. */
+  trustedBaseDir?: string;
   limits?: MediaLimits;
   /** The closed diagnostic contract. Silent by default; see `ports/diagnostics`. */
   diagnostics?: DiagnosticSink;
@@ -67,7 +66,7 @@ export class FsMediaStager {
 
   constructor(
     private readonly source: MediaSourcePort,
-    /** Absolute, already-trusted owner-scoped staging directory. */
+    /** Absolute owner-scoped lane, validated against options.trustedBaseDir before effects. */
     private readonly stagingDir: string,
     private readonly options: MediaStagerOptions = {},
     clock: Clock = systemClock,
@@ -115,6 +114,7 @@ export class FsMediaStager {
     let opened: OpenedMedia | undefined;
     let countedAsActive = false;
     let partialPath: string | undefined;
+    let ownsPartial = false;
 
     try {
       if (this.active >= limits.maxActive) {
@@ -159,6 +159,9 @@ export class FsMediaStager {
         return this.refuse(signal.aborted ? 'aborted' : 'timeout', undefined, startedAt);
       }
 
+      try { inspectContainedDirectory(this.options.trustedBaseDir, this.stagingDir); }
+      catch (error) { return this.refuse('source-failed', error, startedAt); }
+
       try {
         // Raced against the intake signal. `MediaSourcePort` is a documented swap point (specs/16
         // §2) and `open()` is allowed to ignore its signal, so awaiting it bare made a
@@ -198,25 +201,21 @@ export class FsMediaStager {
         return this.refuse('too-large', undefined, startedAt);
       }
 
-      // Inside the guarded region on purpose. `secureMkdir` is a bare `fs.mkdirSync` and throws on
-      // EACCES / ENOTDIR / ENOSPC; an unusable staging path therefore used to escape `stage()`
-      // entirely, which is the same "no reply at all, no media-intake diagnostic" symptom the queue
-      // wait had. An unwritable lane is a source-side failure from the caller's point of view.
+      // Recheck after asynchronous source work, immediately before any filesystem mutation.
       try {
-        secureMkdir(this.stagingDir, { recursive: true });
+        createContainedDirectory(this.options.trustedBaseDir, this.stagingDir);
       } catch (error) {
         await this.cancelOnce(opened);
         return this.refuse('source-failed', error, startedAt);
       }
-      // The display name is presentation metadata. It is sanitised to a basename and never trusted
-      // as a path, and the random stem means two uploads cannot collide.
-      const stem = `${process.pid}-${Date.now()}-${randomSuffix()}`;
-      const finalName = `${stem}-${sanitizeSegment(ref.displayName) || 'upload'}`;
-      partialPath = path.join(this.stagingDir, `${finalName}${PARTIAL_SUFFIX}`);
+      // Naming permits bounded orphan recognition; exclusive creation still owns the partial.
+      const finalName = createMediaArtifactName(ref.displayName);
+      partialPath = path.join(this.stagingDir, `${finalName}${MEDIA_PARTIAL_SUFFIX}`);
       const finalPath = path.join(this.stagingDir, finalName);
 
       const counter = new ByteCap(limits.maxFileBytes);
       const sink = fs.createWriteStream(partialPath, { mode: 0o600, flags: 'wx' });
+      sink.once('open', () => { ownsPartial = true; });
       sink.on('error', () => undefined);
       const sinkClosed = new Promise<void>(resolve => { sink.once('close', resolve); });
 
@@ -226,17 +225,17 @@ export class FsMediaStager {
         // alone would let a hung source keep the intake wait open forever.
         await withinIntake(pipeline(readableFrom(opened), counter, sink, { signal: timeout.signal }), timeout.signal);
       } catch (error) {
+        // Preserve the cause at failure, even if cancellation/descriptor close spans a later deadline.
+        const reason: MediaStageReason = counter.exceeded ? 'too-large'
+          : signal.aborted ? 'aborted' : timeout.signal.aborted ? 'timeout' : 'source-failed';
         await this.cancelOnce(opened);
         // Closing our sink precedes unlink: a pending exclusive open must not create a new partial
         // after cleanup has already looked for it. We do not await an uncooperative source iterator.
         sink.destroy();
         await sinkClosed;
-        this.unlinkQuietly(partialPath);
+        if (ownsPartial) this.unlinkQuietly(partialPath);
         partialPath = undefined;
-        if (counter.exceeded) return this.refuse('too-large', undefined, startedAt);
-        if (signal.aborted) return this.refuse('aborted', undefined, startedAt);
-        if (timeout.signal.aborted) return this.refuse('timeout', undefined, startedAt);
-        return this.refuse('source-failed', error, startedAt);
+        return this.refuse(reason, reason === 'source-failed' ? error : undefined, startedAt);
       }
 
       if (timeout.signal.aborted || signal.aborted) {
@@ -251,10 +250,16 @@ export class FsMediaStager {
         return this.refuse('source-failed', undefined, startedAt);
       }
 
+      let published = false;
       try {
         fs.chmodSync(partialPath, 0o600);
-        fs.renameSync(partialPath, finalPath);
+        // A same-lane hard link publishes without replacing an existing final artifact. Rename would
+        // overwrite a collision. The partial remains ours until this exclusive publication succeeds.
+        fs.linkSync(partialPath, finalPath);
+        published = true;
+        fs.unlinkSync(partialPath);
       } catch (error) {
+        if (published) this.unlinkQuietly(finalPath);
         this.unlinkQuietly(partialPath);
         partialPath = undefined;
         return this.refuse('source-failed', error, startedAt);
@@ -270,7 +275,7 @@ export class FsMediaStager {
         this.active -= 1;
         this.wakeSlot();
       }
-      if (partialPath !== undefined) this.unlinkQuietly(partialPath);
+      if (ownsPartial && partialPath !== undefined) this.unlinkQuietly(partialPath);
       // Released last: the source is only released once nothing else can touch the stream.
       if (opened) await this.cancelOnce(opened);
     }
@@ -390,24 +395,4 @@ function abortError(): Error {
   const error = new Error('media intake aborted');
   error.name = 'AbortError';
   return error;
-}
-
-/** A basename with every path separator and control character removed. Never a trusted path. */
-function sanitizeSegment(name: string | undefined): string {
-  if (!name) return '';
-  return name
-    // Separators and NUL become underscores, so the result is always a single path segment.
-    .replace(/[\\/\0]/g, '_')
-    // eslint-disable-next-line no-control-regex
-    .replace(/[\u0000-\u001f\u007f]/g, '')
-    // A dot run is not needed for presentation and is the classic traversal ingredient. Leading
-    // dots (hidden files, `..`) are removed entirely rather than trimmed, so the sanitised segment
-    // can never contain `..` at all.
-    .replace(/\.{2,}/g, '_')
-    .replace(/^\.+/, '')
-    .slice(0, 120);
-}
-
-function randomSuffix(): string {
-  return Math.random().toString(36).slice(2, 10);
 }

@@ -12,7 +12,10 @@ owner authority composition.
   `readConfigFile`, `writeConfigFile`, `canonicalizeConfigPath`, `ConfigFileSync`, `ConfigWriteOutcome`.
 - Owner authority: `composeOwnerAuthority`, `OwnerAuthority`, `OwnerAuthoritySource`.
 - Local composition edges: `DirectoryLease`, `FileOwnerStatePort`, `CryptoPairingCodePort`.
-- Media staging: `FsMediaStager`, `MediaStagerOptions` — injected source, trusted lane and typed limits.
+- Media staging: `FsMediaStager`, `MediaStagerOptions` — injected source, explicit `trustedBaseDir`
+  (selected owner workspace), lane and typed limits. Missing or unsafe authority refuses before IO.
+- Artifact namespace: `createMediaArtifactName`, `isMediaStagingArtifact`, `MEDIA_PARTIAL_SUFFIX`.
+  Generated UUIDv4 names share one grammar with boot cleanup; display names remain metadata.
 
 **Dependencies:** `../ports`, `../profiles`, `../config`, `../security`, and `./adapters`. No `gateway/`,
 no `channels/`, no core module.
@@ -73,8 +76,13 @@ Media intake preserves one total timer including queue wait, one active attempt 
 Pre-aborted attempts open no source. Caller abort, core timeout and source failure have distinct results.
 Race listeners are detached on settlement; a late source handle is cancelled. Refused pipelines close
 their owned writable before unlinking its partial, so a pending open cannot recreate a discarded file.
-External cancellation requests do not prove acknowledgement. Filesystem containment and boot sweeping
-remain separately governed boundaries.
+Exclusive-open failure preserves the colliding entry; ownership begins only when our writable opens.
+Final publication uses a same-lane exclusive hard link followed by partial removal, so it cannot replace
+another artifact. Source failure keeps its cause while owned file close finishes.
+Before source open and again before mutation, the stager validates the directory chain beneath its
+explicit owner workspace. It creates missing components individually and checks their type and links.
+Saved files are0600 and the lane is0700. Static checks do not provide atomic same-UID race protection.
+External cancellation requests do not prove acknowledgement.
 
 `adapters/` holds the concrete filesystem, crypto, lease and media implementations. They are reachable
 through the public surface when local administration composes them. Media adapters retain their
