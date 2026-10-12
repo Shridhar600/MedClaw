@@ -194,11 +194,9 @@ async function runProviderStep(io: CliIO, state: SetupWizardState): Promise<void
     const defaults = modelDefaultsForProvider(state.provider);
     state.mainModel = defaults.main;
     state.apiKey = undefined;
-    // Medical and embedding selections are independent of a main-provider edit.
+    // Keep the local role endpoint: medical may still use it when main becomes cloud.
     if (state.provider === 'ollama') {
       state.ollamaUrl = state.ollamaUrl ?? LOCAL_OLLAMA_BASE_URL;
-    } else {
-      state.ollamaUrl = undefined;
     }
   }
 

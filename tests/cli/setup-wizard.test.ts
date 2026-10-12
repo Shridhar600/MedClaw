@@ -13,6 +13,7 @@ import {
 } from '../../src/cli/service-onboarding';
 import { makeTestTemp } from '../helpers/test-temp';
 import { observeProviderWire } from '../helpers/provider-wire';
+import { runCli } from '../../src/cli';
 
 jest.mock('openai', () => jest.requireActual('../helpers/provider-wire').offlineOpenAIFactory());
 
@@ -219,6 +220,56 @@ describe('setup wizard', () => {
         expect(loaded.providers.medical.type).toBe('ollama');
         expect(loaded.providers.embeddings.type).toBe('ollama');
         for (const key of ['synthetic-old-main', ownKey]) expect(output.join('') + prompts.join('') + secrets.join('')).not.toContain(key);
+      }
+    } finally {
+      if (before.openai === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = before.openai;
+      if (before.router === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = before.router;
+    }
+  });
+
+  it('M03 preserves the custom local medical endpoint through main-provider review edits, persisted reload and cloud adapter use', async () => {
+    const before = { openai: process.env.OPENAI_API_KEY, router: process.env.OPENROUTER_API_KEY };
+    try {
+      delete process.env.OPENAI_API_KEY;
+      delete process.env.OPENROUTER_API_KEY;
+      for (const cloud of ['openai', 'openrouter']) {
+        const target = path.join(tmpDir, `local-to-${cloud}`, 'config.json');
+        const output: string[] = [];
+        let selections = 0, reviews = 0, prompts = 0;
+        expect(await runCli([
+          '--config', target, 'onboard', '--provider', 'ollama',
+          '--ollama-url', 'http://127.0.0.1:11435/v1', '--medical-model', 'synthetic-local-medical',
+          '--embedding-url', 'http://127.0.0.1:11436/v1', '--embedding-model', 'synthetic-embedding',
+        ], {
+          stdout: (text: string): void => { output.push(text); },
+          stderr: (text: string): void => { output.push(text); },
+          input: async (prompt: string): Promise<string> => {
+            if (++prompts > 80) throw Error('M03 answer bound exceeded');
+            if (prompt.includes('Provider type\n')) return ++selections === 1 ? 'ollama' : cloud;
+            if (prompt.includes('Main model\n')) return 'synthetic-main';
+            if (prompt.includes('Review action\n')) return ++reviews === 1 ? 'provider' : 'apply';
+            return prompt.includes('Next action\n') ? 'exit' : '';
+          },
+          secretInput: async (): Promise<string> => 'synthetic-cloud-key',
+        })).toBe(0);
+        expect({ selections, reviews }).toEqual({ selections: 2, reviews: 2 });
+        const saved = JSON.parse(fs.readFileSync(target, 'utf8')) as {
+          providers: { medical: unknown; embeddings: unknown };
+        };
+        const loaded = await loadRuntimeConfig({ configPath: target });
+        const medical = { type: 'ollama', model: 'synthetic-local-medical', baseUrl: 'http://127.0.0.1:11435/v1' };
+        const embeddings = { type: 'ollama', model: 'synthetic-embedding', baseUrl: 'http://127.0.0.1:11436/v1' };
+        expect(saved.providers.medical).toMatchObject(medical);
+        expect(saved.providers.embeddings).toMatchObject(embeddings);
+        expect(loaded.providers.medical).toMatchObject(medical);
+        expect(loaded.providers.embeddings).toMatchObject(embeddings);
+        const wire = await observeProviderWire(loaded.providers.main);
+        expect(wire.requests).toEqual([{
+          url: cloud === 'openai' ? 'https://api.openai.com/v1/chat/completions' : 'https://openrouter.ai/api/v1/chat/completions',
+          authorization: 'Bearer synthetic-cloud-key', model: 'synthetic-main',
+        }]);
+        expect(wire.reply).toMatchObject({ type: 'text', text: 'Synthetic reply' });
+        expect(output.join('')).not.toContain('synthetic-cloud-key');
       }
     } finally {
       if (before.openai === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = before.openai;

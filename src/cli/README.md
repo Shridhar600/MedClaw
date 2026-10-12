@@ -97,6 +97,8 @@ is available. Its review shows the provider and masks the key; local medical add
 Changing the main provider discards its previous explicit key, including cloud-to-cloud edits; leaving
 the provider unchanged preserves it. Cloud medical setup requires an explicit `--medical-model` or
 wizard model answer. Missing selection refuses before publication; it never inherits local MedGemma.
+Switching main from Ollama to cloud preserves the selected local `--ollama-url` for medical;
+cloud main still uses its own endpoint, and an explicit embedding endpoint stays independent.
 
 ## Public exports added
 
