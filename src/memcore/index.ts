@@ -4,7 +4,7 @@
 // Ledger (versioned health facts)
 export { LedgerStore } from './ledger-store';
 export type { LedgerIndexChunk, LedgerIndexDelta, LedgerFileFingerprint } from './ledger-store';
-export { parseLedgerFile, renderLedgerFile, canonicalFieldValue, canonicalFields } from './ledger-parser';
+export { parseLedgerFile, renderLedgerFile, canonicalFieldValue, canonicalFields, isStorableFieldKey } from './ledger-parser';
 
 // Render-boundary sanitizer (INJ) — single-line discipline for embedded text
 export { sanitizeSingleLine } from './sanitize';

@@ -206,6 +206,14 @@ const RESERVED_TOP_LEVEL_FIELD_KEYS = new Set<string>([
   'replaces', 'replacedBy', 'corrects', 'correctedBy', 'discontinuedReason', 'created_at',
 ]);
 
+/**
+ * Whether a `fields` key survives render → parse unchanged. Reserved names would be dropped or read
+ * back into top-level slots; `:`, `#`, control characters and edge whitespace change the line shape.
+ */
+export function isStorableFieldKey(key: string): boolean {
+  return key !== '' && key === key.trim() && !/[:#\p{Cc}]/u.test(key) && !RESERVED_TOP_LEVEL_FIELD_KEYS.has(key);
+}
+
 export function parseLedgerFile(md: string, options: { type: FactType; profileId: string }): LedgerFact[] {
   const facts: LedgerFact[] = [];
 

@@ -261,3 +261,102 @@ describe('ledger tools arg validation — review findings (I2)', () => {
     expect(r.content[0].text).toContain('winningVersion');
   });
 });
+
+// The owner's ledger over time: stop and restart things, leave disputes for later, restart the
+// daemon in between. Each "restart" builds fresh stores on the same workspace.
+describe('ledger tools — owner lifecycle across restarts', () => {
+  let tmp: string;
+  let ledger: LedgerStore;
+  let view: SafetyView;
+  let tools: Tool[];
+  const byName = (n: string): Tool => tools.find(t => t.name === n)!;
+  const tokenOf = (text: string): string => (text.match(/tokenId="([0-9a-f]{12})"/) ?? [])[1]!;
+  const boot = (): void => {
+    const clock = mutableClock(DAY);
+    ledger = new LedgerStore(tmp, clock);
+    const narrative = new NarrativeStore(tmp, clock);
+    view = new SafetyView(tmp, clock);
+    const curiosity = new CuriosityQueue(tmp, clock, seqIdGen('cur'), 'default');
+    const safety = makeSafetyRenderer({
+      render: (facts) => view.render(facts),
+      listSafetyRelevant: () => ledger.listSafetyRelevant(),
+      markDirty: () => view.markDirty(),
+    });
+    const queue: QueuePort = { enqueue: async (_p, op) => op.run() };
+    const pipeline = new CapturePipeline({ queue, ledger, narrative, safety, curiosity });
+    tools = createLedgerTools({ pipeline, ledger, safety, queue, clock });
+  };
+  const expectCleanChain = async (entity: string, type: 'medication' | 'symptom'): Promise<void> => {
+    const chain = await ledger.getChain(entity, type);
+    expect(new Set(chain.map(f => f.id)).size).toBe(chain.length);
+    expect(chain.filter(f => f.status === 'active')).toHaveLength(1);
+    expect(chain.filter(f => f.status === 'disputed')).toHaveLength(0);
+  };
+
+  beforeEach(() => {
+    tmp = makeTestTemp('redacted-ledgerlife-');
+    boot();
+  });
+  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  it('a medication stopped and later taken again gets a new version, not a second v1', async () => {
+    await byName('ledger_record').execute({ entity: 'lisinopril', type: 'medication', fields: { dose: '10mg' } });
+    const removal = await byName('ledger_remove').execute({ entity: 'lisinopril', type: 'medication', reason: 'stopped' });
+    expect((await byName('ledger_update').execute({ tokenId: tokenOf(removal.content[0].text), confirm: true })).isError).toBeFalsy();
+
+    boot();
+    const again = await byName('ledger_record').execute({ entity: 'lisinopril', type: 'medication', fields: { dose: '10mg' } });
+    expect(again.isError).toBeFalsy();
+    expect(again.content[0].text).toContain('lisinopril@v3');
+
+    boot();
+    await expectCleanChain('lisinopril', 'medication');
+    expect(await view.read()).toContain('lisinopril');
+  });
+
+  it('a dispute left unanswered past a restart can still be resolved by re-stating it', async () => {
+    await byName('ledger_record').execute({ entity: 'headache', type: 'symptom', fields: { severity: 'mild' } });
+    const minted = await byName('ledger_record').execute({ entity: 'headache', type: 'symptom', fields: { severity: 'severe' } });
+    expect(minted.content[0].text).toContain('disputed');
+
+    boot(); // the first dispute token died with the old process
+    const restated = await byName('ledger_record').execute({ entity: 'headache', type: 'symptom', fields: { severity: 'severe' } });
+    expect(restated.content[0].text).toContain('open dispute');
+    const severeVersion = Number((restated.content[0].text.match(/v(\d+): severity=severe/) ?? [])[1]);
+
+    const resolved = await byName('ledger_update').execute({
+      tokenId: tokenOf(restated.content[0].text), confirm: true, winningVersion: severeVersion,
+    });
+    expect(resolved.isError).toBeFalsy();
+
+    boot();
+    await expectCleanChain('headache', 'symptom');
+    expect((await ledger.getActive('headache', 'symptom'))!.fields.severity).toBe('severe');
+  });
+
+  it('a model-invented reserved or colon field key is refused and never corrupts the ledger', async () => {
+    for (const key of ['created_at', 'visibility', 'dose: morning', 'time:of:day', ' dose']) {
+      const r = await byName('ledger_record').execute({ entity: 'metformin', type: 'medication', fields: { [key]: '500mg' } });
+      expect(r.isError).toBe(true);
+    }
+    await byName('ledger_record').execute({ entity: 'metformin', type: 'medication', fields: { dose: '500mg' } });
+
+    boot();
+    expect((await ledger.getActive('metformin', 'medication'))!.fields.dose).toBe('500mg');
+    expect(fs.readdirSync(`${tmp}/ledger`).filter(f => f.includes('.corrupt-'))).toHaveLength(0);
+  });
+
+  it('a SAFETY refresh failure after a confirmed change reports the change as applied', async () => {
+    await byName('ledger_record').execute({ entity: 'warfarin', type: 'medication', fields: { dose: '5mg' } });
+    const proposal = await byName('ledger_record').execute({ entity: 'warfarin', type: 'medication', fields: { dose: '10mg' } });
+    const renderSpy = jest.spyOn(view, 'render').mockRejectedValueOnce(new Error('render failure'));
+
+    const confirmed = await byName('ledger_update').execute({ tokenId: tokenOf(proposal.content[0].text), confirm: true });
+    renderSpy.mockRestore();
+
+    expect(confirmed.isError).toBeFalsy();
+    expect(confirmed.content[0].text).toContain('Confirmed');
+    expect(fs.existsSync(`${tmp}/.state/safety-view.dirty`)).toBe(true);
+    expect((await ledger.getActive('warfarin', 'medication'))!.fields.dose).toBe('10mg');
+  });
+});

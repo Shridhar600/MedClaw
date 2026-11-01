@@ -6,10 +6,10 @@
 
 import type { Tool, ToolExecutionContext, ToolResult } from './types';
 import type { CapturePipeline, QueuePort, SafetyRenderer } from '../capture';
-import { computeIdempotencyKey } from '../capture';
+import { computeIdempotencyKey, refreshSafetyView } from '../capture';
 import type { LedgerStore } from '../memcore';
 import type { FactType, LedgerFact, RecordFactResult, Authority, Provenance } from '../memcore';
-import { TokenRejectedError, sanitizeSingleLine } from '../memcore';
+import { TokenRejectedError, sanitizeSingleLine, isStorableFieldKey } from '../memcore';
 import { normalizeEntitySlug } from '../memcore/sanitize';
 import type { Clock } from '../ports';
 import { systemClock } from '../ports';
@@ -169,8 +169,11 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
         renderRetractRelay(result),
       );
     }
+    const lead = result.reopened
+      ? `${entity} already has an open dispute, so the new value was not recorded. Ask which version is correct, resolve it, then record the new value if neither is right. Resolve with ledger_update tokenId="${result.disputeToken.uuid}", confirm=true, winningVersion=<n>.\n`
+      : `${entity} is now disputed between two versions. Resolve with ledger_update tokenId="${result.disputeToken.uuid}", confirm=true, winningVersion=<n>.\n`;
     return ok(
-      `${entity} is now disputed between two versions. Resolve with ledger_update tokenId="${result.disputeToken.uuid}", confirm=true, winningVersion=<n>.\n` +
+      lead +
       result.versions.map(v => `v${v.version}: ${summarizeFields(v)}`).join('\n') +
       renderRetractRelay(result),
     );
@@ -212,13 +215,11 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       if (!FACT_TYPES.includes(type)) return err(`Unknown fact type "${type}".`);
       const fields = { ...((params.fields as Record<string, string | number | string[]>) ?? {}) };
 
-      // SBX-1: field keys are model-invented names, never health content. A key carrying
-      // newlines/# would forge `## entity` / `### vN (active)` structure into the line-oriented
-      // ledger on re-parse (fabricating active meds/allergies onto SAFETY.md with no confirmation).
-      // Reject illegal keys at the boundary; flattenFactForRender sanitizes keys as defense-in-depth.
+      // Field keys are model-invented names. A key that does not survive the Markdown round-trip
+      // would be silently dropped, renamed, or corrupt its block (or forge ledger structure).
       for (const key of Object.keys(fields)) {
-        if (key === '' || /[\r\n\t#]/.test(key)) {
-          return err(`Write rejected: field key ${JSON.stringify(key.slice(0, 40))} contains illegal characters (newline, tab, or #). Field names must be simple identifiers.`);
+        if (!isStorableFieldKey(key)) {
+          return err(`Write rejected: field key ${JSON.stringify(key.slice(0, 40))} is reserved or contains ":", "#", control characters, or edge spaces. Use a simple name such as "dose".`);
         }
       }
 
@@ -358,9 +359,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
               confirmationContext(context),
             );
             // D8: a confirmed safety-relevant change must re-render SAFETY.md in the same op.
-            if (applied.safetyRelevant) {
-              await deps.safety.render(await deps.safety.listSafetyRelevant());
-            }
+            if (applied.safetyRelevant) await refreshSafetyView(deps.safety);
             // BL: KNEE-01 back-link for the CONFIRMED fact — dispute resolutions
             // and confirmed writes otherwise never appear in the daily log index.
             if (deps.narrative) {
@@ -450,9 +449,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
         run: async () => {
           const outcome = await deps.ledger.discontinue(entity, type, provenance('user', 0.9), { reason });
           if (outcome.kind === 'applied') {
-            if (outcome.fact.safetyRelevant) {
-              await deps.safety.render(await deps.safety.listSafetyRelevant());
-            }
+            if (outcome.fact.safetyRelevant) await refreshSafetyView(deps.safety);
             await afterTier1(outcome.fact.type);
           }
           return outcome;

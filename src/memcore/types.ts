@@ -184,7 +184,7 @@ export interface StoredToken {
 export type RecordFactResult =
   | { kind: 'applied'; fact: LedgerFact; /** CT (SB-2): set when a correction's companion retract needs user confirmation — the tool layer must relay it (DAD-10). */ pendingRetract?: ConfirmationToken }
   | { kind: 'needs-confirmation'; token: ConfirmationToken; current: LedgerFact; proposed: LedgerFact; /** CT: relayed correction-retract token (may accompany a pending corrected arm too). */ pendingRetract?: ConfirmationToken }
-  | { kind: 'disputed'; versions: [LedgerFact, LedgerFact]; disputeToken: ConfirmationToken; /** CT: relayed correction-retract token. */ pendingRetract?: ConfirmationToken };
+  | { kind: 'disputed'; versions: [LedgerFact, LedgerFact]; disputeToken: ConfirmationToken; /** CT: relayed correction-retract token. */ pendingRetract?: ConfirmationToken; /** An existing dispute offered again with a fresh token; nothing was written. */ reopened?: true };
 
 export type RetractResult =
   | { kind: 'applied' | 'needs-confirmation'; fact: LedgerFact; token?: ConfirmationToken }

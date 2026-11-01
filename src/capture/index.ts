@@ -1,4 +1,4 @@
-export { CapturePipeline } from './pipeline';
+export { CapturePipeline, refreshSafetyView } from './pipeline';
 export { FileCaptureIdempotency } from './idempotency';
 export type { CaptureIdempotency, CommittedLookup } from './idempotency';
 export { makeSafetyRenderer } from './safety-renderer';

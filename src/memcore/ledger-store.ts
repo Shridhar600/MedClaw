@@ -449,7 +449,10 @@ export class LedgerStore {
     const now = this.clock.now().toISOString();
 
     if (!cur) {
-      const fact = this.makeFact(p, 1, 'active', now);
+      const reopened = this.reopenDispute(allFacts, p.entity, p.type);
+      if (reopened) return reopened;
+      // The entity may have only terminal versions (stopped, retracted): continue its chain.
+      const fact = this.makeFact(p, this.nextVersion(allFacts, p.entity), 'active', now);
       allFacts.push(fact);
       await this.writeFacts(p.type, allFacts, [fact]);
       return { kind: 'applied', fact };
@@ -557,6 +560,27 @@ export class LedgerStore {
       this.tokens.set(token.uuid, { token, op: { kind: 'write', ...p, fields: p.fields, baselineCurHash }, used: false });
       return { kind: 'needs-confirmation', token, current: active, proposed };
     }
+  }
+
+  /**
+   * A dispute outlives its token (15-minute expiry, daemon restart). When the entity has no
+   * active or paused version but still has two disputed heads, offer the same pair again with a
+   * fresh token instead of starting a parallel chain.
+   */
+  private reopenDispute(facts: LedgerFact[], entity: string, type: FactType): RecordFactResult | null {
+    const heads = facts
+      .filter(f => f.entity === entity && f.status === 'disputed' && f.version >= 1)
+      .sort((a, b) => b.version - a.version)
+      .slice(0, 2);
+    if (heads.length < 2) return null;
+    const [headB, headA] = heads;
+    const token = makeToken(entity, hash(`dispute:${entity}:${headA.version}:${headB.version}`), this.clock.now().getTime());
+    this.tokens.set(token.uuid, {
+      token,
+      op: { kind: 'dispute', entity, type, versionA: headA.version, versionB: headB.version, originalId: headA.supersedes ?? '' },
+      used: false,
+    });
+    return { kind: 'disputed', versions: [headA, headB], disputeToken: token, reopened: true };
   }
 
   async retract(params: {

@@ -97,6 +97,24 @@ export interface Rederiver {
   rederive(relPaths: string[]): Promise<void>;
 }
 
+/**
+ * Re-render SAFETY.md after a ledger write. The write has already landed, so a failed render is
+ * not a write failure: the view is marked dirty, and the next read repairs it from the ledger or
+ * fails closed. Reporting the write as failed would only make the model retry into a duplicate.
+ */
+export async function refreshSafetyView(safety: SafetyRenderer): Promise<void> {
+  try {
+    await safety.render(await safety.listSafetyRelevant());
+  } catch (e) {
+    try {
+      safety.markDirty?.();
+    } catch (markError) {
+      console.warn('[capture] SAFETY dirty marker failed:', summarizeErrorForLog(markError));
+    }
+    console.warn('[capture] SAFETY refresh failed; view marked dirty for repair:', summarizeErrorForLog(e));
+  }
+}
+
 export interface CapturePipelineDeps {
   queue: QueuePort;
   ledger: LedgerWriter;
@@ -279,7 +297,7 @@ export class CapturePipeline {
       changed.push(this.ledgerPath(result.fact.type));
       if (result.fact.safetyRelevant) await this.reRenderSafety();
       await this.emitEvent(result.fact);
-    } else if (result.kind === 'disputed') {
+    } else if (result.kind === 'disputed' && !result.reopened) {
       changed.push(this.ledgerPath(p.type));
       await this.enqueueDisputeCuriosity(result, p.provenance.capturedAt);
     }
@@ -421,17 +439,7 @@ export class CapturePipeline {
 
   /** Re-render SAFETY.md from the current safety-relevant set (D8). */
   private async reRenderSafety(): Promise<void> {
-    try {
-      const facts = await this.deps.safety.listSafetyRelevant();
-      await this.deps.safety.render(facts);
-    } catch (e) {
-      try {
-        this.deps.safety.markDirty?.();
-      } catch (markError) {
-        console.warn('[capture] SAFETY dirty marker failed:', summarizeErrorForLog(markError));
-      }
-      throw e;
-    }
+    await refreshSafetyView(this.deps.safety);
   }
 
   /** Best-effort event mirror (P2 no-op when no sink is injected). Never throws. */

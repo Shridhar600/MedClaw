@@ -101,7 +101,7 @@ describe('W-C/D fix pass — TB: a failed apply leaves the token usable; success
   });
 });
 
-describe('W-C/D fix pass — self-review IMPORTANT-3: fresh active during a dispute window rejects resolution', () => {
+describe('a claim made while a dispute is open', () => {
   let tmp: string;
   let store: LedgerStore;
 
@@ -111,24 +111,19 @@ describe('W-C/D fix pass — self-review IMPORTANT-3: fresh active during a disp
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-  it('confirming a stale dispute while a NEWER active exists is rejected (no double-active)', async () => {
+  it('re-offers the open dispute instead of starting a second active chain', async () => {
     await store.recordFact({ entity: 'knee-pain', type: 'symptom', fields: { severity: 'mild' }, provenance: prov('user'), safetyRelevant: true });
     const d = await store.recordFact({ entity: 'knee-pain', type: 'symptom', fields: { severity: 'severe' }, provenance: prov('user'), safetyRelevant: true });
     if (d.kind !== 'disputed') return throwErr('expected dispute');
 
-    // Mid-window, the user records a THIRD claim — no active version exists, so
-    // it becomes a FRESH ACTIVE fact while the dispute token is still live.
     const third = await store.recordFact({ entity: 'knee-pain', type: 'symptom', fields: { severity: 'moderate' }, provenance: prov('user'), safetyRelevant: true });
-    expect(third.kind).toBe('applied');
+    expect(third.kind).toBe('disputed');
+    expect((await store.getChain('knee-pain', 'symptom')).filter(f => f.status === 'active')).toHaveLength(0);
 
-    let thrown: unknown;
-    try {
-      await store.confirm(d.disputeToken.uuid, { winningVersion: d.versions[0].version });
-    } catch (e) { thrown = e; }
-    expect(thrown).toBeDefined();
-    // Exactly ONE active survives — never two coexisting actives.
+    await store.confirm(d.disputeToken.uuid, { winningVersion: d.versions[0].version });
     const chain = await store.getChain('knee-pain', 'symptom');
     expect(chain.filter(f => f.status === 'active')).toHaveLength(1);
+    expect(new Set(chain.map(f => f.id)).size).toBe(chain.length);
   });
 });
 

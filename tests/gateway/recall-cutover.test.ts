@@ -203,21 +203,9 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
     expect(lastSystem(seen)).toContain('lisinopril');
   });
 
-  // RR-STRUCT R-S3 Part C (mini-plan v3 §3.7): this single test used to assert an UNCONDITIONAL
-  // "next turn fails closed" after any SAFETY render failure. R-S3 adds self-heal — a Tier-1 read
-  // that detects drift attempts ONE on-demand re-projection from the authoritative ledger before
-  // failing. That changes the OLD assertion's premise: a TRANSIENT render failure (the ledger fact
-  // itself was already durably recorded; only the projection publish glitched) no longer
-  // permanently bricks the profile — it self-heals on the very next read. The invariant the old
-  // test actually protects (C-03: SAFETY fails CLOSED, never serves a prompt with no/stale SAFETY)
-  // still holds, but only for a PERSISTENT failure (the heal attempt itself fails too). Migrated
-  // into two precise tests below — each OLD assertion maps to a specific NEW one:
-  //   - `result.isError === true` after the write   -> UNCHANGED in both new tests (Tier-1 write
-  //     path still fails the write + marks dirty on a render failure; not touched by self-heal).
-  //   - "next turn replies 'trouble right now', 0 extra provider calls" (used to be unconditional)
-  //     -> now the PERSISTENT-failure test only (self-heal itself fails, so it still fails closed).
-  //   - (NEW) a TRANSIENT failure's next turn now SUCCEEDS via self-heal — proven by a fresh test.
-  // See the report (§Behavior changes) for the git-stash RED reproduction of the pre-R-S3 baseline.
+  // The ledger write lands before SAFETY.md is re-rendered, so a render failure is not a write
+  // failure: the tool reports the fact as recorded and the view is marked dirty. The next read
+  // repairs it from the ledger, or fails closed if the repair fails too.
   it('SELF-HEALS on the next live turn after a TRANSIENT SAFETY publication failure', async () => {
     gateway = await startGateway(tmpDir);
     const seen = captureProvider(gateway);
@@ -229,7 +217,7 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
       const result = await registryOf().execute('ledger_record', {
         entity: 'penicillin', type: 'allergy', fields: { reaction: 'hives' }, note: 'penicillin allergy',
       });
-      expect(result.isError).toBe(true);
+      expect(result.isError).toBeFalsy();
       expect(fs.existsSync(path.join(workspace, '.state', 'safety-view.dirty'))).toBe(true);
 
       // The mocked failure has been consumed — the self-heal's re-projection attempt succeeds.
@@ -253,7 +241,7 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
       const result = await registryOf().execute('ledger_record', {
         entity: 'penicillin', type: 'allergy', fields: { reaction: 'hives' }, note: 'penicillin allergy',
       });
-      expect(result.isError).toBe(true);
+      expect(result.isError).toBeFalsy();
       expect(fs.existsSync(path.join(workspace, '.state', 'safety-view.dirty'))).toBe(true);
 
       const providerCallsBefore = seen.length;
