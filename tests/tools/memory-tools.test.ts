@@ -207,4 +207,22 @@ describe('Memory Tools', () => {
       expect(afterSecond).not.toContain('abcdefghijklmnopqrstuvwxyz123456');
     });
   });
+
+  describe('captured daily log', () => {
+    const DAY_LOG = 'memory/2026-08-20.md';
+    const captured = '# 2026-08-20\n- 09:00 started metformin 500mg\n\n## Ledger writes\n- metformin → metformin@v1\n';
+
+    it('refuses an overwrite of a captured day but still accepts an append', async () => {
+      const tool = tools.find(t => t.name === 'memory_write')!;
+      await engine.writeFile(DAY_LOG, captured);
+
+      const overwrite = await tool.execute({ path: DAY_LOG, content: '# summary only\n' });
+      expect(overwrite.isError).toBe(true);
+      expect(await engine.readFile(DAY_LOG)).toBe(captured);
+
+      const append = await tool.execute({ path: DAY_LOG, content: '- 18:00 felt fine\n', mode: 'append' });
+      expect(append.isError).toBeFalsy();
+      expect(await engine.readFile(DAY_LOG)).toBe(`${captured}- 18:00 felt fine\n`);
+    });
+  });
 });

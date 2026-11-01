@@ -8,7 +8,7 @@ import {
   LLMSemaphore,
   type SemaphorePriority,
 } from '../tools/semaphore';
-import { summarizeErrorForLog } from '../security';
+import { contentContainsCredentials, summarizeErrorForLog } from '../security';
 import type { HeartbeatJob } from '../scheduler/types';
 import type { ProfileRuntime } from './runtime';
 import { DaemonShutdownError } from '../shared/errors';
@@ -16,6 +16,7 @@ import { DaemonShutdownError } from '../shared/errors';
 const SESSION_RESET_FAILURE_RESPONSE = "I couldn't start a fresh session right now. Please try again in a moment.";
 const AGENT_FAILURE_RESPONSE = "I'm having trouble right now. Please try again in a moment.";
 const SESSION_RESET_RESPONSE = 'Starting fresh session. Your health memory is preserved.';
+const CREDENTIAL_REFUSAL_RESPONSE = "That message looks like it contains a password or API key, so I didn't read or save it. Please send it again without the secret.";
 const COMPACTION_RESPONSE = 'Compacted the conversation. Older turns are summarized; recent context is kept. Nothing is lost — ask me to look anything up.';
 
 export const MAX_QUEUED_TURNS_WAITING = 2;
@@ -229,6 +230,10 @@ export class TurnCoordinator {
       await sessions.runCompaction(chatId);
       return this.emit(egress, COMPACTION_RESPONSE);
     }
+
+    // Secrets are refused at the door, before media-error, onboarding and agent paths can record,
+    // capture or send them. Emergencies were already answered by the Router.
+    if (contentContainsCredentials(text).matched) return this.emit(egress, CREDENTIAL_REFUSAL_RESPONSE);
 
     const agentInput = this.buildAgentInput(incoming);
 

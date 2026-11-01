@@ -1,7 +1,7 @@
 // src/memory/memory-engine.ts
 import * as fs from 'fs';
 import * as path from 'path';
-import { secureMkdir, secureWrite, secureAppend } from '../security';
+import { secureMkdir, secureWriteViaTmp, secureAppend } from '../security';
 
 // Methods are async by interface even though they use synchronous fs operations.
 // This keeps callers future-proof if we switch to fs.promises without API changes.
@@ -77,7 +77,7 @@ export class MemoryEngine {
   async writeFile(relativePath: string, content: string): Promise<void> {
     const fullPath = this.resolve(relativePath);
     secureMkdir(path.dirname(fullPath));
-    secureWrite(fullPath, content);
+    secureWriteViaTmp(fullPath, content);
   }
 
   async appendToFile(relativePath: string, content: string): Promise<void> {

@@ -34,6 +34,7 @@ const MANAGED_REJECT = {
   state: 'Direct writes to .state/ are not allowed (owned by the scheduler/store internals).',
   scratch: 'Direct writes to scratch/ are not allowed via memory_write.',
   traversal: 'Path traversal is not allowed.',
+  dailyLog: 'Captured daily logs are append-only (they hold your exact words and ledger anchors). Use mode "append" to add a note.',
 } as const;
 
 /** Generic tool-path limits. The ReAct loop receives tool results verbatim, so keep this boundary
@@ -167,7 +168,10 @@ async function classifyManagedWrite(
 
   // Narrative lane stays writable (append-only, lossless). Checked first so a `memory/…`
   // path never collides with the `MEMORY.md` rule.
-  if (lower.startsWith('memory/')) return null;
+  if (lower.startsWith('memory/')) {
+    if (mode !== 'append' && /^memory\/\d{4}-\d{2}-\d{2}\.md$/.test(lower)) return rejection(MANAGED_REJECT.dailyLog);
+    return null;
+  }
 
   if (lower.startsWith('ledger/')) return rejection(MANAGED_REJECT.ledger);
   if (lower === 'memory.md') return rejection(MANAGED_REJECT.memoryMd);

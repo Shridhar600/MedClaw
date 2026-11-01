@@ -256,3 +256,72 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
     }
   });
 });
+
+// A secret pasted into chat (a caption, an onboarding answer, a plain message) is refused at the
+// door: it never reaches the provider and never lands in any file under the owner's state.
+describe('Gateway — secrets in inbound messages', () => {
+  const SECRET = 'sk-abcdefghijklmnopqrstuvwxyz0123456789';
+  let tmpDir: string;
+  let gateway: Gateway;
+
+  beforeEach(() => {
+    tmpDir = makeTestTemp('redacted-inbound-secret-');
+  });
+  afterEach(async () => {
+    try { await gateway?.stop(); } catch { /* ignore */ }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const filesContaining = (needle: string): string[] => {
+    const hits: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (fs.readFileSync(full).includes(needle)) hits.push(path.relative(tmpDir, full));
+      }
+    };
+    walk(tmpDir);
+    return hits;
+  };
+
+  it('refuses a chat message carrying an API key without calling the model or saving it', async () => {
+    gateway = await startGateway(tmpDir);
+    const seen = captureProvider(gateway);
+
+    const reply = await gateway.handleTestMessage('chat-1', `my openai key is ${SECRET}`, 'm1');
+
+    expect(reply).toMatch(/password or API key/);
+    expect(seen).toHaveLength(0);
+    expect(filesContaining(SECRET)).toEqual([]);
+  });
+
+  it('refuses a failed-upload caption carrying an API key without saving it', async () => {
+    gateway = await startGateway(tmpDir);
+    let reply = '';
+    await gateway.deliverMessage({
+      chatId: 'chat-1', userId: 'local', channel: 'local', chatType: 'private', eventId: 'local:chat-1:m2',
+      messageId: 'm2', text: `report attached, token=${SECRET}`, mediaError: 'Failed to download uploaded file report.pdf',
+    } as never, async (text) => { reply = text; });
+
+    expect(reply).toMatch(/password or API key/);
+    expect(filesContaining(SECRET)).toEqual([]);
+  });
+
+  it('refuses an onboarding answer carrying an API key without saving it', async () => {
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    await gateway.start();
+    try {
+      const first = await gateway.handleTestMessage('chat-1', 'hi', 'm1');
+      expect(first).not.toMatch(/password or API key/);
+      const reply = await gateway.handleTestMessage('chat-1', SECRET, 'm2');
+      expect(reply).toMatch(/password or API key/);
+      expect(filesContaining(SECRET)).toEqual([]);
+    } finally {
+      warn.mockRestore();
+      log.mockRestore();
+    }
+  });
+});
