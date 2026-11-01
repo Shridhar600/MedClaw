@@ -158,7 +158,7 @@ export class Gateway {
   private bootSweepAttempted = false;
   private bootSweepResult?: MediaSweepResult;
   /**
-   * One media stager per Gateway. Its active/waiting counters implement the intake concurrency bound,
+   * One media stager per Gateway. Its in-flight flag implements the one-at-a-time intake bound,
    * so it must NOT be rebuilt per message — see `mediaStager()`.
    */
   private mediaStagerCache?: FsMediaStager;
@@ -1322,8 +1322,8 @@ export class Gateway {
   }
 
   /**
-   * The Gateway's one media stager, memoised. Its active/waiting counters implement the intake
-   * concurrency bound, so it must not be rebuilt per message. `undefined` when no media source was
+   * The Gateway's one media stager, memoised. Its in-flight flag implements the one-at-a-time intake
+   * bound, so it must not be rebuilt per message. `undefined` when no media source was
    * injected; media is only staged through it, and only after admission.
    */
   private mediaStager(): FsMediaStager | undefined {

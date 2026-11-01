@@ -3,11 +3,11 @@
 //   * The byte cap is enforced while streaming. A transport's advertised size is never trusted: it can
 //     under-report, and by the time `arrayBuffer()` resolves the memory is already spent.
 //   * Nothing is buffered whole. Chunks are written through a stream with backpressure.
-//   * Intake is bounded: one active, four waiting, and a 30-second total wait. A refusal happens before a
-//     stream is opened where the answer is already known.
-//   * A timeout or abort can occur after an owned partial is opened. Refusal cleanup waits for source
-//     cancellation and the owned writable to close before removing that partial. A source that finishes
-//     opening after the attempt ends is asked to cancel rather than streamed.
+//   * Intake is bounded: one stage at a time and a 30-second total deadline. A second upload that arrives
+//     while one is staging is refused before a stream is opened.
+//   * A timeout or abort can occur after an owned partial is opened. Refusal cleanup waits for the owned
+//     writable to close before removing that partial. A source that finishes opening after the attempt
+//     ends is asked to cancel rather than streamed.
 //   * Cleanup is scoped to this operation's own partial file; other staged files are untouched.
 
 import * as fs from 'fs';
@@ -41,17 +41,12 @@ export interface MediaStagerOptions {
 }
 
 export class FsMediaStager {
-  private active = 0;
-  private waiting = 0;
-  /** Slots released by finishing operations, so a waiter can take one without polling. */
-  private readonly slotWaiters: (() => void)[] = [];
-  /** Streams already cancelled, so a stream is never asked to abort twice. */
-  private readonly cancelledSources = new WeakSet<OpenedMedia>();
+  private busy = false;
 
   /**
    * Guarded once here rather than at each emit, so an adapter that throws can never fail a download.
    * Intake runs on a request a stranger can trigger, and a broken log must not turn into a failed
-   * upload or a stuck intake slot.
+   * upload or a stuck intake.
    */
   private readonly sink: DiagnosticSink;
   private readonly clock: Clock;
@@ -76,12 +71,11 @@ export class FsMediaStager {
     return elapsed > 0 ? elapsed : 0;
   }
 
-  get inFlight(): { active: number; waiting: number } {
-    return { active: this.active, waiting: this.waiting };
+  get isBusy(): boolean {
+    return this.busy;
   }
 
   async stage(ref: MediaReference | undefined, signal: AbortSignal): Promise<MediaStageResult> {
-    // Measured across the whole attempt, queue wait included.
     const startedAt = this.clock.now().getTime();
     if (!ref || (ref.kind !== 'photo' && ref.kind !== 'document')) {
       return this.refuse('unsupported', undefined, startedAt);
@@ -94,79 +88,41 @@ export class FsMediaStager {
       return this.refuse('advertised-too-large', undefined, startedAt);
     }
 
-    // The slot is reserved synchronously, before the first await. Deciding queue membership after an await
-    // would let every concurrent caller observe a free slot and exceed the limit.
-    const timeout = new AbortController();
-    const onAbort = (): void => timeout.abort();
-    signal.addEventListener('abort', onAbort, { once: true });
-    const timer = setTimeout(() => timeout.abort(), limits.intakeTimeoutMs);
+    // Telegram delivers updates in order, so a second upload here is a burst: refuse instead of queueing.
+    if (this.busy) return this.refuse('queue-full', undefined, startedAt);
+    this.busy = true;
+
+    const intake = AbortSignal.any([signal, AbortSignal.timeout(limits.intakeTimeoutMs)]);
+    const abortReason = (): MediaStageReason => (signal.aborted ? 'aborted' : 'timeout');
 
     let opened: OpenedMedia | undefined;
-    let countedAsActive = false;
     let partialPath: string | undefined;
     let ownsPartial = false;
 
     try {
-      if (this.active >= limits.maxActive) {
-        if (this.waiting >= limits.maxWaiting) {
-          // Refuse rather than queue without bound: an unbounded wait is a denial of service.
-          return this.refuse('queue-full', undefined, startedAt);
-        }
-        this.waiting += 1;
-        try {
-          await this.awaitSlot(timeout.signal);
-        } catch (error) {
-          // `awaitSlot` rejects when the intake signal fires while this attempt is queued (including at shutdown,
-          // when `Gateway.stop()` aborts intake). `stage()` must resolve saved-or-refused, never reject, or the
-          // owner gets no reply. `signal.aborted` separates a caller abort from the internal intake budget
-          // running out (`timeout`). Anything but an abort error is logged rather than reported as a timeout.
-          if (!isAbortError(error)) {
-            console.warn('[media-stager] Queue wait failed unexpectedly:', summarizeErrorForLog(error));
-          }
-          return this.refuse(signal.aborted ? 'aborted' : 'timeout', undefined, startedAt);
-        } finally {
-          this.waiting -= 1;
-        }
-      }
-      this.active += 1;
-      countedAsActive = true;
-
-      if (timeout.signal.aborted) {
-        return this.refuse(signal.aborted ? 'aborted' : 'timeout', undefined, startedAt);
-      }
-
       try { inspectContainedDirectory(this.options.trustedBaseDir, this.stagingDir); }
       catch (error) { return this.refuse('source-failed', error, startedAt); }
 
       try {
         // Raced against the intake signal: `open()` may ignore its signal, and awaiting it bare would let a
-        // wedged source hold the single active slot forever, which makes "one active download" a real bound.
-        // If the abort wins, `open()` may resolve later with a live handle (a transport connection), so the
-        // open promise carries its own cleanup, armed once we have stopped waiting.
+        // wedged source hold the only stage forever. A handle that arrives after we stopped waiting is cancelled.
         let abandoned = false;
-        const openPromise = this.source.open(ref, timeout.signal).then((handle) => {
-          if (abandoned) void this.cancelOnce(handle);
+        const openPromise = this.source.open(ref, intake).then((handle) => {
+          if (abandoned) void handle.cancel().catch(() => undefined);
           return handle;
         });
         try {
-          opened = await withinIntake(openPromise, timeout.signal);
+          opened = await withinIntake(openPromise, intake);
         } catch (error) {
           abandoned = true;
           throw error;
         }
       } catch (error) {
-        // A source that fails to open is a source failure, not a timeout — unless the abort that
-        // fired is the one that explains it.
-        return this.refuse(signal.aborted ? 'aborted' : timeout.signal.aborted ? 'timeout' : 'source-failed', error, startedAt);
+        return this.refuse(intake.aborted ? abortReason() : 'source-failed', error, startedAt);
       }
 
-      // The wait may have expired while the source was opening. A late completion must not stream.
-      if (timeout.signal.aborted || signal.aborted) {
-        await this.cancelOnce(opened);
-        return this.refuse(signal.aborted ? 'aborted' : 'timeout', undefined, startedAt);
-      }
+      if (intake.aborted) return this.refuse(abortReason(), undefined, startedAt);
       if (typeof opened.advertisedBytes === 'number' && opened.advertisedBytes > limits.maxFileBytes) {
-        await this.cancelOnce(opened);
         return this.refuse('too-large', undefined, startedAt);
       }
 
@@ -174,7 +130,6 @@ export class FsMediaStager {
       try {
         createContainedDirectory(this.options.trustedBaseDir, this.stagingDir);
       } catch (error) {
-        await this.cancelOnce(opened);
         return this.refuse('source-failed', error, startedAt);
       }
       // Naming permits bounded orphan recognition; exclusive creation still owns the partial.
@@ -189,16 +144,12 @@ export class FsMediaStager {
       const sinkClosed = new Promise<void>(resolve => { sink.once('close', resolve); });
 
       try {
-        // The signal is raced explicitly as well as handed to `pipeline`: a source whose iterator never settles
-        // cannot be interrupted by an abort signal alone.
-        await withinIntake(pipeline(readableFrom(opened), counter, sink, { signal: timeout.signal }), timeout.signal);
+        // Raced explicitly as well: a source whose iterator never settles cannot be interrupted by the signal alone.
+        await withinIntake(pipeline(readableFrom(opened), counter, sink, { signal: intake }), intake);
       } catch (error) {
-        // Preserve the cause at failure, even if cancellation/descriptor close spans a later deadline.
-        const reason: MediaStageReason = counter.exceeded ? 'too-large'
-          : signal.aborted ? 'aborted' : timeout.signal.aborted ? 'timeout' : 'source-failed';
-        await this.cancelOnce(opened);
-        // Closing our sink precedes unlink: a pending exclusive open must not create a new partial
-        // after cleanup has already looked for it. We do not await an uncooperative source iterator.
+        const reason: MediaStageReason = counter.exceeded ? 'too-large' : intake.aborted ? abortReason() : 'source-failed';
+        // Closing our sink precedes unlink: a pending exclusive open must not create a new partial after
+        // cleanup has already looked for it. We do not await an uncooperative source iterator.
         sink.destroy();
         await sinkClosed;
         if (ownsPartial) this.unlinkQuietly(partialPath);
@@ -206,15 +157,10 @@ export class FsMediaStager {
         return this.refuse(reason, reason === 'source-failed' ? error : undefined, startedAt);
       }
 
-      if (timeout.signal.aborted || signal.aborted) {
-        return this.refuse(signal.aborted ? 'aborted' : 'timeout', undefined, startedAt);
-      }
+      if (intake.aborted) return this.refuse(abortReason(), undefined, startedAt);
 
       if (counter.bytes === 0) {
         // An empty stream is a failed upload, not a zero-byte document to hand to a model.
-        await this.cancelOnce(opened);
-        this.unlinkQuietly(partialPath);
-        partialPath = undefined;
         return this.refuse('source-failed', undefined, startedAt);
       }
 
@@ -228,57 +174,19 @@ export class FsMediaStager {
         fs.unlinkSync(partialPath);
       } catch (error) {
         if (published) this.unlinkQuietly(finalPath);
-        this.unlinkQuietly(partialPath);
-        partialPath = undefined;
         return this.refuse('source-failed', error, startedAt);
       }
+      partialPath = undefined;
 
       const bytes = counter.bytes;
       this.emit({ stage: 'media-intake', outcome: 'saved', bytes, durationMs: this.elapsedSince(startedAt) });
       return { kind: 'saved', absolutePath: finalPath, bytes };
     } finally {
-      clearTimeout(timer);
-      signal.removeEventListener('abort', onAbort);
-      if (countedAsActive) {
-        this.active -= 1;
-        this.wakeSlot();
-      }
+      this.busy = false;
       if (ownsPartial && partialPath !== undefined) this.unlinkQuietly(partialPath);
       // Released last: the source is only released once nothing else can touch the stream.
-      if (opened) await this.cancelOnce(opened);
+      if (opened) await opened.cancel().catch(() => undefined);
     }
-  }
-
-  /** Wait for an active slot, bounded by the intake signal so a waiter cannot hang forever. */
-  private awaitSlot(signal: AbortSignal): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      if (signal.aborted) { reject(abortError()); return; }
-      const onAbort = (): void => {
-        const index = this.slotWaiters.indexOf(wake);
-        if (index >= 0) this.slotWaiters.splice(index, 1);
-        reject(abortError());
-      };
-      const wake = (): void => {
-        signal.removeEventListener('abort', onAbort);
-        resolve();
-      };
-      signal.addEventListener('abort', onAbort, { once: true });
-      this.slotWaiters.push(wake);
-    });
-  }
-
-  private wakeSlot(): void {
-    this.slotWaiters.shift()?.();
-  }
-
-  /**
-   * Cancel an opened stream at most once. Several refusal paths want to cancel and the `finally` block always
-   * tries as well; a second request could be read by a source as a double abort.
-   */
-  private async cancelOnce(opened: OpenedMedia): Promise<void> {
-    if (this.cancelledSources.has(opened)) return;
-    this.cancelledSources.add(opened);
-    await opened.cancel().catch(() => undefined);
   }
 
   private refuse(reason: MediaStageReason, error?: unknown, startedAt?: number): MediaStageResult {
@@ -350,11 +258,6 @@ async function withinIntake<T>(work: Promise<T>, signal: AbortSignal): Promise<T
   });
   try { return await Promise.race([work, aborted]); }
   finally { signal.removeEventListener('abort', onAbort); }
-}
-
-/** True for the abort rejection produced by `abortError()`. Keeps a catch from swallowing a bug. */
-function isAbortError(error: unknown): boolean {
-  return error instanceof Error && error.message === 'media intake aborted';
 }
 
 function abortError(): Error {

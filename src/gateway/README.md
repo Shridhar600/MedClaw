@@ -51,8 +51,8 @@ Three properties depend on that order, and each has a test that fails if it is b
 2. **Admission runs before the empty-message check**, so a chat that is not the owner cannot consume a
    reply slot at all.
 3. **Media is fetched only after admission.** The channel hands over an identity; the stager opens the
-   stream. 10 MiB per file, 30-second total intake, one active download plus four waiting, and overload
-   refuses *before* a stream is opened.
+   stream. 10 MiB per file, 30-second total intake, one upload staging at a time, and a second
+   upload refuses *before* a stream is opened.
 
 `buildRuntimeFor` refuses any identity that is not the selected owner, so no secondary fixture, job or
 address can activate against owner state.

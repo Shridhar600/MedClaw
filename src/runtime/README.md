@@ -77,7 +77,7 @@ scaffold config parent dirs (structure only) ─▶ CONFIG lease ─▶ owner le
 
 ## Concrete composition edges
 
-Media intake preserves one total timer including queue wait, one active attempt and four waiting.
+Media intake preserves one total deadline and one staging attempt at a time; a second upload is refused.
 Pre-aborted attempts open no source. Caller abort, core timeout and source failure have distinct results.
 Race listeners are detached on settlement; a late source handle is cancelled. Refused pipelines close
 their owned writable before unlinking its partial, so a pending open cannot recreate a discarded file.

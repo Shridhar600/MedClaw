@@ -55,7 +55,7 @@ export type MediaStageReason =
   | 'too-large'
   /** Total intake wait exceeded. */
   | 'timeout'
-  /** A download was already active and the queue is full. Refused BEFORE opening a stream. */
+  /** Another upload was still staging. Refused BEFORE opening a stream. */
   | 'queue-full'
   /** Intake was aborted (stop, or authority lost) while the stream was open. */
   | 'aborted'
@@ -74,22 +74,15 @@ export type MediaStageResult =
  */
 export const MEDIA_MAX_FILE_BYTES = 10 * 1024 * 1024;
 export const MEDIA_INTAKE_TIMEOUT_MS = 30_000;
-/** One download in flight, four waiting owner media events. */
-export const MEDIA_MAX_ACTIVE = 1;
-export const MEDIA_MAX_WAITING = 4;
 
 export interface MediaLimits {
   maxFileBytes: number;
   intakeTimeoutMs: number;
-  maxActive: number;
-  maxWaiting: number;
 }
 
 export const DEFAULT_MEDIA_LIMITS: MediaLimits = {
   maxFileBytes: MEDIA_MAX_FILE_BYTES,
   intakeTimeoutMs: MEDIA_INTAKE_TIMEOUT_MS,
-  maxActive: MEDIA_MAX_ACTIVE,
-  maxWaiting: MEDIA_MAX_WAITING,
 };
 
 /** One bounded, identifier-free diagnostic per staging attempt. No analytics, no filenames. */

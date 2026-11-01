@@ -44,9 +44,7 @@ export type {
 export {
   DEFAULT_MEDIA_LIMITS,
   MEDIA_INTAKE_TIMEOUT_MS,
-  MEDIA_MAX_ACTIVE,
   MEDIA_MAX_FILE_BYTES,
-  MEDIA_MAX_WAITING,
 } from './media-source';
 export {
   PAIRING_ATTEMPTS_PER_CHAT_PER_DAY,

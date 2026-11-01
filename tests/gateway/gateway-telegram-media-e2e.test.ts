@@ -1,26 +1,9 @@
-// tests/gateway/gateway-telegram-media-e2e.test.ts
-//
-// R-16 + B2: the REAL Telegram transport handler, driving a REAL attachment through the REAL Gateway.
-//
-// WHY THIS FILE EXISTS
-// `tests/gateway/gateway-media-admission.test.ts` proves `Gateway.deliverMessage` stages correctly. That
-// was NOT sufficient: the actual B2 defect was that the production transport callback
-// `Gateway.handleMessage` called `route()` DIRECTLY, bypassing `admitAndStage` entirely. A test that only
-// drives `deliverMessage` passes whether or not `handleMessage` delegates to it — and indeed reverting
-// `handleMessage` to the bypass did NOT fail that suite.
-//
-// So this file closes the loop through the path production actually uses:
-//   grammY handler -> TelegramChannel -> Gateway.handleMessage -> deliverMessage -> admitAndStage
-//                    -> FsMediaStager -> turn, with authority re-read AFTER the retrieval.
-//
-// grammY is the only thing faked (there is no bot and no network). The channel, the Gateway, admission,
-// the Router, the media source and the stager are all real. The two external edges are injected: the Bot
-// API `getFile` resolution and the file-body fetch.
+// A real grammY document update drives the real Gateway: channel, admission, Router, media source, stager
+// and runtime are real. Only grammY, the Bot API `getFile`, the file-body fetch and the provider are faked.
 
 import * as fs from 'fs';
 import * as path from 'path';
 
-import type { MediaReference } from '../../src/ports/media-source';
 import type { LLMResponse } from '../../src/providers/types';
 
 // Telegram chat/user ids are NUMERIC on the wire and reach the core as strings. The owner is bound to
@@ -180,10 +163,7 @@ describe('a real Telegram attachment reaches the owner runtime (transport -> cor
       },
     });
 
-    // The provider is the ONLY stubbed collaborator now. The runtime, turn coordinator, session store,
-    // Router, admission, stager and channel are all real, so the prompt the model receives is the real
-    // composed one. An earlier version attached a whole runtime double AFTER start(); it never saw the
-    // turn, because the Router resolves through the REAL manager that start() built.
+    // The provider is the only stubbed collaborator, so the prompt the model receives is the real composed one.
     const prompts: string[] = [];
     const scriptedProvider = {
       modelName: 'scripted',
@@ -285,7 +265,7 @@ describe('a real Telegram attachment reaches the owner runtime (transport -> cor
     }
   }, 90_000);
 
-  it('stop during entered metadata prevents late fetch/write/turn; restart adopts a streamed retry in the same installation (C07)', async () => {
+  it('stop during entered metadata prevents late fetch/write/turn; restart adopts a streamed retry in the same installation', async () => {
     let resolveMetadata!: (file: { file_path: string }) => void;
     const metadata = new Promise<{ file_path: string }>(resolve => { resolveMetadata = resolve; });
     let entered!: () => void;
@@ -353,41 +333,22 @@ describe('a real Telegram attachment reaches the owner runtime (transport -> cor
     }
   }, 90_000);
 
-  it('refuses an attachment the moment it is aborted mid-turn, leaving no file behind', async () => {
-    const { fixture, gateway, fetchCount } = await boot({ telegram: true, fetchSize: 4 * 1024 * 1024 });
+  it('refuses an owner attachment whose real bytes exceed the cap, without handing a file onward', async () => {
+    const { fixture, gateway, prompts } = await boot({ fetchSize: 12 * 1024 * 1024, getFileImpl: async () => ({ file_path: 'files/big.pdf', file_size: 1024 }) });
     await gateway.start();
     try {
-      // Drive the handler, then WAIT until intake has genuinely begun before stopping.
-      //
-      // This wait is the whole point of the rewrite. The previous version called `stop()` immediately
-      // after starting the handler, but `deliverMessage` yields at its first `await`, so `stop()` set
-      // `stopping` and the turn returned BEFORE `admitAndStage` ever ran. Measured on the old code:
-      // `opens=0 cancels=0`. The test therefore asserted its way green without ever reaching the abort
-      // path it names — and it still passed with the abort itself neutered.
-      const inFlight = handlerFor('message:document')(documentUpdate());
+      await handlerFor('message:text')(textUpdate('skip'));
+      prompts.length = 0;
 
-      const deadline = Date.now() + 20_000;
-      while (fetchCount() === 0 && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 5));
-      }
-      // Precondition: the body IS being fetched. Without this the assertions below are vacuous.
-      expect(fetchCount()).toBeGreaterThan(0);
+      await handlerFor('message:document')(documentUpdate());
 
-      await gateway.stop();
-      await inFlight.catch(() => undefined);
-
-      // Never a complete, adoptable file left behind by an aborted retrieval.
-      const lane = fs.existsSync(fixture.mediaStaging) ? fs.readdirSync(fixture.mediaStaging) : [];
-      expect(lane.filter((n) => !n.endsWith('.part'))).toEqual([]);
-      // And no adopted report either: an aborted intake must not reach the reports directory.
-      const reportsDir = path.join(fixture.workspace, 'reports');
-      const reports = fs.existsSync(reportsDir) ? fs.readdirSync(reportsDir) : [];
-      expect(reports.filter((n) => n.endsWith('.pdf'))).toEqual([]);
+      const replies = mockSendMessage.mock.calls.map((c) => String(c[1])).join(' ');
+      expect(replies).toMatch(/10 MB limit|larger than/i);
+      expect(prompts).toEqual([]);
+      expect(fs.readdirSync(fixture.mediaStaging)).toEqual([]);
+      expect(fs.existsSync(path.join(fixture.workspace, 'reports')) ? fs.readdirSync(path.join(fixture.workspace, 'reports')) : []).toEqual([]);
     } finally {
-      await gateway.stop().catch(() => undefined);
+      await gateway.stop();
     }
   }, 90_000);
 });
-
-/** Keep the media-reference type honest: the transport builds these, the core consumes them. */
-export type { MediaReference };

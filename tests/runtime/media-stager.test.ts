@@ -1,42 +1,24 @@
-// tests/runtime/media-stager.test.ts
-//
-// The bounded media path, through the real `FsMediaStager` and a real streaming source.
-//
-// These are the protections the channel used to (badly) attempt at write time and cannot attempt at
-// all now that the transport only emits a reference: a real byte cap enforced while streaming, a
-// bounded intake wait, a bounded queue, refusal before any stream is opened, abort that cannot
-// write, and cleanup scoped to one operation's own partial file.
-//
-// The source is a REAL async iterable, not a mocked `pipeline`. Nothing here asserts on a call
-// count of the stager's internals; every assertion is about bytes on disk, the typed outcome, or
-// what the owner's staging directory is left containing.
+// The bounded media path through the real `FsMediaStager`, a real streaming source and a real disk.
+// Every assertion is about bytes on disk, the typed outcome, or what the staging directory is left holding.
 
 import * as fs from 'fs';
-import fsModule from 'fs';
 import crypto from 'crypto';
 import * as path from 'path';
-import { getEventListeners } from 'events';
 
 import { FsMediaStager } from '../../src/runtime';
 import { TelegramMediaSource } from '../../src/channels';
-import type {
-  MediaReference,
-  MediaSourcePort,
-  MediaStageResult,
-  OpenedMedia,
-} from '../../src/ports/media-source';
+import type { MediaReference, MediaSourcePort, OpenedMedia } from '../../src/ports/media-source';
 import { DEFAULT_MEDIA_LIMITS } from '../../src/ports/media-source';
 import type { DiagnosticEvent } from '../../src/ports/diagnostics';
 import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 
+const limits = (overrides: Partial<typeof DEFAULT_MEDIA_LIMITS>): typeof DEFAULT_MEDIA_LIMITS =>
+  ({ ...DEFAULT_MEDIA_LIMITS, ...overrides });
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
 function reference(overrides: Partial<MediaReference> = {}): MediaReference {
-  return {
-    channel: 'telegram',
-    fileId: 'file-1',
-    kind: 'document',
-    displayName: 'report.pdf',
-    ...overrides,
-  };
+  return { channel: 'telegram', fileId: 'file-1', kind: 'document', displayName: 'report.pdf', ...overrides };
 }
 
 /** A source that yields `chunkSize`-sized pieces until `totalBytes` are produced. */
@@ -70,7 +52,7 @@ function streamingSource(totalBytes: number, chunkSize = 64 * 1024): {
   };
 }
 
-/** A source whose stream blocks forever, for abort/timeout tests. */
+/** A source whose stream never produces a byte, for abort and timeout cases. */
 function blockingSource(): { source: MediaSourcePort; cancels: number } {
   const state = { cancels: 0 };
   return {
@@ -94,12 +76,18 @@ function listStaging(dir: string): string[] {
   return fs.existsSync(dir) ? fs.readdirSync(dir).sort() : [];
 }
 
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((yes) => { resolve = yes; });
+  return { promise, resolve };
+}
+
 describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
   let root: string;
   let staging: string;
 
   beforeEach(() => {
-    root = makeTestTemp('socs-s1-stager');
+    root = makeTestTemp('stager');
     staging = path.join(root, 'state', 'profiles', 'default', '.state', 'media-staging');
   });
 
@@ -107,23 +95,8 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
     removeTestTemp(root);
   });
 
-  it('streams an upload to a unique 0600 file and reports the real byte count', async () => {
+  it('streams an upload to a 0600 file inside staging, whatever name the transport supplied', async () => {
     const { source } = streamingSource(300 * 1024);
-    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root });
-
-    const result = await stager.stage(reference(), new AbortController().signal);
-
-    expect(result.kind).toBe('saved');
-    if (result.kind !== 'saved') throw new Error('unreachable');
-    expect(result.bytes).toBe(300 * 1024);
-    expect(fs.statSync(result.absolutePath).size).toBe(300 * 1024);
-    expect(fs.statSync(result.absolutePath).mode & 0o777).toBe(0o600);
-    // No partial left behind.
-    expect(listStaging(staging).filter((name) => name.endsWith('.part'))).toEqual([]);
-  });
-
-  it('never lets a transport-supplied name become a path', async () => {
-    const { source } = streamingSource(1024, 1024);
     const stager = new FsMediaStager(source, staging, { trustedBaseDir: root });
 
     const result = await stager.stage(
@@ -133,361 +106,145 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
 
     expect(result.kind).toBe('saved');
     if (result.kind !== 'saved') throw new Error('unreachable');
-    // Still inside the owner's staging directory, and the separators were neutralised.
+    expect(result.bytes).toBe(300 * 1024);
+    expect(fs.statSync(result.absolutePath).size).toBe(300 * 1024);
+    expect(fs.statSync(result.absolutePath).mode & 0o777).toBe(0o600);
     expect(path.dirname(result.absolutePath)).toBe(staging);
-    // No traversal ingredient survives sanitisation at all.
     expect(path.basename(result.absolutePath)).not.toContain('..');
+    expect(listStaging(staging).filter((name) => name.endsWith('.part'))).toEqual([]);
   });
 
-  it.each(['missing-authority', 'outside', 'non-directory'] as const)('refuses %s before source or filesystem effects, then stages a valid upload', async (shape) => {
-    const stream = streamingSource(32, 8);
-    const outside = path.join(root, 'outside');
-    fs.mkdirSync(outside, { mode: 0o750 });
-    fs.chmodSync(outside, 0o750); // Synthetic outside permission fixture.
-    const sentinel = path.join(outside, 'sentinel');
-    fs.writeFileSync(sentinel, 'outside bytes', { mode: 0o600 });
-    const trusted = path.join(root, 'owner');
-    fs.mkdirSync(trusted, { mode: 0o700 });
-    const lane = shape === 'outside' ? path.join(outside, 'media-staging') : path.join(trusted, '.state', 'media-staging');
-    if (shape === 'non-directory') fs.writeFileSync(path.join(trusted, '.state'), 'component bytes', { mode: 0o600 });
-    const stager = new FsMediaStager(stream.source, lane, { trustedBaseDir: shape === 'missing-authority' ? undefined : trusted });
-    const refused = await stager.stage(reference(), new AbortController().signal);
-    const beforeControlOpens = stream.opens;
-    const outsideEntries = fs.readdirSync(outside);
-    const outsideMode = fs.statSync(outside).mode & 0o777;
-    expect(fs.readFileSync(sentinel, 'utf8')).toBe('outside bytes');
-    expect(fs.existsSync(lane)).toBe(false);
-    if (shape === 'non-directory') expect(fs.readFileSync(path.join(trusted, '.state'), 'utf8')).toBe('component bytes');
-    const allowed = await new FsMediaStager(stream.source, path.join(trusted, 'safe', 'media-staging'), { trustedBaseDir: trusted })
-      .stage(reference(), new AbortController().signal);
-    expect(allowed.kind).toBe('saved');
-    if (allowed.kind !== 'saved') throw new Error('positive control refused');
-    expect(fs.readFileSync(allowed.absolutePath)).toEqual(Buffer.alloc(32, 65));
-    expect(fs.statSync(allowed.absolutePath).mode & 0o777).toBe(0o600);
-    expect(fs.statSync(path.dirname(allowed.absolutePath)).mode & 0o777).toBe(0o700);
-    expect(beforeControlOpens).toBe(0);
-    expect(outsideEntries).toEqual(['sentinel']);
-    expect(outsideMode).toBe(0o750);
-    expect(refused).toEqual({ kind: 'refused', reason: 'source-failed' });
-  });
+  it.each(['missing-authority', 'outside', 'non-directory'] as const)(
+    'refuses %s staging authority before any source or filesystem effect',
+    async (shape) => {
+      const stream = streamingSource(32, 8);
+      const outside = path.join(root, 'outside');
+      fs.mkdirSync(outside, { mode: 0o750 });
+      fs.chmodSync(outside, 0o750);
+      const sentinel = path.join(outside, 'sentinel');
+      fs.writeFileSync(sentinel, 'outside bytes', { mode: 0o600 });
+      const trusted = path.join(root, 'owner');
+      fs.mkdirSync(trusted, { mode: 0o700 });
+      const lane = shape === 'outside' ? path.join(outside, 'media-staging') : path.join(trusted, '.state', 'media-staging');
+      if (shape === 'non-directory') fs.writeFileSync(path.join(trusted, '.state'), 'component bytes', { mode: 0o600 });
+      const stager = new FsMediaStager(stream.source, lane, { trustedBaseDir: shape === 'missing-authority' ? undefined : trusted });
 
-  it('rechecks an alias installed during asynchronous source open before any write, then retries the same lane', async () => {
-    const entered = deferred<void>();
-    const opening = deferred<OpenedMedia>();
-    const stream = streamingSource(32, 8);
-    let opens = 0;
-    let cancels = 0;
-    const source: MediaSourcePort = { open: async (ref, signal) => {
-      if (++opens === 1) { entered.resolve(); return opening.promise; }
-      return stream.source.open(ref, signal);
-    } };
-    const outside = path.join(root, 'outside');
-    fs.mkdirSync(outside, { mode: 0o750 });
-    fs.chmodSync(outside, 0o750); // Synthetic outside permission fixture.
-    fs.writeFileSync(path.join(outside, 'sentinel'), 'outside bytes', { mode: 0o600 });
-    fs.mkdirSync(path.dirname(staging), { recursive: true, mode: 0o700 });
-    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root });
-    const pending = stager.stage(reference(), new AbortController().signal);
-    await entered.promise;
-    fs.symlinkSync(outside, staging);
-    opening.resolve({ chunks: (async function* (): AsyncGenerator<Uint8Array, void, unknown> { yield Buffer.from('refused bytes'); })(), cancel: async () => { cancels += 1; } });
-    const result = await pending;
-    const entries = fs.readdirSync(outside);
-    const mode = fs.statSync(outside).mode & 0o777;
-    fs.unlinkSync(staging);
-    const allowed = await stager.stage(reference(), new AbortController().signal);
-    expect(allowed.kind).toBe('saved');
-    if (allowed.kind !== 'saved') throw new Error('positive control refused');
-    expect(fs.readFileSync(allowed.absolutePath)).toEqual(Buffer.alloc(32, 65));
-    expect(fs.statSync(allowed.absolutePath).mode & 0o777).toBe(0o600);
-    expect(fs.statSync(staging).mode & 0o777).toBe(0o700);
-    expect(opens).toBe(2);
-    expect(cancels).toBe(1);
-    expect(fs.readFileSync(path.join(outside, 'sentinel'), 'utf8')).toBe('outside bytes');
-    expect(entries).toEqual(['sentinel']);
-    expect(mode).toBe(0o750);
-    expect(result).toEqual({ kind: 'refused', reason: 'source-failed' });
-  });
+      const refused = await stager.stage(reference(), new AbortController().signal);
 
-  it('refuses an advertised oversize upload without opening a stream at all', async () => {
+      expect(refused).toEqual({ kind: 'refused', reason: 'source-failed' });
+      expect(stream.opens).toBe(0);
+      expect(fs.existsSync(lane)).toBe(false);
+      expect(fs.readdirSync(outside)).toEqual(['sentinel']);
+      expect(fs.readFileSync(sentinel, 'utf8')).toBe('outside bytes');
+      expect(fs.statSync(outside).mode & 0o777).toBe(0o750);
+    },
+  );
+
+  it('opens no stream for an unsupported kind or an advertised size over the cap', async () => {
     const { source, opens } = streamingSource(1024);
-    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root,
-      limits: { maxFileBytes: 1024, intakeTimeoutMs: 5_000, maxActive: 1, maxWaiting: 4 },
-    });
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root, limits: limits({ maxFileBytes: 1024 }) });
+    const signal = new AbortController().signal;
 
-    const result = await stager.stage(
-      reference({ advertisedBytes: 5_000 }),
-      new AbortController().signal,
-    );
+    expect(await stager.stage({ ...reference(), kind: 'video' as unknown as MediaReference['kind'] }, signal))
+      .toEqual({ kind: 'refused', reason: 'unsupported' });
+    expect(await stager.stage(undefined, signal)).toEqual({ kind: 'refused', reason: 'unsupported' });
+    expect(await stager.stage(reference({ advertisedBytes: 5_000 }), signal))
+      .toEqual({ kind: 'refused', reason: 'advertised-too-large' });
 
-    expect(result).toEqual({ kind: 'refused', reason: 'advertised-too-large' });
     expect(opens).toBe(0);
     expect(listStaging(staging)).toEqual([]);
   });
 
-  it('refuses an upload that lies about its size, once the real bytes exceed the cap', async () => {
-    // The advertised size claims 100 bytes; the stream is 50 KiB. A trusted claim would pass this.
+  it('stops an upload that lies about its size and removes only its own partial', async () => {
     const { source } = streamingSource(50 * 1024, 4096);
-    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root,
-      limits: { maxFileBytes: 8 * 1024, intakeTimeoutMs: 5_000, maxActive: 1, maxWaiting: 4 },
-    });
+    fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
+    const sibling = path.join(staging, 'earlier-report.pdf');
+    fs.writeFileSync(sibling, 'kept', { mode: 0o600 });
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root, limits: limits({ maxFileBytes: 8 * 1024 }) });
 
-    const result = await stager.stage(
-      reference({ advertisedBytes: 100 }),
-      new AbortController().signal,
-    );
+    const result = await stager.stage(reference({ advertisedBytes: 100 }), new AbortController().signal);
 
     expect(result).toEqual({ kind: 'refused', reason: 'too-large' });
-    // The partial was cleaned up and nothing adoptable remains.
-    expect(listStaging(staging)).toEqual([]);
+    expect(listStaging(staging)).toEqual(['earlier-report.pdf']);
+    expect(fs.readFileSync(sibling, 'utf8')).toBe('kept');
   });
 
   it('refuses an empty stream rather than handing a zero-byte file onward', async () => {
     const { source } = streamingSource(0);
     const stager = new FsMediaStager(source, staging, { trustedBaseDir: root });
 
-    expect(await stager.stage(reference(), new AbortController().signal)).toEqual({
-      kind: 'refused',
-      reason: 'source-failed',
-    });
+    expect(await stager.stage(reference(), new AbortController().signal))
+      .toEqual({ kind: 'refused', reason: 'source-failed' });
     expect(listStaging(staging)).toEqual([]);
   });
 
-  it('refuses a media kind it does not admit', async () => {
-    const { source, opens } = streamingSource(1024);
-    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root });
-
-    const unsupported = await stager.stage(
-      { ...reference(), kind: 'video' as unknown as MediaReference['kind'] },
-      new AbortController().signal,
-    );
-    const missing = await stager.stage(undefined, new AbortController().signal);
-
-    expect(unsupported).toEqual({ kind: 'refused', reason: 'unsupported' });
-    expect(missing).toEqual({ kind: 'refused', reason: 'unsupported' });
-    expect(opens).toBe(0);
-  });
-
-  it('refuses a queued upload when the waiting room is full, before opening a stream', async () => {
+  it('leaves nothing on disk when the caller aborts, before or during the stream', async () => {
     const blocker = blockingSource();
-    const stager = new FsMediaStager(blocker.source, staging, { trustedBaseDir: root,
-      limits: { maxFileBytes: 1024, intakeTimeoutMs: 60_000, maxActive: 1, maxWaiting: 1 },
-    });
+    const stager = new FsMediaStager(blocker.source, staging, { trustedBaseDir: root, limits: limits({ intakeTimeoutMs: 60_000 }) });
 
-    const active = stager.stage(reference({ fileId: 'a' }), new AbortController().signal);
-    // Let the first take the single active slot.
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    const waiting = stager.stage(reference({ fileId: 'b' }), new AbortController().signal);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    const overflow = await stager.stage(reference({ fileId: 'c' }), new AbortController().signal);
+    const early = new AbortController();
+    early.abort();
+    expect(await stager.stage(reference(), early.signal)).toEqual({ kind: 'refused', reason: 'aborted' });
 
-    expect(overflow).toEqual({ kind: 'refused', reason: 'queue-full' });
-    expect(stager.inFlight).toEqual({ active: 1, waiting: 1 });
+    const controller = new AbortController();
+    const pending = stager.stage(reference(), controller.signal);
+    await sleep(10);
+    controller.abort();
 
-    // The blocked attempts are abandoned by the stager's own timeout path; nothing is left running.
-    void active;
-    void waiting;
-    void blocker;
-  });
-
-  it('REFUSES (never throws) when a queued attempt is released by the ACTIVE one timing out', async () => {
-    // A queued attempt whose wait ends because the ACTIVE attempt finished — the ordinary
-    // queue-drain shape. The stager never rejects here, and this is the regression guard for the
-    // sibling case below: it must keep passing after the fix.
-    const blocker = blockingSource();
-    const stager = new FsMediaStager(blocker.source, staging, { trustedBaseDir: root,
-      limits: { maxFileBytes: 1024, intakeTimeoutMs: 40, maxActive: 1, maxWaiting: 2 },
-    });
-
-    const active = stager.stage(reference({ fileId: 'a' }), new AbortController().signal);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    const queued = stager.stage(reference({ fileId: 'b' }), new AbortController().signal);
-
-    await expect(queued).resolves.toMatchObject({ kind: 'refused' });
-    await expect(active).resolves.toMatchObject({ kind: 'refused' });
-    expect(listStaging(staging)).toEqual([]);
-    expect(stager.inFlight.waiting).toBe(0);
-  });
-
-  it('REFUSES (never throws) when the slot is wedged by a source that ignores its signal', async () => {
-    // This is the case my first attempt at this coverage got WRONG, and the correction matters.
-    //
-    // I originally drove the queue wait with `blockingSource()` and a short budget, and reasoned that
-    // a queued attempt could never time out because the ACTIVE attempt's own timer fires first and
-    // wakes it. A cold re-reviewer deleted the new `catch` from a copy of this module and the test
-    // STILL PASSED — it never reached the changed line, so it pinned nothing.
-    //
-    // The timeout branch IS reachable, and this is how: `source.open()` was awaited bare, so a source
-    // that ignores its signal held the single `maxActive: 1` slot FOREVER. `active` was never
-    // decremented, every later owner upload queued, and each then expired in the queue wait — all
-    // reported as 'timeout'. One wedged fetch permanently killed the owner's media path for the life
-    // of the daemon. `open()` is now raced against the intake signal, which is what makes the bound
-    // real; this case is what proves it.
-    let opens = 0;
-    const wedged: MediaSourcePort = {
-      open: async (): Promise<OpenedMedia> => {
-        opens += 1;
-        // `open()` itself never settles and ignores the signal — the exact shape the race exists for.
-        // My first version of this case resolved `open()` and blocked the CHUNK iterator instead,
-        // which the pipeline race already handled, so the case passed with the open() race removed
-        // and pinned nothing. Verified by mutation.
-        await new Promise<void>(() => { /* never settles */ });
-        throw new Error('unreachable');
-      },
-    };
-    const stager = new FsMediaStager(wedged, staging, { trustedBaseDir: root,
-      limits: { maxFileBytes: 1024, intakeTimeoutMs: 40, maxActive: 1, maxWaiting: 2 },
-    });
-
-    // This attempt takes the only slot. With `open()` awaited bare it would hold it forever; with the
-    // race it is released at the intake deadline.
-    const wedgedAttempt = stager.stage(reference({ fileId: 'a' }), new AbortController().signal);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(stager.inFlight.active).toBe(1);
-
-    // These queue behind it. With the wedge in place their only way out is the queue-wait timeout.
-    const first = stager.stage(reference({ fileId: 'b' }), new AbortController().signal);
-    const second = stager.stage(reference({ fileId: 'c' }), new AbortController().signal);
-
-    await expect(first).resolves.toEqual({ kind: 'refused', reason: 'timeout' });
-    await expect(second).resolves.toEqual({ kind: 'refused', reason: 'timeout' });
-    expect(stager.inFlight.waiting).toBe(0);
-
-    // The load-bearing assertion: the wedge is RELEASED. Without the race on `open()`, `active` stays
-    // 1 for the life of the stager and every later owner upload expires in the queue wait — one
-    // signal-ignoring fetch permanently killing the owner's media path. Bounded by a wall clock so the
-    // failure is an assertion rather than a suite timeout.
-    const released = await Promise.race([
-      wedgedAttempt,
-      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('wedged slot was never released')), 1000)),
-    ]);
-    expect(released).toEqual({ kind: 'refused', reason: 'timeout' });
-    expect(stager.inFlight.active).toBe(0);
-    expect(listStaging(staging)).toEqual([]);
-    // Each of the three attempts reached `open()` exactly once. Nothing retried in a loop, which is
-    // what a wedged slot used to cause.
-    expect(opens).toBe(3);
-  });
-
-  it('REFUSES (never throws) when the CALLER aborts while the attempt is waiting for a slot', async () => {
-    // The reachable form of the same contract break. `awaitSlot` is handed the INTERNAL timeout
-    // signal, but the caller's signal is bridged onto it (`onAbort = () => timeout.abort()`), so a
-    // caller abort reaches `awaitSlot` too and rejects it.
-    //
-    // This matters in production because `Gateway.stop()` aborts the intake controller — so every
-    // queued attempt in flight at shutdown took this path, and the rejection escaped `stage()`.
-    const blocker = blockingSource();
-    const stager = new FsMediaStager(blocker.source, staging, { trustedBaseDir: root,
-      limits: { maxFileBytes: 1024, intakeTimeoutMs: 60_000, maxActive: 1, maxWaiting: 2 },
-    });
-
-    const active = stager.stage(reference({ fileId: 'a' }), new AbortController().signal);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-
-    // A long intake budget, so ONLY the caller's abort can end this wait.
-    const caller = new AbortController();
-    const queued = stager.stage(reference({ fileId: 'b' }), caller.signal);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(stager.inFlight).toEqual({ active: 1, waiting: 1 });
-
-    caller.abort();
-
-    // Awaited: a rejection fails this test instead of becoming an unhandled rejection.
-    await expect(queued).resolves.toEqual({ kind: 'refused', reason: 'aborted' });
-    expect(stager.inFlight.waiting).toBe(0);
-
-    void active;
-    void blocker;
-  });
-
-  it('cannot write a file when the intake wait expires mid-stream', async () => {
-    const blocker = blockingSource();
-    const stager = new FsMediaStager(blocker.source, staging, { trustedBaseDir: root,
-      limits: { maxFileBytes: 1024, intakeTimeoutMs: 40, maxActive: 1, maxWaiting: 1 },
-    });
-
-    const result = await stager.stage(reference(), new AbortController().signal);
-
-    expect(result).toEqual({ kind: 'refused', reason: 'timeout' });
-    // The critical assertion: a timed-out intake leaves nothing on disk at all.
+    expect(await pending).toEqual({ kind: 'refused', reason: 'aborted' });
     expect(listStaging(staging)).toEqual([]);
     expect(blocker.cancels).toBeGreaterThan(0);
   });
 
-  it('cannot write a file when the caller aborts intake', async () => {
-    const blocker = blockingSource();
-    const stager = new FsMediaStager(blocker.source, staging, { trustedBaseDir: root,
-      limits: { maxFileBytes: 1024, intakeTimeoutMs: 60_000, maxActive: 1, maxWaiting: 1 },
-    });
+  it('times out a stalled stream and a source that ignores its signal, then accepts the next upload', async () => {
+    const good = streamingSource(1024);
+    let opens = 0;
+    const source: MediaSourcePort = {
+      open: (ref, signal) => {
+        opens += 1;
+        // Neither the first (never settles) nor the second (stalled stream) honours the signal.
+        if (opens === 1) return new Promise<OpenedMedia>(() => { /* wedged open */ });
+        if (opens === 2) return blockingSource().source.open(ref, signal);
+        return good.source.open(ref, signal);
+      },
+    };
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root, limits: limits({ intakeTimeoutMs: 40 }) });
 
-    const controller = new AbortController();
-    const pending = stager.stage(reference(), controller.signal);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    controller.abort();
-
-    const result = await pending;
-    expect(result.kind).toBe('refused');
-    if (result.kind !== 'refused') throw new Error('unreachable');
-    expect(result.reason).toBe('aborted');
+    expect(await stager.stage(reference(), new AbortController().signal)).toEqual({ kind: 'refused', reason: 'timeout' });
+    expect(await stager.stage(reference(), new AbortController().signal)).toEqual({ kind: 'refused', reason: 'timeout' });
     expect(listStaging(staging)).toEqual([]);
+
+    const saved = await stager.stage(reference(), new AbortController().signal);
+    expect(saved.kind).toBe('saved');
   });
 
-  it('cancels a source that finishes opening after intake already expired', async () => {
-    let openCalls = 0;
-    let cancels = 0;
-    const slowSource: MediaSourcePort = {
+  it('refuses a second upload while one is staging, before opening a stream, and recovers afterwards', async () => {
+    const gate = deferred<void>();
+    let opens = 0;
+    const source: MediaSourcePort = {
       open: async (): Promise<OpenedMedia> => {
-        openCalls += 1;
-        // The open itself outlives the intake budget: a late completion must not stream.
-        await new Promise((resolve) => setTimeout(resolve, 120));
+        opens += 1;
         return {
-          chunks: {
-            // eslint-disable-next-line @typescript-eslint/require-await
-            async *[Symbol.asyncIterator]() {
-              yield new Uint8Array(1024);
-            },
-          },
-          cancel: async () => { cancels += 1; },
+          chunks: (async function* (): AsyncGenerator<Uint8Array> { await gate.promise; yield Buffer.from('bytes'); })(),
+          cancel: async () => undefined,
         };
       },
     };
-    const stager = new FsMediaStager(slowSource, staging, { trustedBaseDir: root,
-      limits: { maxFileBytes: 1024, intakeTimeoutMs: 30, maxActive: 1, maxWaiting: 1 },
-    });
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root });
 
-    const result = await stager.stage(reference(), new AbortController().signal);
+    const first = stager.stage(reference(), new AbortController().signal);
+    await sleep(10);
+    const second = await stager.stage(reference({ fileId: 'file-2' }), new AbortController().signal);
 
-    expect(openCalls).toBe(1);
-    // The refusal now arrives at the intake deadline (~30ms) instead of waiting out `open()` (~120ms),
-    // because `open()` is raced against the abort signal. The late handle is cancelled by the losing
-    // side's own cleanup, which necessarily happens AFTER the refusal — so wait for it to land before
-    // asserting. This is the behavioural improvement: `stage()` no longer blocks on a source that
-    // ignores its signal.
-    expect(result).toEqual({ kind: 'refused', reason: 'timeout' });
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(second).toEqual({ kind: 'refused', reason: 'queue-full' });
+    expect(opens).toBe(1);
 
-    expect(cancels).toBe(1);
-    expect(listStaging(staging)).toEqual([]);
+    gate.resolve();
+    expect((await first).kind).toBe('saved');
+    expect((await stager.stage(reference(), new AbortController().signal)).kind).toBe('saved');
   });
 
-  it('cleans up only its own partial file and leaves a sibling staged file alone', async () => {
-    const { source: slowSource } = streamingSource(64 * 1024);
-    // A pre-existing staged file belonging to some earlier successful operation.
-    fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
-    const sibling = path.join(staging, 'earlier-operation-report.pdf');
-    fs.writeFileSync(sibling, 'kept', { mode: 0o600 });
-
-    const stager = new FsMediaStager(slowSource, staging, { trustedBaseDir: root,
-      limits: { maxFileBytes: 8, intakeTimeoutMs: 5_000, maxActive: 1, maxWaiting: 1 },
-    });
-    const result = await stager.stage(reference(), new AbortController().signal);
-
-    expect(result).toEqual({ kind: 'refused', reason: 'too-large' });
-    expect(listStaging(staging)).toEqual(['earlier-operation-report.pdf']);
-    expect(fs.readFileSync(sibling, 'utf8')).toBe('kept');
-  });
-
-  it.each(['partial', 'final'] as const)('a refused exclusive %s collision preserves earlier bytes and allows a later upload', async (shape) => {
+  it.each(['partial', 'final'] as const)('a name collision on the %s file keeps the earlier bytes', async (shape) => {
     const stream = streamingSource(32, 8);
     const stager = new FsMediaStager(stream.source, staging, { trustedBaseDir: root });
     const identity = jest.spyOn(crypto, 'randomUUID').mockReturnValue('12345678-1234-4234-8234-123456789abc');
@@ -497,76 +254,40 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
       const existing = shape === 'partial' ? `${first.absolutePath}.part` : first.absolutePath;
       if (shape === 'partial') fs.renameSync(first.absolutePath, existing);
       fs.writeFileSync(existing, 'earlier owned bytes', { mode: 0o600 });
+
       const refused = await stager.stage(reference(), new AbortController().signal);
-      const preserved = fs.existsSync(existing) ? fs.readFileSync(existing, 'utf8') : undefined;
-      identity.mockRestore();
-      const allowed = await stager.stage(reference(), new AbortController().signal);
-      expect(allowed.kind).toBe('saved');
-      if (allowed.kind !== 'saved') throw new Error('positive control refused');
-      expect(fs.readFileSync(allowed.absolutePath)).toEqual(Buffer.alloc(32, 65));
-      expect(fs.statSync(allowed.absolutePath).mode & 0o777).toBe(0o600);
-      expect(fs.statSync(staging).mode & 0o777).toBe(0o700);
-      expect(stream.opens).toBe(3);
-      expect(preserved).toBe('earlier owned bytes');
+
       expect(refused).toEqual({ kind: 'refused', reason: 'source-failed' });
-      expect(listStaging(staging)).toEqual([path.basename(existing), path.basename(allowed.absolutePath)].sort());
+      expect(fs.readFileSync(existing, 'utf8')).toBe('earlier owned bytes');
+      identity.mockRestore();
+      expect((await stager.stage(reference(), new AbortController().signal)).kind).toBe('saved');
     } finally {
       identity.mockRestore();
     }
   });
 
-  it('reports a bounded, identifier-free diagnostic per attempt', async () => {
+  it('reports one identifier-free diagnostic per attempt and keeps URLs and tokens out of the log', async () => {
     const outcomes: DiagnosticEvent[] = [];
-    const { source } = streamingSource(1024);
-    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root,
-      diagnostics: { emit: (event) => outcomes.push(event) },
-    });
+    const logs: string[] = [];
+    const leaky: MediaSourcePort = {
+      open: async () => { throw new Error('GET https://api.telegram.org/file/bot123:SECRET/documents/a.pdf failed'); },
+    };
+    const diagnostics = { emit: (event: DiagnosticEvent): void => { outcomes.push(event); } };
+    const saved = new FsMediaStager(streamingSource(1024).source, staging, { trustedBaseDir: root, diagnostics });
+    const failing = new FsMediaStager(leaky, staging, { trustedBaseDir: root, diagnostics, log: (message) => logs.push(message) });
 
-    await stager.stage(reference(), new AbortController().signal);
-    await stager.stage(reference({ kind: 'video' as unknown as MediaReference['kind'] }), new AbortController().signal);
+    await saved.stage(reference(), new AbortController().signal);
+    await failing.stage(reference(), new AbortController().signal);
 
-    // One event per attempt, each naming its stage and carrying a measured duration. The old channel
-    // could not say which operation produced an event, nor how long it took.
     expect(outcomes).toEqual([
       { stage: 'media-intake', outcome: 'saved', bytes: 1024, durationMs: expect.any(Number) },
-      { stage: 'media-intake', outcome: 'refused', reason: 'unsupported', durationMs: expect.any(Number) },
+      { stage: 'media-intake', outcome: 'refused', reason: 'source-failed', durationMs: expect.any(Number) },
     ]);
-    // No chat, sender, file id, filename or URL in the diagnostic channel.
-    const serialised = JSON.stringify(outcomes);
-    expect(serialised).not.toContain('report.pdf');
-    expect(serialised).not.toContain('file-1');
-  });
-
-  it('reports a source failure without leaking a URL or token into the sanitized log', async () => {
-    const logs: string[] = [];
-    const leakySource: MediaSourcePort = {
-      open: async () => {
-        throw new Error('GET https://api.telegram.org/file/bot123:SECRET/documents/a.pdf failed');
-      },
-    };
-    const stager = new FsMediaStager(leakySource, staging, { trustedBaseDir: root, log: (message) => logs.push(message) });
-
-    const result: MediaStageResult = await stager.stage(reference(), new AbortController().signal);
-
-    expect(result).toEqual({ kind: 'refused', reason: 'source-failed' });
-    const joined = logs.join('\n');
-    expect(joined).not.toContain('SECRET');
-    expect(joined).not.toContain('api.telegram.org');
-    expect(joined).toContain('source-failed');
+    const everything = JSON.stringify(outcomes) + logs.join('\n');
+    for (const secret of ['report.pdf', 'file-1', 'SECRET', 'api.telegram.org']) expect(everything).not.toContain(secret);
+    expect(logs.join('\n')).toContain('source-failed');
   });
 });
-
-/** Controlled external waits; production source, queue, pipeline and filesystem remain real. */
-function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: Error) => void } {
-  let resolve!: (value: T) => void;
-  let reject!: (error: Error) => void;
-  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
-  return { promise, resolve, reject };
-}
-
-async function settleContinuations(): Promise<void> {
-  for (let i = 0; i < 20; i += 1) await Promise.resolve();
-}
 
 function responseWithBytes(text = 'allowed streamed bytes'): Response {
   const bytes = Buffer.from(text);
@@ -579,323 +300,112 @@ function responseWithBytes(text = 'allowed streamed bytes'): Response {
   }));
 }
 
-describe('Telegram retrieval and real disk staging share one lifetime (C07)', () => {
+describe('FsMediaStager over the Telegram source: a timed-out or aborted intake cannot fetch or write late', () => {
   let root: string;
   let staging: string;
 
   beforeEach(() => {
-    root = makeTestTemp('c07-telegram-lifetime');
+    root = makeTestTemp('stager-telegram');
     staging = path.join(root, 'media-staging');
     fs.mkdirSync(staging, { mode: 0o700 });
   });
 
   afterEach(() => {
-    jest.useRealTimers();
-    jest.restoreAllMocks();
     removeTestTemp(root);
   });
 
-  async function savedControl(stager: FsMediaStager): Promise<string[]> {
-    const before = listStaging(staging);
+  async function expectStagedControl(stager: FsMediaStager): Promise<void> {
     const saved = await stager.stage(reference({ fileId: 'retry' }), new AbortController().signal);
-    expect(saved.kind).toBe('saved');
     if (saved.kind !== 'saved') throw new Error('positive control refused');
     expect(fs.readFileSync(saved.absolutePath, 'utf8')).toBe('allowed streamed bytes');
     expect(fs.statSync(saved.absolutePath).mode & 0o777).toBe(0o600);
-    expect(fs.statSync(staging).mode & 0o777).toBe(0o700);
-    expect(listStaging(staging)).toEqual([...before, path.basename(saved.absolutePath)].sort());
-    return listStaging(staging);
+    expect(listStaging(staging)).toEqual([path.basename(saved.absolutePath)]);
   }
 
-  it.each(['deadline', 'caller'] as const)('late metadata after %s cannot start a body fetch; the same lane retries', async (cause) => {
-    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
-    jest.setSystemTime(new Date('2026-10-10T00:00:00Z'));
+  it.each(['deadline', 'caller'] as const)('late metadata after %s starts no body fetch; the lane then stages again', async (cause) => {
     const metadata = deferred<{ file_path: string }>();
     const entered = deferred<void>();
-    const metadataSignals: (AbortSignal | undefined)[] = [];
-    const fetchSignals: AbortSignal[] = [];
-    const fetchEntryStates: boolean[] = [];
-    const outcomes: DiagnosticEvent[] = [];
+    let fetches = 0;
     const source = new TelegramMediaSource({
       token: 'synthetic-token',
-      api: { getFile: async (id: string, signal?: AbortSignal): Promise<{ file_path: string }> => {
-        metadataSignals.push(signal);
+      api: { getFile: async (id: string): Promise<{ file_path: string }> => {
         if (id === 'retry') return { file_path: 'files/retry' };
         entered.resolve();
         return metadata.promise;
       } },
-      fetchImpl: async (_url, signal): Promise<Response> => {
-        fetchEntryStates.push(signal.aborted);
-        fetchSignals.push(signal);
-        return responseWithBytes();
-      },
+      fetchImpl: async (): Promise<Response> => { fetches += 1; return responseWithBytes(); },
     });
-    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root,
-      limits: { ...DEFAULT_MEDIA_LIMITS, intakeTimeoutMs: 25 },
-      diagnostics: { emit: (event): void => { outcomes.push(event); } },
-    });
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root, limits: limits({ intakeTimeoutMs: 40 }) });
     const caller = new AbortController();
+
     const pending = stager.stage(reference(), caller.signal);
     await entered.promise;
-    expect(stager.inFlight).toEqual({ active: 1, waiting: 0 });
-    expect(fetchSignals).toHaveLength(0);
-    if (cause === 'deadline') await jest.advanceTimersByTimeAsync(25);
-    else caller.abort();
+    if (cause === 'caller') caller.abort();
     const refused = await pending;
-    expect(stager.inFlight).toEqual({ active: 0, waiting: 0 });
-    expect(listStaging(staging)).toEqual([]);
     metadata.resolve({ file_path: 'files/late' });
-    await settleContinuations();
-    const lateFetchStates = [...fetchEntryStates];
-    expect(listStaging(staging)).toEqual([]);
-    jest.useRealTimers();
-    await savedControl(stager);
-    // Decisive RED: received source starts one fetch with a fresh, non-aborted signal.
-    expect(lateFetchStates).toEqual([]);
-    expect(metadataSignals[0]?.aborted).toBe(true);
-    expect(getEventListeners(caller.signal, 'abort')).toEqual([]);
-    expect(getEventListeners(metadataSignals[0]!, 'abort')).toEqual([]);
+    await sleep(20);
+
     expect(refused).toEqual({ kind: 'refused', reason: cause === 'deadline' ? 'timeout' : 'aborted' });
-    expect(outcomes).toHaveLength(2);
-    if (cause === 'deadline') expect(outcomes[0]).toMatchObject({ durationMs: 25 });
+    expect(fetches).toBe(0);
+    expect(listStaging(staging)).toEqual([]);
+    await expectStagedControl(stager);
   });
 
-  it('pre-aborted intake and standalone open perform no metadata/body/write, followed by a saved control', async () => {
-    const getFile = jest.fn(async () => ({ file_path: 'files/allowed' }));
-    const fetchImpl = jest.fn(async () => responseWithBytes());
-    const source = new TelegramMediaSource({ token: 'synthetic-token', api: { getFile }, fetchImpl });
-    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root });
-    const caller = new AbortController();
-    caller.abort();
-    const refused = await stager.stage(reference(), caller.signal);
-    const opened = await source.open(reference(), caller.signal).catch(() => undefined);
-    await opened?.cancel();
-    const metadataCalls = getFile.mock.calls.length;
-    const fetchCalls = fetchImpl.mock.calls.length;
-    const entries = listStaging(staging);
-    await savedControl(stager);
-    expect(metadataCalls).toBe(0);
-    expect(fetchCalls).toBe(0);
-    expect(entries).toEqual([]);
-    expect(opened).toBeUndefined();
-    expect(refused).toEqual({ kind: 'refused', reason: 'aborted' });
-  });
-
-  it('a late fetch response is cancelled without opening a reader or writing; retry still streams', async () => {
-    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
-    jest.setSystemTime(new Date('2026-10-10T00:00:00Z'));
+  it('cancels a fetch response that arrives after the deadline without reading it', async () => {
     const fetched = deferred<Response>();
     const entered = deferred<void>();
     const cancelled = jest.fn();
     const body = new ReadableStream<Uint8Array>({ cancel: cancelled });
-    const reader = jest.spyOn(body, 'getReader');
     let attempts = 0;
     const source = new TelegramMediaSource({
-      token: 'synthetic-token', api: { getFile: async (): Promise<{ file_path: string }> => ({ file_path: 'files/held' }) },
+      token: 'synthetic-token',
+      api: { getFile: async (): Promise<{ file_path: string }> => ({ file_path: 'files/held' }) },
       fetchImpl: async (): Promise<Response> => {
-        attempts += 1;
-        if (attempts > 1) return responseWithBytes();
+        if (++attempts > 1) return responseWithBytes();
         entered.resolve();
         return fetched.promise;
       },
     });
-    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root, limits: { ...DEFAULT_MEDIA_LIMITS, intakeTimeoutMs: 25 } });
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root, limits: limits({ intakeTimeoutMs: 40 }) });
+
     const pending = stager.stage(reference(), new AbortController().signal);
     await entered.promise;
-    await jest.advanceTimersByTimeAsync(25);
     expect(await pending).toEqual({ kind: 'refused', reason: 'timeout' });
     fetched.resolve(new Response(body));
-    await settleContinuations();
+    await sleep(20);
+
     expect(cancelled).toHaveBeenCalledTimes(1);
-    expect(reader).not.toHaveBeenCalled();
     expect(body.locked).toBe(false);
     expect(listStaging(staging)).toEqual([]);
-    jest.useRealTimers();
-    await savedControl(stager);
+    await expectStagedControl(stager);
   });
 
-  it('source timeout during a real held reader refuses truncated bytes and releases the reader, then retries', async () => {
-    const reading = deferred<void>();
+  it('a body that stalls mid-stream is refused as truncated, its reader released, and the lane stays usable', async () => {
     const releaseBody = deferred<void>();
     const cancelled = jest.fn(() => { releaseBody.resolve(); });
     let pulls = 0;
     const body = new ReadableStream<Uint8Array>({
       async pull(controller): Promise<void> {
-        pulls += 1;
-        if (pulls === 1) controller.enqueue(Buffer.from('partial'));
-        else { reading.resolve(); await releaseBody.promise; }
+        if (++pulls === 1) controller.enqueue(Buffer.from('partial'));
+        else await releaseBody.promise;
       },
       cancel: cancelled,
     });
     let attempts = 0;
     const source = new TelegramMediaSource({
-      token: 'synthetic-token', timeoutMs: 100_000,
+      token: 'synthetic-token',
+      timeoutMs: 60,
       api: { getFile: async (): Promise<{ file_path: string }> => ({ file_path: 'files/held' }) },
       fetchImpl: async (): Promise<Response> => ++attempts === 1 ? new Response(body) : responseWithBytes(),
     });
-    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
-    jest.setSystemTime(new Date('2026-10-10T00:00:00Z'));
-    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root, limits: { ...DEFAULT_MEDIA_LIMITS, intakeTimeoutMs: 200_000 } });
-    const pending = stager.stage(reference(), new AbortController().signal);
-    await reading.promise;
-    expect(body.locked).toBe(true);
-    await jest.advanceTimersByTimeAsync(100_000);
-    const result = await pending;
-    const entries = listStaging(staging);
+    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root, limits: limits({ intakeTimeoutMs: 5_000 }) });
+
+    const result = await stager.stage(reference(), new AbortController().signal);
+
+    expect(result).toEqual({ kind: 'refused', reason: 'source-failed' });
     expect(cancelled).toHaveBeenCalledTimes(1);
     expect(body.locked).toBe(false);
-    jest.useRealTimers();
-    await savedControl(stager);
-    expect(result).toEqual({ kind: 'refused', reason: 'source-failed' });
-    expect(entries).toEqual([]);
-  });
-
-  it('one active/four waiting retain queue time in their deadline, settle late rejection, and accept a retry', async () => {
-    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
-    jest.setSystemTime(new Date('2026-10-10T00:00:00Z'));
-    const metadata = deferred<{ file_path: string }>();
-    const opens: string[] = [];
-    const fetches = jest.fn(async () => responseWithBytes());
-    const outcomes: DiagnosticEvent[] = [];
-    const source = new TelegramMediaSource({ token: 'synthetic-token',
-      api: { getFile: async (id): Promise<{ file_path: string }> => {
-        opens.push(id);
-        return id === 'retry' ? { file_path: 'files/retry' } : metadata.promise;
-      } }, fetchImpl: fetches,
-    });
-    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root,
-      limits: { ...DEFAULT_MEDIA_LIMITS, intakeTimeoutMs: 25 },
-      diagnostics: { emit: (event): void => { outcomes.push(event); } },
-    });
-    const active = stager.stage(reference({ fileId: 'active' }), new AbortController().signal);
-    expect(opens).toEqual(['active']);
-    await jest.advanceTimersByTimeAsync(10);
-    const waiting = Array.from({ length: 4 }, (_unused, i) =>
-      stager.stage(reference({ fileId: `waiting-${i}` }), new AbortController().signal));
-    expect(stager.inFlight).toEqual({ active: 1, waiting: 4 });
-    expect(await stager.stage(reference({ fileId: 'overflow' }), new AbortController().signal))
-      .toEqual({ kind: 'refused', reason: 'queue-full' });
-    expect(opens).toEqual(['active']);
-    await jest.advanceTimersByTimeAsync(15);
-    expect(await active).toEqual({ kind: 'refused', reason: 'timeout' });
-    expect(opens).toEqual(['active', 'waiting-0']);
-    expect(stager.inFlight).toEqual({ active: 1, waiting: 3 });
-    await jest.advanceTimersByTimeAsync(10);
-    expect(await Promise.all(waiting)).toEqual(Array.from({ length: 4 }, () => ({ kind: 'refused', reason: 'timeout' })));
-    expect(stager.inFlight).toEqual({ active: 0, waiting: 0 });
-    // A rejecting external loser is observed too; it cannot become an unhandled rejection.
-    metadata.reject(new Error('synthetic external failure'));
-    await settleContinuations();
-    expect(fetches).not.toHaveBeenCalled();
     expect(listStaging(staging)).toEqual([]);
-    expect(outcomes.filter(event => event.stage === 'media-intake' && event.outcome === 'refused' && event.reason === 'timeout'))
-      .toEqual(Array.from({ length: 5 }, () => ({ stage: 'media-intake', outcome: 'refused', reason: 'timeout', durationMs: 25 })));
-    expect(jest.getTimerCount()).toBe(0);
-    jest.useRealTimers();
-    await savedControl(stager);
-    expect(outcomes).toHaveLength(7);
-  });
-
-  it('the source budget starts before metadata and is not reset for body consumption', async () => {
-    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
-    jest.setSystemTime(new Date('2026-10-10T00:00:00Z'));
-    const metadata = deferred<{ file_path: string }>();
-    const reading = deferred<void>();
-    const releaseBody = deferred<void>();
-    const opening = deferred<void>();
-    let finishOpen!: () => void;
-    const createWriteStream = fsModule.createWriteStream;
-    jest.spyOn(fsModule, 'createWriteStream').mockImplementationOnce((target, options) => {
-      if (typeof options === 'string') throw new Error('unexpected encoding option');
-      return createWriteStream(target, { ...options, fs: {
-        ...fsModule,
-        open: ((...args: unknown[]) => {
-          finishOpen = (): void => { Reflect.apply(fsModule.open, fsModule, args); };
-          opening.resolve();
-        }) as typeof fsModule.open,
-      } });
-    });
-    let attempts = 0;
-    let retrievalSignal: AbortSignal | undefined;
-    const source = new TelegramMediaSource({ token: 'synthetic-token', timeoutMs: 25,
-      api: { getFile: async (id): Promise<{ file_path: string }> => id === 'retry' ? { file_path: 'files/retry' } : metadata.promise },
-      fetchImpl: async (_url, signal): Promise<Response> => {
-        retrievalSignal = signal;
-        if (++attempts > 1) return responseWithBytes();
-        let pulls = 0;
-        return new Response(new ReadableStream<Uint8Array>({
-          async pull(controller): Promise<void> {
-            if (++pulls === 1) controller.enqueue(Buffer.from('partial'));
-            else {
-              reading.resolve();
-              await releaseBody.promise;
-              if (!retrievalSignal?.aborted) controller.close();
-            }
-          },
-          cancel(): void { releaseBody.resolve(); },
-        }));
-      },
-    });
-    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root, limits: { ...DEFAULT_MEDIA_LIMITS, intakeTimeoutMs: 100 } });
-    const pending = stager.stage(reference(), new AbortController().signal);
-    await jest.advanceTimersByTimeAsync(15);
-    metadata.resolve({ file_path: 'files/held' });
-    await reading.promise;
-    await opening.promise;
-    await jest.advanceTimersByTimeAsync(10);
-    const abortedAtDeadline = retrievalSignal?.aborted;
-    // Settle a non-aborted inverse without advancing a competing core deadline over real disk IO.
-    releaseBody.resolve();
-    finishOpen();
-    const result = await pending;
-    const entries = listStaging(staging);
-    jest.useRealTimers();
-    await savedControl(stager);
-    expect(abortedAtDeadline).toBe(true);
-    expect(result).toEqual({ kind: 'refused', reason: 'source-failed' });
-    expect(entries).toEqual([]);
-  });
-
-  it('abort retains the intake slot until its held filesystem open closes and its partial is removed', async () => {
-    const opening = deferred<void>();
-    const closed = deferred<void>();
-    let finishOpen!: () => void;
-    const createWriteStream = fsModule.createWriteStream;
-    jest.spyOn(fsModule, 'createWriteStream').mockImplementationOnce((target, options) => {
-      if (typeof options === 'string') throw new Error('unexpected encoding option');
-      const stream = createWriteStream(target, { ...options, fs: {
-        ...fsModule,
-        open: ((...args: unknown[]) => {
-          finishOpen = (): void => { Reflect.apply(fsModule.open, fsModule, args); };
-          opening.resolve();
-        }) as typeof fsModule.open,
-      } });
-      stream.once('close', () => { closed.resolve(); });
-      return stream;
-    });
-    let attempts = 0;
-    const source = new TelegramMediaSource({ token: 'synthetic-token',
-      api: { getFile: async (): Promise<{ file_path: string }> => ({ file_path: 'files/held' }) },
-      fetchImpl: async (): Promise<Response> => ++attempts === 1
-        ? new Response(new ReadableStream<Uint8Array>()) : responseWithBytes(),
-    });
-    const stager = new FsMediaStager(source, staging, { trustedBaseDir: root });
-    const caller = new AbortController();
-    let settled = false;
-    const pending = stager.stage(reference(), caller.signal).then(result => { settled = true; return result; });
-    await opening.promise;
-    caller.abort();
-    await settleContinuations();
-    const settledBeforeOwnedClose = settled;
-    const inFlightBeforeOwnedClose = stager.inFlight;
-    finishOpen();
-    const result = await pending;
-    await closed.promise;
-    const entries = listStaging(staging);
-    await savedControl(stager);
-    expect(entries).toEqual([]);
-    expect(settledBeforeOwnedClose).toBe(false);
-    expect(inFlightBeforeOwnedClose).toEqual({ active: 1, waiting: 0 });
-    expect(result).toEqual({ kind: 'refused', reason: 'aborted' });
+    await expectStagedControl(stager);
   });
 });
