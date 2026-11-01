@@ -7,8 +7,6 @@
 //
 // Identity is chosen HERE and nowhere else. The state root defaults to the selected config file's
 // directory, the owner ID defaults to `default`, and every owner path is DERIVED from that pair.
-// `--workspace` and `--force` are retired rather than silently reinterpreted: an old invocation
-// gets an explicit message instead of writing somewhere it did not mean to.
 //
 // This module does no prompting and no daemon launch. Those stay in the wizard and the service
 // entry.
@@ -218,18 +216,6 @@ export function parseArgs(argv: string[]): ServiceOnboardingArgs {
         args.ownerId = requireOptionValue('--owner-id', next);
         index += 1;
         break;
-      // Retired on purpose (plan 15 §2.4). An old invocation is refused with guidance rather than
-      // silently reinterpreted as the new scoped layout.
-      case '--workspace':
-        throw new Error(
-          '--workspace is retired. The owner workspace is now DERIVED from the state root; '
-          + 'choose one with --state-root <dir> (or --config <file>, whose directory becomes the state root).',
-        );
-      case '--force':
-        throw new Error(
-          '--force is retired. Setup refuses to overwrite an existing installation; '
-          + 'choose a fresh --state-root / --config target instead. Existing credentials and evidence are never removed.',
-        );
       case '--provider':
         args.provider = parseProviderOption('--provider', next);
         index += 1;

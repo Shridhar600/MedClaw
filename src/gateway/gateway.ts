@@ -6,7 +6,6 @@ import type { OwnerAdmissionService, OwnerPaths, ProfileId } from '../profiles';
 import type { AdmittedMessage, Channel, IncomingMessage } from '../channels';
 import { TelegramChannel } from '../channels';
 import { LLMSemaphore, HeartbeatQueueFullError } from '../tools/semaphore';
-import { deprecatedSessionWarnings } from '../config/deprecations';
 import { createProvider, type ProviderFactory } from '../providers/factory';
 import { syncHeartbeatMarkdown } from '../scheduler/heartbeat-markdown';
 import type { NightlySweepResult } from '../scheduler/transcript-sweep-job';
@@ -369,12 +368,6 @@ export class Gateway {
     this.stopped = false;
 
     console.log('[gateway] Starting Redacted...');
-
-    // P2b DD10 / D3.7: warn once at boot for any retired idle-reset config key still set to a
-    // non-default value (they no longer trigger anything).
-    for (const warning of deprecatedSessionWarnings(config.sessions)) {
-      console.warn(`[gateway] Deprecated config: ${warning}`);
-    }
 
     // ── S1 admission comes first ──────────────────────────────────────────────────────────
     // A missing, unreadable, corrupt or wrong-owner record must NOT boot into a serving state,

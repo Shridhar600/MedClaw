@@ -113,20 +113,4 @@ describe('RR-6b session and window durability', () => {
     expect(restarted.getHistory('chat-1')).toEqual([]);
   });
 
-  it('does not trust a torn session migration sentinel', () => {
-    const dayFile = `${dateKey(new Date())}.jsonl`;
-    fs.writeFileSync(
-      path.join(sessionsDir, 'active-chat-1.jsonl'),
-      JSON.stringify({ timestamp: '2026-08-26T10:00:00.000Z', role: 'user', content: 'legacy context', chatId: 'chat-1' }) + '\n',
-    );
-    fs.writeFileSync(path.join(sessionsDir, '.migrated'), '{"version":1');
-
-    new SessionManager({ sessionsPath: sessionsDir });
-
-    expect(fs.readFileSync(path.join(sessionsDir, dayFile), 'utf8')).toContain('legacy context');
-    expect(JSON.parse(fs.readFileSync(path.join(sessionsDir, '.migrated'), 'utf8'))).toMatchObject({
-      version: 1,
-      completed: true,
-    });
-  });
 });

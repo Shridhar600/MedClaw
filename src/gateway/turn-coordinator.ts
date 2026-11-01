@@ -30,8 +30,6 @@ export async function captureUserTurn(runtime: ProfileRuntime, incoming: Admitte
   if (!pipeline || incoming.text.trim().length === 0) return;
   try {
     await pipeline.ingest({
-      profileId: String(runtime.profileId),
-      source: 'chat',
       kind: 'narrative-note',
       payload: { text: incoming.text },
       ...(incoming.messageId ? { idempotencyKey: `chat:${incoming.chatId}:${incoming.messageId}` } : {}),
@@ -401,8 +399,6 @@ export class TurnCoordinator {
     const pending: string[] = [];
     for (const fact of facts) {
       const result = await pipeline.ingest({
-        profileId: String(this.runtime.profileId),
-        source: 'onboarding',
         kind: 'ledger-fact',
         idempotencyKey: `onboarding:${fact.type}:${fact.entity}:${JSON.stringify(fact.fields)}`,
         payload: {

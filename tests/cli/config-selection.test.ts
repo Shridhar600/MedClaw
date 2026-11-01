@@ -605,37 +605,6 @@ describe('malformed setup input refuses before any mutation', () => {
     }
   });
 
-  it('refuses the retired --workspace and --force flags with guidance and no write', async () => {
-    const t = threeTargets();
-    try {
-      for (const [flag, value, expected] of [
-        ['--workspace', path.join(t.root, 'ws'), '--workspace is retired'],
-        ['--force', undefined, '--force is retired'],
-      ] as const) {
-        const before = listAll(t);
-        const bytes = snapshot(t);
-        const output: string[] = [];
-        const argv = value === undefined ? [flag] : [flag, value];
-
-        const code = await runCli(
-          ['--config', t.selectedConfig, 'onboard', '--yes', '--provider', 'ollama', ...argv],
-          {
-            stdout: (text: string) => output.push(text),
-            stderr: (text: string) => output.push(text),
-            input: async () => '',
-          },
-        );
-
-        expect(code).toBe(1);
-        expect(output.join('')).toContain(expected);
-        expect(unexpectedPaths(t, before)).toEqual([]);
-        expect(snapshot(t)).toEqual(bytes);
-      }
-    } finally {
-      t.restore();
-    }
-  });
-
   // ── C04-P01: a refused value must NEVER be printed ─────────────────────────────────────────
   //
   // One shared table, three real entry points. The parent review reproduced 12/12 echoes: the three

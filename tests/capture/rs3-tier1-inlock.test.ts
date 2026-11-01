@@ -62,7 +62,7 @@ describe('RR-STRUCT R-S3 — Tier-1 FactMirror lands atomically with the write (
 
   it('a fresh factMirror.queryActive() read the INSTANT ingest() resolves already reflects the new fact — no async gap', async () => {
     await pipeline.ingest({
-      profileId: 'default', source: 'tool:ledger_record', kind: 'ledger-fact',
+      kind: 'ledger-fact',
       payload: {
         entity: 'metformin', type: 'medication', fields: { dose: '500mg' },
         provenance: { source: 'user', confidence: 1, anchor: '', capturedAt: '2026-09-01T09:00:00.000Z' },
@@ -80,7 +80,7 @@ describe('RR-STRUCT R-S3 — Tier-1 FactMirror lands atomically with the write (
     // A non-med/allergy type (LedgerStore.discontinue applies med/allergy discontinuation only
     // after confirmation — this test isolates the Tier-1 atomicity property, not the confirm flow).
     await pipeline.ingest({
-      profileId: 'default', source: 'tool:ledger_record', kind: 'ledger-fact',
+      kind: 'ledger-fact',
       payload: {
         entity: 'headache', type: 'symptom', fields: {},
         provenance: { source: 'user', confidence: 1, anchor: '', capturedAt: '2026-09-01T09:00:00.000Z' },

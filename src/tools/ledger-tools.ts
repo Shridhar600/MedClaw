@@ -279,8 +279,6 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       let result: RecordFactResult | void;
       try {
         result = await deps.pipeline.ingest({
-          profileId: 'default',
-          source: 'tool:ledger_record',
           kind: 'ledger-fact',
           idempotencyKey,
           payload: {

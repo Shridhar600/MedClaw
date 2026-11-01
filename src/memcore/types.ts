@@ -141,21 +141,16 @@ export interface LedgerCorrectionInput {
   note: string;
 }
 
-interface CaptureEventBase {
-  profileId: string;
-  source: string;
-}
-
 /**
  * A normalized inbound capture event, discriminated by `kind`. Each payload is an
  * INPUT shape (not a stored record) — the pipeline resolves ids/anchors when it writes.
  */
 export type CaptureEvent =
-  | (CaptureEventBase & { kind: 'ledger-fact'; payload: LedgerFactInput })
-  | (CaptureEventBase & { kind: 'narrative-note'; payload: NarrativeNoteInput })
-  | (CaptureEventBase & { kind: 'metric-point'; payload: MetricPointInput })
-  | (CaptureEventBase & { kind: 'curiosity-item'; payload: Omit<CuriosityItem, 'id' | 'profileId' | 'createdAt'> })
-  | (CaptureEventBase & { kind: 'ledger-correction'; payload: LedgerCorrectionInput });
+  | { kind: 'ledger-fact'; payload: LedgerFactInput }
+  | { kind: 'narrative-note'; payload: NarrativeNoteInput }
+  | { kind: 'metric-point'; payload: MetricPointInput }
+  | { kind: 'curiosity-item'; payload: Omit<CuriosityItem, 'id' | 'profileId' | 'createdAt'> }
+  | { kind: 'ledger-correction'; payload: LedgerCorrectionInput };
 
 export type PendingOp =
   | { kind: 'write'; entity: string; type: FactType; fields: Record<string, string | number | string[]>; provenance: Provenance; safetyRelevant?: boolean; episodeId?: string; language?: string; verbatim?: string; visibility?: string; resume?: boolean; /** Cross-entity links (E1.2): carried through confirm so a confirmed write stamps the reverse link. */ replaces?: string; corrects?: string; /** Hash of the current fact at proposal time (CH): verified at confirm to reject stale-token clobbers. */ baselineCurHash?: string }

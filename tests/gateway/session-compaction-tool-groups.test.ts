@@ -414,8 +414,8 @@ describe('Reload sanitizes an OpenAI-invalid persisted history (F1)', () => {
 
   it('drops a trailing orphan assistant+tool_calls left by a torn append', async () => {
     const chatId = 'chat-torn';
-    const jsonlPath = path.join(tmpDir, `active-${chatId}.jsonl`);
     const ts = new Date().toISOString();
+    const jsonlPath = path.join(tmpDir, `${ts.slice(0, 10)}.jsonl`);
     const lines =
       [
         { timestamp: ts, role: 'user', content: 'u1', chatId },

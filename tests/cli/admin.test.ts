@@ -109,8 +109,6 @@ describe('cli admin surfaces', () => {
       ['profiles.defaultProfileId.child', 'other-owner'],
       ['heartbeat', '{}'],
       ['memory', '{}'],
-      ['sessions', '{"softResetAfterMinutes":1}'],
-      [' sessions . hardResetAfterMinutes ', '1'],
       ['profiles..defaultProfileId', 'other-owner'],
       ['profiles[0].defaultProfileId', 'other-owner'],
       ['providers.main.__proto__.polluted', 'true'],

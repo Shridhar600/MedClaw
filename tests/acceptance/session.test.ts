@@ -242,27 +242,6 @@ describe('P2b acceptance — spec 14 §7 session hooks', () => {
     expect(index.search('blood pressure 150/95', { chatId: 'c2' }).hits).toEqual([]);
   });
 
-  it('migration round-trip: a legacy active file becomes day files that a fresh manager resumes', async () => {
-    const { sessionsPath } = tmp();
-    fs.writeFileSync(
-      path.join(sessionsPath, 'active-c1.jsonl'),
-      [
-        JSON.stringify({ timestamp: '2026-08-24T10:00:00.000Z', role: 'user', content: 'migrated one', chatId: 'c1' }),
-        JSON.stringify({ timestamp: '2026-08-24T10:01:00.000Z', role: 'assistant', content: 'migrated two', chatId: 'c1' }),
-      ].join('\n') + '\n',
-    );
-
-    // no-registry (perChatArchive) migration buckets the source into its own <chatId>/ subdir.
-    const mgr = new SessionManager({ sessionsPath, perChatArchive: true });
-    expect(fs.existsSync(path.join(sessionsPath, '.migrated'))).toBe(true);
-    const dayFile = path.join(sessionsPath, 'c1', '2026-08-24.jsonl');
-    expect(fs.existsSync(dayFile)).toBe(true);
-    expect(fs.readFileSync(dayFile, 'utf8')).toContain('migrated one');
-
-    const resumed = mgr.getHistory('c1').map(m => m.content);
-    expect(resumed).toEqual(['migrated one', 'migrated two']);
-  });
-
   it('sweep goldens: 2 planted misses (med critical + symptom) become exactly 2 curiosity items on disk', async () => {
     const { sessionsPath } = tmp();
     const dir = path.dirname(sessionsPath);

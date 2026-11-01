@@ -1,6 +1,6 @@
 // tests/providers/openrouter.test.ts
 // OpenRouter = OpenAI-compatible router added as a first-class provider type.
-// Research: 505/research/13-openrouter-integration.md. Live-probed 2026-08-24:
+// Live-probed 2026-08-24:
 // tools work with mandatory reasoning; reasoning_effort:'none' is REJECTED;
 // reasoning_effort:'low' is valid; usage object comes back on every response.
 import { createProvider } from '../../src/providers/factory';

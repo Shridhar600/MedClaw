@@ -34,8 +34,6 @@ describe('W-C/D fix pass — CRED: pipeline-level credential scan (defense-in-de
 
   it('a narrative-note carrying a credential is skipped (never persisted), never throws', async () => {
     await expect(pipeline.ingest({
-      profileId: 'default',
-      source: 'chat',
       kind: 'narrative-note',
       payload: { text: `note to self ${SECRET}` },
     })).resolves.not.toThrow();
@@ -44,8 +42,6 @@ describe('W-C/D fix pass — CRED: pipeline-level credential scan (defense-in-de
 
   it('clean narrative notes still land (no false-positive regression)', async () => {
     await pipeline.ingest({
-      profileId: 'default',
-      source: 'chat',
       kind: 'narrative-note',
       payload: { text: 'token ring device reported 500mg dose' },
     });
@@ -78,8 +74,6 @@ describe('W-C/D fix pass — PHI: correction warn never carries the entity name'
       await ledgerSeed(pl);
       const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
       await pl.ingest({
-        profileId: 'default',
-        source: 'chat',
         kind: 'ledger-correction',
         payload: {
           wrong: { entity: 'metformin-PHI-MARKER-8686', type: 'medication' as const },
@@ -103,8 +97,6 @@ describe('W-C/D fix pass — PHI: correction warn never carries the entity name'
       const { pl, ledger } = makePl(tmp);
       await ledgerSeed(pl);
       const result = await pl.ingest({
-        profileId: 'default',
-        source: 'chat',
         kind: 'ledger-correction',
         payload: {
           wrong: { entity: 'metformin-PHI-MARKER-8686', type: 'medication' as const },
@@ -133,8 +125,6 @@ describe('W-C/D fix pass — PHI: correction warn never carries the entity name'
 /** Seed an active med fact through the pipeline (mirrors a real capture turn). */
 async function ledgerSeed(pl: CapturePipeline): Promise<void> {
   await pl.ingest({
-    profileId: 'default',
-    source: 'chat',
     kind: 'ledger-fact',
     payload: {
       entity: 'metformin-PHI-MARKER-8686', type: 'medication' as const, fields: { dose: '500mg' },
@@ -169,14 +159,14 @@ describe('W-C/D fix pass — DS/A1: a minted dispute creates a follow-up curiosi
     const { pl, curiosity } = buildPl();
     // Same-rank conflicting claims on a CONDITION → dispute (meds would confirm instead).
     await pl.ingest({
-      profileId: 'default', source: 'chat', kind: 'ledger-fact',
+      kind: 'ledger-fact',
       payload: {
         entity: 'migraine', type: 'condition' as const, fields: { frequency: 'weekly' },
         provenance: { source: 'user', confidence: 0.9, anchor: '', capturedAt: DAY },
       },
     });
     const result = await pl.ingest({
-      profileId: 'default', source: 'chat', kind: 'ledger-fact',
+      kind: 'ledger-fact',
       payload: {
         entity: 'migraine', type: 'condition' as const, fields: { frequency: 'daily' },
         provenance: { source: 'user', confidence: 0.9, anchor: '', capturedAt: DAY },
@@ -201,7 +191,7 @@ describe('W-C/D fix pass — DS/A1: a minted dispute creates a follow-up curiosi
   it('applied facts create NO curiosity noise (the item is dispute-specific)', async () => {
     const { pl, curiosity } = buildPl();
     await pl.ingest({
-      profileId: 'default', source: 'chat', kind: 'ledger-fact',
+      kind: 'ledger-fact',
       payload: {
         entity: 'knee-injury', type: 'condition' as const, fields: { severity: 'mild' },
         provenance: { source: 'user', confidence: 0.9, anchor: '', capturedAt: DAY },
@@ -232,7 +222,7 @@ describe('W-C/D fix pass — self-review IMPORTANT-4: pendingRetract survives a 
 
       // Wrong entity = active MED (its retract will need confirmation)…
       await pl.ingest({
-        profileId: 'default', source: 'chat', kind: 'ledger-fact',
+        kind: 'ledger-fact',
         payload: {
           entity: 'ibuprofen-wrong', type: 'medication' as const, fields: { dose: '200mg' },
           provenance: { source: 'user', confidence: 0.9, anchor: '', capturedAt: DAY },
@@ -246,7 +236,7 @@ describe('W-C/D fix pass — self-review IMPORTANT-4: pendingRetract survives a 
       });
 
       const result = await pl.ingest({
-        profileId: 'default', source: 'chat', kind: 'ledger-correction',
+        kind: 'ledger-correction',
         payload: {
           wrong: { entity: 'ibuprofen-wrong', type: 'medication' as const },
           corrected: {

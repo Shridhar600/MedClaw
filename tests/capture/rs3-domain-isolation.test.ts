@@ -44,7 +44,7 @@ describe('RR-STRUCT R-S3 — domain isolation: narrative-only writes never touch
     expect(before).toContain('penicillin');
 
     await pipeline.ingest({
-      profileId: 'default', source: 'chat', kind: 'narrative-note',
+      kind: 'narrative-note',
       payload: { text: 'felt a bit tired today, nothing unusual' },
     });
 
@@ -63,7 +63,7 @@ describe('RR-STRUCT R-S3 — domain isolation: narrative-only writes never touch
 
     for (let i = 0; i < 5; i++) {
       await pipeline.ingest({
-        profileId: 'default', source: 'chat', kind: 'narrative-note',
+        kind: 'narrative-note',
         payload: { text: `day ${i} note about something unrelated to health facts` },
       });
     }
@@ -76,7 +76,7 @@ describe('RR-STRUCT R-S3 — domain isolation: narrative-only writes never touch
     expect(before).toBeNull(); // nothing recorded yet
 
     await pipeline.ingest({
-      profileId: 'default', source: 'chat', kind: 'ledger-fact',
+      kind: 'ledger-fact',
       payload: {
         entity: 'peanuts', type: 'allergy', fields: {},
         provenance: { source: 'user', confidence: 1, anchor: '', capturedAt: '2026-09-01T09:00:00.000Z' },

@@ -300,56 +300,6 @@ describe('service onboarding init', () => {
     expect(fs.readFileSync(configPath, 'utf8')).toBe('{"existing":true}\n');
   });
 
-  it('refuses the retired --force flag with guidance instead of overwriting', async () => {
-    fs.mkdirSync(path.dirname(configPath), { recursive: true });
-    fs.writeFileSync(configPath, '{"existing":true}\n', 'utf8');
-
-    const output: string[] = [];
-    const code = await runServiceOnboarding(
-      [
-        '--yes',
-        '--force',
-        '--config', configPath,
-        '--provider', 'ollama',
-        '--telegram-enabled', 'false',
-      ],
-      {
-        stdout: (text: string) => output.push(text),
-        stderr: (text: string) => output.push(text),
-        input: async () => {
-          throw new Error('prompt should not be called');
-        },
-      },
-    );
-
-    // S1 change (old -> new): this test asserted `--force` OVERWROTE an existing config. Setup is
-    // now additive only — there is no overwrite, no resume and no unsolicited wipe.
-    expect(code).toBe(1);
-    expect(output.join('')).toContain('--force is retired');
-    expect(output.join('')).toContain('never removed');
-    expect(fs.readFileSync(configPath, 'utf8')).toBe('{"existing":true}\n');
-  });
-
-  it('refuses the retired --workspace flag instead of silently ignoring it', async () => {
-    const output: string[] = [];
-    const code = await runServiceOnboarding(
-      ['--yes', '--config', configPath, '--workspace', workspacePath, '--provider', 'ollama'],
-      {
-        stdout: (text: string) => output.push(text),
-        stderr: (text: string) => output.push(text),
-        input: async () => {
-          throw new Error('prompt should not be called');
-        },
-      },
-    );
-
-    // S1 change (old -> new): `--workspace` used to be accepted and then overridden by the derived
-    // owner path. An old invocation now fails loudly rather than quietly writing somewhere else.
-    expect(code).toBe(1);
-    expect(output.join('')).toContain('--workspace is retired');
-    expect(output.join('')).toContain('--state-root');
-    expect(fs.existsSync(configPath)).toBe(false);
-  });
   it('fails clearly for OpenAI provider without an API key', async () => {
     const original = process.env.OPENAI_API_KEY;
     delete process.env.OPENAI_API_KEY;

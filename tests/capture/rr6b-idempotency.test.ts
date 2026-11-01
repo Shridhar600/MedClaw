@@ -35,8 +35,6 @@ describe('RR-6b capture idempotency', () => {
   }
 
   const event = {
-    profileId: 'default',
-    source: 'telegram',
     kind: 'ledger-fact' as const,
     idempotencyKey: 'telegram:chat-1:message-7',
     payload: {

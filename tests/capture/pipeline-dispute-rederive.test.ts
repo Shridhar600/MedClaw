@@ -32,7 +32,7 @@ describe('CapturePipeline re-derives the recall mirror on a disputed mint (H-1)'
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
   const record = (fields: Record<string, string>): Promise<unknown> => pipeline.ingest({
-    profileId: 'default', source: 'chat', kind: 'ledger-fact',
+    kind: 'ledger-fact',
     payload: { entity: 'headache', type: 'symptom', fields, provenance: userProv },
   });
 

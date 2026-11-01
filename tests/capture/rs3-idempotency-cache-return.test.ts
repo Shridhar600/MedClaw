@@ -48,8 +48,6 @@ describe('RR-STRUCT R-S3 — idempotency cache-return (Finding-5/C-39)', () => {
   }
 
   const event = {
-    profileId: 'default',
-    source: 'telegram',
     kind: 'ledger-fact' as const,
     idempotencyKey: 'chat:chat-1:msg-42',
     payload: {

@@ -37,7 +37,6 @@ export { DEFAULT_STORED_CONFIG, DEFAULT_SESSION_WINDOW, LOCAL_OLLAMA_BASE_URL, c
 export {
   OWNER_ID_PATTERN,
   PROTECTED_SET_PATHS,
-  RETIRED_PATH_KEYS,
   decodeStoredConfig,
   expandHomePath,
   formatConfigIssue,

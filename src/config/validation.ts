@@ -11,9 +11,6 @@
 //  - Unknown keys are refused, not merged. `heartbeat.storepath` used to load and then be
 //    re-persisted forever.
 //  - Prototype keys are refused at every level.
-//  - The retired derived-path keys (`memory.workspace`, `heartbeat.storePath`,
-//    `heartbeat.audit`) are refused with setup guidance instead of being migrated or
-//    silently ignored, so there is never a second path authority.
 //  - Identity is required: `profiles.baseDir` and `profiles.defaultProfileId`. A document
 //    without them cannot serve, because a default must never become an owner.
 //  - Defaults fill only omitted NON-IDENTITY settings, and only after the supplied shape
@@ -41,30 +38,6 @@ import { isCronValidationWorkBounded } from './cron-resource-policy';
 
 export const OWNER_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
-/** Keys that were valid persisted path authorities before `schemaVersion: 2`. */
-export const RETIRED_PATH_KEYS: ReadonlyArray<{ field: string; guidance: string }> = [
-  {
-    field: 'memory.workspace',
-    guidance:
-      'The owner workspace is derived from profiles.baseDir and profiles.defaultProfileId. Remove memory.workspace and re-run setup.',
-  },
-  {
-    field: 'heartbeat.storePath',
-    guidance:
-      'The heartbeat store is derived inside the selected owner workspace. Remove heartbeat.storePath and re-run setup.',
-  },
-  {
-    field: 'heartbeat.audit',
-    guidance:
-      'The audit log is derived inside the selected owner workspace. Remove heartbeat.audit and re-run setup.',
-  },
-  {
-    field: 'heartbeat.audit.path',
-    guidance:
-      'The audit log is derived inside the selected owner workspace. Remove heartbeat.audit and re-run setup.',
-  },
-];
-
 /** Keys `config set` refuses to change because they select identity or are derived. */
 export const PROTECTED_SET_PATHS: ReadonlyArray<{ prefix: string; reason: string }> = [
   { prefix: 'schemaVersion', reason: 'the persisted schema version is set by setup, not by config set' },
@@ -75,14 +48,6 @@ export const PROTECTED_SET_PATHS: ReadonlyArray<{ prefix: string; reason: string
     reason: 'the heartbeat store is derived from the selected owner',
   },
   { prefix: 'heartbeat.audit', reason: 'the audit log is derived from the selected owner' },
-  {
-    prefix: 'sessions.softResetAfterMinutes',
-    reason: 'idle resets are retired (P2b DD10); the value is inert',
-  },
-  {
-    prefix: 'sessions.hardResetAfterMinutes',
-    reason: 'idle resets are retired (P2b DD10); the value is inert',
-  },
 ];
 
 export type ConfigIssueCode =
@@ -91,7 +56,6 @@ export type ConfigIssueCode =
   | 'missing-field'
   | 'unknown-field'
   | 'prototype-field'
-  | 'retired-field'
   | 'wrong-type'
   | 'invalid-enum'
   | 'invalid-url'
@@ -205,12 +169,7 @@ function readObject(
     }
     if (!allowed.includes(key)) {
       const unknownPath = field === '' ? key : `${field}.${key}`;
-      const retired = RETIRED_PATH_KEYS.find((entry) => entry.field === unknownPath);
-      if (retired) {
-        issues.add('retired-field', unknownPath, retired.guidance);
-      } else {
-        issues.add('unknown-field', unknownPath, 'unknown setting; remove it or re-run setup');
-      }
+      issues.add('unknown-field', unknownPath, 'unknown setting; remove it or re-run setup');
       continue;
     }
     out[key] = value[key];

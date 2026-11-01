@@ -209,7 +209,8 @@ export class SqliteStore {
       CREATE TABLE IF NOT EXISTS file_hashes (
         path TEXT PRIMARY KEY,
         hash TEXT NOT NULL,
-        indexed_at TEXT NOT NULL
+        indexed_at TEXT NOT NULL,
+        embedding_model TEXT
       );
       CREATE TABLE IF NOT EXISTS chunk_stats (
         chunk_id TEXT PRIMARY KEY,
@@ -230,23 +231,6 @@ export class SqliteStore {
       );
     `);
 
-    try {
-      this.db.exec("ALTER TABLE file_hashes ADD COLUMN embedding_model TEXT");
-    } catch {
-      // Column already exists
-    }
-    this.ensureColumn('chunks', 'lane', "lane TEXT NOT NULL DEFAULT ''");
-    this.ensureColumn('chunks', 'created_at', "created_at TEXT NOT NULL DEFAULT ''");
-
-    // Migrate legacy vec_meta table (pre-consolidation) into meta, then drop it.
-    const vecMetaExists = this.db.prepare(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'vec_meta'",
-    ).get();
-    if (vecMetaExists) {
-      this.db.exec('INSERT OR IGNORE INTO meta (key, value) SELECT key, value FROM vec_meta');
-      this.db.exec('DROP TABLE vec_meta');
-    }
-
     this.db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1')").run();
 
     if (this.hasVec) {
@@ -262,11 +246,6 @@ export class SqliteStore {
 
   private setStoredDimension(dim: number): void {
     this.db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('embedding_dimension', ?)").run(String(dim));
-  }
-
-  private ensureColumn(table: string, column: string, ddl: string): void {
-    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-    if (!cols.some(c => c.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
   }
 
   ensureVecTable(dimension: number): void {

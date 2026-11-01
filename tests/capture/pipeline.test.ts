@@ -81,8 +81,6 @@ describe('CapturePipeline (Task 10 — both-lane, cross-anchored, port-injected)
   // hand-rolled test adapter, which silently dropped resolved facts.
   it('renders a resolved safety fact on SAFETY.md via the safety-relevant source', async () => {
     await pipeline.ingest({
-      profileId: 'default',
-      source: 'chat',
       kind: 'ledger-fact',
       payload: {
         entity: 'metformin',
@@ -101,8 +99,6 @@ describe('CapturePipeline (Task 10 — both-lane, cross-anchored, port-injected)
 
   it('ledger-fact writes BOTH lanes with cross-anchors and re-renders SAFETY when safety-relevant (KNEE-01 / D8)', async () => {
     const event: CaptureEvent = {
-      profileId: 'default',
-      source: 'chat',
       kind: 'ledger-fact',
       payload: {
         entity: 'metformin',
@@ -138,7 +134,7 @@ describe('CapturePipeline (Task 10 — both-lane, cross-anchored, port-injected)
 
   it('derives the day from the event capturedAt, not the store clock (F20)', async () => {
     await pipeline.ingest({
-      profileId: 'default', source: 'chat', kind: 'ledger-fact',
+      kind: 'ledger-fact',
       payload: { entity: 'lisinopril', type: 'medication', fields: {}, provenance: prov(CAPTURED) },
     });
     expect(await narrative.read(CAPTURED_DAY)).not.toBeNull();
@@ -149,7 +145,7 @@ describe('CapturePipeline (Task 10 — both-lane, cross-anchored, port-injected)
 
   it('narrative-note writes ONLY the narrative lane (CHAT-06)', async () => {
     await pipeline.ingest({
-      profileId: 'default', source: 'chat', kind: 'narrative-note',
+      kind: 'narrative-note',
       payload: { text: 'felt tired all afternoon', date: CAPTURED_DAY },
     });
     const day = await narrative.read(CAPTURED_DAY);
@@ -160,7 +156,7 @@ describe('CapturePipeline (Task 10 — both-lane, cross-anchored, port-injected)
 
   it('metric-point writes a metric fact WITH a date field plus a narrative note (F19 / DIAB-02)', async () => {
     await pipeline.ingest({
-      profileId: 'default', source: 'sensor', kind: 'metric-point',
+      kind: 'metric-point',
       payload: {
         entity: 'fasting-glucose',
         fields: { value: 110, unit: 'mg/dL' },
@@ -188,7 +184,7 @@ describe('CapturePipeline (Task 10 — both-lane, cross-anchored, port-injected)
 
     queueCalls.length = 0; // count only the correction op
     const result = await pipeline.ingest({
-      profileId: 'default', source: 'chat', kind: 'ledger-correction',
+      kind: 'ledger-correction',
       payload: {
         wrong: { entity: 'headche', type: 'symptom' },
         corrected: {
@@ -214,7 +210,7 @@ describe('CapturePipeline (Task 10 — both-lane, cross-anchored, port-injected)
 
   it('curiosity-item routes to the curiosity queue', async () => {
     await pipeline.ingest({
-      profileId: 'default', source: 'agent', kind: 'curiosity-item',
+      kind: 'curiosity-item',
       payload: { kind: 'follow-up', description: 'ask about sleep next week' },
     });
     const items = await curiosity.list();
@@ -228,7 +224,7 @@ describe('CapturePipeline (Task 10 — both-lane, cross-anchored, port-injected)
     const before = await view.read();
 
     const result = await pipeline.ingest({
-      profileId: 'default', source: 'chat', kind: 'ledger-fact',
+      kind: 'ledger-fact',
       payload: { entity: 'warfarin', type: 'medication', fields: { dose: '10mg' }, provenance: prov(CAPTURED), text: 'now on warfarin 10mg' },
     });
 
@@ -244,7 +240,7 @@ describe('CapturePipeline (Task 10 — both-lane, cross-anchored, port-injected)
 
   it('unknown kind warns and continues without throwing', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
-    const bogus = { profileId: 'default', source: 'x', kind: 'bogus', payload: {} } as unknown as CaptureEvent;
+    const bogus = { kind: 'bogus', payload: {} } as unknown as CaptureEvent;
     await expect(pipeline.ingest(bogus)).resolves.toBeUndefined();
     warn.mockRestore();
   });

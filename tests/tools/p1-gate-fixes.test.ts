@@ -88,7 +88,7 @@ describe('P1 gate fix — DAD-09: terse acknowledgements are captured losslessly
     const safety = makeSafetyRenderer({ render: (f) => view.render(f), listSafetyRelevant: () => ledger.listSafetyRelevant() });
     const pipeline = new CapturePipeline({ queue: { enqueue: async (_p, op) => op.run() }, ledger, narrative, safety, curiosity });
 
-    await pipeline.ingest({ profileId: 'default', source: 'chat', kind: 'narrative-note', payload: { text: 'ok' } });
+    await pipeline.ingest({ kind: 'narrative-note', payload: { text: 'ok' } });
 
     const day = fs.readFileSync(path.join(tmp, 'memory', '2026-08-22.md'), 'utf8');
     expect(day).toContain('ok');

@@ -104,16 +104,15 @@ describe('stored config decoding', () => {
     expect(issueCodes(result)).toContain('invalid-schema-version');
   });
 
-  // RETIRED -> the three derived path keys are no longer persisted authority. Each is now
-  // refused with setup guidance instead of being merged, migrated or silently ignored.
+  // The derived path keys are not settings: each is refused like any unknown key.
   it.each([
     ['memory.workspace', (doc: Record<string, unknown>) => { (doc.memory as Record<string, unknown>).workspace = '/tmp/x'; }],
     ['heartbeat.storePath', (doc: Record<string, unknown>) => { (doc.heartbeat as Record<string, unknown>).storePath = '/tmp/x.json'; }],
     ['heartbeat.audit', (doc: Record<string, unknown>) => { (doc.heartbeat as Record<string, unknown>).audit = { path: '/tmp/x.jsonl' }; }],
-  ])('refuses the retired path authority %s', (field, apply) => {
+  ])('refuses the derived path %s as a setting', (field, apply) => {
     const result = decode(validDoc(tmpDir, apply), tmpDir);
 
-    expect(issueCodes(result)).toContain('retired-field');
+    expect(issueCodes(result)).toContain('unknown-field');
     expect(issueFields(result)).toContain(field);
   });
 
@@ -134,13 +133,12 @@ describe('stored config decoding', () => {
     expect(({} as Record<string, unknown>).injected).toBeUndefined();
   });
 
-  // RETIRED -> `heartbeat.audit = null` used to reach a non-null assertion and crash the
-  // loader with `TypeError: Cannot read properties of null`. The key is refused first, and a
-  // non-retired malformed branch is refused by type instead.
+  // `heartbeat.audit = null` used to crash the loader with a TypeError. The key is refused first,
+  // and a malformed known branch is refused by type instead.
   it('refuses the malformed heartbeat branch that used to crash the loader with a TypeError', () => {
     const retired = decode(validDoc(tmpDir, (doc) => { doc.heartbeat = { audit: null }; }), tmpDir);
 
-    expect(issueCodes(retired)).toContain('retired-field');
+    expect(issueCodes(retired)).toContain('unknown-field');
 
     const malformed = decode(validDoc(tmpDir, (doc) => { doc.memory = { search: null }; }), tmpDir);
     expect(issueCodes(malformed)).toContain('wrong-type');
