@@ -1,9 +1,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { createMemoryTools } from '../../src/tools/memory-tools';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import type { MemorySearch } from '../../src/memory/search';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('Memory Tools', () => {
   let tmpDir: string;
@@ -11,7 +11,7 @@ describe('Memory Tools', () => {
   let tools: ReturnType<typeof createMemoryTools>;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-tools-'));
+    tmpDir = makeTestTemp('redacted-tools-');
     engine = new MemoryEngine(tmpDir);
     tools = createMemoryTools(engine);
   });
@@ -167,13 +167,6 @@ describe('Memory Tools', () => {
       expect(second.isError).toBeFalsy();
     });
 
-    // SEC-M2b: the exact review exploit — a credential is smuggled across two
-    // appends. Append 1 writes the label plus >8192 chars of '#' padding (no
-    // value, so the tail-window pre-scan sees no credential). Append 2 writes
-    // the value; the 8K tail window now contains only padding + value (label
-    // pushed out), so the pre-scan passes — but the assembled file reconstructs
-    // the credential. The fix re-reads the ENTIRE file after the append and, on
-    // match, rolls the append back to the pre-append content and rejects.
     it('rejects the split-append exploit (label + >8192 # padding, then value) and restores the file', async () => {
       const tool = tools.find(t => t.name === 'memory_write')!;
 
@@ -189,9 +182,6 @@ describe('Memory Tools', () => {
       expect(afterFirst).toContain('api_key =');
       expect(afterFirst).not.toContain('abcdefghijklmnopqrstuvwxyz123456');
 
-      // Append 2: the value. The pre-scan sees only padding + value (no label)
-      // so it passes — but the post-write full re-scan catches the assembled
-      // credential, rolls the append back, and rejects.
       const second = await tool.execute({
         path: 'split.md',
         content: 'abcdefghijklmnopqrstuvwxyz123456',
@@ -200,11 +190,27 @@ describe('Memory Tools', () => {
       expect(second.isError).toBe(true);
       expect(second.content[0].text).toContain('credential');
 
-      // The append was rolled back: the file content is unchanged from after
-      // the first append (the value is NOT on disk).
       const afterSecond = await engine.readFile('split.md');
       expect(afterSecond).toBe(afterFirst);
       expect(afterSecond).not.toContain('abcdefghijklmnopqrstuvwxyz123456');
+    });
+  });
+
+  describe('captured daily log', () => {
+    const DAY_LOG = 'memory/2026-08-20.md';
+    const captured = '# 2026-08-20\n- 09:00 started metformin 500mg\n\n## Ledger writes\n- metformin → metformin@v1\n';
+
+    it('refuses an overwrite of a captured day but still accepts an append', async () => {
+      const tool = tools.find(t => t.name === 'memory_write')!;
+      await engine.writeFile(DAY_LOG, captured);
+
+      const overwrite = await tool.execute({ path: DAY_LOG, content: '# summary only\n' });
+      expect(overwrite.isError).toBe(true);
+      expect(await engine.readFile(DAY_LOG)).toBe(captured);
+
+      const append = await tool.execute({ path: DAY_LOG, content: '- 18:00 felt fine\n', mode: 'append' });
+      expect(append.isError).toBeFalsy();
+      expect(await engine.readFile(DAY_LOG)).toBe(`${captured}- 18:00 felt fine\n`);
     });
   });
 });

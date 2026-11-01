@@ -1,11 +1,3 @@
-// src/capture/idempotency.ts
-//
-// Durable capture commit markers. RR-STRUCT R-S3 (Finding-5/C-39): a matched-committed key must
-// return the CACHED ORIGINAL RESULT (e.g. `ledger_record`'s `RecordFactResult`), not `undefined` —
-// so the marker now optionally carries the op's own result alongside the opaque key. The result is
-// whatever the domain writer's `run()` returned (a health-domain value — e.g. entity/fields), so
-// this file is no longer PHI-free by construction; it is protected the same way every other
-// PHI-bearing memcore lane is (0600 file / 0700 dir via `src/security/secure-fs.ts`, never raw fs).
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -18,11 +10,9 @@ export interface CommittedLookup {
 
 export interface CaptureIdempotency {
   hasCommitted(key: string): boolean;
-  /** `result` is stored alongside the commit marker so a replayed key can return the ORIGINAL
-   *  result rather than `undefined` (Finding-5). Omit for callers with no result to cache. */
+  /** `result` is stored alongside the commit marker so a replayed key can return the original
+   *  result rather than `undefined`. Omit for callers with no result to cache. */
   markCommitted(key: string, result?: unknown): void;
-  /** `found: true` on a previously-committed key — `result` is the cached original (may itself be
-   *  `undefined` if the op legitimately returned nothing, e.g. a narrative-only capture). */
   getCommittedResult(key: string): CommittedLookup;
 }
 
@@ -61,9 +51,6 @@ export class FileCaptureIdempotency implements CaptureIdempotency {
     if (!validKey(key)) throw new Error('invalid-capture-idempotency-key');
     if (this.committed.has(key)) return;
     if (!this.writable) throw new Error('capture-idempotency-unavailable');
-    // A result that fails to serialize (e.g. a circular structure — never expected for the plain
-    // health-domain result shapes this carries) degrades to a key-only marker rather than losing
-    // the durable commit record entirely.
     let record: string;
     try {
       record = JSON.stringify({ phase: 'commit', key, result });

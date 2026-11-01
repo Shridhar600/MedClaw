@@ -1,13 +1,14 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { SessionManager } from '../../src/gateway/session';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
-import { ProfileRegistry } from '../../src/profiles/registry';
-import type { ProfileId } from '../../src/profiles/types';
+import {} from '../helpers/test-config';
+import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { makeTestTemp } from '../helpers/test-temp';
 
 jest.mock('../../src/memory/indexer', () => ({
   MemoryIndexer: jest.fn().mockImplementation(() => ({
@@ -52,7 +53,7 @@ describe('Gateway reconciler debounce', () => {
 
   beforeEach(() => {
     jest.useFakeTimers();
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-reconciler-debounce-'));
+    tmpDir = makeTestTemp('redacted-reconciler-debounce-');
     mockBuildDesired.mockClear();
     mockReconcile.mockClear();
     mockSyncMarkdown.mockClear();
@@ -64,8 +65,16 @@ describe('Gateway reconciler debounce', () => {
     jest.restoreAllMocks();
   });
 
-  function makeConfig(): AppConfig {
+  async function boundGateway(config: EffectiveConfig): Promise<Gateway> {
+    const owner = fixtureOwner(tmpDir);
+    const bound = await bindOwnerFixture(owner.ownerRecord, owner.ownerId, 'chat-1');
+    return new Gateway(config, bound.gatewayDeps);
+  }
+
+  function makeConfig(): EffectiveConfig {
     return {
+    schemaVersion: 2,
+    ...ownerSelection(fixtureOwner(tmpDir)),
       providers: {
         main: { type: 'ollama', model: 'kimi-k2.5:cloud', baseUrl: 'http://localhost:11434/v1' },
         medical: { type: 'ollama', model: 'medgemma', baseUrl: 'http://localhost:11434/v1' },
@@ -74,23 +83,21 @@ describe('Gateway reconciler debounce', () => {
       channels: { telegram: { enabled: false, botToken: '' } },
       tools: { allow: ['*'], deny: [] },
       memory: {
-        workspace: path.join(tmpDir, 'workspace'),
+        workspace: fixtureOwner(tmpDir).workspace,
         search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
         bootstrapMaxChars: 20000,
       },
       sessions: {
-        softResetAfterMinutes: 240,
-        hardResetAfterMinutes: 1440,
-        compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+        compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
       },
       heartbeat: {
         enabled: true,
         timezone: 'Asia/Kolkata',
-        storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+        storePath: fixtureOwner(tmpDir).storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 3, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-        audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+        audit: { path: fixtureOwner(tmpDir).auditLogPath },
         policy: {
           quietHours: { enabled: true, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,
@@ -100,14 +107,14 @@ describe('Gateway reconciler debounce', () => {
           },
         },
       },
-      agent: { maxIterations: 15, disclaimerEnabled: true },
+      agent: { maxIterations: 15 },
     };
   }
 
-  function setupGatewayWithScheduler() {
+  async function setupGatewayWithScheduler() {
     const config = makeConfig();
-    const gateway = new Gateway(config);
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const gateway = await boundGateway(config);
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
     const mockScheduler = {
       listJobs: jest.fn().mockResolvedValue([]),
     };
@@ -117,21 +124,11 @@ describe('Gateway reconciler debounce', () => {
     });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).resolvedMemoryWorkspace = config.memory.workspace;
-    // RR2-B1 setup migration: the policy-reconcile path refuses chats the resolving profile
-    // does not own; pair the fixture chats so the debounce/timer assertions keep their meaning.
-    const baseDir = path.join(tmpDir, 'profiles-base');
-    fs.mkdirSync(baseDir, { recursive: true });
-    const pairingRegistry = new ProfileRegistry(baseDir);
-    pairingRegistry.getOrCreateDefaultProfile();
-    for (const chatId of ['chat-1', 'chat-A', 'chat-B']) {
-      pairingRegistry.pairChatToProfile(chatId, 'default' as ProfileId);
-    }
-    (gateway as any).profileRegistry = pairingRegistry;
     return { gateway, config };
   }
 
   it('burst of messages triggers exactly one reconcile after debounce window', async () => {
-    const { gateway } = setupGatewayWithScheduler();
+    const { gateway } = await setupGatewayWithScheduler();
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const gw = gateway as any;
@@ -149,26 +146,26 @@ describe('Gateway reconciler debounce', () => {
     expect(mockReconcile).toHaveBeenCalledTimes(1);
   });
 
-  it('two different chatIds get independent debounce timers', async () => {
-    const { gateway } = setupGatewayWithScheduler();
+  it('two different chatIds get independent debounce timers, and only the BOUND chat may reconcile', async () => {
+    const { gateway } = await setupGatewayWithScheduler();
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const gw = gateway as any;
-    await gw.debouncedReconcile('chat-A');
-    await gw.debouncedReconcile('chat-B');
+    await gw.debouncedReconcile('chat-1'); // the bound owner destination (see boundGateway)
+    await gw.debouncedReconcile('chat-B'); // not bound
 
     jest.advanceTimersByTime(30_000);
     await Promise.resolve();
 
-    expect(mockReconcile).toHaveBeenCalledTimes(2);
+    expect(mockReconcile).toHaveBeenCalledTimes(1);
 
     const chatIds = mockBuildDesired.mock.calls.map((call: unknown[]) => (call[0] as { chatId: string }).chatId);
-    expect(chatIds).toContain('chat-A');
-    expect(chatIds).toContain('chat-B');
+    expect(chatIds).toContain('chat-1');
+    expect(chatIds).not.toContain('chat-B');
   });
 
   it('re-scheduling within the window resets the timer for that chatId', async () => {
-    const { gateway } = setupGatewayWithScheduler();
+    const { gateway } = await setupGatewayWithScheduler();
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const gw = gateway as any;
@@ -200,25 +197,16 @@ describe('Gateway reconciler debounce', () => {
       'utf8',
     );
 
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     const disconnect = jest.fn().mockResolvedValue(undefined);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined), disconnect };
     const runtime = attachGatewayTestRuntime(gateway, config, {
       agentLoop: { run: jest.fn().mockResolvedValue({ text: 'ok', trace: [] }) },
     });
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
     await sessions.recordTurn('chat-1', [{ role: 'user', content: 'Seed startup chat.' }]);
     (runtime as any).sessions = sessions;
-    // RR2-B1 setup migration: pair the startup chat so the guarded policy reconcile runs.
-    {
-      const baseDir = path.join(tmpDir, 'profiles-base');
-      fs.mkdirSync(baseDir, { recursive: true });
-      const pairingRegistry = new ProfileRegistry(baseDir);
-      pairingRegistry.getOrCreateDefaultProfile();
-      pairingRegistry.pairChatToProfile('chat-1', 'default' as ProfileId);
-      (gateway as any).profileRegistry = pairingRegistry;
-    }
 
     await (gateway as any).initializeScheduler();
 
@@ -229,7 +217,7 @@ describe('Gateway reconciler debounce', () => {
   });
 
   it('debounce timers do not keep the process alive (unref)', async () => {
-    const { gateway } = setupGatewayWithScheduler();
+    const { gateway } = await setupGatewayWithScheduler();
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const gw = gateway as any;
@@ -239,17 +227,15 @@ describe('Gateway reconciler debounce', () => {
     const timers = (gateway as any).reconcileTimers as Map<string, ReturnType<typeof setTimeout>>;
     const timer = timers.get('chat-1');
     expect(timer).toBeDefined();
-    // Sinon fake timers implement hasRef(); an unref'd timeout reports false.
-    // This pins the actual unref() contract, not just the timer's existence.
     expect((timer as unknown as { hasRef(): boolean }).hasRef()).toBe(false);
   });
 
-  it('stop() clears pending debounce timers', async () => {
+  it('stop clears pending debounce timers', async () => {
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     jest.spyOn(console, 'log').mockImplementation(() => undefined);
 
     const config = makeConfig();
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     await gateway.start();
 
     const mockScheduler = {

@@ -1,7 +1,7 @@
 import { assertSafetyInjected } from '../../src/context2';
 import { InvariantViolationError } from '../../src/shared/errors';
 
-describe('assertSafetyInjected (PLAT-04 / PLAT-05)', () => {
+describe('assertSafetyInjected', () => {
   const SAFETY = '# SAFETY\n- ALLERGY: penicillin — anaphylaxis\n- MED: warfarin 5mg';
 
   it('passes when the full safety content is present in the prompt', () => {

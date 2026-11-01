@@ -1,6 +1,6 @@
 # memcore
 
-**Purpose:** Core memory stores — the v2 memory system's heart. Manages the ledger
+**Purpose:** Core memory stores. Manages the ledger
 (Markdown + SQLite mirror), daily narratives, episodes, curated MEMORY.md, scratch notes,
 inferences, curiosity items, and the SAFETY.md rendered view.
 
@@ -14,7 +14,7 @@ inferences, curiosity items, and the SAFETY.md rendered view.
   narrative and ledger lanes agree on the day.
 - `SafetyView` — renders `SAFETY.md` (always-injected safety net) from safety-relevant
   active/resolved facts; preserves agent-add-only `## Critical Events` + user `## Notes` and any
-  hand-written section; date-free (C6a); base allergy/med removal refused in code without user
+  hand-written section; date-free; base allergy/med removal refused in code without user
   confirmation (`SafetyRemovalRefusedError`).
 - `CuratedMemory` — `MEMORY.md` budget engine, Health 60% / Life 20% / Agent 20%, fail-loud
   (`BudgetExceededError`), never auto-evicts across categories, never evicts health for non-health.
@@ -22,7 +22,7 @@ inferences, curiosity items, and the SAFETY.md rendered view.
   per episode under `episodes/`.
 - `ScratchStore` — ephemeral `scratch/<id>.md` notes with a TTL sweep (injected clock) and a
   `scanForPromotion` safety gate (credential reuse + `INJECTION_PATTERNS` defense-in-depth).
-- `CuriosityQueue` — durable `curiosity.md` follow-up items (add/list/resolve); consumed by P4.
+- `CuriosityQueue` — durable `curiosity.md` follow-up items (add/list/resolve).
 - `parseLedgerFile` / `renderLedgerFile` — pure Markdown round-trip for ledger files.
 - Types: `LedgerFact`, `Provenance`, `FactStatus`, `FactType`, `Authority`, `NarrativeAppendResult`,
   `Episode`, `ScratchNote`, `CuratedMemoryOptions`, etc.

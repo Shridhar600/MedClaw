@@ -1,7 +1,6 @@
 import { OpenAIProvider } from '../../src/providers/openai';
 import type { ProviderConfig } from '../../src/config/types';
 
-// Capture the params the provider sends to the OpenAI SDK without a network call.
 const createMock = jest.fn();
 jest.mock('openai', () => {
   return {
@@ -51,5 +50,29 @@ describe('OpenAIProvider reasoning-model handling (forka #13)', () => {
       [{ mimeType: 'image/png', data: 'AAAA' }],
     );
     expect(createMock.mock.calls[0][0].reasoning_effort).toBe('none');
+  });
+});
+
+describe('OpenAIProvider robustness', () => {
+  beforeEach(() => createMock.mockReset());
+
+  it('fails a request that never answers instead of hanging the turn', async () => {
+    createMock.mockImplementationOnce((_params: unknown, options: { signal: AbortSignal }) =>
+      new Promise((_resolve, reject) => options.signal.addEventListener('abort', () => reject(options.signal.reason))));
+    const slow = new OpenAIProvider({ type: 'openai', model: 'gpt-4o', apiKey: 'sk-test' }, 50);
+    await expect(slow.chat([{ role: 'user', content: 'hi' }])).rejects.toThrow();
+  });
+
+  it('reports an empty reply as a provider error', async () => {
+    createMock.mockResolvedValueOnce({ choices: [] });
+    await expect(makeProvider('gpt-4o').chat([{ role: 'user', content: 'hi' }])).rejects.toThrow('no choices');
+  });
+
+  it('turns malformed tool arguments into an empty call the tool layer can refuse', async () => {
+    createMock.mockResolvedValueOnce({
+      choices: [{ message: { content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'memory_get', arguments: 'not json' } }] } }],
+    });
+    const result = await makeProvider('gpt-4o').chat([{ role: 'user', content: 'hi' }], tools);
+    expect(result).toMatchObject({ type: 'tool_call', toolCalls: [{ id: 'c1', name: 'memory_get', arguments: {} }] });
   });
 });

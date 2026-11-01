@@ -24,9 +24,7 @@ function isUsableEmbedding(values: number[] | undefined, expectedDimension?: num
 }
 
 export class SqliteStore {
-  // `db` is mutable to allow the corruption-recovery path to reopen a fresh
-  // handle. Reads from tests/runtime go through this field (public). Assigned
-  // inside openDatabaseOrRecover (called from the constructor).
+  // Mutable so corruption recovery can reopen a fresh handle.
   db!: Database.Database;
   private hasVec = false;
   private vecDimensionFixed = false;
@@ -38,14 +36,7 @@ export class SqliteStore {
     this.openDatabaseOrRecover(dbPath);
   }
 
-  // RES-P0-3: open the DB (and run schema init) inside a guard. A corrupt DB
-  // file (garbage bytes / SQLite "file is not a database") only manifests at the
-  // first PRAGMA/exec inside init(), not at construction — so the whole
-  // open+vec-load+init sequence is wrapped. On a SqliteError we quarantine the
-  // bad files (-wal/-shm siblings included) and open a fresh DB. The gateway
-  // reindexes from Markdown via indexer.indexAll() at boot, so the fresh DB is
-  // fully repopulated automatically. Never throws on corruption (resilience law:
-  // try→catch→log→fallback→continue); only genuine non-SQLite errors re-throw.
+  // Corruption quarantines the DB and opens a fresh one; only genuine errors re-throw.
   private openDatabaseOrRecover(dbPath: string): void {
     this.hasVec = false;
     let db: Database.Database | undefined;
@@ -57,21 +48,12 @@ export class SqliteStore {
       this.hardenDbFiles(dbPath);
       return;
     } catch (e) {
-      // Identify a SQLite corruption-class error in an identity-stable way.
-      // `instanceof Database.SqliteError` is NOT identity-stable: if this
-      // module and the throwing `better-sqlite3` copy differ (e.g. under some
-      // test-runner module layouts), the instanceof check returns false and
-      // a corrupt DB would re-throw instead of recovering. Match on the
-      // error name + SQLite corruption codes / messages instead. Logic bugs
-      // in our own init SQL (generic SQLITE_ERROR) deliberately do NOT match,
-      // so a programmer error never silently nukes a valid DB.
+      // Duck-typed: a second better-sqlite3 copy throws from another realm; a generic SQLITE_ERROR never matches.
       if (!SqliteStore.isSqliteCorruptionError(e)) {
         throw e;
       }
       const reason = summarizeErrorForLog(e);
-      // Quarantine FIRST, before any close(): a better-sqlite3 close() on a
-      // corrupt handle checkpoints/deletes the -wal/-shm siblings, which would
-      // erase the very quarantine evidence we want to preserve.
+      // Quarantine before close(): closing deletes the -wal/-shm evidence.
       this.quarantineCorruptDb(dbPath);
       try {
         db?.close();
@@ -82,22 +64,14 @@ export class SqliteStore {
         `[sqlite-store] CORRUPTION DETECTED. DB file quarantined; opened a fresh DB. Reason: ${reason}`,
       );
       this.hasVec = false;
-      // Bounded reopen-retry. Under heavier test load the fresh `new
-      // Database(path)` + init() can transiently re-fail with a corruption-
-      // class error (native better-sqlite3 / WAL-sibling timing after a
-      // close() on the corrupt handle). Each attempt unlinks the path + any
-      // -wal/-shm siblings first (quarantine already moved the original
-      // corrupt file; this only clears post-close leftovers), then opens
-      // fresh. Non-corruption errors re-throw immediately. A real corrupt
-      // file is already quarantined, so this loop only ever opens a path that
-      // does not yet exist — it cannot mask a genuine logic bug.
+      // Retry transient corruption-class failures; non-corruption errors re-throw.
       let lastReopenError: unknown;
       for (let attempt = 0; attempt < 3; attempt++) {
         for (const candidate of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
           try {
             fs.unlinkSync(candidate);
           } catch {
-            // already gone — expected
+            // Already gone.
           }
         }
         try {
@@ -112,17 +86,14 @@ export class SqliteStore {
           if (!SqliteStore.isSqliteCorruptionError(reopenError)) {
             throw reopenError;
           }
-          // corruption-class transient error → retry (unlink + fresh open)
+          // Transient corruption-class failure; unlink and retry.
         }
       }
       throw lastReopenError;
     }
   }
 
-  // forka #2: better-sqlite3 creates search.db (and its -wal/-shm siblings)
-  // with default 0644 — world-readable PHI chunk content, bypassing secure-fs.
-  // Tighten all three to 0600 after open+init. The parent dir is already 0700,
-  // so this closes the last loose PHI file in the tree. Warn-and-continue.
+  // Files hold PHI; better-sqlite3 creates them world-readable, so tighten to 0600.
   private hardenDbFiles(dbPath: string): void {
     for (const candidate of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
       tightenFile(candidate);
@@ -134,18 +105,12 @@ export class SqliteStore {
       sqliteVec.load(db);
       this.hasVec = true;
     } catch (e) {
-      // sqlite-vec is optional (BM25-only fallback). Log sanitized; never crash.
+      // sqlite-vec is optional; never crash.
       console.warn('[sqlite-store] sqlite-vec not available, vector search disabled:', summarizeErrorForLog(e));
     }
   }
 
-  // Identity-stable SQLite corruption detection (see openDatabaseOrRecover).
-  // Duck-typed, NOT `instanceof Error`/`instanceof Database.SqliteError`:
-  // under some test-runner module layouts a SECOND copy of better-sqlite3 is
-  //resolved (its Error base class lives in a different realm), so the thrown
-  // object is `typeof === 'object'` but NOT `instanceof Error`. Matching on
-  // the `.code` property / message text is realm-stable and matches SQLite's
-  // own corruption errors regardless of which copy threw.
+  // Duck-typed and realm-stable, unlike `instanceof`.
   private static isSqliteCorruptionError(e: unknown): boolean {
     const code = (e as { code?: unknown }).code;
     if (typeof code === 'string') {
@@ -165,10 +130,7 @@ export class SqliteStore {
     return /(?:not a database|database disk image is malformed|file is not a database)/i.test(text);
   }
 
-  // Quarantine the corrupt DB file plus its WAL/SHM siblings to
-  // `<path>.corrupt-<stamp>`. Mirrors HeartbeatStore store.ts:150-176. Falls
-  // back to unlink if rename is impossible (best-effort; the fresh DB needs the
-  // original path available). Quarantined copies are tightened to 0o600.
+  // Quarantines the DB and its WAL/SHM siblings as 0600; falls back to unlink.
   private quarantineCorruptDb(dbPath: string): void {
     secureMkdir(path.dirname(dbPath));
     const stamp = Date.now();
@@ -182,8 +144,7 @@ export class SqliteStore {
         try {
           fs.unlinkSync(candidate);
         } catch {
-          // Give up on this sibling; the fresh open below will overwrite the
-          // main file regardless, so a leftover -wal/-shm is non-fatal.
+          // A leftover -wal/-shm is non-fatal; the fresh open overwrites the main file.
         }
       }
     }
@@ -209,7 +170,8 @@ export class SqliteStore {
       CREATE TABLE IF NOT EXISTS file_hashes (
         path TEXT PRIMARY KEY,
         hash TEXT NOT NULL,
-        indexed_at TEXT NOT NULL
+        indexed_at TEXT NOT NULL,
+        embedding_model TEXT
       );
       CREATE TABLE IF NOT EXISTS chunk_stats (
         chunk_id TEXT PRIMARY KEY,
@@ -230,23 +192,6 @@ export class SqliteStore {
       );
     `);
 
-    try {
-      this.db.exec("ALTER TABLE file_hashes ADD COLUMN embedding_model TEXT");
-    } catch {
-      // Column already exists
-    }
-    this.ensureColumn('chunks', 'lane', "lane TEXT NOT NULL DEFAULT ''");
-    this.ensureColumn('chunks', 'created_at', "created_at TEXT NOT NULL DEFAULT ''");
-
-    // Migrate legacy vec_meta table (pre-consolidation) into meta, then drop it.
-    const vecMetaExists = this.db.prepare(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'vec_meta'",
-    ).get();
-    if (vecMetaExists) {
-      this.db.exec('INSERT OR IGNORE INTO meta (key, value) SELECT key, value FROM vec_meta');
-      this.db.exec('DROP TABLE vec_meta');
-    }
-
     this.db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1')").run();
 
     if (this.hasVec) {
@@ -262,11 +207,6 @@ export class SqliteStore {
 
   private setStoredDimension(dim: number): void {
     this.db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('embedding_dimension', ?)").run(String(dim));
-  }
-
-  private ensureColumn(table: string, column: string, ddl: string): void {
-    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-    if (!cols.some(c => c.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
   }
 
   ensureVecTable(dimension: number): void {

@@ -1,15 +1,15 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { SqliteSessionIndex } from '../../src/indexstore';
 import type { SessionSearchResult } from '../../src/indexstore';
 import { createSessionTools } from '../../src/tools/session-tools';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const tmpDirs: string[] = [];
 
 function realIndex(): SqliteSessionIndex {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-sesstool-'));
+  const dir = makeTestTemp('redacted-sesstool-');
   tmpDirs.push(dir);
   return new SqliteSessionIndex({ dbPath: path.join(dir, 'search.db'), sessionsDir: path.join(dir, 'sessions') });
 }
@@ -28,7 +28,7 @@ describe('session_search tool', () => {
     expect(tool.parameters.required).toContain('query');
   });
 
-  test('returns a planted turn with its anchor, role, timestamp, and verbatim snippet (PLAT-20/A-L1)', async () => {
+  test('returns a planted turn with its anchor, role, timestamp, and verbatim snippet', async () => {
     const index = realIndex();
     index.indexTurn('chat1', '2026-06-01.jsonl', 7, 'user', '2026-06-01T09:00:00.000Z', 'metformin 500mg twice daily');
     const [tool] = createSessionTools({ index });
@@ -38,7 +38,7 @@ describe('session_search tool', () => {
 
     expect(res.isError).toBeFalsy();
     const text = res.content[0].text;
-    expect(text).toContain('sessions/2026-06-01.jsonl#L7'); // anchor is the session identity (A-L1)
+    expect(text).toContain('sessions/2026-06-01.jsonl#L7');
     expect(text).toContain('metformin 500mg twice daily'); // verbatim
     expect(text).toContain('user');
     expect(text).toContain('2026-06-01T09:00:00.000Z');
@@ -66,8 +66,8 @@ describe('session_search tool', () => {
     expect(res.content[0].text.toLowerCase()).toContain('unavailable');
   });
 
-  // X-1: the tool must scope the search to the calling chat, and fail closed if no chat context is present.
-  test('passes the calling chatId (and limit) through to the index (X-1 scope)', async () => {
+  // The tool must scope the search to the calling chat and fail closed when there is no chat context.
+  test('passes the calling chatId (and limit) through to the index (chat scope)', async () => {
     let captured: { chatId?: string; limit?: number } | undefined;
     const spy = {
       search: (_q: string, opts?: { chatId?: string; limit?: number }): SessionSearchResult => {

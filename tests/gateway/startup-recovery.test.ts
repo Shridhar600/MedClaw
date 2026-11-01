@@ -1,9 +1,10 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
-import type { AppConfig } from '../../src/config/types';
-import type { ProfileId } from '../../src/profiles/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { HeartbeatJob } from '../../src/scheduler/types';
+import {} from '../helpers/test-config';
+import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const mockSendMessage = jest.fn();
 const mockBotOn = jest.fn();
@@ -55,7 +56,7 @@ describe('Gateway scheduler recovery wiring', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-startup-recovery-'));
+    tmpDir = makeTestTemp('redacted-startup-recovery-');
     jest.clearAllMocks();
     mockBotStart.mockResolvedValue(undefined);
     mockBotStop.mockResolvedValue(undefined);
@@ -72,8 +73,9 @@ describe('Gateway scheduler recovery wiring', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  function makeConfig(): AppConfig {
+  function makeConfig(): EffectiveConfig {
     return {
+    schemaVersion: 2,
       providers: {
         main: { type: 'ollama', model: 'test-main' },
         medical: { type: 'ollama', model: 'test-medical' },
@@ -87,9 +89,7 @@ describe('Gateway scheduler recovery wiring', () => {
         bootstrapMaxChars: 20_000,
       },
       sessions: {
-        softResetAfterMinutes: 240,
-        hardResetAfterMinutes: 1440,
-        compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+        compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
       },
       heartbeat: {
         enabled: true,
@@ -108,9 +108,7 @@ describe('Gateway scheduler recovery wiring', () => {
           },
         },
       },
-      agent: { maxIterations: 5, disclaimerEnabled: false },
-      // RR2-B1 setup migration: the destination-ownership guard reads the profile registry,
-      // so the fixture persists a default profile with the recovered job's chat pre-paired.
+      agent: { maxIterations: 5 },
       profiles: { baseDir: path.join(tmpDir, 'profiles-base'), defaultProfileId: 'default' },
     };
   }
@@ -135,7 +133,7 @@ describe('Gateway scheduler recovery wiring', () => {
     };
   }
 
-  function installRuntime(config: AppConfig): void {
+  function installRuntime(config: EffectiveConfig): void {
     const job = recoveryJob();
     const runtime: Record<string, unknown> = {
       profileId: 'default',
@@ -172,8 +170,6 @@ describe('Gateway scheduler recovery wiring', () => {
       runScheduledJob: (job: HeartbeatJob) => Promise<void>;
       sideEffectLookup?: (entity: string) => Promise<string[]>;
     }) => {
-      // Reproduce the old construction-time recovery callback. On the fixed path
-      // Gateway passes false and performs recovery after it owns the runtime.
       capturedSideEffectLookup = deps.sideEffectLookup;
       if (deps.canSchedule) await deps.runScheduledJob(job);
       return runtime;
@@ -182,15 +178,11 @@ describe('Gateway scheduler recovery wiring', () => {
 
   it('does not drop a recovered heartbeat while ProfileRuntime.create is in progress', async () => {
     const { Gateway } = await import('../../src/gateway/gateway');
-    const { ProfileRegistry } = await import('../../src/profiles/registry');
     const config = makeConfig();
-    // Persist the pairing fixture BEFORE boot: the destination guard refuses unpaired chats.
-    fs.mkdirSync(path.join(tmpDir, 'profiles-base'), { recursive: true });
-    const fixtureRegistry = new ProfileRegistry(path.join(tmpDir, 'profiles-base'));
-    fixtureRegistry.getOrCreateDefaultProfile();
-    fixtureRegistry.pairChatToProfile('chat-1', 'default' as ProfileId);
+    const ownerRecord = path.join(tmpDir, 'owner-workspace', '.state', 'owner-access.json');
+    const bound = await bindOwnerFixture(ownerRecord, 'default', 'chat-1');
     installRuntime(config);
-    const gateway = new Gateway(config);
+    const gateway = new Gateway(config, bound.gatewayDeps);
 
     await gateway.start();
     try {

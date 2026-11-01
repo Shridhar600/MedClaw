@@ -1,17 +1,3 @@
-// src/memcore/curiosity-queue.ts
-//
-// Minimal durable curiosity queue: open follow-up / hypothesis items at
-// `curiosity.md` (D7). P4's proactive engine will PICK from this queue; in P1
-// we build only the store surface — add/list/resolve. No picking logic.
-//
-// G13: `CuriosityItem` is expected to grow in P4 (priority, evidence, expiry).
-// This store persists ONLY the current fields; a `- resolvedAt:` line is a
-// STORAGE-LEVEL marker appended on resolve (so resolution history survives and
-// `list()` simply excludes resolved items) — it is NOT a CuriosityItem field
-// and nothing here makes the P1 shape load-bearing for picking.
-//
-// The single-file format degrades safely: a corrupt block is skipped with a
-// sanitized warning, never a crash (D2).
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -56,18 +42,12 @@ export class CuriosityQueue {
       try {
         items.push(toItem(block));
       } catch (err) {
-        // PHI-safe: the block id is parsed from a `## <heading>` content line, so it
-        // must NEVER be logged — a corrupt heading could carry health content.
         console.warn(`[curiosity-queue] corrupt curiosity item skipped: ${summarizeErrorForLog(err)}`);
       }
     }
     return items;
   }
 
-  /**
-   * Mark an item resolved (durable). Returns true when an unresolved item was
-   * found and marked; false for an unknown or already-resolved id.
-   */
   async resolve(id: string): Promise<boolean> {
     const lines = this.readRaw().split('\n');
     // Locate the target block by its `## <id>` heading.
@@ -86,16 +66,12 @@ export class CuriosityQueue {
     for (let i = start; i < end; i++) {
       if (/^- resolvedAt:/.test(lines[i])) return false;
     }
-    // Insert the marker at the end of the block, preserving every other line verbatim
-    // (unknown/forward-compat keys AND free-floating content survive — no full rewrite).
     let insertAt = end;
     while (insertAt > start + 1 && lines[insertAt - 1].trim() === '') insertAt--;
     lines.splice(insertAt, 0, `- resolvedAt: ${this.clock.now().toISOString()}`);
     secureWriteViaTmp(this.filePath(), `${lines.join('\n').replace(/\n+$/, '')}\n`);
     return true;
   }
-
-  // ---- internals ---------------------------------------------------------
 
   private readRaw(): string {
     try {
@@ -104,8 +80,6 @@ export class CuriosityQueue {
       const nodeErr = err as NodeJS.ErrnoException;
       if (nodeErr.code === 'ENOENT') return '';
       console.warn(`[curiosity-queue] read failed: ${summarizeErrorForLog(err)}`);
-      // A readable empty queue is valid; an unreadable existing queue is not.
-      // Refuse every read-modify-write or listing operation until the source is readable.
       throw err;
     }
   }

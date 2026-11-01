@@ -1,14 +1,14 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { writeOnboardingProfile } from '../../src/onboarding/profile-writer';
 import type { OnboardingAnswers } from '../../src/onboarding/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('writeOnboardingProfile', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-profile-writer-'));
+    tmpDir = makeTestTemp('redacted-profile-writer-');
     fs.writeFileSync(path.join(tmpDir, 'USER.md'), '# User Preferences\n\nKeep this user edit.\n', 'utf8');
     fs.writeFileSync(path.join(tmpDir, 'HEALTH_PROFILE.md'), '# Health Profile\n\nKeep this health edit.\n', 'utf8');
   });
@@ -39,8 +39,8 @@ describe('writeOnboardingProfile', () => {
     expect(user).toContain('Reminder preferences: Morning reminders');
     expect(profile).toContain('Keep this health edit.');
     expect(profile).toContain('Age: 31');
-    expect(profile).toContain('Active conditions: Type 2 diabetes');
-    expect(profile).toContain('Current medications: Metformin');
+    expect(profile).not.toMatch(/Type 2 diabetes|Metformin/);
+    expect(profile).toContain('health ledger');
   });
 
   it('replaces only the managed onboarding section on repeated writes', async () => {

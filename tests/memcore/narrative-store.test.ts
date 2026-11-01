@@ -1,13 +1,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { NarrativeStore } from '../../src/memcore';
 import { fixedClock } from '../helpers/memcore-fixtures';
+import { makeTestTemp } from '../helpers/test-temp';
 
 let tmpDir: string;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-narrative-'));
+  tmpDir = makeTestTemp('redacted-narrative-');
 });
 
 afterEach(() => {
@@ -29,7 +29,6 @@ describe('NarrativeStore.append', () => {
     const content = await fs.promises.readFile(fp, 'utf-8');
     expect(content).toContain('walked 30 minutes, knee felt fine');
     expect(content).toContain('# 2026-08-18');
-    // The anchored line number actually points at the entry.
     const lines = content.split('\n');
     expect(lines[r.lineStart - 1]).toContain('walked 30 minutes, knee felt fine');
     expect(fs.statSync(fp).mode & 0o777).toBe(0o600);
@@ -43,7 +42,6 @@ describe('NarrativeStore.append', () => {
     const content = (await s.read('2026-08-18'))!;
     expect(content).toContain('first note');
     expect(content).toContain('second note');
-    // The first entry is still exactly where its anchor said it was.
     const lines = content.split('\n');
     expect(lines[first.lineStart - 1]).toContain('first note');
   });
@@ -70,11 +68,10 @@ describe('NarrativeStore.append', () => {
     expect(content).toContain('- ibuprofen → ibuprofen@v2');
     expect(anchor1).toMatch(/^memory\/2026-08-18\.md#L\d+$/);
     expect(anchor2).toMatch(/^memory\/2026-08-18\.md#L\d+$/);
-    // Log content still present alongside the cross-anchor section.
     expect(content).toContain('started metformin');
   });
 
-  it('uses an explicit date over the clock so both lanes agree on the day (F20)', async () => {
+  it('uses an explicit date over the clock so both lanes agree on the day', async () => {
     const s = new NarrativeStore(tmpDir, clockAt('2026-08-18T00:00:00Z'));
     const r = await s.append({ text: 'backdated note', date: '2026-08-12' });
     expect(r.date).toBe('2026-08-12');
@@ -91,7 +88,7 @@ describe('NarrativeStore.append', () => {
     expect(fs.readFileSync(safetyPath, 'utf8')).toBe('keep this safety file\n');
   });
 
-  it('read() returns null for a day with no entries', async () => {
+  it('read returns null for a day with no entries', async () => {
     const s = new NarrativeStore(tmpDir, clockAt('2026-08-18T00:00:00Z'));
     expect(await s.read('2026-01-01')).toBeNull();
   });
@@ -156,7 +153,7 @@ describe('NarrativeStore.append', () => {
   });
 });
 
-describe('NarrativeStore.appendSessionSummary (spec 14 §4 step 4)', () => {
+describe('NarrativeStore.appendSessionSummary', () => {
   it('stores a summary in a chat-scoped state lane instead of profile-wide memory', async () => {
     const store = new NarrativeStore(tmpDir);
     const anchor = await store.appendSessionSummary(

@@ -1,19 +1,21 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { SafetyView } from '../../src/memcore';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { LLMProvider, LLMResponse, Message } from '../../src/providers/types';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+import { makeTestTemp } from '../helpers/test-temp';
+import { ownerTools } from '../helpers/owner-tools';
 
-// C3 — the prompt cutover: the live chat path builds its system prompt per turn through the v2
-// assembler with recall injected and SAFETY re-rendered EVERY turn (D9). These are gateway-level
-// integration tests over the REAL agentLoop + prepareSystem; only the chat PROVIDER is scripted so
-// we can read back the assembled system message it is handed. Embeddings are unavailable in the test
-// env, so every turn also exercises the recall keyword-only/degrade path (resilience).
+const CHAT_BINDING = 'chat-1';
 
-function makeConfig(tmpDir: string): AppConfig {
+function makeConfig(tmpDir: string): EffectiveConfig {
+const owner = fixtureOwner(tmpDir);
   return {
+  schemaVersion: 2,
+  ...ownerSelection(owner),
     providers: {
       main: { type: 'ollama', model: 'kimi-k2.5:cloud', baseUrl: 'http://localhost:11434/v1' },
       medical: { type: 'ollama', model: 'medgemma', baseUrl: 'http://localhost:11434/v1' },
@@ -22,23 +24,21 @@ function makeConfig(tmpDir: string): AppConfig {
     channels: { telegram: { enabled: false, botToken: '' } },
     tools: { allow: ['*'], deny: [] },
     memory: {
-      workspace: path.join(tmpDir, 'workspace'),
+      workspace: owner.workspace,
       search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
       bootstrapMaxChars: 20000,
     },
     sessions: {
-      softResetAfterMinutes: 240,
-      hardResetAfterMinutes: 1440,
-      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+      compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
     },
     heartbeat: {
       enabled: false,
       timezone: 'Asia/Kolkata',
-      storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+      storePath: owner.storePath,
       recovery: { enabled: false, windowMinutes: 60 },
       retry: { maxRetries: 3, backoffMinutes: 5 },
       rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-      audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+      audit: { path: owner.auditLogPath },
       policy: {
         quietHours: { enabled: true, start: '22:00', end: '07:00' },
         skipIfChatActiveWithinMinutes: 60,
@@ -48,12 +48,10 @@ function makeConfig(tmpDir: string): AppConfig {
         },
       },
     },
-    agent: { maxIterations: 15, disclaimerEnabled: true },
+    agent: { maxIterations: 15 },
   };
 }
 
-/** Replace the chat provider on the live agentLoop with a capturing stub; returns the captured
- *  message arrays (each `chat()` call). Recall still uses the real (unavailable) embedding provider. */
 function captureProvider(gateway: Gateway): Message[][] {
   const seen: Message[][] = [];
   const scripted: LLMProvider = {
@@ -66,26 +64,25 @@ function captureProvider(gateway: Gateway): Message[][] {
 }
 
 async function startGateway(tmpDir: string): Promise<Gateway> {
-  const gateway = new Gateway(makeConfig(tmpDir));
+  const gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
   const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
   const log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
   await gateway.start();
   warn.mockRestore();
   log.mockRestore();
-  // Skip onboarding so chat turns reach the agent path.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (gateway.runtimeInstance!.turnCoordinator as any).handleOnboarding = async (): Promise<null> => null;
   return gateway;
 }
 
-describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
+describe('Gateway — per-turn recall + v2 assembly cutover', () => {
   let tmpDir: string;
   let gateway: Gateway;
   let workspace: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-recall-cutover-'));
-    workspace = path.join(tmpDir, 'workspace');
+    tmpDir = makeTestTemp('redacted-recall-cutover-');
+    workspace = fixtureOwner(tmpDir).workspace;
   });
   afterEach(async () => {
     try { await gateway?.stop(); } catch { /* ignore */ }
@@ -93,17 +90,17 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
   });
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const registryOf = (): any => (gateway as any).agentLoop.registry;
+  const registryOf = (): any => ownerTools((gateway as any).agentLoop.registry);
   const lastSystem = (seen: Message[][]): string => String(seen[seen.length - 1][0].content);
 
-  it('re-renders SAFETY into the running prompt after a mid-session mutation, no restart (D9)', async () => {
+  it('re-renders SAFETY into the running prompt after a mid-session mutation, no restart', async () => {
     gateway = await startGateway(tmpDir);
     const seen = captureProvider(gateway);
 
     await gateway.handleTestMessage('chat-1', 'hello there');
     expect(lastSystem(seen)).not.toContain('penicillin');
 
-    // Mid-session: record a safety-relevant allergy (D8 re-renders SAFETY.md).
+    // Mid-session: record a safety-relevant allergy, so the next render must include it.
     const res = await registryOf().execute('ledger_record', {
       entity: 'penicillin', type: 'allergy', fields: { reaction: 'hives' }, note: 'penicillin allergy, hives',
     });
@@ -114,7 +111,7 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
     expect(lastSystem(seen)).toContain('penicillin');
   });
 
-  it('injects Stage-1 active-ledger one-liners on a heartbeat turn but not full MEMORY (KNEE-02)', async () => {
+  it('injects Stage-1 active-ledger one-liners on a heartbeat turn but not full MEMORY', async () => {
     gateway = await startGateway(tmpDir);
     const seen = captureProvider(gateway);
 
@@ -123,7 +120,6 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
       note: 'knee MCL sprain',
     });
 
-    // Drive a heartbeat-mode turn directly (Gateway maps origin→mode for the scheduler path).
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).agentLoop.run('heartbeat check-in', [], { chatId: 'chat-1', origin: 'heartbeat', mode: 'heartbeat' });
 
@@ -175,7 +171,7 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
     expect(system).not.toContain('stable prose '.repeat(4_000));
   });
 
-  it('reports per-turn prompt mode in /status when the recall path is wired (L-2)', async () => {
+  it('reports per-turn prompt mode in /status when the recall path is wired', async () => {
     gateway = await startGateway(tmpDir);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const status = (gateway as any).buildBootStatusText();
@@ -196,40 +192,19 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
     expect(lastSystem(seen)).toContain('lisinopril');
   });
 
-  // RR-STRUCT R-S3 Part C (mini-plan v3 §3.7): this single test used to assert an UNCONDITIONAL
-  // "next turn fails closed" after any SAFETY render failure. R-S3 adds self-heal — a Tier-1 read
-  // that detects drift attempts ONE on-demand re-projection from the authoritative ledger before
-  // failing. That changes the OLD assertion's premise: a TRANSIENT render failure (the ledger fact
-  // itself was already durably recorded; only the projection publish glitched) no longer
-  // permanently bricks the profile — it self-heals on the very next read. The invariant the old
-  // test actually protects (C-03: SAFETY fails CLOSED, never serves a prompt with no/stale SAFETY)
-  // still holds, but only for a PERSISTENT failure (the heal attempt itself fails too). Migrated
-  // into two precise tests below — each OLD assertion maps to a specific NEW one:
-  //   - `result.isError === true` after the write   -> UNCHANGED in both new tests (Tier-1 write
-  //     path still fails the write + marks dirty on a render failure; not touched by self-heal).
-  //   - "next turn replies 'trouble right now', 0 extra provider calls" (used to be unconditional)
-  //     -> now the PERSISTENT-failure test only (self-heal itself fails, so it still fails closed).
-  //   - (NEW) a TRANSIENT failure's next turn now SUCCEEDS via self-heal — proven by a fresh test.
-  // See the report (§Behavior changes) for the git-stash RED reproduction of the pre-R-S3 baseline.
   it('SELF-HEALS on the next live turn after a TRANSIENT SAFETY publication failure', async () => {
     gateway = await startGateway(tmpDir);
     const seen = captureProvider(gateway);
-    // Fails exactly ONCE — the ledger_record write's own re-render. The ledger fact itself is
-    // still recorded successfully (recordFact runs before reRenderSafety); only the SAFETY
-    // projection publish glitched transiently.
     const renderSpy = jest.spyOn(SafetyView.prototype, 'render').mockRejectedValueOnce(new Error('render failure'));
     try {
       const result = await registryOf().execute('ledger_record', {
         entity: 'penicillin', type: 'allergy', fields: { reaction: 'hives' }, note: 'penicillin allergy',
       });
-      expect(result.isError).toBe(true);
+      expect(result.isError).toBeFalsy();
       expect(fs.existsSync(path.join(workspace, '.state', 'safety-view.dirty'))).toBe(true);
 
-      // The mocked failure has been consumed — the self-heal's re-projection attempt succeeds.
       const reply = await gateway.handleTestMessage('chat-1', 'what should I know about antibiotics');
       expect(reply).not.toContain('trouble right now');
-      // The self-healed SAFETY.md carries the penicillin allergy that was already durably recorded
-      // in the ledger — proving the heal re-derived from REAL data, not stale/empty content.
       expect(fs.readFileSync(path.join(workspace, 'SAFETY.md'), 'utf8')).toContain('penicillin');
       expect(lastSystem(seen)).toContain('penicillin');
     } finally {
@@ -240,24 +215,220 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
   it('STILL fails closed on the next live turn when SAFETY publication fails PERSISTENTLY', async () => {
     gateway = await startGateway(tmpDir);
     const seen = captureProvider(gateway);
-    // Fails on EVERY call — the initial write AND the self-heal's retry attempt.
     const renderSpy = jest.spyOn(SafetyView.prototype, 'render').mockRejectedValue(new Error('render failure'));
     try {
       const result = await registryOf().execute('ledger_record', {
         entity: 'penicillin', type: 'allergy', fields: { reaction: 'hives' }, note: 'penicillin allergy',
       });
-      expect(result.isError).toBe(true);
+      expect(result.isError).toBeFalsy();
       expect(fs.existsSync(path.join(workspace, '.state', 'safety-view.dirty'))).toBe(true);
 
       const providerCallsBefore = seen.length;
       const reply = await gateway.handleTestMessage('chat-1', 'what should I know about antibiotics');
-      // The self-heal attempt itself failed (render is STILL broken) — the C-03 invariant holds:
-      // fails closed, exactly once, never spins (the loop guard is unit-tested directly in
-      // tests/gateway/rs3-safety-self-heal.test.ts).
       expect(reply).toContain('trouble right now');
       expect(seen.length).toBe(providerCallsBefore);
     } finally {
       renderSpy.mockRestore();
+    }
+  });
+});
+
+describe('Gateway — current facts follow the ledger', () => {
+  let tmpDir: string;
+  let gateway: Gateway;
+  let workspace: string;
+
+  beforeEach(() => {
+    tmpDir = makeTestTemp('redacted-ledger-truth-');
+    workspace = fixtureOwner(tmpDir).workspace;
+  });
+  afterEach(async () => {
+    try { await gateway?.stop(); } catch { /* ignore */ }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const registryOf = (): any => ownerTools((gateway as any).agentLoop.registry);
+  const lastSystem = (seen: Message[][]): string => String(seen[seen.length - 1][0].content);
+  const ledgerFile = (name: string): string => path.join(workspace, 'ledger', name);
+
+  it('a hand edit of the ledger reaches the next reply', async () => {
+    gateway = await startGateway(tmpDir);
+    const seen = captureProvider(gateway);
+    await registryOf().execute('ledger_record', { entity: 'daily-walk', type: 'goal', fields: { target: '5000 steps' } });
+    await gateway.handleTestMessage('chat-1', 'hello', 'm1');
+    expect(lastSystem(seen)).toContain('5000 steps');
+
+    const file = ledgerFile('goals.md');
+    fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace('5000 steps', '9000 steps'));
+    await gateway.handleTestMessage('chat-1', 'hello again', 'm2');
+
+    expect(lastSystem(seen)).toContain('9000 steps');
+    expect(lastSystem(seen)).not.toContain('5000 steps');
+  });
+
+  it('a damaged ledger file is flagged in the reply context and refuses changes until repaired', async () => {
+    gateway = await startGateway(tmpDir);
+    const seen = captureProvider(gateway);
+    await registryOf().execute('ledger_record', { entity: 'metformin', type: 'medication', fields: { dose: '500mg' } });
+    const file = ledgerFile('medications.md');
+    fs.appendFileSync(file, '## warfarin\n### v1 (active)\n- dose 5mg\n');
+    const damaged = fs.readFileSync(file, 'utf8');
+
+    await gateway.handleTestMessage('chat-1', 'what am I taking?', 'm1');
+    expect(lastSystem(seen)).toMatch(/medications\.md[^\n]*damaged/);
+    expect(lastSystem(seen)).toContain('metformin');
+
+    const change = await registryOf().execute('ledger_record', { entity: 'metformin', type: 'medication', fields: { dose: '1000mg' } });
+    expect(change.isError).toBe(true);
+    expect(change.content[0].text).toMatch(/damaged/);
+    await gateway.handleTestMessage('chat-1', 'and now?', 'm2');
+
+    expect(fs.readFileSync(file, 'utf8')).toBe(damaged);
+    expect(fs.readdirSync(path.dirname(file)).filter((f) => f.startsWith('medications.md.corrupt-'))).toHaveLength(1);
+  });
+
+  it('an unreadable allergy file is named in SAFETY.md instead of silently dropping the allergies', async () => {
+    gateway = await startGateway(tmpDir);
+    const seen = captureProvider(gateway);
+    await registryOf().execute('ledger_record', { entity: 'penicillin', type: 'allergy', fields: { reaction: 'hives' } });
+    await gateway.handleTestMessage('chat-1', 'hello', 'm1');
+    expect(lastSystem(seen)).toContain('penicillin');
+
+    fs.writeFileSync(ledgerFile('allergies.md'), Buffer.from([0xff, 0xfe, 0x00, 0x41]));
+    await gateway.handleTestMessage('chat-1', 'can I take amoxicillin?', 'm2');
+
+    const safety = fs.readFileSync(path.join(workspace, 'SAFETY.md'), 'utf8');
+    expect(safety).toMatch(/allergies\.md[^\n]*damaged/);
+    expect(lastSystem(seen)).toMatch(/allergies\.md[^\n]*damaged/);
+  });
+});
+
+describe('Gateway — onboarding seeds the health record', () => {
+  let tmpDir: string;
+  let gateway: Gateway;
+  let workspace: string;
+
+  beforeEach(() => {
+    tmpDir = makeTestTemp('redacted-onboarding-seed-');
+    workspace = fixtureOwner(tmpDir).workspace;
+  });
+  afterEach(async () => {
+    try { await gateway?.stop(); } catch { /* ignore */ }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('meds, allergies and conditions given at setup reach SAFETY.md and the next reply', async () => {
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    await gateway.start();
+    try {
+      const answers = [
+        'hi', 'Asha', '54', 'yes', 'type 2 diabetes', 'Metformin 500mg twice daily, vitamin D3 1000 IU',
+        'penicillin (hives) and peanuts', 'walk daily', 'morning reminders', 'confirm',
+      ];
+      let reply = '';
+      for (const [i, text] of answers.entries()) reply = await gateway.handleTestMessage('chat-1', text, `o${i}`);
+      expect(reply).toMatch(/onboarding is complete/i);
+
+      const safety = fs.readFileSync(path.join(workspace, 'SAFETY.md'), 'utf8');
+      for (const entity of ['penicillin', 'peanuts', 'metformin', 'vitamin d3']) expect(safety).toContain(entity);
+      expect(fs.readFileSync(path.join(workspace, 'ledger', 'medications.md'), 'utf8')).toContain('500mg twice daily');
+      expect(fs.readFileSync(path.join(workspace, 'ledger', 'allergies.md'), 'utf8')).toContain('hives');
+
+      const seen = captureProvider(gateway);
+      await gateway.handleTestMessage('chat-1', 'how am I doing?', 'after');
+      expect(lastSystemOf(seen)).toContain('type 2 diabetes');
+    } finally {
+      warn.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  it('"none" answers record nothing', async () => {
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    await gateway.start();
+    try {
+      const answers = ['hi', 'Ravi', '30', 'yes', 'none', 'no', 'none known', 'sleep better', 'none', 'confirm'];
+      for (const [i, text] of answers.entries()) await gateway.handleTestMessage('chat-1', text, `o${i}`);
+      for (const file of ['conditions.md', 'medications.md', 'allergies.md']) {
+        expect(fs.existsSync(path.join(workspace, 'ledger', file))).toBe(false);
+      }
+    } finally {
+      warn.mockRestore();
+      log.mockRestore();
+    }
+  });
+});
+
+const lastSystemOf = (seen: Message[][]): string => String(seen[seen.length - 1][0].content);
+
+describe('Gateway — secrets in inbound messages', () => {
+  const SECRET = 'sk-abcdefghijklmnopqrstuvwxyz0123456789';
+  let tmpDir: string;
+  let gateway: Gateway;
+
+  beforeEach(() => {
+    tmpDir = makeTestTemp('redacted-inbound-secret-');
+  });
+  afterEach(async () => {
+    try { await gateway?.stop(); } catch { /* ignore */ }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const filesContaining = (needle: string): string[] => {
+    const hits: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (fs.readFileSync(full).includes(needle)) hits.push(path.relative(tmpDir, full));
+      }
+    };
+    walk(tmpDir);
+    return hits;
+  };
+
+  it('refuses a chat message carrying an API key without calling the model or saving it', async () => {
+    gateway = await startGateway(tmpDir);
+    const seen = captureProvider(gateway);
+
+    const reply = await gateway.handleTestMessage('chat-1', `my openai key is ${SECRET}`, 'm1');
+
+    expect(reply).toMatch(/password or API key/);
+    expect(seen).toHaveLength(0);
+    expect(filesContaining(SECRET)).toEqual([]);
+  });
+
+  it('refuses a failed-upload caption carrying an API key without saving it', async () => {
+    gateway = await startGateway(tmpDir);
+    let reply = '';
+    await gateway.deliverMessage({
+      chatId: 'chat-1', userId: 'local', channel: 'local', chatType: 'private', eventId: 'local:chat-1:m2',
+      messageId: 'm2', text: `report attached, token=${SECRET}`, mediaError: 'Failed to download uploaded file report.pdf',
+    } as never, async (text) => { reply = text; });
+
+    expect(reply).toMatch(/password or API key/);
+    expect(filesContaining(SECRET)).toEqual([]);
+  });
+
+  it('refuses an onboarding answer carrying an API key without saving it', async () => {
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    await gateway.start();
+    try {
+      const first = await gateway.handleTestMessage('chat-1', 'hi', 'm1');
+      expect(first).not.toMatch(/password or API key/);
+      const reply = await gateway.handleTestMessage('chat-1', SECRET, 'm2');
+      expect(reply).toMatch(/password or API key/);
+      expect(filesContaining(SECRET)).toEqual([]);
+    } finally {
+      warn.mockRestore();
+      log.mockRestore();
     }
   });
 });

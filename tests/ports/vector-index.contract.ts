@@ -1,9 +1,3 @@
-// Shared VectorIndex contract (specs/16 §8). Any VectorIndex adapter must pass this
-// suite — the liftability guarantee. Import and invoke it from an adapter's own
-// *.test.ts, passing a factory that builds a fresh, isolated adapter per dimension.
-//
-// This file is NOT a test file itself (jest testMatch is **/*.test.ts) — it only
-// exports the suite function.
 
 import type { VectorIndex, Chunk, ChunkWithScore } from '../../src/ports';
 
@@ -31,7 +25,7 @@ function chunk(id: string, embedding: number[], over: Partial<Chunk> = {}): Chun
 }
 
 export function runVectorIndexContract(makeAdapter: MakeAdapter): void {
-  describe('VectorIndex contract (specs/16 §8)', () => {
+  describe('VectorIndex contract', () => {
     const DIM = 4;
     let idx: ContractAdapter;
 
@@ -52,7 +46,6 @@ export function runVectorIndexContract(makeAdapter: MakeAdapter): void {
       expect(results.length).toBeGreaterThan(0);
       expect(results[0].id).toBe('a'); // nearest to [1,0,0,0]
       expect(results[0].score).toBeGreaterThan(0);
-      // Returned rows carry the chunk metadata back.
       expect(results[0].path).toBe('a.md');
       expect(results[0].lane).toBe('narrative');
     });
@@ -86,12 +79,12 @@ export function runVectorIndexContract(makeAdapter: MakeAdapter): void {
       expect(results.find(r => r.id === 'b')).toBeUndefined();
     });
 
-    it('rejects a query embedding whose dimension mismatches the index (B3)', async () => {
+    it('rejects a query embedding whose dimension mismatches the index', async () => {
       await idx.upsert([chunk('a', [1, 0, 0, 0])]); // fixes the index dimension at 4
       await expect(collect(idx.queryKnn([1, 0, 0], 1))).rejects.toThrow(/dimension/i);
     });
 
-    it('rejects an upsert whose embedding dimension mismatches the index (B3)', async () => {
+    it('rejects an upsert whose embedding dimension mismatches the index', async () => {
       await idx.upsert([chunk('a', [1, 0, 0, 0])]);
       await expect(idx.upsert([chunk('z', [1, 0, 0])])).rejects.toThrow(/dimension/i);
     });

@@ -1,12 +1,13 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
 import { runCli } from '../../src/cli/index';
-import { createCliSessionManager } from '../../src/test-cli';
+import { SessionManager } from '../../src/gateway/session';
+import { writeConfigFixture } from '../helpers/config-fixture';
+import { makeTestTemp } from '../helpers/test-temp';
 
 function createTempHome(): { tmpDir: string; restore: () => void } {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-cli-home-'));
+  const tmpDir = makeTestTemp('redacted-cli-home-');
   const originalHome = process.env.HOME;
   process.env.HOME = tmpDir;
   return {
@@ -23,10 +24,10 @@ function createTempHome(): { tmpDir: string; restore: () => void } {
 }
 
 describe('cli router', () => {
-  it('keeps web-harness sessions isolated by chat id', async () => {
-    const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-cli-sessions-'));
+  it('keeps per-chat session archives isolated by chat id', async () => {
+    const sessionsDir = makeTestTemp('redacted-cli-sessions-');
     try {
-      const sessions = createCliSessionManager({ sessionsPath: sessionsDir });
+      const sessions = new SessionManager({ sessionsPath: sessionsDir, perChatArchive: true });
       await sessions.recordTurn('chat-a', [{ role: 'user', content: 'private A' }]);
       await sessions.recordTurn('chat-b', [{ role: 'user', content: 'private B' }]);
 
@@ -70,15 +71,15 @@ describe('cli router', () => {
   it('routes config show through the admin surface', async () => {
     const home = createTempHome();
     try {
-      const configPath = path.join(home.tmpDir, 'config.json');
-      fs.mkdirSync(path.dirname(configPath), { recursive: true });
-      fs.writeFileSync(
-        configPath,
-        JSON.stringify({
-          providers: { main: { type: 'openai', model: 'gpt-4o', apiKey: 'sk-secret' } },
-          channels: { telegram: { enabled: true, botToken: '123:secret-token' } },
-        }),
-      );
+      const fixture = writeConfigFixture(home.tmpDir, {
+        telegramEnabled: true,
+        telegramToken: '123:secret-token',
+        providerType: 'openai',
+        apply: (stored) => {
+          stored.providers.main.apiKey = 'sk-secret';
+        },
+      });
+      const configPath = fixture.configPath;
 
       const output: string[] = [];
       const code = await runCli(['--config', configPath, 'config', 'show'], {
@@ -96,17 +97,60 @@ describe('cli router', () => {
     }
   });
 
+  it('never prints endpoint credentials in status output', async () => {
+    const home = createTempHome();
+    try {
+      const fixture = writeConfigFixture(home.tmpDir, {
+        apply: (stored) => {
+          stored.providers.main.baseUrl = 'https://url-user:url-password@proxy.example/v1';
+        },
+      });
+      const output: string[] = [];
+      const code = await runCli(['--config', fixture.configPath, 'status'], {
+        stdout: (text: string) => output.push(text),
+        stderr: (text: string) => output.push(text),
+        input: async () => '',
+      });
+
+      expect(code).toBe(0);
+      const printed = output.join('');
+      expect(printed).not.toContain('url-user');
+      expect(printed).not.toContain('url-password');
+      expect(printed).toContain('proxy.example');
+    } finally {
+      home.restore();
+    }
+  });
+
+  it.each([
+    ['config with an option-shaped subcommand', ['config', '--api-key=sk-config-sub-secret']],
+    ['config set with an option-shaped path', ['config', 'set', '--api-key=sk-config-set-secret', 'x']],
+    ['config set with a single-dash path', ['config', 'set', '-sk-single-set-secret', 'x']],
+  ])('never echoes a secret-shaped token from %s', async (_label, argv) => {
+    const home = createTempHome();
+    try {
+      const fixture = writeConfigFixture(home.tmpDir, {});
+      const output: string[] = [];
+      const code = await runCli(['--config', fixture.configPath, ...argv], {
+        stdout: (text: string) => output.push(text),
+        stderr: (text: string) => output.push(text),
+        input: async () => '',
+      });
+
+      expect(code).toBe(1);
+      expect(output.join('')).not.toContain('sk-config-sub-secret');
+      expect(output.join('')).not.toContain('sk-config-set-secret');
+      expect(output.join('')).not.toContain('sk-single-set-secret');
+    } finally {
+      home.restore();
+    }
+  });
+
   it('routes heartbeats list through the admin surface', async () => {
     const home = createTempHome();
     try {
-      const configPath = path.join(home.tmpDir, 'config.json');
-      fs.writeFileSync(
-        configPath,
-        JSON.stringify({
-          memory: { workspace: path.join(home.tmpDir, 'workspace') },
-          heartbeat: { storePath: path.join(home.tmpDir, 'heartbeats', 'jobs.json') },
-        }),
-      );
+      const fixture = writeConfigFixture(home.tmpDir, {});
+      const configPath = fixture.configPath;
       const output: string[] = [];
       const code = await runCli(['--config', configPath, 'heartbeats', 'list'], {
         stdout: (text: string) => output.push(text),
@@ -125,12 +169,15 @@ describe('cli router', () => {
     const home = createTempHome();
     try {
       const configPath = path.join(home.tmpDir, 'config.json');
-      const workspacePath = path.join(home.tmpDir, 'workspace');
+      const stateRoot = path.join(home.tmpDir, 'state');
       const input = [
-        workspacePath,
+        stateRoot,
+        'default',
         'ollama',
         '',
         '',
+        '',
+        'ollama',
         '',
         '',
         'n',
@@ -166,10 +213,8 @@ describe('cli router', () => {
     const home = createTempHome();
     try {
       const configPath = path.join(home.tmpDir, 'config.json');
-      const workspacePath = path.join(home.tmpDir, 'workspace');
-      // Deliberately too few answers: the wizard must abort with a clear
-      // error, not spin in a re-prompt loop (the old Node-26 hang).
-      const input = [workspacePath, 'ollama'].join('\n');
+      const stateRoot = path.join(home.tmpDir, 'state');
+      const input = [stateRoot, 'default', 'ollama'].join('\n');
 
       const result = spawnSync(
         process.execPath,
@@ -195,12 +240,15 @@ describe('cli router', () => {
     const home = createTempHome();
     try {
       const configPath = path.join(home.tmpDir, 'config.json');
-      const workspacePath = path.join(home.tmpDir, 'workspace');
+      const stateRoot = path.join(home.tmpDir, 'state');
       const input = [
-        workspacePath,
+        stateRoot,
+        'default',
         'ollama',
         '',
         '',
+        '',
+        'ollama',
         '',
         '',
         'y',

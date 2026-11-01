@@ -100,10 +100,8 @@ this is garbage that should not parse
 - provenance: user (1.00) · memory/2026-07-07.md#L15
 `;
       const parsed = parseLedgerFile(md, { type: 'medication', profileId: 'test' });
-      // valid entities still parse
       expect(parsed.some(f => f.entity === 'metformin')).toBe(true);
       expect(parsed.some(f => f.entity === 'ibuprofen')).toBe(true);
-      // the broken block is preserved as a QUARANTINE fact, not silently fabricated
       const quarantined = parsed.filter(f => f.fields._quarantine !== undefined);
       expect(quarantined).toHaveLength(1);
       // the garbage line NEVER becomes a real structured field on any fact
@@ -171,7 +169,7 @@ this is garbage that should not parse
   });
 
   describe('round-trip', () => {
-    it('preserves fields through parse(render())', () => {
+    it('preserves fields through parse(render)', () => {
       const facts = [
         makeFact({
           entity: 'metformin',
@@ -271,7 +269,7 @@ this is garbage that should not parse
     });
   });
 
-  describe('cross-entity + discontinue round-trip (Task 3)', () => {
+  describe('cross-entity + discontinue round-trip ', () => {
     it('round-trips replaces/replacedBy/corrects/correctedBy/discontinuedReason as top-level fields', () => {
       const f = makeFact({
         entity: 'naproxen', version: 2, status: 'discontinued',

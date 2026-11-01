@@ -1,7 +1,6 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
-import { ProfileRegistry } from '../../src/profiles/registry';
+import { asProfileId, resolveOwnerPaths } from '../../src/profiles';
 import type { ProfileId } from '../../src/profiles/types';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import { SessionManager } from '../../src/gateway/session';
@@ -10,37 +9,42 @@ import { SchedulerAuditLog } from '../../src/scheduler/audit-log';
 import { syncHeartbeatMarkdown } from '../../src/scheduler/heartbeat-markdown';
 import { createMemoryTools } from '../../src/tools/memory-tools';
 import { SqliteStore } from '../../src/memory/sqlite-store';
+import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 
 describe('Profile-scoped store isolation', () => {
   let tmpDir: string;
   let baseDir: string;
-  let registry: ProfileRegistry;
   let profileA: ProfileId;
   let profileB: ProfileId;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-profile-isolation-'));
+    tmpDir = makeTestTemp('profile-isolation');
     baseDir = path.join(tmpDir, 'base');
     fs.mkdirSync(baseDir, { recursive: true });
-    registry = new ProfileRegistry(baseDir);
-    profileA = registry.createProfile('alpha').profileId;
-    profileB = registry.createProfile('beta').profileId;
+    profileA = asProfileId('alpha')!;
+    profileB = asProfileId('beta')!;
+    for (const id of [profileA, profileB]) {
+      fs.mkdirSync(resolveOwnerPaths(baseDir, id).workspace, { recursive: true, mode: 0o700 });
+    }
   });
 
   afterEach(() => {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    removeTestTemp(tmpDir);
   });
+
+  /** The derivation that replaced `ownerPaths(id)` and friends. */
+  const ownerPaths = (id: ProfileId): ReturnType<typeof resolveOwnerPaths> => resolveOwnerPaths(baseDir, id);
 
   describe('on-disk directory separation', () => {
     it('two profiles resolve to distinct workspace, session, scheduler, and audit directories', () => {
-      const wsA = registry.profileWorkspace(profileA);
-      const wsB = registry.profileWorkspace(profileB);
-      const sessA = registry.profileSessions(profileA);
-      const sessB = registry.profileSessions(profileB);
-      const hbA = registry.profileSchedulerStore(profileA);
-      const hbB = registry.profileSchedulerStore(profileB);
-      const auditA = registry.profileAuditLog(profileA);
-      const auditB = registry.profileAuditLog(profileB);
+      const wsA = ownerPaths(profileA).workspace;
+      const wsB = ownerPaths(profileB).workspace;
+      const sessA = ownerPaths(profileA).sessions;
+      const sessB = ownerPaths(profileB).sessions;
+      const hbA = ownerPaths(profileA).schedulerStore;
+      const hbB = ownerPaths(profileB).schedulerStore;
+      const auditA = ownerPaths(profileA).auditLog;
+      const auditB = ownerPaths(profileB).auditLog;
 
       expect(wsA).not.toBe(wsB);
       expect(sessA).not.toBe(sessB);
@@ -56,8 +60,8 @@ describe('Profile-scoped store isolation', () => {
 
   describe('MemoryEngine isolation', () => {
     it('writes to profile A workspace are absent from profile B workspace', async () => {
-      const wsA = registry.profileWorkspace(profileA);
-      const wsB = registry.profileWorkspace(profileB);
+      const wsA = ownerPaths(profileA).workspace;
+      const wsB = ownerPaths(profileB).workspace;
       const engineA = new MemoryEngine(wsA, profileA);
       const engineB = new MemoryEngine(wsB, profileB);
 
@@ -82,17 +86,16 @@ describe('Profile-scoped store isolation', () => {
 
   describe('SessionManager isolation', () => {
     it('sessions recorded for profile A are absent from profile B directory', async () => {
-      const sessA = registry.profileSessions(profileA);
-      const sessB = registry.profileSessions(profileB);
-      const mgrA = new SessionManager(240, 1440, sessA, undefined, undefined, undefined, profileA);
-      new SessionManager(240, 1440, sessB, undefined, undefined, undefined, profileB);
+      const sessA = ownerPaths(profileA).sessions;
+      const sessB = ownerPaths(profileB).sessions;
+      const mgrA = new SessionManager(sessA, undefined, undefined, undefined, profileA);
+      new SessionManager(sessB, undefined, undefined, undefined, profileB);
 
       await mgrA.recordTurn('chat-1', [
         { role: 'user', content: 'A private data' },
         { role: 'assistant', content: 'A response' },
       ]);
 
-      // P2b/D1.6: the day-file archive replaces the active file. Registry mode ⇒ flat `<date>.jsonl`.
       const dayFileName = new Date().toISOString().slice(0, 10) + '.jsonl';
       const filesA = fs.readdirSync(sessA).filter(f => f.endsWith('.jsonl'));
       const filesB = fs.readdirSync(sessB).filter(f => f.endsWith('.jsonl'));
@@ -106,10 +109,10 @@ describe('Profile-scoped store isolation', () => {
     });
 
     it('two profiles can have sessions for the same chatId without collision', async () => {
-      const sessA = registry.profileSessions(profileA);
-      const sessB = registry.profileSessions(profileB);
-      const mgrA = new SessionManager(240, 1440, sessA, undefined, undefined, undefined, profileA);
-      const mgrB = new SessionManager(240, 1440, sessB, undefined, undefined, undefined, profileB);
+      const sessA = ownerPaths(profileA).sessions;
+      const sessB = ownerPaths(profileB).sessions;
+      const mgrA = new SessionManager(sessA, undefined, undefined, undefined, profileA);
+      const mgrB = new SessionManager(sessB, undefined, undefined, undefined, profileB);
 
       await mgrA.recordTurn('shared-chat', [
         { role: 'user', content: 'Profile A context' },
@@ -133,8 +136,8 @@ describe('Profile-scoped store isolation', () => {
 
   describe('HeartbeatStore isolation', () => {
     it('heartbeat jobs for profile A land under profiles/A/.state/ and are absent from B', async () => {
-      const hbPathA = registry.profileSchedulerStore(profileA);
-      const hbPathB = registry.profileSchedulerStore(profileB);
+      const hbPathA = ownerPaths(profileA).schedulerStore;
+      const hbPathB = ownerPaths(profileB).schedulerStore;
       const storeA = new HeartbeatStore(hbPathA, profileA);
       const storeB = new HeartbeatStore(hbPathB, profileB);
 
@@ -168,8 +171,8 @@ describe('Profile-scoped store isolation', () => {
 
   describe('SchedulerAuditLog isolation', () => {
     it('audit events for profile A are absent from profile B', async () => {
-      const auditPathA = registry.profileAuditLog(profileA);
-      const auditPathB = registry.profileAuditLog(profileB);
+      const auditPathA = ownerPaths(profileA).auditLog;
+      const auditPathB = ownerPaths(profileB).auditLog;
       const auditA = new SchedulerAuditLog(auditPathA, profileA);
       new SchedulerAuditLog(auditPathB, profileB);
 
@@ -197,8 +200,8 @@ describe('Profile-scoped store isolation', () => {
 
   describe('syncHeartbeatMarkdown profile-scoped workspace', () => {
     it('writes HEARTBEAT.md to the profile workspace it is given, not to any other directory', async () => {
-      const wsA = registry.profileWorkspace(profileA);
-      const wsB = registry.profileWorkspace(profileB);
+      const wsA = ownerPaths(profileA).workspace;
+      const wsB = ownerPaths(profileB).workspace;
       const now = new Date().toISOString();
 
       await syncHeartbeatMarkdown(wsA, [{
@@ -228,8 +231,8 @@ describe('Profile-scoped store isolation', () => {
 
   describe('SqliteStore profile-scoped search index isolation', () => {
     it('search index databases for two profiles are separate files', () => {
-      const dbPathA = registry.profileSearchDb(profileA);
-      const dbPathB = registry.profileSearchDb(profileB);
+      const dbPathA = ownerPaths(profileA).searchDb;
+      const dbPathB = ownerPaths(profileB).searchDb;
 
       expect(dbPathA).not.toBe(dbPathB);
       expect(dbPathA).toContain(path.join('profiles', profileA, '.state'));
@@ -264,7 +267,7 @@ describe('Profile-scoped store isolation', () => {
 
   describe('createMemoryTools accepts profileId', () => {
     it('accepts profileId parameter and tools still operate on the correct profile workspace', async () => {
-      const wsA = registry.profileWorkspace(profileA);
+      const wsA = ownerPaths(profileA).workspace;
       const engineA = new MemoryEngine(wsA, profileA);
       const tools = createMemoryTools(engineA, undefined, undefined, profileA);
 

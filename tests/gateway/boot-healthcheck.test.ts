@@ -1,7 +1,5 @@
 import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { ReadinessResult } from '../../src/providers/healthcheck';
 
 jest.mock('../../src/memory/indexer', () => ({
@@ -35,6 +33,12 @@ jest.mock('../../src/onboarding/flow', () => ({
 }));
 
 import { Gateway } from '../../src/gateway/gateway';
+import {} from '../helpers/test-config';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+import { makeTestTemp } from '../helpers/test-temp';
+
+const CHAT_BINDING = 'chat-1';
 
 function allReadyResult(): { providers: ReadinessResult[]; telegram: ReadinessResult } {
   return {
@@ -62,15 +66,13 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-boot-health-'));
+    tmpDir = makeTestTemp('redacted-boot-health-');
     mockCheckSystemReadiness.mockReset();
     mockCheckProviderBindAddresses.mockReset();
     mockVerifyWorkspacePermissions.mockReset();
     mockCheckProviderBindAddresses.mockReturnValue({ localhostOnly: true, warnings: [] });
     mockVerifyWorkspacePermissions.mockReturnValue({ secure: true, warnings: [] });
     mockProbeChatCompletion.mockReset();
-    // Default: the live completion probe passes (isolates the config-check tests
-    // from the probe). Individual tests override it.
     mockProbeChatCompletion.mockResolvedValue({
       ready: true, checked: true, label: 'main provider', status: 'ok',
       details: ['live completion verified'], warnings: [],
@@ -82,8 +84,10 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     jest.restoreAllMocks();
   });
 
-  function makeConfig(): AppConfig {
+  function makeConfig(): EffectiveConfig {
     return {
+    schemaVersion: 2,
+    ...ownerSelection(fixtureOwner(tmpDir)),
       providers: {
         main: { type: 'ollama', model: 'kimi-k2.5:cloud', baseUrl: 'http://localhost:11434/v1' },
         medical: { type: 'ollama', model: 'medgemma', baseUrl: 'http://localhost:11434/v1' },
@@ -92,23 +96,21 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
       channels: { telegram: { enabled: false, botToken: '' } },
       tools: { allow: ['*'], deny: [] },
       memory: {
-        workspace: path.join(tmpDir, 'workspace'),
+        workspace: fixtureOwner(tmpDir).workspace,
         search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
         bootstrapMaxChars: 20000,
       },
       sessions: {
-        softResetAfterMinutes: 240,
-        hardResetAfterMinutes: 1440,
-        compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+        compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
       },
       heartbeat: {
         enabled: false,
         timezone: 'Asia/Kolkata',
-        storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+        storePath: fixtureOwner(tmpDir).storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 3, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-        audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+        audit: { path: fixtureOwner(tmpDir).auditLogPath },
         policy: {
           quietHours: { enabled: true, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,
@@ -118,7 +120,7 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
           },
         },
       },
-      agent: { maxIterations: 15, disclaimerEnabled: true },
+      agent: { maxIterations: 15 },
     };
   }
 
@@ -126,7 +128,7 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     mockCheckSystemReadiness.mockResolvedValue(allReadyResult());
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     jest.spyOn(console, 'log').mockImplementation(() => undefined);
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), CHAT_BINDING, { channel: 'local', userId: 'user-1' }));
 
     await gateway.start();
 
@@ -151,7 +153,7 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     });
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     jest.spyOn(console, 'log').mockImplementation(() => undefined);
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), CHAT_BINDING, { channel: 'local', userId: 'user-1' }));
 
     await gateway.start();
 
@@ -171,7 +173,7 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
   it('Ollama-down boot warns loudly, does NOT throw, and stores degraded health', async () => {
     mockCheckSystemReadiness.mockResolvedValue(degradedResult());
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), CHAT_BINDING, { channel: 'local', userId: 'user-1' }));
 
     await expect(gateway.start()).resolves.toBeUndefined();
 
@@ -191,7 +193,7 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
   it('user messages still route after degraded boot', async () => {
     mockCheckSystemReadiness.mockResolvedValue(degradedResult());
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-1', { channel: 'local', userId: 'user-1' }));
     await gateway.start();
 
     const send = jest.fn().mockResolvedValue(undefined);
@@ -215,9 +217,13 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     (gateway.runtimeInstance as any).sessions = sessions;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (gateway as any).handleMessage({ chatId: 'chat-1', text: 'hi there' });
+    await (gateway as any).handleMessage({
+      channel: 'local',
+      userId: 'user-1',
+      chatType: 'private',
+      eventId: 'local:chat-1:1', chatId: 'chat-1', text: 'hi there' });
 
-    expect(run).toHaveBeenCalledWith('hi there', expect.any(Array), { chatId: 'chat-1', mode: 'chat' });
+    expect(run).toHaveBeenCalledWith('hi there', expect.any(Array), { chatId: 'chat-1', origin: 'user', mode: 'chat', turnId: undefined });
     expect(send).toHaveBeenCalledWith('chat-1', { text: 'hello from agent' });
 
     await gateway.stop();
@@ -226,7 +232,7 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
   it('/status returns degraded text when a provider is down', async () => {
     mockCheckSystemReadiness.mockResolvedValue(degradedResult());
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-1', { channel: 'local', userId: 'user-1' }));
     await gateway.start();
 
     const send = jest.fn().mockResolvedValue(undefined);
@@ -235,7 +241,11 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     (gateway as any).channel = { send, disconnect };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (gateway as any).handleMessage({ chatId: 'chat-1', text: '/status' });
+    await (gateway as any).handleMessage({
+      channel: 'local',
+      userId: 'user-1',
+      chatType: 'private',
+      eventId: 'local:chat-1:2', chatId: 'chat-1', text: '/status' });
 
     expect(send).toHaveBeenCalledTimes(1);
     const statusText = send.mock.calls[0][1].text;
@@ -251,7 +261,7 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     mockCheckSystemReadiness.mockImplementation(() => new Promise(() => {}));
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     jest.spyOn(console, 'log').mockImplementation(() => undefined);
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-1', { channel: 'local', userId: 'user-1' }));
 
     const startPromise = gateway.start();
 
@@ -260,14 +270,17 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     (gateway as any).channel = { send };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (gateway as any).handleMessage({ chatId: 'chat-1', text: '/status' });
+    await (gateway as any).handleMessage({
+      channel: 'local',
+      userId: 'user-1',
+      chatType: 'private',
+      eventId: 'local:chat-1:3', chatId: 'chat-1', text: '/status' });
 
     expect(send).toHaveBeenCalledTimes(1);
     const statusText = send.mock.calls[0][1].text;
     expect(statusText).toContain('not yet');
 
     mockCheckSystemReadiness.mockResolvedValue(allReadyResult());
-    // let start complete
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = undefined;
     await startPromise.catch(() => {});
@@ -278,7 +291,7 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     mockCheckSystemReadiness.mockResolvedValue(allReadyResult());
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     jest.spyOn(console, 'log').mockImplementation(() => undefined);
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-1'));
     await gateway.start();
 
     const result = await gateway.handleTestMessage('chat-1', '/status');
@@ -296,7 +309,7 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     });
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     jest.spyOn(console, 'log').mockImplementation(() => undefined);
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-1', { channel: 'local', userId: 'user-1' }));
     await gateway.start();
 
     const send = jest.fn().mockResolvedValue(undefined);
@@ -305,12 +318,14 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     (gateway as any).channel = { send, disconnect };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (gateway as any).handleMessage({ chatId: 'chat-1', text: '/status' });
+    await (gateway as any).handleMessage({
+      channel: 'local',
+      userId: 'user-1',
+      chatType: 'private',
+      eventId: 'local:chat-1:4', chatId: 'chat-1', text: '/status' });
 
     const statusText = send.mock.calls[0][1].text;
     expect(statusText).toContain('Security warnings: 1');
-    // Provider baseUrls and warning bodies are config internals — they must
-    // never reach a network channel.
     expect(statusText).not.toContain('api.example.com');
     expect(statusText).not.toContain('not localhost');
 
@@ -325,7 +340,7 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     });
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     jest.spyOn(console, 'log').mockImplementation(() => undefined);
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), 'chat-1', { channel: 'local', userId: 'user-1' }));
     await gateway.start();
 
     const send = jest.fn().mockResolvedValue(undefined);
@@ -334,7 +349,11 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     (gateway as any).channel = { send, disconnect };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (gateway as any).handleMessage({ chatId: 'chat-1', text: '/status' });
+    await (gateway as any).handleMessage({
+      channel: 'local',
+      userId: 'user-1',
+      chatType: 'private',
+      eventId: 'local:chat-1:5', chatId: 'chat-1', text: '/status' });
 
     const statusText = send.mock.calls[0][1].text;
     expect(statusText).toContain('Security warnings: 1');
@@ -353,7 +372,7 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     });
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     jest.spyOn(console, 'log').mockImplementation(() => undefined);
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), CHAT_BINDING, { channel: 'local', userId: 'user-1' }));
     await gateway.start();
 
     const warned = warnSpy.mock.calls.map((c) => c.join(' ')).join('\n');
@@ -369,7 +388,7 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     jest.spyOn(console, 'log').mockImplementation(() => undefined);
     const config = makeConfig();
-    const gateway = new Gateway(config);
+    const gateway = new Gateway(config, await bindGatewayOwner(config, CHAT_BINDING, { channel: 'local', userId: 'user-1' }));
     await gateway.start();
 
     expect(mockVerifyWorkspacePermissions).toHaveBeenCalled();

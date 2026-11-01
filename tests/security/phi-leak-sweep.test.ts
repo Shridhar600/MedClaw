@@ -1,14 +1,5 @@
-// tests/security/phi-leak-sweep.test.ts
-//
-// SEC-M1 regression deliverable: for each runtime-proven PHI leak site, drive
-// the failure path with a PHI marker injected into the error message and
-// assert (a) the marker never reaches console output and (b) the sanitized
-// name/frame DOES reach console. Pattern follows tests/scheduler/runtime.test.ts
-// 'sanitized lastError'. These tests FAIL on the reverted (pre-W3F-B) source
-// because the raw error object/message was logged directly.
 
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { MemoryIndexer } from '../../src/memory/indexer';
 import { MemorySearch } from '../../src/memory/search';
@@ -20,17 +11,22 @@ import { createMemoryTools } from '../../src/tools/memory-tools';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import type { LLMProvider } from '../../src/providers/types';
 import type { Tool } from '../../src/tools/types';
+import { Gateway } from '../../src/gateway';
+import { composeOwnerAuthority, loadRuntimeConfig } from '../../src/runtime';
+import { asProfileId } from '../../src/profiles';
+import { writeConfigFixture } from '../helpers/config-fixture';
+import { stageMediaFixture } from '../helpers/media-artifact-fixture';
+import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 
 const PHI = 'glucose-PHI-marker-142857';
 
-describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () => {
+describe('PHI leak sweep — raw error objects never reach console', () => {
   afterEach(() => jest.restoreAllMocks());
 
-  // ── medical-tools.ts: medical provider + main provider both fail → two logs.
   it('medgemma_query logs a sanitized frame, never the PHI-bearing provider error', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phi-med-'));
+    const tmpDir = makeTestTemp('phi-med-');
     try {
       fs.writeFileSync(path.join(tmpDir, 'HEALTH_PROFILE.md'), '# none');
       const engine = new MemoryEngine(tmpDir);
@@ -62,24 +58,19 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
   // ── gateway/session.ts: compaction flush + summary chat both throw PHI error.
   it('session compaction logs a sanitized frame, never the PHI-bearing provider error', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phi-sess-'));
+    const tmpDir = makeTestTemp('phi-sess-');
     try {
       const provider: LLMProvider = {
-        chat: jest.fn().mockRejectedValue(new Error(`compact summary failed: ${PHI}`)),
+        chat: jest.fn().mockRejectedValue(Object.assign(new Error(`compact summary failed: ${PHI}`), { status: 400 })),
         embed: jest.fn().mockResolvedValue([0.1]),
       };
       const registry = new ToolRegistry({ allow: ['*'], deny: [] });
       const manager = new SessionManager(
-        240,
-        1440,
         tmpDir,
         provider,
         registry,
-        { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 2 },
+        { enabled: true, memoryFlush: true, keepRecentTurns: 2 },
       );
-      // I3 added bounded retries to compaction LLM calls; this test asserts log
-      // sanitization, so use a single fast attempt to stay inside the timeout.
-      manager.setCompactionRetryPolicy({ attempts: 1 });
       const chatId = 'chat-phi';
       for (let i = 0; i < 6; i++) {
         await manager.addTurn(chatId, { role: 'user', content: `u${i}` }, { role: 'assistant', content: `a${i}` });
@@ -87,8 +78,6 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
       await expect(manager.runCompaction(chatId)).resolves.toBeUndefined();
 
       const warnText = warnSpy.mock.calls.flat().map(String).join('\n');
-      // The PHI marker in the provider error must never reach console; the
-      // flush (line 222) and compact (line 255) catches both log the frame.
       expect(warnText).not.toContain(PHI);
       expect(warnText).not.toContain('compact summary failed');
       expect(warnText).toContain('session');
@@ -101,7 +90,7 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
   // ── memory/indexer.ts: embedding failure logs sanitized frame.
   it('indexer embed failure logs a sanitized frame, never the PHI-bearing chunk error', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phi-idx-'));
+    const tmpDir = makeTestTemp('phi-idx-');
     try {
       const store = new SqliteStore(path.join(tmpDir, 'test.db'));
       const provider: LLMProvider = {
@@ -126,7 +115,7 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
   // ── memory/search.ts: vector search embedding failure logs sanitized frame.
   it('search vector failure logs a sanitized frame, never the PHI-bearing query error', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phi-search-'));
+    const tmpDir = makeTestTemp('phi-search-');
     try {
       const store = new SqliteStore(path.join(tmpDir, 'test.db'));
       const query = `glucose spikes ${PHI}`;
@@ -163,8 +152,6 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
     registry.register(throwingTool);
     const result = await registry.execute('leaky', {});
-    // The full tool error text is still returned to the agent (persisted into
-    // the 0600 session JSONL), but the console log must be sanitized.
     expect((result.content[0] as { text: string }).text).toContain(PHI);
     const errorText = errorSpy.mock.calls.flat().map(String).join('\n');
     expect(errorText).not.toContain(PHI);
@@ -172,49 +159,43 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
     expect(errorText).toContain('Error');
   });
 
-  // ── profiles/registry.ts: deleteProfile rename failure logs sanitized frame.
-  it('profiles deleteProfile quarantine failure logs a sanitized frame, never the PHI-bearing fs error', async () => {
-    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+  // ── destructive fs op on owner data logs a sanitized frame, never the PHI-bearing error.
+  it('staged-media unlink failure reaches the real boot consumer with only closed fields', async () => {
+    const errorSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const fsReal = jest.requireActual<typeof import('fs')>('fs');
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phi-profs-'));
+    const staging = makeTestTemp('phi-staging');
+    const fixture = writeConfigFixture(staging);
+    const authority = composeOwnerAuthority({ ownerId: asProfileId(fixture.ownerId)!, ownerPaths: { ownerRecord: fixture.ownerRecord } });
+    await authority.admission.initialize();
+    const artifact = await stageMediaFixture(fixture.workspace, fixture.mediaStaging, 'data');
+    const gateway = new Gateway(await loadRuntimeConfig({ configPath: fixture.configPath }), authority);
     try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { ProfileRegistry } = require('../../src/profiles/registry');
-      const registry = new ProfileRegistry(tmpDir);
-      const profile = registry.createProfile('test-profile');
-      fs.mkdirSync(path.join(tmpDir, 'profiles', profile.profileId), { recursive: true });
-      fs.writeFileSync(path.join(tmpDir, 'profiles', profile.profileId, 'note.md'), 'data');
-
-      const originalRename = fsReal.renameSync;
-      const renameSpy = jest.spyOn(fsReal, 'renameSync').mockImplementation((src, dest) => {
-        const destStr = typeof dest === 'string' ? dest : dest.toString();
-        if (destStr.includes('.trash')) {
-          throw new Error(`rename fs failure: ${PHI}`);
-        }
-        return originalRename.call(fsReal, src, dest);
+      const unlinkSpy = jest.spyOn(fsReal, 'unlinkSync').mockImplementation(() => {
+        throw new Error(`unlink fs failure: ${PHI}`);
       });
-      registry.deleteProfile(profile.profileId);
-      renameSpy.mockRestore();
 
-      const errorText = errorSpy.mock.calls.flat().map(String).join('\n');
-      expect(errorText).not.toContain(PHI);
-      expect(errorText).not.toContain('rename fs failure');
-      expect(errorText).toContain('profiles');
-      expect(errorText).toContain('Error');
+      await gateway.start();
+      unlinkSpy.mockRestore();
+
+      const warnText = errorSpy.mock.calls.flat().map(String).join('\n');
+      // The PHI marker and the raw message never appear…
+      expect(warnText).not.toContain(PHI);
+      expect(warnText).not.toContain('unlink fs failure');
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(warnText).toBe('[gateway] Media staging cleanup partial: reason=io-failed inspected=1 removed=0');
+      expect(gateway.stagingCleanupResult).toEqual({ kind: 'partial', reason: 'io-failed', inspected: 1, removed: 0 });
+      expect(fs.readFileSync(artifact, 'utf8')).toBe('data');
+      expect(warnText).not.toContain(staging);
     } finally {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
+      await gateway.stop();
+      removeTestTemp(staging);
+      errorSpy.mockRestore();
     }
   });
-});
 
-// ── Sweep additions the review MISSED — each driven with a PHI marker.
-describe('SEC-M1 extra sweep — review-missed raw-error logs', () => {
-  afterEach(() => jest.restoreAllMocks());
-
-  // memory-tools.ts:88 reindex catch logs sanitized frame.
   it('memory_write append reindex failure logs a sanitized frame, never the PHI-bearing reindex error', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phi-reindex-'));
+    const tmpDir = makeTestTemp('phi-reindex-');
     try {
       const engine = new MemoryEngine(tmpDir);
       const failingIndexer = {
@@ -223,7 +204,6 @@ describe('SEC-M1 extra sweep — review-missed raw-error logs', () => {
       const tools = createMemoryTools(engine, undefined, failingIndexer as unknown as Parameters<typeof createMemoryTools>[2]);
       const writeTool = tools.find((t) => t.name === 'memory_write')!;
       await writeTool.execute({ path: 'note.md', content: 'a benign health note', mode: 'overwrite' });
-      // The reindex runs fire-and-forget; allow the rejected promise to settle.
       await new Promise((r) => setImmediate(r));
 
       const warnText = warnSpy.mock.calls.flat().map(String).join('\n');
@@ -239,11 +219,8 @@ describe('SEC-M1 extra sweep — review-missed raw-error logs', () => {
   // scheduler/audit-log.ts:43 rotation failure logs sanitized frame.
   it('audit-log rotation failure logs a sanitized frame, never the PHI-bearing rotation error', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phi-audit-'));
+    const tmpDir = makeTestTemp('phi-audit-');
     try {
-      // Force the rotation check to throw on the first append (appendCount === 1
-      // triggers a rotation check). Inject a PHI-bearing throw via the rotation
-      // module that audit-log imports.
       jest.isolateModules(() => {
         jest.doMock('../../src/scheduler/rotation', () => ({
           rotateFileIfNeeded: jest.fn().mockImplementation(() => {

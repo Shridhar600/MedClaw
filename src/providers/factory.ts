@@ -1,8 +1,9 @@
-// src/providers/factory.ts
 import type { ProviderConfig } from '../config/types';
 import type { LLMProvider } from './types';
 import { OllamaProvider } from './ollama';
 import { OpenAIProvider } from './openai';
+
+export type ProviderFactory = (config: ProviderConfig) => LLMProvider;
 
 export function createProvider(config: ProviderConfig): LLMProvider {
   switch (config.type) {
@@ -14,7 +15,7 @@ export function createProvider(config: ProviderConfig): LLMProvider {
     case 'openrouter': // OpenRouter is OpenAI-compatible; base URL defaults in OpenAIProvider
       return new OpenAIProvider(config);
     default: {
-      // TypeScript exhaustiveness check
+      // Exhaustiveness check.
       const _exhaustive: never = config.type;
       throw new Error(`Unknown provider type: ${String(_exhaustive)}`);
     }

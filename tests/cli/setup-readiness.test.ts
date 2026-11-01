@@ -1,8 +1,8 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { getDefaultConfig } from '../../src/config/config';
 import { ensureOllamaRuntime, preflightStartCheck, verifyTelegramRuntime } from '../../src/cli/setup-readiness';
+import { makeTestTemp } from '../helpers/test-temp';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -24,7 +24,7 @@ describe('setup readiness', () => {
   const originalOpenAiApiKey = process.env.OPENAI_API_KEY;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-setup-readiness-'));
+    tmpDir = makeTestTemp('redacted-setup-readiness-');
     configPath = path.join(tmpDir, 'config.json');
     workspacePath = path.join(tmpDir, 'workspace');
     fs.mkdirSync(workspacePath, { recursive: true });
@@ -69,6 +69,36 @@ describe('setup readiness', () => {
         expect.stringContaining(`Missing Ollama model for providers.embeddings at ${config.providers.embeddings.baseUrl}: ${config.providers.embeddings.model}`),
       ]),
     );
+  });
+
+  it('never prints endpoint credentials in a start-preflight blocker', async () => {
+    const config = getDefaultConfig();
+    config.memory.workspace = workspacePath;
+    config.channels.telegram.enabled = false;
+    config.heartbeat.enabled = true;
+    config.providers.main.baseUrl = 'http://url-user:url-password@127.0.0.1:11434/v1';
+    config.providers.medical.baseUrl = 'http://url-user:url-password@127.0.0.1:11434/v1';
+    config.providers.embeddings.baseUrl = 'http://url-user:url-password@127.0.0.1:11434/v1';
+
+    const report = await preflightStartCheck(config, configPath, {
+      fetchImpl: jest.fn(async (url: string | URL) => {
+        const target = String(url);
+        if (target.endsWith('/api/version')) {
+          return jsonResponse({ version: '0.6.0' });
+        }
+        if (target.endsWith('/api/tags')) {
+          return jsonResponse({ models: [] });
+        }
+        throw new Error(`Unexpected URL: ${target}`);
+      }) as typeof fetch,
+      timeoutMs: 50,
+    });
+
+    expect(report.ready).toBe(false);
+    const printed = report.blockers.join('\n') + report.warnings.join('\n');
+    expect(printed).not.toContain('url-user');
+    expect(printed).not.toContain('url-password');
+    expect(printed).toContain('127.0.0.1:11434');
   });
 
   it('blocks startup when an OpenAI provider has no inline or environment api key', async () => {

@@ -1,9 +1,3 @@
-// src/indexstore/adapters/sqlite-event-sink.ts
-//
-// EventSink adapter over SQLite — the append-only event store feeding Stage-3 entity-correlation
-// lag queries (P2 Task A3, specs/07 §4 `events`). Own better-sqlite3 connection to the per-profile
-// search.db (WAL + busy_timeout, D6); imports better-sqlite3 DIRECTLY — never src/memory/.
-// Mirror-layer owned (M-3): the `events` table.
 
 import Database from 'better-sqlite3';
 import { summarizeErrorForLog } from '../../security';

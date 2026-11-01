@@ -72,8 +72,8 @@ export class ToolRegistry {
     this.tools.set(tool.name, tool);
   }
 
-  getAvailable(): Tool[] {
-    return [...this.tools.values()].filter(t => this.isAllowed(t));
+  getAvailable(origin?: ToolExecutionContext['origin']): Tool[] {
+    return [...this.tools.values()].filter(t => this.isAllowed(t) && !this.ownerOnlyRefused(t, origin));
   }
 
   async execute(
@@ -84,18 +84,23 @@ export class ToolRegistry {
     const tool = this.tools.get(name);
     if (!tool) throw new Error(`Tool not found: ${name}`);
     if (!this.isAllowed(tool)) throw new Error(`Tool not allowed: ${name}`);
+    if (this.ownerOnlyRefused(tool, context?.origin)) {
+      return { content: [{ type: 'text', text: `${name} is only available in a turn the owner started.` }], isError: true };
+    }
     const validationError = validateParameters(tool, params);
     if (validationError) return validationError;
     try {
       return await tool.execute(params, context);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      // Tool error messages can echo PHI (tool args carry health content) — log
-      // the tool name + sanitized frame only. The full error text is returned
-      // to the agent (persisted into the 0600 session JSONL, not stdout/stderr).
+      // Tool errors can echo PHI; log the tool name and sanitized frame only.
       console.error(`[tool:${name}] Error:`, summarizeErrorForLog(e));
       return { content: [{ type: 'text', text: `Tool error: ${msg}` }], isError: true };
     }
+  }
+
+  private ownerOnlyRefused(tool: Tool, origin: ToolExecutionContext['origin']): boolean {
+    return tool.ownerTurnOnly === true && origin !== 'user';
   }
 
   private isAllowed(tool: Tool): boolean {

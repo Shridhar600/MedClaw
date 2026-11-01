@@ -1,15 +1,12 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
-import type { AppConfig } from '../config/types';
-import { ProfileRegistry } from '../profiles';
-import type { ProfileId } from '../profiles';
-import type { Channel, IncomingMessage } from '../channels/types';
-import { TelegramChannel } from '../channels/telegram';
+import type { EffectiveConfig } from '../config/types';
+import { asProfileId, resolveOwnerPaths } from '../profiles';
+import type { OwnerAdmissionService, OwnerPaths, ProfileId } from '../profiles';
+import type { AdmittedMessage, Channel, IncomingMessage } from '../channels';
+import { TelegramChannel } from '../channels';
 import { LLMSemaphore, HeartbeatQueueFullError } from '../tools/semaphore';
-import { deprecatedSessionWarnings } from '../config/deprecations';
-import { createProvider } from '../providers/factory';
-import { SessionManager } from './session';
+import { createProvider, type ProviderFactory } from '../providers/factory';
 import { syncHeartbeatMarkdown } from '../scheduler/heartbeat-markdown';
 import type { NightlySweepResult } from '../scheduler/transcript-sweep-job';
 import type { HeartbeatJob } from '../scheduler/types';
@@ -27,20 +24,45 @@ import {
 } from '../security';
 import { ProfileRuntime } from './runtime';
 import { ProfileRuntimeManager } from './manager';
-import { GatewayMessageRouter, sweepStagedMedia } from './router';
+import { GatewayMessageRouter, transportIdentityOf } from './router';
+import { sweepStagedMedia, type MediaSweepResult } from './media-sweep';
+import { FsMediaStager } from '../runtime';
+import type { MediaSourcePort } from '../ports/media-source';
+import type { DiagnosticEvent, DiagnosticSink } from '../ports/diagnostics';
+import { SILENT_DIAGNOSTIC_SINK, guardedDiagnosticSink } from '../ports/diagnostics';
+import type { Clock } from '../ports/clock';
+import { systemClock } from '../ports/defaults';
 import { TurnQueueFullError, heartbeatTurnId } from './turn-coordinator';
+
+/** Canned, non-clinical explanations for a refused attachment. Never leaks a reason detail. */
+const MEDIA_REFUSAL_TEXT: Record<string, string> = {
+  unsupported: 'That attachment type cannot be accepted.',
+  'advertised-too-large': 'That file is larger than the 10 MB limit.',
+  'too-large': 'That file is larger than the 10 MB limit.',
+  timeout: 'That upload took too long and was cancelled. Please try again.',
+  'queue-full': 'Too many uploads are already being processed. Please try again in a moment.',
+  aborted: 'That upload was cancelled.',
+  'source-failed': 'Failed to retrieve that attachment. Please try uploading it again.',
+};
+
+export interface GatewayAdmissionDeps {
+  /** The owner's enrollment authority. Required: a Gateway without it would serve every chat as the owner. */
+  admission: OwnerAdmissionService;
+  /** The owner identity `admission` is configured for. REQUIRED; never inferred, never defaulted. */
+  ownerId: ProfileId;
+  /** How providers are built for this daemon. Defaults to the real factory. */
+  createProvider?: ProviderFactory;
+  /** When absent, media is refused rather than silently dropped: a transport that cannot retrieve bytes must not appear to succeed. */
+  mediaSource?: MediaSourcePort;
+  /** The closed diagnostic contract for admission, pairing, media intake and start/stop. Silent by default. */
+  diagnostics?: DiagnosticSink;
+  /** Optional: defaults to the system clock. Injected in tests so durations are real measurements. */
+  clock?: Clock;
+}
 
 const SHUTDOWN_RESPONSE = 'The health assistant is shutting down. Please try again in a moment.';
 const BOOT_HEALTHCHECK_BUDGET_MS = 3_000;
 
-/**
- * RR2-B1 (R2-10/11): a narrow, gateway-local boundary representing an AUTHORIZATION
- * suppression of a scheduled delivery — the destination chat stopped belonging to the owning
- * profile between dispatch and egress. Deliberately NOT an operational/provider error: it must
- * never enter `recordFailure`'s retry/dead-letter state machine, and it must never let
- * `afterDelivery` record an honest-looking sent/noop. Module-local by design — no other
- * consumer may throw or catch it.
- */
 class HeartbeatDestinationSuppressedError extends Error {
   constructor() {
     super('heartbeat destination is no longer owned by the dispatching profile');
@@ -73,48 +95,80 @@ function readinessLabel(result: ReadinessResult): 'OK' | 'FAIL' | 'PENDING' {
   return result.ready ? 'OK' : 'FAIL';
 }
 
+class PreviousWorkUnsettledError extends Error {}
+class AdmissionRefusedError extends Error {}
+
 export class Gateway {
-  private config: AppConfig;
+  private config: EffectiveConfig;
   private channel?: Channel;
-  private profileRegistry?: ProfileRegistry;
   private resolvedMemoryWorkspace?: string;
   private bootHealth?: { providers: ReadinessResult[]; telegram: ReadinessResult };
   private mainProvider?: LLMProvider;
-  /** RR-STRUCT R-S5a: the medical-provider fallback used for medication side-effect lookups,
-   *  shared across every profile's runtime (daemon-singleton per mini-plan v3 §3.1) — hoisted to
-   *  a field (was a `start()`-local var) so `buildRuntimeFor` can close over it for any profile. */
+  /** Medical-provider fallback for medication side-effect lookups, shared by every profile's runtime. */
   private sideEffectProvider?: LLMProvider;
   private securityWarnings: string[] = [];
   private reconcileTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private semaphore?: LLMSemaphore;
   private stopping = false;
   private stopped = false;
+  /** Inbound turns that have started and not settled. Drives `getShutdownDisposition()`. */
+  private inboundTurnsInFlight = 0;
   private stopPromise?: Promise<void>;
   private runtime?: ProfileRuntime;
-  /** RR-STRUCT R-S5a (mini-plan v3 §3.3): owns one ProfileRuntime per paired profile. `this.runtime`
-   *  above stays the DEFAULT profile's runtime (`manager.get(defaultProfileId)`) — every existing
-   *  accessor/handler/Router keeps reading `this.runtime` unchanged; dispatch stays default-only
-   *  (the RR-4 refusal is untouched — R-S5b routes by profile and retires it). */
+  /** Owns one ProfileRuntime per paired profile. `this.runtime` is the default profile's runtime. */
   private manager?: ProfileRuntimeManager;
   private router?: GatewayMessageRouter;
+  /** Sole authority for who may reach a clinical runtime; its boot answer decides whether one is built. */
+  private admission: OwnerAdmissionService;
+  /** While true the daemon serves pairing and canned emergency guidance only: no provider, workspace, runtime, index or scheduler. */
+  private unpairedOnly = false;
+  /** The owner identity admission is configured for, used as the dispatch target when admitted. */
+  private admissionOwnerId: ProfileId;
+  /** The one derivation of this owner's resources, memoised from the validated config. */
+  private ownerPathsCache?: OwnerPaths;
+  private readonly buildProvider: ProviderFactory;
+  private readonly mediaSource?: MediaSourcePort;
+  private readonly sink: DiagnosticSink;
+  /** Injected so a start/stop duration is measured, not guessed. */
+  private readonly clock: Clock;
+  private mediaIntake = new AbortController();
+  /** In-flight unpaired -> bound promotion, so concurrent messages cannot both build a runtime. */
+  private pairingTransition?: Promise<void>;
+  /** An attempt is not successful completion. Never retry during promotion or live intake. */
+  private bootSweepAttempted = false;
+  private bootSweepResult?: MediaSweepResult;
+  /** One stager per Gateway: its in-flight flag is the one-at-a-time intake bound, so it must never be rebuilt per message. */
+  private mediaStagerCache?: FsMediaStager;
 
-  constructor(config: AppConfig) {
+  constructor(config: EffectiveConfig, deps: GatewayAdmissionDeps) {
     this.config = config;
+    this.admission = deps.admission;
+    this.admissionOwnerId = deps.ownerId;
+    this.buildProvider = deps.createProvider ?? createProvider;
+    this.mediaSource = deps.mediaSource;
+    this.sink = guardedDiagnosticSink(deps.diagnostics ?? SILENT_DIAGNOSTIC_SINK);
+    this.clock = deps.clock ?? systemClock;
+  }
+
+  /** True when the daemon is serving pairing only, with no clinical runtime built. */
+  get servesPairingOnly(): boolean {
+    return this.unpairedOnly;
   }
 
   get runtimeInstance(): ProfileRuntime | undefined {
     return this.runtime;
   }
 
-  /** Test/diagnostic seam (mirrors `runtimeInstance`): the manager owning every built profile's
-   *  runtime. `undefined` until `start()` has run (or in the `attachGatewayTestRuntime` test-double
-   *  seam, which never constructs one). */
+  /** Actual boot cleanup outcome, including bounded partial/unavailable disposition. */
+  get stagingCleanupResult(): MediaSweepResult | undefined {
+    return this.bootSweepResult ? { ...this.bootSweepResult } : undefined;
+  }
+
+  /** Test/diagnostic seam: the manager owning every built profile's runtime. */
   get runtimeManager(): ProfileRuntimeManager | undefined {
     return this.manager;
   }
 
-  // Narrow test-backed seams. Setters require a runtime attached by ProfileRuntime.create
-  // (or a structural runtime test double); they never construct one.
   get agentLoop(): ProfileRuntime['agentLoop'] {
     return this.runtime?.agentLoop;
   }
@@ -175,31 +229,120 @@ export class Gateway {
   }
 
   async start(): Promise<void> {
+    const startedAt = this.clock.now().getTime();
+    try {
+      await this.startServing();
+    } catch (error) {
+      // Report a replacement refusal as its own outcome, not as a build failure: nothing was built.
+      if (error instanceof PreviousWorkUnsettledError) {
+        this.sink.emit({
+          stage: 'start-stop',
+          operation: 'start',
+          outcome: 'refused',
+          reason: 'previous-work-unsettled',
+          durationMs: this.elapsedSince(startedAt),
+        });
+      } else if (error instanceof AdmissionRefusedError) {
+        this.emit({ stage: 'start-stop', operation: 'start', outcome: 'refused', reason: 'admission-refused', durationMs: this.elapsedSince(startedAt) });
+      } else {
+        this.sink.emit({
+          stage: 'start-stop',
+          operation: 'start',
+          outcome: 'failed',
+          reason: 'build-failed',
+          durationMs: this.elapsedSince(startedAt),
+        });
+      }
+      throw error;
+    }
+    this.sink.emit({ stage: 'start-stop', operation: 'start', outcome: 'started', durationMs: this.elapsedSince(startedAt) });
+  }
+
+  /** Emit helpers. The sink is guarded in the constructor, so no emit can throw into a boot. */
+  private emit(event: DiagnosticEvent): void {
+    this.sink.emit(event);
+  }
+
+  private elapsedSince(startedAt: number): number {
+    const elapsed = this.clock.now().getTime() - startedAt;
+    return elapsed > 0 ? elapsed : 0;
+  }
+
+  private async startServing(): Promise<void> {
     const { config } = this;
-    const profilesConfig = config.profiles;
-    const profileId = (profilesConfig?.defaultProfileId ?? 'default') as ProfileId;
     this.stopping = false;
     this.stopped = false;
 
     console.log('[gateway] Starting Redacted...');
 
-    // P2b DD10 / D3.7: warn once at boot for any retired idle-reset config key still set to a
-    // non-default value (they no longer trigger anything).
-    for (const warning of deprecatedSessionWarnings(config.sessions)) {
-      console.warn(`[gateway] Deprecated config: ${warning}`);
+    this.mediaIntake = new AbortController();
+
+    const admissionState = this.admission.inspectInstallation();
+    if (admissionState.kind === 'refused') {
+      // start() owns the one terminal result. Admission has already emitted the precise reason.
+      throw new AdmissionRefusedError(
+        `Refusing to serve: the owner record is ${admissionState.reason}. `
+        + 'Re-run setup on this computer, then start the daemon again.',
+      );
+    }
+    this.sweepOwnerStagingLane();
+
+    if (admissionState.kind === 'unpaired') {
+      this.unpairedOnly = true;
+      await this.startUnpaired(config);
+      return;
     }
 
-    // Bootstrap workspace with template files on first run
+    await this.serveOwner({ connectChannel: true, runHealthchecks: true });
+
+    console.log('[gateway] Redacted is running.');
+  }
+
+  /** Runs once, only before intake: a sweep during an upload could delete the owner's file. Never retried. */
+  private sweepOwnerStagingLane(): void {
+    if (this.bootSweepAttempted) return;
+    this.bootSweepAttempted = true;
+    const ownerStaging = this.mediaStagingDir();
+    const result: MediaSweepResult = ownerStaging
+      ? sweepStagedMedia(ownerStaging, this.ownerStagingBase())
+      : { kind: 'unavailable', inspected: 0, removed: 0, reason: 'invalid-root' };
+    this.bootSweepResult = result;
+    if (result.kind !== 'complete') {
+      console.warn(`[gateway] Media staging cleanup ${result.kind}: reason=${result.reason} inspected=${result.inspected} removed=${result.removed}`);
+    }
+  }
+
+  private replacementWouldHideLiveWork(): boolean {
+    if (this.stopPromise) return true;
+    // Draining awaits an unsettled construction with no budget of its own, so replacing now could block start() forever.
+    if ((this.manager?.pendingBuildCount() ?? 0) > 0) return true;
+    const runtimes = this.manager ? this.manager.all() : (this.runtime ? [this.runtime] : []);
+    for (const runtime of runtimes) {
+      if (runtime.getShutdownDisposition() === 'pending') return true;
+    }
+    return false;
+  }
+
+  private refuseRuntimeReplacement(): never {
+    throw new PreviousWorkUnsettledError(
+      'Refusing to serve: the previous runtime still has work in flight that can write to this '
+      + 'installation, so ownership cannot be handed to a replacement. Wait for it to finish, then '
+      + 'start the daemon again.',
+    );
+  }
+
+  private async serveOwner(options: { connectChannel: boolean; runHealthchecks: boolean }): Promise<void> {
+    const { config } = this;
+
+    if (this.replacementWouldHideLiveWork()) this.refuseRuntimeReplacement();
+
+    // Resolved once so a config that names no valid owner refuses the boot before anything is built.
+    const ownerPaths = this.ownerPaths();
+    const profileId = ownerPaths.profileId;
+
     this.bootstrapWorkspace(config.memory.workspace);
-    const stagingDir = this.mediaStagingDir();
-    sweepStagedMedia(stagingDir, os.homedir());
 
-    // Profiles: construct the registry. Legacy migration (idempotent) happens per-profile inside
-    // buildRuntimeFor below, restricted to the DEFAULT profile only (RR-STRUCT R-S5a Part B,
-    // mini-plan v3 §3.8 A-F04 — SAFETY-CRITICAL: a secondary profile must never see it).
-    this.profileRegistry = profilesConfig ? this.tryCreateProfileRegistry(profilesConfig.baseDir) : undefined;
-
-    const mainProvider = createProvider(config.providers.main);
+    const mainProvider = this.buildProvider(config.providers.main);
     this.mainProvider = mainProvider;
 
     const semaphore = new LLMSemaphore();
@@ -207,55 +350,55 @@ export class Gateway {
 
     let sideEffectProvider: LLMProvider = mainProvider;
     try {
-      sideEffectProvider = createProvider(config.providers.medical);
+      sideEffectProvider = this.buildProvider(config.providers.medical);
     } catch (error) {
       console.warn('[gateway] Medical provider for side-effect lookup unavailable; using main:', summarizeErrorForLog(error));
     }
     this.sideEffectProvider = sideEffectProvider;
 
-    // Channel
-    if (config.channels.telegram.enabled) {
+    if (!this.channel && config.channels.telegram.enabled) {
       const token = config.channels.telegram.botToken || process.env.TELEGRAM_BOT_TOKEN;
       if (!token) {
         throw new Error('TELEGRAM_BOT_TOKEN not set. Set it in config or environment.');
       }
-      this.channel = new TelegramChannel(token, stagingDir, os.homedir());
+      this.channel = new TelegramChannel(token);
       this.channel.onMessage((msg) => this.handleMessage(msg));
     }
 
-    // RR-STRUCT R-S5a (mini-plan v3 §3.3): ProfileRuntimeManager owns one ProfileRuntime per
-    // paired profile. The DEFAULT profile is built first and DIRECTLY (not via buildAll) so its
-    // failure semantics stay byte-identical to pre-R-S5a: exactly one build attempt, and a
-    // genuine failure propagates straight out of start() (see tests/gateway/memcore-wiring.test.ts
-    // "aborts boot when the SAFETY.md injection invariant is violated"). Every OTHER paired
-    // profile is then eager-built via buildAll — individually guarded, so a secondary profile's
-    // broken storage degrades only that profile and never touches the default or aborts boot.
+    if (this.manager !== undefined) {
+      try {
+        await this.manager.drainAndCloseAll();
+      } catch (error) {
+        console.warn('[gateway] Failed to drain the previous runtime before rebuilding:', summarizeErrorForLog(error));
+      }
+      if (this.replacementWouldHideLiveWork()) this.refuseRuntimeReplacement();
+    }
+
     this.manager = new ProfileRuntimeManager((id) => this.buildRuntimeFor(id));
     this.runtime = await this.manager.get(profileId);
-    await this.manager.buildAll(this.pairedProfileIds(profileId));
+    await this.manager.buildAll(this.pairedProfileIds());
 
     this.router = this.createRouter();
-    if (this.channel && typeof this.channel.connect === 'function') {
+    if (options.connectChannel && this.channel && typeof this.channel.connect === 'function') {
       await this.channel.connect();
     }
+
+    // If stop() began during the build, do not start a scheduler that nothing would drain.
+    if (this.stopping) {
+      console.log('[gateway] Shutdown began while building the owner runtime; not starting the scheduler.');
+      return;
+    }
+
     await this.initializeScheduler();
 
-    await this.runBootHealthchecks();
-    this.runSecurityChecks();
+    if (options.runHealthchecks) {
+      await this.runBootHealthchecks();
+      this.runSecurityChecks();
+    }
 
-    console.log('[gateway] Redacted is running.');
+    this.unpairedOnly = false;
   }
 
-  /**
-   * RR-STRUCT R-S5a Part C (mini-plan v3 §3.8 A-F07): a nightly-sweep COORDINATOR across every
-   * built profile — each profile's own cron (`ProfileRuntime`'s internal `sweepTask`, R-S1)
-   * already sweeps itself independently in production; this is the manual/test-triggered surface
-   * (`gateway.runTranscriptSweep()`). Preserves the EXISTING external contract exactly: it still
-   * returns the DEFAULT profile's `NightlySweepResult` (the shape every existing sweep test
-   * asserts on), while additionally sweeping every OTHER built profile against its OWN sessions/
-   * ledger/curiosity, individually guarded — one profile's sweep failure never aborts another's
-   * (including the default's).
-   */
   async runTranscriptSweep(): Promise<NightlySweepResult> {
     if (this.stopping) return { scanned: false, added: 0 };
     if (!this.manager) {
@@ -310,34 +453,175 @@ export class Gateway {
 
   async handleTestMessage(chatId: string, text: string, sourceMessageId?: string): Promise<string> {
     if (this.stopping) return SHUTDOWN_RESPONSE;
-    return this.trackOperation(() => this.requireRouter().route(
-      { chatId, userId: '', text, ...(sourceMessageId ? { messageId: sourceMessageId } : {}) },
-      async () => undefined,
-      false,
-    ).then((response) => response ?? ''));
+    const eventId = `local:${chatId}:${sourceMessageId ?? 'adhoc'}`;
+    let reply = '';
+    await this.deliverMessage(
+      {
+        chatId,
+        userId: 'local',
+        text,
+        channel: 'local',
+        chatType: 'private',
+        eventId,
+        ...(sourceMessageId ? { messageId: sourceMessageId } : {}),
+      },
+      async (response) => {
+        reply = response;
+      },
+    );
+    return reply;
   }
 
+  /** The Telegram channel's inbound callback: a thin adapter over `deliverMessage` that supplies the channel's egress. */
   private async handleMessage(incoming: IncomingMessage): Promise<void> {
-    if (this.stopping) return;
     try {
-      await this.trackOperation(() => this.requireRouter().route(
-        incoming,
-        (text) => this.channel!.send(incoming.chatId, { text }),
-      ));
+      await this.deliverMessage(incoming, (text) => this.channel!.send(incoming.chatId, { text }));
     } catch (error) {
       console.error('[gateway] Handler error:', summarizeErrorForLog(error));
     }
   }
 
+  async deliverMessage(incoming: IncomingMessage, egress: (text: string) => Promise<void>): Promise<void> {
+    if (this.stopping) return;
+    await this.trackInboundTurn(() => this.ensureOwnerServing(incoming));
+    if (this.stopping) return;
+    const admitted = await this.admitAndStage(incoming);
+    if (!admitted) return;
+    await this.trackInboundTurn(() => this.requireRouter().route(admitted, egress));
+  }
+
+  private async ensureOwnerServing(incoming: IncomingMessage): Promise<void> {
+    if (!this.unpairedOnly || this.stopping) return;
+    if (this.admission.inspect(transportIdentityOf(incoming)).kind !== 'owner') return;
+
+    const transition = this.pairingTransition ??= (async () => {
+      const startedAt = this.clock.now().getTime();
+      try {
+        console.log('[gateway] Owner paired. Building the owner runtime.');
+        await this.serveOwner({ connectChannel: false, runHealthchecks: false });
+        this.emit(this.unpairedOnly
+          ? { stage: 'start-stop', operation: 'promotion', outcome: 'refused', reason: 'shutdown-in-progress', durationMs: this.elapsedSince(startedAt) }
+          : { stage: 'start-stop', operation: 'promotion', outcome: 'started', durationMs: this.elapsedSince(startedAt) });
+      } catch (error) {
+        console.error('[gateway] Could not start serving after pairing:', summarizeErrorForLog(error));
+        this.emit(error instanceof PreviousWorkUnsettledError
+          ? { stage: 'start-stop', operation: 'promotion', outcome: 'refused', reason: 'previous-work-unsettled', durationMs: this.elapsedSince(startedAt) }
+          : { stage: 'start-stop', operation: 'promotion', outcome: 'failed', reason: 'build-failed', durationMs: this.elapsedSince(startedAt) });
+      }
+    })();
+
+    try {
+      await transition;
+    } finally {
+      // A settled waiter owns cleanup only for the flight it actually awaited.
+      if (this.pairingTransition === transition) this.pairingTransition = undefined;
+    }
+  }
+
+  private async admitAndStage(incoming: IncomingMessage): Promise<AdmittedMessage | undefined> {
+    // Admission always exists, so there is no "no authority" branch to fail closed in.
+    const decision = this.admission.inspect(transportIdentityOf(incoming));
+    const admitted: AdmittedMessage = { ...incoming };
+
+    if (decision.kind !== 'owner') {
+      if (incoming.media) admitted.mediaError = MEDIA_REFUSAL_TEXT.unsupported;
+      return admitted;
+    }
+
+    if (!incoming.media) return admitted;
+
+    const stager = this.mediaStager();
+    if (!stager) {
+      // No source bound: say the upload could not be taken rather than pretending it succeeded.
+      admitted.mediaError = 'Attachments cannot be accepted by this installation right now.';
+      return admitted;
+    }
+
+    const signal = this.mediaIntake.signal;
+    const staged = await this.trackInboundTurn(() => stager.stage(incoming.media, signal));
+    if (staged.kind === 'refused') {
+      admitted.mediaError = MEDIA_REFUSAL_TEXT[staged.reason];
+      return admitted;
+    }
+
+    // Re-check authority AFTER the retrieval. A binding revoked mid-download must not adopt a file.
+    const recheck = this.admission.inspect(transportIdentityOf(incoming));
+    if (recheck.kind !== 'owner') {
+      this.deleteStagedFile(staged.absolutePath);
+      return undefined;
+    }
+
+    admitted.mediaPath = staged.absolutePath;
+    return admitted;
+  }
+
+  /** Remove one staged file this operation created. Scoped: it never sweeps a directory. */
+  private deleteStagedFile(target: string): void {
+    try {
+      fs.unlinkSync(target);
+    } catch {
+      // best effort: a leftover staged file is swept on the next owned boot
+    }
+  }
+
+  private async trackInboundTurn<T>(operation: () => Promise<T>): Promise<T> {
+    this.inboundTurnsInFlight += 1;
+    try {
+      return await this.trackOperation(operation);
+    } finally {
+      this.inboundTurnsInFlight -= 1;
+    }
+  }
+
+  getShutdownDisposition(): 'quiescent' | 'pending' {
+    if (this.stopPromise) return 'pending';
+    if (this.inboundTurnsInFlight > 0) return 'pending';
+    if ((this.manager?.pendingBuildCount() ?? 0) > 0) return 'pending';
+    for (const runtime of this.manager ? this.manager.all() : (this.runtime ? [this.runtime] : [])) {
+      if (runtime.getShutdownDisposition() === 'pending') return 'pending';
+    }
+    return 'quiescent';
+  }
+
+  shutdownWorkInFlight(): { turns: number; builds: number; runtimes: number; stopping: boolean } {
+    let runtimes = 0;
+    for (const runtime of this.manager ? this.manager.all() : (this.runtime ? [this.runtime] : [])) {
+      if (runtime.getShutdownDisposition() === 'pending') runtimes += 1;
+    }
+    return {
+      turns: this.inboundTurnsInFlight,
+      builds: this.manager?.pendingBuildCount() ?? 0,
+      runtimes,
+      stopping: this.stopping,
+    };
+  }
+
   async stop(): Promise<void> {
     if (this.stopped) return;
     if (this.stopPromise) return this.stopPromise;
+    const startedAt = this.clock.now().getTime();
     this.stopping = true;
+    // Abort in-flight media intake first so a `stage()` in progress stops writing before the drain.
+    this.mediaIntake.abort();
     this.runtime?.beginStopping();
-    const shared = this.stopResources().finally(() => {
-      this.stopped = true;
-      if (this.stopPromise === shared) this.stopPromise = undefined;
-    });
+    const shared = this.stopResources()
+      .then(() => {
+        this.emit({ stage: 'start-stop', operation: 'stop', outcome: 'stopped', durationMs: this.elapsedSince(startedAt) });
+      })
+      .catch((error: unknown) => {
+        this.emit({
+          stage: 'start-stop',
+          outcome: 'failed',
+          reason: 'release-failed',
+          operation: 'stop',
+          durationMs: this.elapsedSince(startedAt),
+        });
+        throw error;
+      })
+      .finally(() => {
+        this.stopped = true;
+        if (this.stopPromise === shared) this.stopPromise = undefined;
+      });
     this.stopPromise = shared;
     return shared;
   }
@@ -362,11 +646,10 @@ export class Gateway {
 
     try {
       if (this.manager) {
-        // RR-STRUCT R-S5a: drains + closes EVERY built profile's runtime (not just the default).
+        // Drains and closes every built profile's runtime.
         await this.manager.drainAndCloseAll();
       } else {
-        // Test-double seam (attachGatewayTestRuntime): start() never ran, so no manager exists —
-        // fall back to closing the directly-attached runtime, exactly as pre-R-S5a.
+        // Test-double seam: start() never ran, so close the directly attached runtime.
         await this.runtime?.drainAndClose();
       }
     } catch (error) {
@@ -379,14 +662,6 @@ export class Gateway {
     }
   }
 
-  /**
-   * RR-STRUCT R-S5b (mini-plan v3 §3.1 Finding-6, §3.8 A-F03; the R-S5a deferral): starts EACH
-   * built profile's OWN heartbeat scheduler (R-S5a built every runtime with `canSchedule:false`
-   * and started only the default's). Boot order is unchanged — the Router is created before
-   * this runs, so the R-S5a scheduler-recovery race guard (recovery invoking
-   * `runScheduledJob → handleScheduledJob → requireRouter()` before the router exists) still
-   * holds for every profile. No-manager (test-double) mode starts just the attached runtime.
-   */
   private async initializeScheduler(): Promise<void> {
     if (!this.config.heartbeat.enabled || !this.channel) return;
     const runtimes = this.manager ? this.manager.all() : (this.runtime ? [this.runtime] : []);
@@ -394,10 +669,7 @@ export class Gateway {
       if (!runtime.agentLoop || !runtime.sessions) continue;
       if (!runtime.scheduler) {
         await runtime.initializeScheduler({
-          schedulerPaths: this.schedulerPathsFor(runtime.profileId),
-          // RR2-B1: the trigger closure captures THIS profile's concrete runtime — the job's
-          // `chatId` never re-selects a runtime — and the destination guard is threaded into
-          // the scheduler so create/update/resume/registration refuse foreign addresses.
+          schedulerPaths: this.schedulerPathsFor(),
           runScheduledJob: (job) => this.handleScheduledJob(job, runtime, true),
           canAddressChat: (chatId) => this.canChatIdAddressProfile(chatId, runtime.profileId),
         });
@@ -410,38 +682,17 @@ export class Gateway {
     }
   }
 
-  /**
-   * RR-STRUCT R-S5b: scheduler paths per OWNING profile. The default (or legacy no-registry
-   * mode) goes through the `hasBeenMigrated`-gated `resolveSchedulerPaths` exactly as before;
-   * a NON-DEFAULT profile resolves DIRECTLY from the registry — never through that gate
-   * (preserves the R-S5a invariant its spy test enforces: `resolveSchedulerPaths` is only
-   * ever called with the default profileId).
-   */
-  private schedulerPathsFor(profileId: ProfileId): { storePath: string; auditLogPath: string } {
-    const defaultProfileId = (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
-    if (profileId === defaultProfileId || !this.profileRegistry) {
-      return this.resolveSchedulerPaths(profileId);
-    }
-    return {
-      storePath: this.profileRegistry.profileSchedulerStore(profileId),
-      auditLogPath: this.profileRegistry.profileAuditLog(profileId),
-    };
+  /** Scheduler paths for the owner, derived from the same bundle as every other owner resource. */
+  private schedulerPathsFor(): { storePath: string; auditLogPath: string } {
+    const ownerPaths = this.ownerPaths();
+    return { storePath: ownerPaths.schedulerStore, auditLogPath: ownerPaths.auditLog };
   }
 
-  /**
-   * RR2-B1 (R2-10/11) destination-ownership predicate: `chatId` may be addressed by work
-   * running as `profileId` ONLY when the (optional) profile registry currently pairs that
-   * chat to that profile. Side-effect-free: it READS `registry.getProfileForChat` only —
-   * never Router.resolveProfileForChat / getOrCreateDefaultProfile / pairChatToProfile, and
-   * it never builds or initializes another runtime. A missing/unreadable registry is FALSE
-   * (no implicit default authorization), and lookup failures are logged sanitized and
-   * refused. `job.chatId` is a destination, never authority.
-   */
   private canChatIdAddressProfile(chatId: string, profileId: ProfileId): boolean {
+    // Work dispatched as another identity may not address this daemon's single owner destination.
+    if (this.admissionOwnerId !== profileId) return false;
     try {
-      const resolved = this.profileRegistry?.getProfileForChat(chatId);
-      if (!resolved) return false;
-      return resolved.profileId === profileId;
+      return this.admission.ownsDestination(chatId);
     } catch (error) {
       console.warn('[gateway] Scheduled-work destination lookup failed; refusing:', summarizeErrorForLog(error));
       return false;
@@ -458,13 +709,6 @@ export class Gateway {
     }
   }
 
-  /**
-   * RR2-B1: scheduled dispatch requires an explicit trusted runtime. `owner` is the
-   * ProfileRuntime whose scheduler created/fired this job — every trigger closure captures
-   * its concrete runtime at construction, so `job.chatId` never re-selects a runtime. All
-   * session/turn/scheduler/outcome state stays on the owner; a foreign or unpaired
-   * destination is refused BEFORE any session, tool, model, delivery-policy or channel work.
-   */
   private async handleScheduledJob(
     job: HeartbeatJob,
     owner: ProfileRuntime,
@@ -501,15 +745,9 @@ export class Gateway {
       `Prompt: ${job.prompt}`,
     ].join('\n');
 
-    // RR2-B1: the destination can be REASSIGNED while the model runs. Re-check ownership
-    // immediately before channel.send (the delivery gate) and again before recording a
-    // sent/noop outcome, so a mid-turn reassignment is refused and suppressed — never
-    // delivered, never recorded as an honest success, never pushed into retry logic.
     let delivered = false;
     try {
-      // RR-STRUCT R-S3b (C-39 for heartbeats): thread the per-occurrence turnId so a
-      // `ledger_record` inside this turn gets a deterministic idempotency key — a
-      // scheduler RETRY of this occurrence dedupes instead of double-writing.
+      // A per-occurrence turnId gives ledger writes a deterministic idempotency key, so a scheduler retry dedupes.
       const turnId = heartbeatTurnId(job);
       const result = await coordinator.runHeartbeat({
         chatId: job.chatId,
@@ -576,8 +814,7 @@ export class Gateway {
 
   private async reconcileAfterScheduledDelivery(chatId: string, owner: ProfileRuntime): Promise<void> {
     try {
-      // RR2-B1: reconciliation after a scheduled job stays owner-bound. If ownership no
-      // longer holds, skip — never re-resolve a now-foreign chat into another runtime.
+      // Reconciliation stays owner-bound: if ownership no longer holds, skip rather than re-resolve another runtime.
       if (!this.canChatIdAddressProfile(chatId, owner.profileId)) {
         console.warn(
           '[gateway] Skipping post-delivery heartbeat reconciliation: destination is no longer owned by this profile.',
@@ -590,29 +827,14 @@ export class Gateway {
     }
   }
 
-  /**
-   * RR-STRUCT R-S5b: reconcile runs against the runtime OWNING `chatId` — its scheduler +
-   * workspace — never the ambient default. A non-default chat's reconcile writes ONLY that
-   * profile's `HEARTBEATS.md` + scheduler store (the pre-R-S5b early-return for non-default
-   * chats is retired along with the refusal).
-   */
   private async reconcileHeartbeatPolicies(chatId: string): Promise<void> {
     if (this.stopping) {
       return;
     }
-    // Sync-first: every already-built profile (boot eager-build, the overwhelming common case)
-    // resolves with ZERO async hops, preserving the exact pre-R-S5b microtask timing the
-    // debounce path is pinned to. The async fallback on-demand builds a profile paired after
-    // boot that was never built (lazy serving). NON-JOB callers only (user-turn reconcile +
-    // debounce + startup): scheduled delivery uses the owner-bound path below.
     const runtime = this.runtimeForChatSync(chatId) ?? await this.runtimeForChat(chatId);
     if (!runtime?.scheduler) {
       return;
     }
-    // RR2-B1: fail-closed, matching the scheduler's createJob guard. An unpaired chat
-    // (or a lookup failure) must not arm policy jobs on the resolved runtime — and the
-    // refusal must degrade here (sanitized warn, no reconcile) instead of propagating a
-    // createJob ownership error through reconcilePolicyJobs' rethrow path.
     if (!this.canChatIdAddressProfile(chatId, runtime.profileId)) {
       console.warn('[gateway] Skipping heartbeat policy reconciliation: chat is not owned by the resolving profile.');
       return;
@@ -620,12 +842,6 @@ export class Gateway {
     await this.reconcileHeartbeatPoliciesOnRuntime(runtime, chatId);
   }
 
-  /**
-   * RR2-B1: the reconcile body, bound to an explicit runtime. Called by
-   * `reconcileAfterScheduledDelivery` with the OWNING runtime (never a chat-derived
-   * re-resolution), and by `reconcileHeartbeatPolicies` for non-job callers (existing
-   * chat-resolution behavior retained there).
-   */
   private async reconcileHeartbeatPoliciesOnRuntime(runtime: ProfileRuntime, chatId: string): Promise<void> {
     const scheduler = runtime.scheduler;
     if (!scheduler) {
@@ -645,8 +861,7 @@ export class Gateway {
     if (this.stopping) {
       return;
     }
-    // Synchronous resolve (no async hop): the debounce timer must be scheduled synchronously
-    // so the window's timer semantics hold exactly as pre-R-S5b (fake-timer-pinned).
+    // Resolve synchronously so the debounce timer is scheduled synchronously.
     const runtime = this.runtimeForChatSync(chatId);
     if (!runtime?.scheduler) {
       return;
@@ -664,20 +879,6 @@ export class Gateway {
     this.reconcileTimers.set(chatId, timer);
   }
 
-  /**
-   * Kept for the single-runtime/test-double surface (F11 test calls this directly): resolves
-   * the startup-policy chat for the DEFAULT (attached) runtime, exactly as before.
-   */
-  private async resolveStartupPolicyChatId(): Promise<string | undefined> {
-    return this.resolveStartupPolicyChatIdFor(this.runtime);
-  }
-
-  /**
-   * RR-STRUCT R-S5b: startup-policy resolution SCOPED to one profile's runtime — its most
-   * recent session chat or scheduler job belonging to THAT profile (an unpaired/stale chat
-   * belongs to the default only, preserving the F11 no-auto-pair-at-boot invariant for every
-   * profile: this method only READS the registry, never pairs).
-   */
   private async resolveStartupPolicyChatIdFor(runtime: ProfileRuntime | undefined): Promise<string | undefined> {
     if (!runtime) return undefined;
     const sessionChatId = runtime.sessions?.getMostRecentChatId();
@@ -692,10 +893,6 @@ export class Gateway {
 
   private launchBackgroundReconcile(chatId: string): void {
     if (this.stopping) return;
-    // Track the background op on the OWNING runtime so each profile's shutdown drain accounts
-    // for its own reconciles (falls back to the default-tracked op if unresolvable). The
-    // reconcile itself (`reconcileHeartbeatPolicies`) re-resolves async — this stays sync so
-    // the timer callback's fire-and-track semantics hold under fake timers.
     const runtime = this.runtimeForChatSync(chatId) ?? this.runtime;
     if (!runtime) return;
     runtime.trackBackgroundOperation('heartbeat reconciliation', () => this.reconcileHeartbeatPolicies(chatId));
@@ -729,190 +926,61 @@ export class Gateway {
     }
   }
 
-  private tryCreateProfileRegistry(baseDir: string): ProfileRegistry | undefined {
-    try {
-      return new ProfileRegistry(baseDir);
-    } catch (error) {
-      console.error(
-        '[gateway] Failed to initialize ProfileRegistry; continuing without profile-scoped storage:',
-        summarizeErrorForLog(error),
-      );
-      return undefined;
-    }
-  }
-
-  private migrateLegacySessionsBeforeProfileSeal(
-    registry: ProfileRegistry,
-    profileId: ProfileId,
-    legacyWorkspace: string,
-  ): boolean {
-    const legacySessionsPath = path.join(path.dirname(legacyWorkspace), 'sessions');
-    try {
-      if (!fs.existsSync(legacySessionsPath)) return true;
-      const legacyFiles = fs.readdirSync(legacySessionsPath)
-        .filter((file) => file.startsWith('active-') && file.endsWith('.jsonl'));
-      if (legacyFiles.length === 0) return true;
-
-      const migration = new SessionManager({
-        sessionsPath: registry.profileSessions(profileId),
-        legacySessionsPath,
-        perChatArchive: true,
-        compaction: this.config.sessions.compaction,
-      });
-      if (!migration.didCompleteLegacyMigration) {
-        console.warn('[gateway] Legacy global session migration did not complete; profile sentinel remains unsealed.');
-        return false;
-      }
-      return true;
-    } catch (error) {
-      console.error('[gateway] Legacy global session migration failed; profile sentinel remains unsealed:', summarizeErrorForLog(error));
-      return false;
-    }
-  }
-
-  private migrateAndResolveWorkspace(
-    registry: ProfileRegistry,
-    profileId: ProfileId,
-    legacyWorkspace: string,
-  ): string {
-    try {
-      if (registry.hasBeenMigrated(profileId, legacyWorkspace)) {
-        if (!this.migrateLegacySessionsBeforeProfileSeal(registry, profileId, legacyWorkspace)) {
-          return legacyWorkspace;
-        }
-        const profileWorkspace = registry.profileWorkspace(profileId);
-        console.log(`[gateway] Profile "${profileId}" already migrated; using ${profileWorkspace}`);
-        return profileWorkspace;
-      }
-
-      if (!this.migrateLegacySessionsBeforeProfileSeal(registry, profileId, legacyWorkspace)) {
-        return legacyWorkspace;
-      }
-
-      const result = registry.migrateLegacyWorkspace(legacyWorkspace);
-      console.log(
-        `[gateway] Legacy workspace migration: migrated=${result.migrated} skipped=${result.skipped} errors=${result.errors.length}`,
-      );
-      if (result.errors.length > 0) {
-        console.warn(`[gateway] Migration encountered ${result.errors.length} error(s); details withheld from logs.`);
-      }
-
-      if (registry.hasBeenMigrated(profileId, legacyWorkspace)) {
-        const profileWorkspace = registry.profileWorkspace(profileId);
-        console.log(`[gateway] Using profile-scoped workspace: ${profileWorkspace}`);
-        return profileWorkspace;
-      }
-
-      console.warn(
-        `[gateway] Migration did not complete (no sentinel written); falling back to legacy workspace: ${legacyWorkspace}`,
-      );
-      return legacyWorkspace;
-    } catch (error) {
-      console.error(
-        '[gateway] Profile migration failed unexpectedly; falling back to legacy workspace:',
-        summarizeErrorForLog(error),
-      );
-      return legacyWorkspace;
-    }
-  }
-
-  /**
-   * RR-STRUCT R-S5a (mini-plan v3 §3.8 A-F04 — SAFETY-CRITICAL): the `buildRuntimeFor` injected
-   * into `ProfileRuntimeManager`. Branches by profileId:
-   *  - the DEFAULT profile (or ANY profile when there is no ProfileRegistry — legacy no-registry
-   *    mode, A-F11) resolves paths via the EXACT SAME migration path as pre-R-S5a
-   *    (`migrateAndResolveWorkspace` / `resolveSchedulerPaths`) — unchanged.
-   *  - any NON-DEFAULT profile NEVER calls `migrateAndResolveWorkspace` or
-   *    `migrateLegacySessionsBeforeProfileSeal` — it has no legacy data, and running either
-   *    against it would leak the default user's legacy workspace/sessions into it (the design
-   *    review reproduced exactly this — `505/exec/reviews/rr-struct-design-review-isolation.md`
-   *    F-04). Instead every path is resolved DIRECTLY from the registry
-   *    (`profileSearchDb`/`profileSessions`/`profileSchedulerStore`/`profileAuditLog`, no
-   *    `hasBeenMigrated` gate, no `legacySessionsPath`) and the workspace is bootstrapped CLEAN —
-   *    generic template files only (`ensureWorkspaceBootstrap`, the same primitive
-   *    `bootstrapWorkspace()` uses for the legacy workspace — ships no PHI, just static repo
-   *    assets), never a copy of the legacy/default content.
-   */
   private async buildRuntimeFor(profileId: ProfileId): Promise<ProfileRuntime> {
     const { config } = this;
-    const defaultProfileId = (config.profiles?.defaultProfileId ?? 'default') as ProfileId;
-    const registry = this.profileRegistry;
-    const isDefault = profileId === defaultProfileId;
+    const ownerPaths = this.ownerPaths();
 
-    let workspace: string;
-    let dbPath: string;
-    let sessionsPath: string | undefined;
-    let schedulerPaths: { storePath: string; auditLogPath: string };
-
-    if (isDefault || !registry) {
-      const legacyWorkspace = config.memory.workspace;
-      workspace = registry
-        ? this.migrateAndResolveWorkspace(registry, profileId, legacyWorkspace)
-        : legacyWorkspace;
-      this.resolvedMemoryWorkspace = workspace;
-      const usingProfileWorkspace = workspace !== legacyWorkspace;
-
-      dbPath = usingProfileWorkspace && registry
-        ? registry.profileSearchDb(profileId)
-        : path.join(legacyWorkspace, '..', 'search.db');
-
-      sessionsPath = registry
-        ? (usingProfileWorkspace
-          ? registry.profileSessions(profileId)
-          : path.join(path.dirname(legacyWorkspace), 'sessions'))
-        : undefined;
-
-      schedulerPaths = this.resolveSchedulerPaths(profileId);
-    } else {
-      workspace = registry.profileWorkspace(profileId);
-      try {
-        ensureWorkspaceBootstrap(workspace, {
-          preserveExisting: true,
-          log: (message) => console.log(`[gateway] [profile:${profileId}] ${message}`),
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        throw new Error(`Workspace bootstrap failed for profile "${profileId}": ${message}`);
-      }
-      dbPath = registry.profileSearchDb(profileId);
-      sessionsPath = registry.profileSessions(profileId);
-      schedulerPaths = {
-        storePath: registry.profileSchedulerStore(profileId),
-        auditLogPath: registry.profileAuditLog(profileId),
-      };
+    // A request for any other identity is refused rather than served from the owner's resources.
+    if (profileId !== ownerPaths.profileId) {
+      throw new Error(`Refusing to build a runtime for "${profileId}": this daemon serves owner "${ownerPaths.profileId}".`);
     }
 
+    const workspace = ownerPaths.workspace;
+    try {
+      ensureWorkspaceBootstrap(workspace, {
+        preserveExisting: true,
+        log: (message) => console.log(`[gateway] ${message}`),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Workspace bootstrap failed for owner "${ownerPaths.profileId}": ${message}`);
+    }
+
+    this.resolvedMemoryWorkspace = workspace;
+
     return ProfileRuntime.create({
-      profileId,
+      profileId: ownerPaths.profileId,
       workspace,
-      dbPath,
-      sessionsPath,
-      schedulerPaths,
+      dbPath: ownerPaths.searchDb,
+      sessionsPath: ownerPaths.sessions,
+      schedulerPaths: {
+        storePath: ownerPaths.schedulerStore,
+        auditLogPath: ownerPaths.auditLog,
+      },
       config,
       mainProvider: this.mainProvider!,
+      createProvider: this.buildProvider,
       semaphore: this.semaphore!,
-      // RR-STRUCT R-S5a: scheduler recovery must not invoke a callback before
-      // ProfileRuntime.create returns. Gateway explicitly initializes every runtime's
-      // scheduler AFTER boot (initializeScheduler), where the concrete runtime exists to
-      // capture in the trigger closure and the destination guard is threaded (RR2-B1).
-      // RR2-B1: no owner-less `runScheduledJob` is passed here — a closure captured at
-      // build time could not bind this runtime, and canSchedule stays false so the
-      // direct-factory activation path (which requires canAddressChat) is not used.
       canSchedule: false,
       reconcile: (chatId) => this.debouncedReconcile(chatId),
       sideEffectLookup: (entity) => this.lookupSideEffects(this.sideEffectProvider ?? this.mainProvider!, entity),
     });
   }
 
-  /** Every profile the manager should eager-build at boot: the default (always) plus every
-   *  profile with >=1 paired chat (mini-plan v3 §3.8/§5 R-S5a). A profile that exists in the
-   *  registry but has never been paired to a chat has nothing to serve yet and is skipped. */
-  private pairedProfileIds(defaultProfileId: ProfileId): ProfileId[] {
-    if (!this.profileRegistry) return [defaultProfileId];
-    const paired = this.profileRegistry.getAllProfiles()
-      .filter((profile) => profile.chatIds.length > 0)
-      .map((profile) => profile.profileId);
-    return [...new Set([defaultProfileId, ...paired])];
+  private ownerPaths(): OwnerPaths {
+    if (this.ownerPathsCache) return this.ownerPathsCache;
+    const profilesConfig = this.config.profiles;
+    const ownerId = asProfileId(profilesConfig?.defaultProfileId ?? '');
+    if (!profilesConfig || ownerId === undefined) {
+      throw new Error('Refusing to serve: no valid owner identity is configured. Re-run setup.');
+    }
+    this.ownerPathsCache = resolveOwnerPaths(profilesConfig.baseDir, ownerId);
+    return this.ownerPathsCache;
+  }
+
+  /** The owner, and only the owner. */
+  private pairedProfileIds(): ProfileId[] {
+    return [this.ownerPaths().profileId];
   }
 
   private async runBootHealthchecks(): Promise<void> {
@@ -1063,35 +1131,61 @@ export class Gateway {
     return this.runtime?.workspace || this.resolvedMemoryWorkspace || this.config.memory?.workspace || '';
   }
 
-  private mediaStagingDir(): string {
-    return path.join(os.homedir(), '.redacted', '.staging', 'media');
+  /** Owner-scoped incoming media staging directory, inside the owner's workspace. */
+  private mediaStagingDir(): string | undefined {
+    const base = this.getEffectiveWorkspace();
+    return base ? path.join(base, '.state', 'media-staging') : undefined;
+  }
+
+  private ownerStagingBase(): string | undefined {
+    const base = this.getEffectiveWorkspace();
+    return base === '' ? undefined : base;
+  }
+
+  private mediaStager(): FsMediaStager | undefined {
+    const stagingDir = this.mediaStagingDir();
+    if (!this.mediaSource || !stagingDir) return undefined;
+    this.mediaStagerCache ??= new FsMediaStager(this.mediaSource, stagingDir, {
+      trustedBaseDir: this.ownerStagingBase(),
+      diagnostics: this.sink,
+    });
+    return this.mediaStagerCache;
+  }
+
+  /** Deliberately builds NO provider, workspace, runtime, manager or scheduler: there is nothing to serve yet. */
+  private async startUnpaired(config: EffectiveConfig): Promise<void> {
+    this.stopping = false;
+    this.stopped = false;
+    if (config.channels.telegram.enabled) {
+      const token = config.channels.telegram.botToken || process.env.TELEGRAM_BOT_TOKEN;
+      if (!token) {
+        throw new Error('TELEGRAM_BOT_TOKEN not set. Set it in config or environment.');
+      }
+      this.channel = new TelegramChannel(token);
+      this.channel.onMessage((msg) => this.handleMessage(msg));
+    }
+
+    this.router = this.createRouter();
+    console.log('[gateway] Owner is not paired yet: serving pairing only. Run `medclaw pairing issue`, then send the code from the owner chat.');
+
+    if (this.channel && typeof this.channel.connect === 'function') {
+      await this.channel.connect();
+    }
   }
 
   private createRouter(): GatewayMessageRouter {
     return new GatewayMessageRouter({
       config: this.config,
       runtime: this.runtime,
-      profileRegistry: this.profileRegistry,
+      admission: this.admission,
+      ownerId: this.admissionOwnerId,
       stagingDir: this.mediaStagingDir(),
-      stagingBaseDir: os.homedir(),
+      stagingBaseDir: this.ownerStagingBase(),
       buildBootStatusText: () => this.buildBootStatusText(),
-      // RR-STRUCT R-S5b (mini-plan v3 §3.2): the Router dispatches every turn to the runtime
-      // OWNING the resolved profile. Manager-backed in production; when no manager exists
-      // (the `attachGatewayTestRuntime` test-double seam, which never builds one) every
-      // profileId resolves to the single attached runtime — one resolver-based code path,
-      // both worlds working. Never rejects: a degraded profile yields `undefined` and the
-      // Router emits the canned degraded reply instead of crashing.
       resolveRuntime: (profileId) => this.resolveRuntimeForProfile(profileId),
     });
   }
 
-  /**
-   * RR-STRUCT R-S5b: the single per-profile runtime accessor every dispatch path funnels
-   * through (message routing via the Router's resolver, scheduled jobs, reconciles).
-   * `manager.get` is a memoized map read (single-flight); a persistently-broken profile
-   * rejects per call (rejection-evict + retry, Finding-7a) and degrades to `undefined`
-   * with a sanitized log — never a throw to the daemon.
-   */
   private async resolveRuntimeForProfile(profileId: ProfileId): Promise<ProfileRuntime | undefined> {
     try {
       if (this.manager) return await this.manager.get(profileId);
@@ -1105,30 +1199,23 @@ export class Gateway {
     }
   }
 
-  /** The runtime OWNING `chatId` (registry lookup only — never auto-pairs; an unpaired chat
-   *  falls back to the default exactly as the pre-R-S5b reconcile did). May on-demand BUILD a
-   *  not-yet-built profile via the manager (single-flight, memoized) — for foreground paths
-   *  (turns, jobs, startup) where the caller already awaits. */
   private async runtimeForChat(chatId: string): Promise<ProfileRuntime | undefined> {
-    const resolved = this.profileRegistry?.getProfileForChat(chatId);
-    const profileId = resolved?.profileId ?? (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
-    return this.resolveRuntimeForProfile(profileId);
+    const ownerPaths = this.ownerPaths();
+    if (!this.canChatIdAddressProfile(chatId, ownerPaths.profileId)) return undefined;
+    return this.resolveRuntimeForProfile(ownerPaths.profileId);
   }
 
-  /** Synchronous twin of `runtimeForChat` for the timer-driven reconcile path (see
-   *  `ProfileRuntimeManager.getIfBuilt`): never builds, never awaits — `undefined` means
-   *  "nothing to reconcile right now". */
+  /** Synchronous twin of `runtimeForChat` for the timer-driven reconcile path: never builds or awaits. */
   private runtimeForChatSync(chatId: string): ProfileRuntime | undefined {
-    const resolved = this.profileRegistry?.getProfileForChat(chatId);
-    const profileId = resolved?.profileId ?? (this.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
-    if (this.manager) return this.manager.getIfBuilt(profileId);
+    const ownerPaths = this.ownerPaths();
+    if (!this.canChatIdAddressProfile(chatId, ownerPaths.profileId)) return undefined;
+    if (this.manager) return this.manager.getIfBuilt(ownerPaths.profileId);
     return this.runtime;
   }
 
+  /** Whether `chatId` is a destination this daemon's owner may address (the owner record, fail-closed). */
   private chatBelongsToProfile(chatId: string, profileId: ProfileId): boolean {
-    const resolved = this.profileRegistry?.getProfileForChat(chatId);
-    if (!resolved) return profileId === (this.config.profiles?.defaultProfileId ?? 'default');
-    return resolved.profileId === profileId;
+    return this.canChatIdAddressProfile(chatId, profileId);
   }
 
   private requireRuntimeForAccess(): ProfileRuntime {
@@ -1141,26 +1228,4 @@ export class Gateway {
     return this.router;
   }
 
-  private resolveSchedulerPaths(profileId: ProfileId): { storePath: string; auditLogPath: string } {
-    const legacy = { storePath: this.config.heartbeat.storePath, auditLogPath: this.config.heartbeat.audit.path };
-    if (!this.profileRegistry) {
-      return legacy;
-    }
-    try {
-      if (!this.profileRegistry.hasBeenMigrated(profileId, this.config.memory.workspace)) {
-        console.warn('[gateway] Profile migration incomplete; using legacy heartbeat/audit paths.');
-        return legacy;
-      }
-      const storePath = this.profileRegistry.profileSchedulerStore(profileId);
-      const auditLogPath = this.profileRegistry.profileAuditLog(profileId);
-      console.log(`[gateway] Using profile-scoped scheduler paths: store=${storePath} audit=${auditLogPath}`);
-      return { storePath, auditLogPath };
-    } catch (error) {
-      console.error(
-        '[gateway] Failed to resolve profile-scoped scheduler paths; falling back to legacy paths:',
-        summarizeErrorForLog(error),
-      );
-      return legacy;
-    }
-  }
 }

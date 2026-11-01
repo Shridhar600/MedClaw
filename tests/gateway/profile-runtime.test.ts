@@ -1,15 +1,17 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { ProfileId } from '../../src/profiles';
 import type { LLMProvider } from '../../src/providers/types';
 import { LLMSemaphore } from '../../src/tools/semaphore';
 import { Gateway } from '../../src/gateway/gateway';
+import { withoutOwnerIdentity } from '../helpers/test-config';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
 import { ProfileRuntime } from '../../src/gateway/runtime';
 import { SqliteChunkStats, SqliteEventSink, SqliteFactMirror, SqliteKeywordIndex, SqliteSessionIndex, SqliteVecIndex } from '../../src/indexstore';
 import { SqliteStore } from '../../src/memory/sqlite-store';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const mockMainProvider: LLMProvider = {
   modelName: 'runtime-test-main',
@@ -34,9 +36,10 @@ jest.mock('../../src/memory/indexer', () => ({
   })),
 }));
 
-function makeConfig(tmpDir: string, withProfiles = true): AppConfig {
+function makeConfig(tmpDir: string): EffectiveConfig {
   const workspace = path.join(tmpDir, 'workspace');
   return {
+  schemaVersion: 2,
     providers: {
       main: { type: 'ollama', model: 'runtime-test-main', baseUrl: 'http://127.0.0.1:9/v1' },
       medical: { type: 'ollama', model: 'runtime-test-main', baseUrl: 'http://127.0.0.1:9/v1' },
@@ -50,9 +53,7 @@ function makeConfig(tmpDir: string, withProfiles = true): AppConfig {
       bootstrapMaxChars: 20000,
     },
     sessions: {
-      softResetAfterMinutes: 240,
-      hardResetAfterMinutes: 1440,
-      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+      compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
     },
     heartbeat: {
       enabled: true,
@@ -71,23 +72,19 @@ function makeConfig(tmpDir: string, withProfiles = true): AppConfig {
         },
       },
     },
-    agent: { maxIterations: 15, disclaimerEnabled: true },
-    ...(withProfiles
-      ? {
-        profiles: {
-          baseDir: path.join(tmpDir, 'profiles'),
-          defaultProfileId: 'default',
-        },
-      }
-      : {}),
+    agent: { maxIterations: 15 },
+    profiles: {
+      baseDir: path.join(tmpDir, 'profiles'),
+      defaultProfileId: 'default',
+    },
   };
 }
 
-describe('ProfileRuntime Seam Tests (R-S1)', () => {
+describe('ProfileRuntime Seam Tests', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-profile-runtime-'));
+    tmpDir = makeTestTemp('redacted-profile-runtime-');
     fs.mkdirSync(path.join(tmpDir, 'workspace'), { recursive: true });
   });
 
@@ -167,10 +164,8 @@ describe('ProfileRuntime Seam Tests (R-S1)', () => {
       sideEffectLookup: jest.fn().mockResolvedValue([]),
     });
 
-    // First drain and close
     await runtime.drainAndClose();
 
-    // Verify all 7 handles closed once in exact documented order
     expect(vecSpy).toHaveBeenCalledTimes(1);
     expect(kwSpy).toHaveBeenCalledTimes(1);
     expect(chunkSpy).toHaveBeenCalledTimes(1);
@@ -188,7 +183,6 @@ describe('ProfileRuntime Seam Tests (R-S1)', () => {
       'store',
     ]);
 
-    // Second drain and close must be idempotent (no double close, no throw)
     await expect(runtime.drainAndClose()).resolves.toBeUndefined();
     expect(vecSpy).toHaveBeenCalledTimes(1);
     expect(storeSpy).toHaveBeenCalledTimes(1);
@@ -254,39 +248,24 @@ describe('ProfileRuntime Seam Tests (R-S1)', () => {
     await runtime.drainAndClose();
     expect(runtime.isClosed()).toBe(true);
 
-    // Any late reindex or background operation arriving after close must not crash
     expect(() => {
       runtime.trackBackgroundOperation('late-op', async () => {
         throw new Error('should not execute');
       });
     }).not.toThrow();
 
-    // Late sweep call must return empty result immediately
     const sweepResult = await runtime.runTranscriptSweep();
     expect(sweepResult).toEqual({ scanned: false, added: 0 });
   });
 
-  it('legacy mode without profiles config builds runtime on legacy paths and operates', async () => {
-    const config = makeConfig(tmpDir, false); // no profiles section
-    const gateway = new Gateway(config);
+  it('REFUSES a document with no owner identity instead of serving on a legacy path', async () => {
+    const config = withoutOwnerIdentity(makeConfig(tmpDir));
+    const gateway = new Gateway(config, await bindGatewayOwner(makeConfig(tmpDir), 'owner-chat'));
 
-    await gateway.start();
-    try {
-      expect(gateway.runtimeInstance).toBeDefined();
-      expect(gateway.runtimeInstance?.workspace).toBe(config.memory.workspace);
-      expect((gateway as unknown as { getEffectiveWorkspace(): string }).getEffectiveWorkspace()).toBe(config.memory.workspace);
+    await expect(gateway.start()).rejects.toThrow(/no valid owner identity/i);
 
-      // Handle a message in legacy mode: first message enters onboarding
-      const onboardingReply = await gateway.handleTestMessage('test-chat', 'hello legacy');
-      expect(onboardingReply).toContain('personal health companion');
-
-      // Subsequent agent message after onboarding bypassed
-      (gateway.runtimeInstance!.turnCoordinator as any).handleOnboarding = jest.fn().mockResolvedValue(undefined);
-      const agentReply = await gateway.handleTestMessage('test-chat', 'hello agent');
-      expect(agentReply).toContain('ok');
-      expect(agentReply).toContain('I am an AI health companion');
-    } finally {
-      await gateway.stop();
-    }
+    expect(gateway.runtimeInstance).toBeUndefined();
+    expect(gateway.runtimeManager).toBeUndefined();
+    expect(gateway.servesPairingOnly).toBe(false);
   });
 });

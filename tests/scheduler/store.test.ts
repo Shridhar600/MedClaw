@@ -1,14 +1,14 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { HeartbeatStore } from '../../src/scheduler/store';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('HeartbeatStore', () => {
   let tmpDir: string;
   let storePath: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-heartbeat-store-'));
+    tmpDir = makeTestTemp('redacted-heartbeat-store-');
     storePath = path.join(tmpDir, 'heartbeats', 'jobs.json');
   });
 

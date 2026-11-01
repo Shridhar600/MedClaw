@@ -1,17 +1,20 @@
 import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { MemoryIndexer } from '../../src/memory/indexer';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { FactRecord } from '../../src/ports';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+import { makeTestTemp } from '../helpers/test-temp';
+import { ownerTools } from '../helpers/owner-tools';
 
-// P2 Wave A — the recall substrate wired behind the live Gateway: every ledger write live-populates
-// the FactMirror (recall Stage 1 source) and reindexes the changed file (M-2 closed), and the mirror
-// is rebuilt from Markdown at boot (A4 self-heal). Re-derivation runs OUTSIDE the write-queue op (B2).
+const CHAT_BINDING = 'owner-chat';
 
-function makeConfig(tmpDir: string): AppConfig {
+function makeConfig(tmpDir: string): EffectiveConfig {
+const owner = fixtureOwner(tmpDir);
   return {
+  schemaVersion: 2,
+  ...ownerSelection(owner),
     providers: {
       main: { type: 'ollama', model: 'kimi-k2.5:cloud', baseUrl: 'http://localhost:11434/v1' },
       medical: { type: 'ollama', model: 'medgemma', baseUrl: 'http://localhost:11434/v1' },
@@ -20,23 +23,21 @@ function makeConfig(tmpDir: string): AppConfig {
     channels: { telegram: { enabled: false, botToken: '' } },
     tools: { allow: ['*'], deny: [] },
     memory: {
-      workspace: path.join(tmpDir, 'workspace'),
+      workspace: owner.workspace,
       search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
       bootstrapMaxChars: 20000,
     },
     sessions: {
-      softResetAfterMinutes: 240,
-      hardResetAfterMinutes: 1440,
-      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+      compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
     },
     heartbeat: {
       enabled: false,
       timezone: 'Asia/Kolkata',
-      storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+      storePath: owner.storePath,
       recovery: { enabled: false, windowMinutes: 60 },
       retry: { maxRetries: 3, backoffMinutes: 5 },
       rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-      audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+      audit: { path: owner.auditLogPath },
       policy: {
         quietHours: { enabled: true, start: '22:00', end: '07:00' },
         skipIfChatActiveWithinMinutes: 60,
@@ -46,7 +47,7 @@ function makeConfig(tmpDir: string): AppConfig {
         },
       },
     },
-    agent: { maxIterations: 15, disclaimerEnabled: true },
+    agent: { maxIterations: 15 },
   };
 }
 
@@ -59,15 +60,15 @@ async function collectActive(gateway: Gateway, type?: string): Promise<FactRecor
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const registryOf = (gateway: Gateway): any => (gateway as any).agentLoop.registry;
+const registryOf = (gateway: Gateway): any => ownerTools((gateway as any).agentLoop.registry);
 
-describe('Gateway recall substrate wiring (P2 Wave A)', () => {
+describe('Gateway recall substrate wiring', () => {
   let tmpDir: string;
   let gateway: Gateway;
   let warn: jest.SpyInstance;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-recall-sub-'));
+    tmpDir = makeTestTemp('redacted-recall-sub-');
     warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
   });
   afterEach(async () => {
@@ -76,9 +77,9 @@ describe('Gateway recall substrate wiring (P2 Wave A)', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it('live-populates the FactMirror on a ledger write and reindexes the changed files (M-2)', async () => {
+  it('live-populates the FactMirror on a ledger write and reindexes the changed files', async () => {
     const indexFileSpy = jest.spyOn(MemoryIndexer.prototype, 'indexFile');
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     await gateway.start();
     indexFileSpy.mockClear(); // ignore the boot indexAll's calls; assert only the post-write ones
 
@@ -88,7 +89,6 @@ describe('Gateway recall substrate wiring (P2 Wave A)', () => {
     });
     expect(res.isError).toBeFalsy();
 
-    // Recall Stage 1 source is live — no reboot needed (M-2 closed for the ledger lane).
     const meds = await collectActive(gateway, 'medication');
     const metformin = meds.find(f => f.entity === 'metformin');
     expect(metformin).toBeDefined();
@@ -97,7 +97,6 @@ describe('Gateway recall substrate wiring (P2 Wave A)', () => {
     expect(metformin!.authority).toBe('user'); // ledger_record default provenance
     expect(metformin!.fields).toMatchObject({ dose: '500mg' });
 
-    // The changed ledger + narrative files were reindexed after the write (embeds off the write lock).
     const reindexed = indexFileSpy.mock.calls.map(c => c[0]);
     expect(reindexed).toEqual(expect.arrayContaining(['ledger/medications.md']));
     expect(reindexed.some(p => /^memory\/\d{4}-\d{2}-\d{2}\.md$/.test(p))).toBe(true);
@@ -105,18 +104,15 @@ describe('Gateway recall substrate wiring (P2 Wave A)', () => {
     indexFileSpy.mockRestore();
   });
 
-  it('rebuilds the FactMirror from ledger Markdown at boot (A4 self-heal)', async () => {
-    // First daemon writes a fact, then stops.
-    gateway = new Gateway(makeConfig(tmpDir));
+  it('rebuilds the FactMirror from ledger Markdown at boot (self-heal)', async () => {
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     await gateway.start();
     await registryOf(gateway).execute('ledger_record', {
       entity: 'lisinopril', type: 'medication', fields: { dose: '10mg' }, note: 'started lisinopril',
     });
     await gateway.stop();
 
-    // A fresh daemon over the SAME workspace rebuilds the mirror from Markdown at boot — the fact
-    // is queryable without any new write (proves the mirror is derived state, not the source).
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     await gateway.start();
     const meds = await collectActive(gateway, 'medication');
     expect(meds.map(f => f.entity)).toContain('lisinopril');

@@ -1,13 +1,5 @@
-// RR-STRUCT R-S3b Part B — heartbeat idempotency `turnId`.
-//
-// RED baseline: on HEAD f73b557 `HeartbeatTurnRequest` carries NO turnId and
-// `executeHeartbeat` drops it, so a scheduler RETRY of a heartbeat re-runs the turn
-// with a fresh `AgentLoop` sequence number — any `ledger_record` inside re-writes
-// instead of returning the cached original. And a static `job.id`-only key would drop
-// tomorrow's recurring reminder as a duplicate of tonight's.
 
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { CapturePipeline, FileCaptureIdempotency, makeSafetyRenderer } from '../../src/capture';
 import { LedgerStore, NarrativeStore, SafetyView } from '../../src/memcore';
@@ -17,6 +9,7 @@ import { LLMSemaphore } from '../../src/tools/semaphore';
 import { TurnCoordinator, heartbeatTurnId } from '../../src/gateway/turn-coordinator';
 import type { ProfileRuntime } from '../../src/gateway/runtime';
 import type { AgentRunResult } from '../../src/providers/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
 function heartbeatResponse(text: string): AgentRunResult {
   return {
@@ -27,7 +20,7 @@ function heartbeatResponse(text: string): AgentRunResult {
   };
 }
 
-describe('R-S3b Part B — heartbeat turnId scheme', () => {
+describe('Part B — heartbeat turnId scheme', () => {
   it('is stable across a RETRY of one occurrence (same job.id + same lastRunAt)', () => {
     const job = { id: 'job-1', lastRunAt: '2026-09-01T10:00:00.000Z' };
     expect(heartbeatTurnId(job)).toBe(heartbeatTurnId({ ...job }));
@@ -37,7 +30,6 @@ describe('R-S3b Part B — heartbeat turnId scheme', () => {
     const tonight = heartbeatTurnId({ id: 'job-1', lastRunAt: '2026-09-01T10:00:00.000Z' })!;
     const tomorrow = heartbeatTurnId({ id: 'job-1', lastRunAt: '2026-09-02T10:00:00.000Z' })!;
     expect(tonight).not.toBe(tomorrow);
-    // The occurrence MUST be in the key — a bare job.id is the exact bug this closes.
     expect(tonight).not.toBe('job-1');
     expect(tonight).toContain('job-1');
     expect(tonight).toContain('2026-09-01T10:00:00.000Z');
@@ -49,7 +41,7 @@ describe('R-S3b Part B — heartbeat turnId scheme', () => {
   });
 });
 
-describe('R-S3b Part B — runHeartbeat threads the turnId into the agent turn', () => {
+describe('Part B — runHeartbeat threads the turnId into the agent turn', () => {
   function makeRuntime(agentRun: jest.Mock) {
     return {
       agentLoop: { run: agentRun },
@@ -101,11 +93,11 @@ describe('R-S3b Part B — runHeartbeat threads the turnId into the agent turn',
   });
 });
 
-describe('R-S3b Part B — a heartbeat ledger_record dedupes on retry, fires anew next occurrence', () => {
+describe('Part B — a heartbeat ledger_record dedupes on retry, fires anew next occurrence', () => {
   let root: string;
 
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-rs3b-hb-'));
+    root = makeTestTemp('redacted-hb-');
   });
   afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 
@@ -136,11 +128,9 @@ describe('R-S3b Part B — a heartbeat ledger_record dedupes on retry, fires ane
     const first = await ledgerRecord.execute({ ...params }, retryContext);
     expect(first.isError).toBeFalsy();
 
-    // Scheduler RETRY of the same occurrence: same key → cached ORIGINAL, no double-write.
     const replayed = await ledgerRecord.execute({ ...params }, retryContext);
     expect(replayed.content[0].text).toBe(first.content[0].text);
 
-    // NEXT occurrence: new lastRunAt → NOT dropped as a duplicate.
     const next = await ledgerRecord.execute(
       { ...params },
       { ...retryContext, turnId: heartbeatTurnId({ id: 'job-1', lastRunAt: '2026-09-02T10:00:00.000Z' }) },

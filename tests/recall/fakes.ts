@@ -1,11 +1,18 @@
-// In-memory port fakes for RecallEngine unit tests (P2 Wave B). Not a *.test.ts — helpers only.
-// Deterministic: the caller supplies exact vec/keyword scores so scoring goldens are reproducible
-// (M-4 discipline — no live Ollama, injected clock).
 
 import type {
   FactMirror, FactRecord, VectorIndex, KeywordIndex, ChunkWithScore, VectorStats,
   EmbeddingPort, ChunkStat, ChunkStatsWriter, Clock,
 } from '../../src/ports';
+
+/** Serve the ledger-backed current-facts port from the same records a fake mirror holds. */
+export function currentFactsOf(mirror: FactMirror): () => Promise<{ facts: FactRecord[]; damagedFiles: string[] }> {
+  return async () => {
+    const facts: FactRecord[] = [];
+    for await (const f of mirror.queryActive()) facts.push(f);
+    for await (const f of mirror.queryPaused()) facts.push(f);
+    return { facts, damagedFiles: [] };
+  };
+}
 
 export class FakeFactMirror implements FactMirror {
   constructor(private records: FactRecord[] = []) {}
@@ -41,7 +48,6 @@ export class FakeFactMirror implements FactMirror {
   }
 
   async *queryEntityHeads(): AsyncIterable<FactRecord> {
-    // Deterministic head per type/entity: active wins, then version, createdAt, and id.
     const heads = new Map<string, FactRecord>();
     for (const r of this.records) {
       if (r.version < 1) continue;
@@ -133,7 +139,7 @@ export class FakeChunkStats implements ChunkStatsWriter {
   }
 }
 
-/** A ChunkStatsWriter whose reads throw — for the F8 resilience-granularity test. */
+/** A ChunkStatsWriter whose reads throw — for the resilience-granularity test. */
 export class ThrowingChunkStats implements ChunkStatsWriter {
   async bumpInjected(): Promise<void> {}
   async bumpUsed(): Promise<void> {}

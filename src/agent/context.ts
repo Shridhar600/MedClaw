@@ -2,8 +2,6 @@ import type { Message } from '../providers/types';
 import type { MemoryEngine } from '../memory/memory-engine';
 import { assertSafetyInjected } from '../context2';
 
-// SAFETY.md is injected in full, before the budgeted sections, and is NEVER truncated
-// (PLAT-05 / D9). An empty SAFETY.md is allowed and skipped (PLAT-04).
 const SAFETY_FILE = 'SAFETY.md';
 // Files always loaded into every context
 const ALWAYS_LOAD = ['SOUL.md', 'HEALTH_PROFILE.md', 'USER.md', 'HEARTBEAT.md'];
@@ -28,7 +26,7 @@ export class ContextAssembler {
   async buildSystemMessages(): Promise<Message[]> {
     const sections: Section[] = [];
 
-    // SAFETY.md first, in full, non-truncatable (PLAT-05 / D9). Empty => skipped (PLAT-04).
+    // SAFETY.md first, in full, non-truncatable. Empty => skipped.
     const safetyMd = await this.memory.readFile(SAFETY_FILE);
     if (safetyMd && safetyMd.trim() !== '') {
       sections.push({ key: SAFETY_FILE, title: SAFETY_FILE, content: safetyMd, nonTruncatable: true });
@@ -74,8 +72,6 @@ export class ContextAssembler {
 
     const systemContent = this.composeWithBudget(sections);
 
-    // Boot-time non-omission invariant (D9): a non-empty SAFETY.md must be present in full.
-    // A violation aborts the turn/boot (medical-safety > resilience).
     assertSafetyInjected(systemContent, safetyMd);
 
     return [{ role: 'system', content: systemContent }];

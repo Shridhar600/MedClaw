@@ -8,14 +8,6 @@ import { chunkHasStaleEntity } from '../recall';
 import * as path from 'path';
 import { contentContainsCredentials, summarizeErrorForLog, PathContainmentError } from '../security';
 
-// --- Managed-lane write guard (Task 12.6 / G1) -------------------------------------------
-// `memory_write` must never raw-overwrite an invariant-bearing managed path — that would
-// bypass versioning/confirmation (ledger), the 60/20/20 budget (MEMORY.md), the SAFETY.md
-// non-removal rule (CONTRA-03/04), or a store's ownership. The narrative lane (`memory/**`)
-// and core files (SOUL/USER/HEALTH_PROFILE/…) stay writable — the lossless guarantee lives
-// in the Task 13.3 capture hook, not a block.
-
-// memory_search v2 lane → path-prefix mapping (Task 12.7).
 const LANE_PREFIX: Record<string, string> = {
   narrative: 'memory/',
   ledger: 'ledger/',
@@ -25,28 +17,24 @@ const LANE_PREFIX: Record<string, string> = {
 };
 
 const MANAGED_REJECT = {
-  ledger: 'Direct writes to the versioned ledger are not allowed. Use ledger_record / ledger_update — versioning, med-class confirmation, and SAFETY.md re-render (D8) live there.',
+  ledger: 'Direct writes to the versioned ledger are not allowed. Use ledger_record / ledger_update — versioning, med-class confirmation, and the SAFETY.md re-render live there.',
   memoryMd: 'Direct writes to MEMORY.md are not allowed — it is managed by the curated-memory budget engine (Health 60 / Life 20 / Agent 20).',
   safetyDrop: (entity: string): string =>
-    `Refused: this SAFETY.md overwrite would drop the base allergy/medication entry "${entity}". Removal requires user confirmation — route it through ledger_update (CONTRA-03/04).`,
+    `Refused: this SAFETY.md overwrite would drop the base allergy/medication entry "${entity}". Removal requires user confirmation — route it through ledger_update.`,
   episodes: 'Direct writes to episodes/ are not allowed. Use episode_manage.',
   curiosity: 'Direct writes to curiosity.md are not allowed (owned by the curiosity queue).',
   state: 'Direct writes to .state/ are not allowed (owned by the scheduler/store internals).',
   scratch: 'Direct writes to scratch/ are not allowed via memory_write.',
   traversal: 'Path traversal is not allowed.',
+  soul: 'SOUL.md holds the safety doctrine and cannot be overwritten. Use mode "append" to add a note.',
+  dailyLog: 'Captured daily logs are append-only (they hold your exact words and ledger anchors). Use mode "append" to add a note.',
 } as const;
 
-/** Generic tool-path limits. The ReAct loop receives tool results verbatim, so keep this boundary
- * finite even when a caller bypasses the context assembler. */
+/** Tool results reach the ReAct loop verbatim; keep them bounded. */
 export const MEMORY_TOOL_MAX_BYTES = 16 * 1024;
 export const MEMORY_TOOL_MAX_TOKENS = 4_000;
 
-/**
- * Normalize a raw workspace-relative path to its RESOLVED form (PT / SB-1):
- * backslashes → slashes, then `path.posix.normalize` collapses `.` and `..`
- * segments. Returns null when `..` segments remain after normalization — the
- * path escapes above the workspace root and is never classifiable.
- */
+/** Collapses `.`/`..`; `null` means the path escapes the workspace. */
 function normalizeManagedPath(p: string): string | null {
   const s = path.posix.normalize(p.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, ''));
   if (s.split('/').includes('..')) return null;
@@ -107,13 +95,7 @@ function exceedsMemoryWriteLimit(value: string): boolean {
     || estimateToolTokens(value) > MEMORY_TOOL_MAX_TOKENS;
 }
 
-/**
- * Load the current per-entity ledger heads for the `status:active` stale-drop (E1.1). Best-effort:
- * a missing mirror or a read failure yields `available:false` (⇒ no filtering) — the search must never
- * crash or lose backward-compat because the fact mirror is degraded (resilience). `available:false` is
- * distinct from an empty-but-working mirror (empty ledger = nothing to filter, no warning owed) so the
- * caller can honestly tell the model the filter could NOT be applied (M-2).
- */
+/** Best effort: `available:false` means the filter could not be applied, not an empty mirror. */
 async function loadEntityHeads(mirror: FactMirror | undefined): Promise<{ heads: FactRecord[]; available: boolean }> {
   if (!mirror) return { heads: [], available: false };
   try {
@@ -126,7 +108,6 @@ async function loadEntityHeads(mirror: FactMirror | undefined): Promise<{ heads:
   }
 }
 
-/** Entity names listed under SAFETY.md's `## Allergies` / `## Medications` sections, lower-cased. */
 function extractSafetyBaseEntries(md: string): Set<string> {
   const entries = new Set<string>();
   let inBaseSection = false;
@@ -145,7 +126,6 @@ function extractSafetyBaseEntries(md: string): Set<string> {
   return entries;
 }
 
-/** The first base allergy/med entity present in `current` but missing from `proposed`, else null. */
 function safetyDroppedBaseEntry(current: string, proposed: string): string | null {
   const proposedEntries = extractSafetyBaseEntries(proposed);
   for (const entity of extractSafetyBaseEntries(current)) {
@@ -154,6 +134,7 @@ function safetyDroppedBaseEntry(current: string, proposed: string): string | nul
   return null;
 }
 
+// memory_write never overwrites a managed path.
 async function classifyManagedWrite(
   engine: MemoryEngine,
   rawPath: string,
@@ -161,13 +142,14 @@ async function classifyManagedWrite(
   content: string,
 ): Promise<ToolResult | null> {
   const p = normalizeManagedPath(rawPath);
-  // Residual `..` after normalization = traversal above the workspace root.
   if (p === null) return rejection(MANAGED_REJECT.traversal);
   const lower = p.toLowerCase();
 
-  // Narrative lane stays writable (append-only, lossless). Checked first so a `memory/…`
-  // path never collides with the `MEMORY.md` rule.
-  if (lower.startsWith('memory/')) return null;
+  // Checked before MEMORY.md so `memory/...` never collides with it.
+  if (lower.startsWith('memory/')) {
+    if (mode !== 'append' && /^memory\/\d{4}-\d{2}-\d{2}\.md$/.test(lower)) return rejection(MANAGED_REJECT.dailyLog);
+    return null;
+  }
 
   if (lower.startsWith('ledger/')) return rejection(MANAGED_REJECT.ledger);
   if (lower === 'memory.md') return rejection(MANAGED_REJECT.memoryMd);
@@ -175,9 +157,10 @@ async function classifyManagedWrite(
   if (lower === 'curiosity.md') return rejection(MANAGED_REJECT.curiosity);
   if (lower.startsWith('.state/')) return rejection(MANAGED_REJECT.state);
   if (lower.startsWith('scratch/')) return rejection(MANAGED_REJECT.scratch);
+  if (lower === 'soul.md' && mode !== 'append') return rejection(MANAGED_REJECT.soul);
 
   if (lower === 'safety.md') {
-    // Removal is only possible via overwrite — append cannot drop text (G1).
+    // Only an overwrite can drop text; a non-dropping overwrite is allowed.
     if (mode === 'append') return null;
     let current: string | null = null;
     try {
@@ -189,35 +172,21 @@ async function classifyManagedWrite(
       const dropped = safetyDroppedBaseEntry(current, content);
       if (dropped) return rejection(MANAGED_REJECT.safetyDrop(dropped));
     }
-    return null; // a non-dropping SAFETY.md overwrite is not destructive
+    return null;
   }
 
-  return null; // unmanaged path (core files, conditions/*, …) — allowed as before
+  return null;
 }
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars -- profileId reserved for Task 8 (profile-scoped index metadata)
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- profileId is reserved for profile-scoped index metadata
 export function createMemoryTools(
   engine: MemoryEngine,
   search?: MemorySearch,
   indexer?: MemoryIndexer,
   _profileId?: string,
-  // E1.1: the fact mirror powers memory_search's `status:active` stale-drop. Accepts a lazy
-  // accessor because the gateway builds the mirror AFTER these tools register — the closure reads
-  // it at execute time (boot-complete), and `undefined` degrades to no filtering.
+  // Lazy: the gateway builds the mirror after these tools register; `undefined` means no filtering.
   factMirror?: FactMirror | (() => FactMirror | undefined),
-  /**
-   * RR-STRUCT R-S3b (C-46, last bypass): `memory_write` used to write DIRECTLY to
-   * `MemoryEngine` — two concurrent writes to the SAME file (two turns, or a turn racing
-   * a heartbeat) could interleave, and the credential-scan-and-rollback read-modify-write
-   * was not atomic against a concurrent write. Routing the WHOLE write body through the
-   * single-writer coordinator closes that window. Optional + falls back to the direct
-   * (pre-R-S3b) call when absent, so existing single-caller test construction is
-   * unaffected — a missing coordinator degrades atomicity, never availability
-   * (resilience law). Accepts a lazy accessor because the gateway registers these tools
-   * BEFORE the memcore block builds the `WriteQueue`/`MutationCoordinator` — the closure
-   * reads it at execute time (boot-complete), exactly like `factMirror` above. A direct
-   * instance is also accepted (tests / late wiring).
-   */
+  /** Single-writer coordinator: the whole write runs as one op, so scan-and-rollback is atomic. */
   queue?: QueuePort | (() => QueuePort | undefined),
 ): Tool[] {
   const getMirror: () => FactMirror | undefined =
@@ -259,6 +228,7 @@ export function createMemoryTools(
     name: 'memory_write',
     group: 'group:memory',
     description: 'Write or append content to a health memory file',
+    ownerTurnOnly: true,
     parameters: {
       type: 'object',
       properties: {
@@ -281,27 +251,18 @@ export function createMemoryTools(
           return rejection(`Write rejected: content exceeds the ${MEMORY_TOOL_MAX_BYTES}-byte / ${MEMORY_TOOL_MAX_TOKENS}-token memory tool limit.`);
         }
 
-        // The WHOLE write body — managed-lane guard, credential pre-scan, engine write,
-        // post-append full-file re-scan + rollback — runs as ONE coordinator op so the
-        // read-modify-write is atomic against every other memory-domain write. The LOGIC
-        // below is unchanged pre-R-S3b behavior, only wrapped. No embed/LLM runs in the
-        // lock (the reindex trigger stays outside, below); nothing in here re-enqueues,
-        // so the coordinator's re-entrancy guard cannot fire on this path.
+        // One coordinator op makes the read-modify-write atomic; no embed/LLM work inside the lock.
         const doWrite = async (): Promise<ToolResult> => {
-          // Managed-lane guard (G1): refuse invariant-bearing paths before any write.
           const managed = await classifyManagedWrite(engine, filePath, mode, content);
           if (managed) return managed;
 
           if (mode === 'append') {
-            // SEC-M2b: capture the FULL existing content pre-append — both for the
-            // tail-window pre-scan and as the rollback target if the post-append
-            // full-file re-scan catches a split-append credential that the
-            // tail-window pre-scan missed.
+            // Keep the pre-append content as the rollback target.
             let preAppendContent: string | null = null;
             try {
               preAppendContent = await engine.readFile(filePath);
             } catch {
-              // file doesn't exist yet, that's fine
+              // Treat any read failure as no existing content.
             }
             const existingTail = preAppendContent !== null && preAppendContent.length > 0
               ? preAppendContent.slice(-8192)
@@ -316,12 +277,7 @@ export function createMemoryTools(
             }
             await engine.appendToFile(filePath, content);
 
-            // SEC-M2b: re-read the ENTIRE assembled file and re-scan. A split-append
-            // can hide a label behind >8192 chars of non-alphanumeric padding so the
-            // tail-window pre-scan passes, yet the assembled file reconstructs a
-            // complete credential. On match, roll the append back to the pre-append
-            // content and reject. Cost is acceptable for health-memory files. A
-            // rollback failure must warn-and-continue (resilience) — never crash.
+            // A split append can hide a credential past the 8192-char tail window; re-scan and roll back.
             try {
               const assembled = await engine.readFile(filePath);
               if (assembled !== null) {
@@ -342,8 +298,7 @@ export function createMemoryTools(
                 }
               }
             } catch (postScanError) {
-              // Post-append re-scan is defense-in-depth; a read failure here must
-              // not undo a legitimate append nor crash the daemon.
+              // A read failure here must not undo a legitimate append.
               console.warn(
                 '[memory-tools] Post-append credential re-scan failed (continuing):',
                 summarizeErrorForLog(postScanError),
@@ -362,17 +317,12 @@ export function createMemoryTools(
           return { content: [{ type: 'text', text: `Written to ${filePath}` }] };
         };
 
-        // Serialize this write against every other memory-domain writer. Absent
-        // coordinator ⇒ run inline (today's behavior): degraded atomicity, never
-        // availability (resilience law).
+        // Serialize against every other memory-domain writer; without a coordinator, run inline.
         const coordinator = getQueue();
         const result = coordinator
           ? await coordinator.enqueue('turn', { label: 'memory:write', scope: 'memory', run: doWrite })
           : await doWrite();
-        // Tier-2 stays OFF the write lock (RR-7 C-09: embeddings never run inside the
-        // single-writer lock) — fire-and-forget after the op resolves, and only on
-        // success: every rejection above returns `isError: true` from inside the op,
-        // exactly matching the pre-R-S3b "reached the indexer line" behavior.
+        // Indexing stays off the lock and only runs on success.
         if (indexer && !result.isError) {
           void indexer.indexFile(filePath).catch(e =>
             console.warn(`[memory-tools] Reindex failed for ${filePath}:`, summarizeErrorForLog(e)),
@@ -407,20 +357,14 @@ export function createMemoryTools(
       const limit = (params.limit as number) ?? 5;
       const lane = params.lane as string | undefined;
       const prefix = lane ? LANE_PREFIX[lane] : undefined;
-      // `status:active` (default) drops chunks whose derived ledger entity head is stale — the same
-      // rule the recall engine applies in Stage-2 (chunkHasStaleEntity), so both paths agree
-      // (CONTRA-06/08). `all` disables it. Version ordering is a fact query — use ledger_query.
+      // Same stale-drop rule as recall so both paths agree; version ordering is ledger_query's job.
       const factStatus = (params.status as string) ?? 'active';
       const willStatusFilter = factStatus !== 'all';
-      // Over-fetch when a lane OR the status filter can drop rows, so we still surface up to `limit`.
+      // Over-fetch because a lane or status filter can drop rows.
       const fetchK = (prefix || willStatusFilter) ? Math.max(limit * 4, 20) : limit;
       let results = await search.search(params.query as string, fetchK);
       if (prefix) results = results.filter(r => r.path.startsWith(prefix));
-      // M-2: fail OPEN but not SILENT. If a status filter was requested but the fact-status substrate
-      // is unavailable (no mirror wired, or the heads read threw), we return unfiltered results AND
-      // tell the model the filter could not be applied — a medical answer must never assume active-only
-      // filtering happened when it did not. An empty-but-working mirror is NOT unavailable (nothing to
-      // filter), so it earns no banner.
+      // Fail open but tell the model: never let it assume active-only filtering happened.
       let statusUnavailable = false;
       if (willStatusFilter) {
         const { heads, available } = await loadEntityHeads(getMirror());

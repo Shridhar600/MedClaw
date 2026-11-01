@@ -1,14 +1,3 @@
-// src/tools/session-tools.ts
-//
-// session_search (PLAT-20, spec 14 §2) — verbatim FTS over the append-only day-file session archive.
-// This is how the agent recalls something said many turns ago (including a tool result that prune
-// replaced with a marker in the rolling window — the losslessness contract). Read-only; it never
-// mutates the archive.
-//
-// The result's session identity is the day-file `{file, line}` anchor, rendered `sessions/<file>#L<line>`
-// (A-L1: the anchor IS the session ID PLAT-20 asks for). Degrades gracefully — a failed index yields a
-// plain "unavailable" note, never a throw (resilience). PHI: snippets are returned to the agent (that is
-// the feature — verbatim retrieval into the agent's own 0600 context) but are NEVER logged.
 
 import type { Tool, ToolResult } from './types';
 import type { SessionSearchResult } from '../indexstore';
@@ -49,8 +38,6 @@ export function createSessionTools(deps: SessionToolsDeps): Tool[] {
         return ok('Provide a non-empty query to search past conversation turns.');
       }
       const limit = typeof params.limit === 'number' ? params.limit : undefined;
-      // Per-chat isolation (X-1): scope the search to the calling chat so it can never surface another
-      // chat's health turns. Fail closed if no chat context is present rather than searching unscoped.
       const chatId = context?.chatId;
       if (chatId === undefined) {
         return ok('Session search is unavailable in this context.');
@@ -70,7 +57,7 @@ export function createSessionTools(deps: SessionToolsDeps): Tool[] {
         const header = `Found ${result.hits.length} matching turn(s) for "${query}":`;
         return ok([header, ...lines].join('\n\n'));
       } catch (e) {
-        // The index degrades internally, but never let the tool throw (resilience). Sanitized frame only.
+        // Never let the tool throw. Sanitized frame only.
         console.warn('[session_search] failed:', summarizeErrorForLog(e));
         return ok('Session search is temporarily unavailable (index error). Try again shortly.');
       }

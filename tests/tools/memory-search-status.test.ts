@@ -1,18 +1,11 @@
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import { createMemoryTools } from '../../src/tools/memory-tools';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import type { MemorySearch } from '../../src/memory/search';
 import type { SearchResult } from '../../src/memory/types';
 import type { FactMirror, FactRecord } from '../../src/ports';
 import type { Tool } from '../../src/tools/types';
-
-// E1.1 — CONTRA-06 / CONTRA-08. memory_search is chunk/hybrid search over Markdown (NOT a
-// fact-version query — version ordering lives in ledger_query). Its `status` filter therefore
-// means: `active` (the default) drops chunks whose derived ledger entity head is stale
-// (retracted/discontinued/superseded); `all` disables that filter. This is the same stale-drop
-// the recall engine applies in Stage-2 (chunkHasStaleEntity), so the two paths agree.
+import { makeTestTemp } from '../helpers/test-temp';
 
 function headRec(entity: string, status: string, extra: Partial<FactRecord> = {}): FactRecord {
   return {
@@ -22,7 +15,6 @@ function headRec(entity: string, status: string, extra: Partial<FactRecord> = {}
   };
 }
 
-// A FactMirror whose only meaningful method is queryEntityHeads (the head-status source).
 function makeMirror(heads: FactRecord[], opts: { throws?: boolean } = {}): FactMirror {
   async function* headsGen(): AsyncIterable<FactRecord> {
     if (opts.throws) throw new Error('mirror down');
@@ -44,7 +36,7 @@ const canned: SearchResult[] = [
 ];
 const fakeSearch = { search: async (): Promise<SearchResult[]> => canned } as unknown as MemorySearch;
 
-describe('memory_search status filter (CONTRA-06/08)', () => {
+describe('memory_search status filter', () => {
   let tmpDir: string;
   let engine: MemoryEngine;
 
@@ -53,7 +45,7 @@ describe('memory_search status filter (CONTRA-06/08)', () => {
     createMemoryTools(engine, fakeSearch, undefined, 'p1', mirror).find(t => t.name === 'memory_search')!;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-search-status-'));
+    tmpDir = makeTestTemp('redacted-search-status-');
     engine = new MemoryEngine(tmpDir);
   });
   afterEach(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
@@ -63,7 +55,7 @@ describe('memory_search status filter (CONTRA-06/08)', () => {
     expect(props.status.enum).toEqual(expect.arrayContaining(['active', 'all']));
   });
 
-  it('status:active drops chunks whose entity head is stale (CONTRA-06)', async () => {
+  it('status:active drops chunks whose entity head is stale', async () => {
     const r = await tool(makeMirror(staleHeads)).execute({ query: 'metformin', status: 'active' });
     expect(r.content[0].text).not.toContain('metformin');
     expect(r.content[0].text).toContain('lisinopril');
@@ -92,7 +84,7 @@ describe('memory_search status filter (CONTRA-06/08)', () => {
     expect(r.content[0].text).toContain('metformin');
   });
 
-  it('M-2: warns (fail-open banner) when a status filter is requested but the mirror is unavailable', async () => {
+  it('warns (fail-open banner) when a status filter is requested but the mirror is unavailable', async () => {
     const noMirror = await tool(undefined).execute({ query: 'metformin', status: 'active' });
     expect(noMirror.content[0].text).toContain('fact-status: unavailable');
 
@@ -100,7 +92,7 @@ describe('memory_search status filter (CONTRA-06/08)', () => {
     expect(throwing.content[0].text).toContain('fact-status: unavailable');
   });
 
-  it('M-2: no banner when the filter was applied (working mirror) or not requested (status:all)', async () => {
+  it('no banner when the filter was applied (working mirror) or not requested (status:all)', async () => {
     const applied = await tool(makeMirror(staleHeads)).execute({ query: 'metformin', status: 'active' });
     expect(applied.content[0].text).not.toContain('fact-status: unavailable');
 

@@ -1,14 +1,3 @@
-// src/recall/engine.ts
-//
-// RecallEngine — the per-turn automatic recall pipeline (P2 Wave B, specs/07 §6 + specs/13 B-series).
-// Ports-only (no memcore/legacy imports — arch:check enforces). READ-only except Stage-4 chunk_stats
-// (P2-D4). Stages:
-//   1 ledger    — active clinical facts + paused facts carrying a pre_pause_summary (KNEE-08)
-//   2 narrative — hybrid vec∪keyword, scored (scoreChunk), thresholded on `raw`, suppressed by
-//                 ledger head status (CONTRA-10 / KNEE-10), top-K within budget (CHAT-08)
-//   3 entity    — deterministic side-effect correlation against active meds (DIAB-05), CHECK: lines
-//   4 feedback  — chunk_stats bump + <used> tag (Task B3)
-// Every embed call is wrapped in a timeout (v2-BL-2) → keyword-only degrade.
 
 import type { EmbeddingPort } from '../ports/embedding-port';
 import type { VectorIndex } from '../ports/vector-index';
@@ -32,19 +21,12 @@ export interface RecallConfig {
   finalTopK: number;
   preDecayFloor: number;
   healthLaneBoost: number;
-  /**
-   * The "health" lanes — triple-duty (kept as one set because all three uses are the
-   * ledger|episode health surface; split into separate keys if Wave E needs to tune them apart):
-   *   (1) safety-threshold gate: safety_relevant && lane∈healthLanes → 0.3 threshold (B5);
-   *   (2) CHAT-07 post-threshold content-type boost;
-   *   (3) B4 auto-mute exemption (ledger|episode never muted).
-   */
   healthLanes: string[];
-  /** Lanes carrying versioned ledger-fact statements — newer-active suppression is scoped here (F2). */
+  /** Lanes carrying versioned ledger-fact statements; newer-active suppression is scoped here. */
   ledgerLanes: string[];
   ledgerTypes: string[];
   autoMuteInjectedThreshold: number;
-  /** Stage-3 side-effect correlation only considers meds started within this window (specs/07 §6). */
+  /** Stage-3 side-effect correlation only considers meds started within this window. */
   recentMedDays: number;
 }
 
@@ -53,19 +35,19 @@ export const DEFAULT_RECALL_CONFIG: RecallConfig = {
   topKKeyword: 24,
   narrativeBudget: 2000,
   ledgerBudget: 600,
-  halfLifeDays: 120, // v2-BL-1b (45 falsifies KNEE-06)
+  halfLifeDays: 120,
   scoreThreshold: 0.5,
   safetyThreshold: 0.3,
-  embedTimeoutMs: 500, // v2-BL-2
+  embedTimeoutMs: 500,
   overfetchFactor: 3,
   finalTopK: 3,
-  preDecayFloor: 0.15, // specs/13 B6 (safety_relevant chunks are exempt — see stage2)
-  healthLaneBoost: 1.5, // CHAT-07 content-type bias (post-threshold, H-4)
-  healthLanes: ['ledger', 'episode'], // safety-threshold lanes (B5) + CHAT-07 boost + B4 mute-exempt
-  ledgerLanes: ['ledger'], // newer-active version suppression is scoped to ledger-fact chunks (F2)
+  preDecayFloor: 0.15, // safety_relevant chunks are exempt (see stage 2)
+  healthLaneBoost: 1.5, // content-type bias, applied post-threshold
+  healthLanes: ['ledger', 'episode'], // safety-threshold lanes, content-type boost, auto-mute exempt
+  ledgerLanes: ['ledger'], // newer-active version suppression is scoped to ledger-fact chunks
   ledgerTypes: ['medication', 'condition', 'symptom', 'appointment', 'metric', 'goal', 'allergy'],
-  autoMuteInjectedThreshold: 20, // specs/13 B7 (never applied to safety_relevant / ledger|episode, B4)
-  recentMedDays: 90, // specs/07 §6 Stage 3 "active + recent(90d) meds"
+  autoMuteInjectedThreshold: 20, // never applied to safety_relevant or ledger|episode chunks
+  recentMedDays: 90, // Stage 3 considers active meds started within this many days
 };
 
 export interface RecallDeps {
@@ -76,17 +58,12 @@ export interface RecallDeps {
   chunkStats: ChunkStatsWriter;
   clock: Clock;
   config: RecallConfig;
-  /**
-   * RR-STRUCT R-S3 (mini-plan v3 §3.7 Finding-3): Tier-1 fail-closed-per-role for active facts.
-   * `src/recall/` is ports-only and cannot import `LedgerStore` (arch:check `v2-core-boundary`),
-   * so when `factMirror.queryActive()` throws, Stage 1 calls this INJECTED port instead of
-   * returning an empty ledger context. An empty Stage-1 result on a mirror failure is a fail-OPEN
-   * clinical hazard (a discontinued/active medication silently vanishes from the prompt) — the
-   * fallback must NEVER be empty by construction of its wiring (composed from the ledger's own
-   * active-fact read in the composition root; see `src/gateway/runtime.ts`). Optional: when
-   * absent, Stage 1 degrades to empty on a mirror failure (pre-R-S3 behavior), same as today.
-   */
-  fallbackActiveFacts?: () => Promise<FactRecord[]>;
+  currentFacts: () => Promise<CurrentFacts>;
+}
+
+export interface CurrentFacts {
+  facts: FactRecord[];
+  damagedFiles: string[];
 }
 
 export interface RecallInput {
@@ -115,7 +92,7 @@ export interface RecallReport {
   hits: RecallHit[];
   injectedChunkIds: string[];
   indexStatus: IndexStatus;
-  /** Stage-3 deterministic correlation output — `CHECK:` lines (was `entity`, F13 rename). */
+  /** Stage-3 deterministic correlation output: `CHECK:` lines. */
   checkNotes: string;
   /** Optional heartbeat-only follow-up surface attached by the composition root. */
   curiosity?: readonly {
@@ -136,13 +113,11 @@ interface Stage2Result {
   indexStatus: IndexStatus;
 }
 
-// Mirror of src/memcore AUTHORITY_RANK (kept local — the engine is ports-only, cannot import the
-// memcore value). Keep in sync with src/memcore/types.ts if the ladder changes.
 const AUTHORITY_RANK: Record<string, number> = {
   doctor: 5, lab: 5, report: 4, sensor: 3, user: 2, inference: 1,
 };
 
-// A stale/disputed head status → any chunk for that entity is stale and fail-closed dropped (KNEE-10).
+// A stale/disputed head status means any chunk for that entity is stale and is dropped (fail closed).
 const STALE_STATUSES = new Set(['retracted', 'discontinued', 'superseded', 'disputed']);
 const MS_PER_DAY = 86_400_000;
 const CHECK_BUDGET_TOKENS = 200;
@@ -156,7 +131,7 @@ function fmtFieldValue(v: string | number | string[]): string {
 }
 
 function toWordSet(s: string): Set<string> {
-  // Singularize so plural/inflected mentions still match entity words (F4 — "UTIs" → "uti").
+  // Singularize so plural/inflected mentions still match entity words ("UTIs" -> "uti").
   return new Set(s.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).map(singular));
 }
 
@@ -169,18 +144,10 @@ function matchEntities(content: string, heads: FactRecord[]): FactRecord[] {
   });
 }
 
-/**
- * True when `content` mentions an entity whose CURRENT HEAD is terminal
- * (retracted/discontinued/superseded). This is the DRY form of the Stage-2 stale-drop
- * ({@link RecallEngine.isSuppressed}), exported so `memory_search`'s `status:active` filter
- * applies the identical rule (E1.1 / CONTRA-06/08). `heads` = `factMirror.queryEntityHeads()`.
- */
 export function chunkHasStaleEntity(content: string, heads: FactRecord[]): boolean {
   return matchEntities(content, heads).some(h => STALE_STATUSES.has(h.status));
 }
 
-// Stage-1 ledger fill priority when the budget is tight (F3): safety rows first, then a clinical
-// ordering, so a critical allergy is never silently evicted by rowid-arbitrary order.
 const LEDGER_TYPE_PRIORITY: Record<string, number> = {
   allergy: 0, medication: 1, condition: 2, symptom: 3, appointment: 4, metric: 5, goal: 6,
 };
@@ -207,11 +174,6 @@ function normalizeMessageWords(s: string): Set<string> {
   return new Set(s.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).map(singular));
 }
 
-/**
- * Deterministic side-effect ↔ symptom match (DIAB-05): the side effect's HEAD word plus at least
- * one qualifier word must appear in the message (single-word effects match on the head alone). This
- * matches "genital-yeast-infection" to "yeast infections" without matching "uti"/"dehydration".
- */
 function sideEffectMatches(sideEffect: string, msgWords: Set<string>): boolean {
   const words = sideEffect.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).map(singular);
   if (words.length === 0) return false;
@@ -277,17 +239,13 @@ export class RecallEngine {
   constructor(private deps: RecallDeps) {}
 
   async run(input: RecallInput, opts?: { narrative?: boolean }): Promise<RecallReport> {
-    // narrative:false (heartbeat/dream/subagent — modes that render no narrative hits) runs Stage-1
-    // ledger only: no embed, no Stage-2/3, no bumpInjected. This avoids poisoning B4 auto-mute with
-    // injected_count bumps for chunks that were never shown, and skips the embed budget (M-1).
     const includeNarrative = opts?.narrative ?? true;
-    const stage1 = await this.stage1Ledger();
+    const current = await this.readCurrentFacts();
+    const stage1 = this.stage1Ledger(current);
     const stage2: Stage2Result = includeNarrative
       ? await this.stage2Narrative(input)
       : { text: '', tokens: 0, hits: [], injectedChunkIds: [], indexStatus: 'full' };
-    const stage3 = includeNarrative ? await this.stage3Entity(input) : '';
-    // Stage 4a: record that these chunks were injected (used_count bumped later via recordUsage
-    // when the model reports the <used> tag). Mirror-connection bookkeeping — never blocks the turn.
+    const stage3 = includeNarrative && current ? this.stage3Entity(input, current.facts) : '';
     if (stage2.injectedChunkIds.length > 0) {
       try {
         await this.deps.chunkStats.bumpInjected(stage2.injectedChunkIds);
@@ -308,10 +266,6 @@ export class RecallEngine {
     };
   }
 
-  /**
-   * Stage 4b — record that the model used these recall chunks this turn (from the stripped B7
-   * `<used>` tag; the AgentLoop parses it via {@link parseUsedTag}). Best-effort; never throws.
-   */
   async recordUsage(chunkIds: string[], at: string, injectedChunkIds?: readonly string[]): Promise<void> {
     const injected = injectedChunkIds === undefined ? undefined : new Set(injectedChunkIds);
     const accepted = [...new Set(chunkIds)].filter(id => injected === undefined || injected.has(id));
@@ -323,60 +277,51 @@ export class RecallEngine {
     }
   }
 
-  // ---- Stage 1: active ledger + paused-with-summary --------------------------------------
-
-  private async stage1Ledger(): Promise<{ text: string; tokens: number; truncated: boolean }> {
-    const { factMirror, config } = this.deps;
+  /** One ledger read per turn, shared by Stages 1 and 3. `null` means the ledger could not be read. */
+  private async readCurrentFacts(): Promise<CurrentFacts | null> {
     try {
-      const byEntity = new Map<string, FactRecord[]>();
-      const groupActive = (f: FactRecord): void => {
-        if (!config.ledgerTypes.includes(f.type)) return;
-        const key = `${f.type}::${f.entity}`;
-        const group = byEntity.get(key);
-        if (group) group.push(f); else byEntity.set(key, [f]);
-      };
-      try {
-        for await (const f of factMirror.queryActive()) groupActive(f);
-      } catch (e) {
-        // RR-STRUCT R-S3 Finding-3: the mirror is unavailable — an EMPTY Stage-1 here is fail-OPEN
-        // (a discontinued/active medication would silently vanish from the prompt). Fall back to
-        // the injected ledger-backed port, which is NEVER empty by construction of its wiring.
-        // Without a fallback configured, degrade to empty (pre-R-S3 behavior) — still resilient
-        // (never throws to the caller), just not clinically fail-closed.
-        console.warn('[recall] stage1 fact-mirror unavailable; falling back to ledger read:', summarizeErrorForLog(e));
-        if (this.deps.fallbackActiveFacts) {
-          const fallbackFacts = await this.deps.fallbackActiveFacts();
-          for (const f of fallbackFacts) groupActive(f);
-        } else {
-          console.warn('[recall] no fallbackActiveFacts port configured — stage1 ledger degrades to empty');
-        }
-      }
-      // Priority order so a tight budget never silently evicts a safety row (F3): safety/allergy
-      // first, then the clinical ordering, stable tiebreak by entity.
-      const activeGroups = [...byEntity.values()].sort((a, b) =>
-        ledgerRank(a[0]) - ledgerRank(b[0]) || a[0].entity.localeCompare(b[0].entity));
-      const lines: string[] = activeGroups.map((group) => {
-        if (group.length === 1) return RecallEngine.renderActive(group[0]);
-        const values = [...group]
-          .sort((a, b) => a.version - b.version)
-          .map((f) => `v${f.version}: ${RecallEngine.renderActive(f).replace(/^- /, '')}`)
-          .join(' | ');
-        return `- CONFLICT: multiple active ${group[0].type} records for ${group[0].entity} — ${values}`;
-      });
-      // Paused facts that carry a pre_pause_summary (KNEE-08) — skip entities that already have an
-      // active head (active wins; no double-render, F15).
-      for await (const f of factMirror.queryPaused()) {
-        if (!config.ledgerTypes.includes(f.type)) continue;
-        if (byEntity.has(`${f.type}::${f.entity}`)) continue;
-        const summary = f.fields['pre_pause_summary'];
-        if (summary === undefined) continue;
-        lines.push(`- ${f.entity} (${f.type}) paused — ${fmtFieldValue(summary)}`);
-      }
-      return RecallEngine.fitLines(lines, config.ledgerBudget);
+      return await this.deps.currentFacts();
     } catch (e) {
-      console.warn('[recall] stage1 ledger failed:', summarizeErrorForLog(e));
-      return { text: '', tokens: 0, truncated: false };
+      console.warn('[recall] current ledger facts unreadable:', summarizeErrorForLog(e));
+      return null;
     }
+  }
+
+  private stage1Ledger(current: CurrentFacts | null): { text: string; tokens: number; truncated: boolean } {
+    const { config } = this.deps;
+    if (!current) {
+      return RecallEngine.fitLines(
+        ['- WARNING: the health record could not be read this turn. Do not assume any medication, allergy or condition is current; ask the owner.'],
+        config.ledgerBudget,
+      );
+    }
+    const warnings = current.damagedFiles.map((file) =>
+      `- WARNING: ledger/${file} is damaged and could not be fully read. Facts from it may be missing, and it cannot be changed until the owner repairs it.`);
+    const byEntity = new Map<string, FactRecord[]>();
+    for (const f of current.facts) {
+      if (f.status !== 'active' || !config.ledgerTypes.includes(f.type)) continue;
+      const key = `${f.type}::${f.entity}`;
+      const group = byEntity.get(key);
+      if (group) group.push(f); else byEntity.set(key, [f]);
+    }
+    const activeGroups = [...byEntity.values()].sort((a, b) =>
+      ledgerRank(a[0]) - ledgerRank(b[0]) || a[0].entity.localeCompare(b[0].entity));
+    const lines: string[] = [...warnings, ...activeGroups.map((group) => {
+      if (group.length === 1) return RecallEngine.renderActive(group[0]);
+      const values = [...group]
+        .sort((a, b) => a.version - b.version)
+        .map((f) => `v${f.version}: ${RecallEngine.renderActive(f).replace(/^- /, '')}`)
+        .join(' | ');
+      return `- CONFLICT: multiple active ${group[0].type} records for ${group[0].entity} — ${values}`;
+    })];
+    for (const f of current.facts) {
+      if (f.status !== 'paused' || !config.ledgerTypes.includes(f.type)) continue;
+      if (byEntity.has(`${f.type}::${f.entity}`)) continue;
+      const summary = f.fields['pre_pause_summary'];
+      if (summary === undefined) continue;
+      lines.push(`- ${f.entity} (${f.type}) paused — ${fmtFieldValue(summary)}`);
+    }
+    return RecallEngine.fitLines(lines, config.ledgerBudget);
   }
 
   private static renderActive(f: FactRecord): string {
@@ -399,8 +344,6 @@ export class RecallEngine {
     return { text, tokens: estimateTokens(text), truncated };
   }
 
-  // ---- Stage 2: hybrid narrative recall --------------------------------------------------
-
   private async stage2Narrative(input: RecallInput): Promise<Stage2Result> {
     const { config, clock } = this.deps;
     try {
@@ -410,8 +353,6 @@ export class RecallEngine {
       }
       const headRead = await this.loadEntityHeads();
       if (!headRead.available) {
-        // Head status is the safety filter. An unavailable mirror is not an empty mirror:
-        // suppress every candidate rather than allowing stale clinical narrative through.
         return { text: '', tokens: 0, hits: [], injectedChunkIds: [], indexStatus: 'failed' };
       }
       const heads = headRead.heads;
@@ -424,20 +365,12 @@ export class RecallEngine {
 
         const safetyRelevant = matched.some(m => m.safetyRelevant);
 
-        // On keyword-only degrade there is no cosine, so the keyword score stands in for the
-        // semantic signal (full weight on the only signal we have) — otherwise a bm25-only chunk
-        // caps at raw 0.3 and can never clear the 0.5 threshold, and degrade would return nothing.
         const effectiveCosine = indexStatus === 'keyword-only' ? c.bm25n : c.cosine;
         const base = 0.7 * effectiveCosine + 0.3 * c.bm25n;
-        // B6 pre-decay floor — safety_relevant chunks are EXEMPT (specs/13 B6 "OR safety_relevant",
-        // v2-BL-1b: safety facts must stay surface-able). The floor must not run before this carve-out.
         if (!safetyRelevant && base < config.preDecayFloor) continue;
 
         const inHealthLane = config.healthLanes.includes(c.lane);
 
-        // B4 auto-mute: a chunk injected ≫ used is noise — drop it, EXCEPT safety_relevant chunks
-        // or ledger|episode lanes, which are NEVER muted (specs/13 B4 / v2-H-1). The stat read is
-        // best-effort: a corrupt stats row must degrade to no-mute, never sink the turn (F8).
         if (!safetyRelevant && !inHealthLane) {
           let stat = null;
           try {
@@ -458,8 +391,6 @@ export class RecallEngine {
         const threshold = safetyRelevant && inHealthLane ? config.safetyThreshold : config.scoreThreshold;
         if (raw < threshold) continue;
 
-        // Content-type bias is a post-threshold ranking multiplier (H-4 — cannot smuggle a
-        // sub-threshold chunk in; only reorders survivors so health outranks rants, CHAT-07).
         const boosted = inHealthLane ? ranking * config.healthLaneBoost : ranking;
         scored.push({ id: c.id, raw, ranking: boosted, lane: c.lane, content: c.content, safetyRelevant });
       }
@@ -475,24 +406,17 @@ export class RecallEngine {
     }
   }
 
-  /**
-   * Hybrid gather: embed (timeout-guarded) → vec KNN ∪ keyword match, merged by chunk id. Each arm
-   * is isolated (F8b) so one arm's failure never discards the other's candidates. PLAT-11 status:
-   * 'failed' only when BOTH arms are down; 'keyword-only' when the vector arm is unavailable.
-   */
   private async gatherCandidates(userMessage: string): Promise<{ candidates: Map<string, Candidate>; indexStatus: IndexStatus }> {
     const { config } = this.deps;
     const candidates = new Map<string, Candidate>();
-
-    // --- vector arm: embed (timeout-guarded); empty or failed embedding ⇒ vec unavailable ---
     let embedding: number[] | null = null;
     try {
       const vecs = await this.embedWithTimeout(userMessage);
       const v = vecs[0];
       if (v && v.length > 0) embedding = v;
-      else console.warn('[recall] empty embedding → keyword-only (specs/13 B3)'); // F6
+      else console.warn('[recall] empty embedding → keyword-only');
     } catch (e) {
-      // Embed throw OR 500ms timeout ⇒ keyword-only degrade (PLAT-11, v2-BL-2).
+      // An embed throw or 500ms timeout degrades to keyword-only.
       console.warn('[recall] embed failed → keyword-only:', summarizeErrorForLog(e));
     }
 
@@ -510,8 +434,6 @@ export class RecallEngine {
         console.warn('[recall] vector query failed:', summarizeErrorForLog(e)); // keep the keyword arm
       }
     }
-
-    // --- keyword arm: independent try so a throw here preserves already-gathered vec candidates ---
     let keywordAvailable = false;
     try {
       for await (const h of this.deps.keywordIndex.match(userMessage, config.topKKeyword)) {
@@ -548,8 +470,6 @@ export class RecallEngine {
       for await (const h of this.deps.factMirror.queryEntityHeads()) heads.push(h);
       return { heads, available: true };
     } catch (e) {
-      // No heads is not an empty working mirror. A safety filter that cannot read its source
-      // must fail closed for this turn.
       console.warn('[recall] entity-heads load failed:', summarizeErrorForLog(e));
       return { heads: [], available: false };
     }
@@ -559,10 +479,7 @@ export class RecallEngine {
     const chunkDay = RecallEngine.dayOf(chunk.createdAt);
     const isLedgerLane = config.ledgerLanes.includes(chunk.lane);
     for (const m of matched) {
-      if (STALE_STATUSES.has(m.status)) return true; // stale fail-closed (KNEE-10) — all lanes
-      // Newer-active version suppression (CONTRA-10) is scoped to ledger-fact chunks (F2): a
-      // narrative adverse-event mention of an active med must NOT be dropped by a later dose update.
-      // Compared at DAY granularity so sub-day serialization drift can't flip the boundary (F5).
+      if (STALE_STATUSES.has(m.status)) return true; // stale head status fails closed, all lanes
       if (m.status === 'active' && isLedgerLane) {
         const headDay = RecallEngine.dayOf(m.createdAt);
         if (headDay !== null && chunkDay !== null && headDay > chunkDay) return true;
@@ -587,8 +504,7 @@ export class RecallEngine {
   }
 
   private static dedupeByContent(hits: RecallHit[]): RecallHit[] {
-    // Exact restated-content dedupe, keep highest raw. (Pairwise cosine>0.92 semantic dedupe needs
-    // per-candidate embeddings in the result set — deferred to a later refinement; documented.)
+    // Exact restated-content dedupe, keep highest raw.
     const best = new Map<string, RecallHit>();
     for (const h of hits) {
       const key = h.content.trim().toLowerCase();
@@ -609,26 +525,17 @@ export class RecallEngine {
     return { kept, text, tokens: estimateTokens(text) };
   }
 
-  // ---- Stage 3: deterministic side-effect correlation ------------------------------------
-  //
-  // Data-driven from active meds' known_side_effects (no embeddings, no LLM). Surfaces a CHECK:
-  // line phrased as a possibility, never an alarm (DIAB-05). Findings are context-only here;
-  // persisting them to the inferences/ sandbox (graduation substrate) is P5 — not wired in P2.
-  // New-med→active-condition contraindication and event-lag windows (DIAB-07) need a med lexicon /
-  // the event store consumer respectively and are deferred (documented in the P2 plan).
-
-  private async stage3Entity(input: RecallInput): Promise<string> {
-    const { factMirror, clock, config } = this.deps;
+  private stage3Entity(input: RecallInput, facts: FactRecord[]): string {
+    const { clock, config } = this.deps;
     try {
       const msgWords = normalizeMessageWords(input.userMessage);
       const now = clock.now();
       const candidates = new Map<string, CheckCandidate>();
-      for await (const med of factMirror.queryActive('medication')) {
+      for (const med of facts) {
+        if (med.type !== 'medication' || med.status !== 'active') continue;
         const sideEffects = med.fields['known_side_effects'];
         if (!Array.isArray(sideEffects)) continue;
         const started = typeof med.fields['started'] === 'string' ? (med.fields['started'] as string) : '';
-        // Only recent(90d) meds correlate (specs/07 §6) — a long-standing med would fire CHECK on
-        // every mention and erode signal (F7). Fail-open for undated/unparseable starts.
         if (!RecallEngine.isRecentMed(started, now, config.recentMedDays)) continue;
         for (const se of sideEffects) {
           if (typeof se !== 'string') continue;

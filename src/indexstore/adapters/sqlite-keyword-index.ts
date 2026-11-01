@@ -1,13 +1,3 @@
-// src/indexstore/adapters/sqlite-keyword-index.ts
-//
-// KeywordIndex adapter over SQLite FTS5 — the keyword arm of hybrid recall (P2 Task A2,
-// specs/07 §6 Stage 2). Opens its OWN better-sqlite3 connection to the per-profile search.db
-// (WAL + explicit busy_timeout, D6) and imports better-sqlite3 DIRECTLY — never src/memory/.
-//
-// Wraps the same P0-owned `chunks` + `chunks_fts` tables (M-3): in the live system the P0
-// sqlite-store inits them first; standalone (contract tests) this adapter creates a compatible
-// subset. bm25 `rank` is normalized to (0,1]; queries are OR-joined for recall breadth.
-
 import Database from 'better-sqlite3';
 import { summarizeErrorForLog } from '../../security';
 import type { KeywordIndex, Chunk, ChunkWithScore } from '../../ports';
@@ -69,9 +59,9 @@ export class SqliteKeywordIndex implements KeywordIndex {
   async *match(query: string, k: number, filter?: Record<string, unknown>): AsyncIterable<ChunkWithScore> {
     if (k <= 0) return;
     const matchQuery = SqliteKeywordIndex.toFtsMatchQuery(query);
-    if (!matchQuery) return; // empty / punctuation-only → no results, never an error
+    if (!matchQuery) return; // empty or punctuation-only: no results, never an error
 
-    // Over-fetch when a post-query metadata filter is present so it can still return up to k.
+    // Over-fetch when a post-query filter is present so it can still return up to k.
     const fetch = filter ? k * 5 : k;
     let rows: MatchRow[];
     try {
@@ -86,7 +76,7 @@ export class SqliteKeywordIndex implements KeywordIndex {
         LIMIT ?
       `).all(matchQuery, fetch) as MatchRow[];
     } catch (e) {
-      // A malformed FTS query or transient error must not crash a turn (resilience).
+      // A malformed query or transient error must not crash a turn.
       console.warn('[sqlite-keyword-index] match failed:', summarizeErrorForLog(e));
       return;
     }
@@ -104,8 +94,7 @@ export class SqliteKeywordIndex implements KeywordIndex {
         startLine: r.start_line,
         endLine: r.end_line,
         createdAt: r.created_at,
-        // fts5 bm25 `rank` is more-negative for better matches; |rank| grows with relevance.
-        // Squash to (0,1] so it combines with cosine in scoreChunk (Stage 2).
+        // bm25 |rank| grows with relevance; squash to (0,1] to combine with cosine.
         score: SqliteKeywordIndex.normalize(Math.abs(r.rank)),
       };
     }
@@ -119,7 +108,7 @@ export class SqliteKeywordIndex implements KeywordIndex {
     run(targetPath);
   }
 
-  /** Release the underlying connection. Not part of KeywordIndex; needed for lifecycle/tests. */
+  /** Not part of KeywordIndex; used by lifecycle code. */
   close(): void {
     try {
       this.db.close();
@@ -128,36 +117,26 @@ export class SqliteKeywordIndex implements KeywordIndex {
     }
   }
 
-  // ---- internals ---------------------------------------------------------
-
   private initSchema(): void {
-    // CREATE IF NOT EXISTS so this no-ops when the P0 store already owns these tables on a
-    // shared search.db (M-3: store inits first). Standalone (contract), this creates the subset
-    // the keyword arm needs (no `embedding` column — that is the vec adapter's / P0's concern).
+    // The memory store owns these tables in the live system; standalone this creates the keyword subset.
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS chunks (
         id TEXT PRIMARY KEY,
         path TEXT NOT NULL,
+        lane TEXT NOT NULL DEFAULT '',
         content TEXT NOT NULL,
         start_line INTEGER NOT NULL DEFAULT 0,
-        end_line INTEGER NOT NULL DEFAULT 0
+        end_line INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT '',
+        embedding BLOB
       );
       CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
       CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(id UNINDEXED, path, content);
     `);
-    // The port's Chunk carries lane + createdAt, which P0's chunks table predates.
-    this.ensureColumn('chunks', 'lane', "lane TEXT NOT NULL DEFAULT ''");
-    this.ensureColumn('chunks', 'created_at', "created_at TEXT NOT NULL DEFAULT ''");
   }
 
-  private ensureColumn(table: string, column: string, ddl: string): void {
-    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-    if (!cols.some(c => c.name === column)) {
-      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
-    }
-  }
 
-  /** Tokenize like the P0 store (Unicode letters/numbers), quote each term, OR-join for recall. */
+  /** Tokenize like the memory store, quote each term, and OR-join. */
   private static toFtsMatchQuery(query: string): string | null {
     const tokens = query.match(/[\p{L}\p{N}]+/gu) ?? [];
     if (tokens.length === 0) return null;

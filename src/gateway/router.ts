@@ -1,8 +1,18 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import type { AppConfig } from '../config/types';
-import type { IncomingMessage } from '../channels/types';
-import { ProfileRegistry, type ProfileId } from '../profiles';
+import type { EffectiveConfig } from '../config/types';
+import type { AdmittedMessage, ChatType } from '../channels';
+import type { ProfileId } from '../profiles';
+import type { OwnerAdmissionService, PairingResult } from '../profiles';
+import {
+  PAIRING_COMPLETE_TEXT,
+  PAIRING_EXPIRED_TEXT,
+  PAIRING_INVALID_TEXT,
+  PAIRING_PROMPT_TEXT,
+  PAIRING_UNAVAILABLE_TEXT,
+  refusalTextFor,
+} from '../profiles';
+import type { TransportIdentity } from '../ports/owner-state';
 import { EMERGENCY_RESPONSE, isEmergencyInput } from '../safety/emergency-detector';
 import {
   PathContainmentError,
@@ -21,10 +31,7 @@ import {
 
 const UNRECOGNIZED_CHAT_RESPONSE =
   'This chat is not recognized. This is a private health assistant; new chats cannot be added over this channel.';
-/** RR-STRUCT R-S5b: the RR-4 interim refusal is RETIRED (paired non-default chats are now
- *  dispatched to their own runtime — see `route()`). What remains is the GENUINE-failure path:
- *  the chat IS paired but its profile's runtime cannot be resolved this turn (a degraded
- *  profile whose build keeps failing). That is temporary, never policy — hence new wording. */
+/** Canned reply for a paired chat whose profile runtime cannot be resolved this turn. Temporary, never policy. */
 const PROFILE_DEGRADED_RESPONSE =
   "This chat's profile is temporarily unavailable. Please try again in a moment.";
 const EMPTY_MESSAGE_RESPONSE = "I didn't catch any message. Send some text or an attachment and I'll take a look.";
@@ -32,22 +39,29 @@ const TURN_QUEUE_FULL_RESPONSE = "I'm still processing your previous message. Pl
 const STAGED_MEDIA_FAILURE_RESPONSE = 'Failed to store uploaded file. Please try uploading it again.';
 
 export interface GatewayMessageRouterDeps {
-  config: AppConfig;
+  config: EffectiveConfig;
   runtime?: ProfileRuntime;
-  profileRegistry?: ProfileRegistry;
-  stagingDir: string;
+  stagingDir: string | undefined;
   stagingBaseDir?: string;
   buildBootStatusText: () => string;
-  /**
-   * RR-STRUCT R-S5b (mini-plan v3 §3.2): per-profile runtime resolution, injected by the
-   * Gateway and backed by `ProfileRuntimeManager.get`. Absent (unit tests that construct a
-   * Router directly with a single runtime), every dispatch falls back to `deps.runtime`.
-   * Must never reject to the Router — but the Router treats a rejection the same as
-   * `undefined` (degraded profile → canned reply, never a throw) so a misbehaving resolver
-   * cannot crash the daemon either.
-   */
   resolveRuntime?: (profileId: ProfileId) => Promise<ProfileRuntime | undefined>;
+  /** The only authority for "who may talk to this owner". Required; there is no fallback path. */
+  admission: OwnerAdmissionService;
+  /** The owner identity `admission` is configured for: the dispatch target once admission proves the chat is the owner. */
+  ownerId: ProfileId;
 }
+
+/** Canned pairing replies. Pairing is never a health answer. */
+const PAIRING_RESULT_TEXT: Record<PairingResult['kind'], string | undefined> = {
+  paired: PAIRING_COMPLETE_TEXT,
+  'already-paired': PAIRING_COMPLETE_TEXT,
+  prompt: PAIRING_PROMPT_TEXT,
+  invalid: PAIRING_INVALID_TEXT,
+  expired: PAIRING_EXPIRED_TEXT,
+  limited: undefined,
+  refused: UNRECOGNIZED_CHAT_RESPONSE,
+  unavailable: PAIRING_UNAVAILABLE_TEXT,
+};
 
 interface StagedMedia {
   sourcePath: string;
@@ -59,53 +73,32 @@ interface TrustedDirectory {
   real: string;
 }
 
-/** Remove files left in the profile-agnostic media staging lane after a crash. */
-export function sweepStagedMedia(stagingDir: string, stagingBaseDir?: string): void {
-  try {
-    const root = trustedDirectory(stagingDir, stagingBaseDir);
-    if (!root) return;
-    secureMkdir(root.lexical);
-    const entries = fs.readdirSync(root.real);
-    for (const entry of entries) {
-      let candidate: string;
-      try {
-        candidate = resolveContainedPath(root.real, entry);
-      } catch (error) {
-        // A symlink is safe to unlink as a link, but never follow it.
-        const raw = path.join(root.real, entry);
-        try {
-          if (fs.lstatSync(raw).isSymbolicLink()) fs.unlinkSync(raw);
-        } catch (unlinkError) {
-          console.warn('[gateway] Failed to sweep staged media entry:', summarizeErrorForLog(unlinkError));
-        }
-        if (!(error instanceof PathContainmentError)) {
-          console.warn('[gateway] Failed to inspect staged media entry:', summarizeErrorForLog(error));
-        }
-        continue;
-      }
-      try {
-        const stat = fs.lstatSync(candidate);
-        if (stat.isFile() || stat.isSymbolicLink()) {
-          fs.unlinkSync(candidate);
-        }
-      } catch (error) {
-        console.warn('[gateway] Failed to sweep staged media entry:', summarizeErrorForLog(error));
-      }
-    }
-  } catch (error) {
-    console.warn('[gateway] Media staging sweep failed; continuing:', summarizeErrorForLog(error));
-  }
-}
-
 export class GatewayMessageRouter {
   constructor(private readonly deps: GatewayMessageRouterDeps) {}
 
-  async route(incoming: IncomingMessage, egress: TurnEgress, logIncoming = true): Promise<string | undefined> {
-    const { chatId, text } = incoming;
-    if (logIncoming) {
-      console.log(
-        `[gateway] Message from ${chatId}: ${text.length} chars${incoming.mediaPath ? ', media attached' : ''}`,
+  async route(incoming: AdmittedMessage, egress: TurnEgress): Promise<string | undefined> {
+    const { text } = incoming;
+    const admission = this.deps.admission;
+    const identity = transportIdentityOf(incoming);
+    const decision = admission.inspect(identity);
+    if (decision.kind === 'refused') {
+      this.deleteStagedMedia(incoming.mediaPath);
+      return this.emitSafely(
+        egress,
+        this.emergencyResponse(text) ?? refusalTextFor(decision.reason),
+        'Failed to send admission refusal',
       );
+    }
+    if (decision.kind === 'pairing-only') {
+      return this.routePairing(incoming, egress, identity);
+    }
+
+    // Admission has proved this chat is the bound owner, so the owner identity is the only dispatch target.
+    const admittedOwnerId = this.deps.ownerId;
+
+    if (admission.isRedeliveredPairingEvent(identity)) {
+      this.deleteStagedMedia(incoming.mediaPath);
+      return this.emitSafely(egress, PAIRING_COMPLETE_TEXT, 'Failed to answer redelivered pairing event');
     }
 
     if (text.trim().length === 0 && !incoming.mediaPath && !incoming.mediaError) {
@@ -114,21 +107,12 @@ export class GatewayMessageRouter {
 
     const emergency = this.emergencyResponse(text);
     if (emergency) {
-      return this.routeEmergency(incoming, egress, emergency);
+      return this.routeEmergency(incoming, egress, emergency, admittedOwnerId);
     }
 
-    const profileId = this.getProfileForChat(chatId);
-    if (profileId === null) {
-      this.deleteStagedMedia(incoming.mediaPath);
-      return this.emitSafely(
-        egress,
-        UNRECOGNIZED_CHAT_RESPONSE,
-        'Failed to respond to unrecognized chat',
-      );
-    }
-    // RR-STRUCT R-S5b: the RR-4 interim refusal (`!isDefaultRuntimeProfile`) is RETIRED — a
-    // paired non-default chat is dispatched to its OWN runtime below. The `profileId === null`
-    // refusal above is untouched: an unpaired chat can never reach the resolved-runtime path.
+    // Owner chat: the only path that may reach a clinical runtime.
+    const profileId = admittedOwnerId ?? this.deps.ownerId;
+    // A chat admission refused was already answered above and never reaches this line.
     const runtime = await this.resolveRuntimeFor(profileId);
     if (!runtime) {
       this.deleteStagedMedia(incoming.mediaPath);
@@ -162,72 +146,37 @@ export class GatewayMessageRouter {
     }
   }
 
-  resolveProfileForChat(chatId: string): ProfileId | null {
-    return this.getProfileForChat(chatId);
-  }
+  private async routePairing(
+    incoming: AdmittedMessage,
+    egress: TurnEgress,
+    identity: TransportIdentity,
+  ): Promise<string | undefined> {
+    this.deleteStagedMedia(incoming.mediaPath);
 
-  isDefaultProfile(profileId: ProfileId): boolean {
-    return this.isDefaultRuntimeProfile(profileId);
-  }
-
-  private getProfileForChat(chatId: string): ProfileId | null {
-    const registry = this.deps.profileRegistry;
-    if (!registry) {
-      return (this.deps.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
-    }
-    const existing = registry.getProfileForChat(chatId);
-    if (existing) return existing.profileId;
-
-    const anyChatPaired = registry.getAllProfiles().some((profile) => profile.chatIds.length > 0);
-    if (anyChatPaired) {
-      console.warn(`[gateway] Refused unrecognized chat ${chatId} (auto-pair closed after first pairing)`);
-      return null;
+    const emergency = this.emergencyResponse(incoming.text);
+    if (emergency) {
+      return this.emitSafely(egress, emergency, 'Failed to send emergency response');
     }
 
-    const defaultProfile = registry.getOrCreateDefaultProfile();
-    registry.pairChatToProfile(chatId, defaultProfile.profileId);
-    console.log(`[gateway] Paired chat ${chatId} to profile "${defaultProfile.profileId}" (first-contact auto-pair)`);
-    return defaultProfile.profileId;
-  }
-
-  private getExistingProfileForChat(chatId: string): ProfileId | null {
-    const registry = this.deps.profileRegistry;
-    if (!registry) {
-      return (this.deps.config.profiles?.defaultProfileId ?? 'default') as ProfileId;
-    }
-    return registry.getProfileForChat(chatId)?.profileId ?? null;
-  }
-
-  private isDefaultRuntimeProfile(profileId: ProfileId): boolean {
-    return profileId === (this.deps.config.profiles?.defaultProfileId ?? 'default');
+    const result = await this.deps.admission.handlePairing(identity, incoming.text);
+    const reply = PAIRING_RESULT_TEXT[result.kind];
+    if (reply === undefined) return undefined;
+    return this.emitSafely(egress, reply, 'Failed to send pairing response');
   }
 
   private emergencyResponse(input: string): string | undefined {
-    // RR2-A2 raw-input boundary: inspect `incoming.text` verbatim. Lines that look
-    // like `User id:` / `Reply to message id:` / `Uploaded media path:` can be
-    // user-authored (the router has not added trusted metadata yet), so they must
-    // not be stripped here. Actual metadata fields (userId/mediaPath/reply) are
-    // never concatenated into this input — see `buildAgentInput` callers.
     return isEmergencyInput(input, this.deps.config.emergency?.keywords)
       ? EMERGENCY_RESPONSE
       : undefined;
   }
 
-  private buildAgentInput(incoming: IncomingMessage): string {
+  private buildAgentInput(incoming: AdmittedMessage): string {
     const parts: string[] = [incoming.text];
     if (incoming.mediaPath) parts.push('', `Uploaded media path (relative to workspace): ${incoming.mediaPath}`);
     if (incoming.replyToMessageId) parts.push('', `Reply to message id: ${incoming.replyToMessageId}`);
-    if (incoming.userId) parts.push('', `User id: ${incoming.userId}`);
     return parts.join('\n');
   }
 
-  /**
-   * RR-STRUCT R-S5b: resolve the runtime OWNING `profileId` for this turn — exactly once per
-   * turn; every dispatch method below receives the result instead of re-resolving. Falls back
-   * to the single injected `deps.runtime` when no resolver is present (direct Router unit
-   * tests). A rejection (persistently-broken profile build, manager stopping) degrades to
-   * `undefined` with a sanitized log — the caller emits the canned degraded reply, never throws.
-   */
   private async resolveRuntimeFor(profileId: ProfileId): Promise<ProfileRuntime | undefined> {
     const resolver = this.deps.resolveRuntime;
     if (!resolver) return this.deps.runtime;
@@ -240,7 +189,7 @@ export class GatewayMessageRouter {
   }
 
   private async persistEmergencyTurn(
-    incoming: IncomingMessage,
+    incoming: AdmittedMessage,
     emergency: string,
     runtime: ProfileRuntime,
   ): Promise<void> {
@@ -254,12 +203,13 @@ export class GatewayMessageRouter {
     }
   }
 
-  private async routeEmergency(incoming: IncomingMessage, egress: TurnEgress, emergency: string): Promise<string> {
-    // NOTE: deliberately `getExistingProfileForChat` (no auto-pair) — an emergency from an
-    // unknown chat must NEVER consume the one-time first-contact pairing, and stays
-    // unpersisted guidance. Only a chat already paired to a profile resolves a runtime.
-    const profileId = this.getExistingProfileForChat(incoming.chatId);
-    const runtime = profileId !== null ? await this.resolveRuntimeFor(profileId) : undefined;
+  private async routeEmergency(
+    incoming: AdmittedMessage,
+    egress: TurnEgress,
+    emergency: string,
+    admittedOwnerId?: ProfileId,
+  ): Promise<string> {
+    const runtime = admittedOwnerId ? await this.resolveRuntimeFor(admittedOwnerId) : undefined;
     const emergencyIncoming = { ...incoming };
     if (path.isAbsolute(emergencyIncoming.mediaPath ?? '')) {
       this.deleteStagedMedia(emergencyIncoming.mediaPath);
@@ -276,11 +226,11 @@ export class GatewayMessageRouter {
     return emergency;
   }
 
-  private scheduleBackgroundCapture(incoming: IncomingMessage, runtime: ProfileRuntime): void {
+  private scheduleBackgroundCapture(incoming: AdmittedMessage, runtime: ProfileRuntime): void {
     scheduleBackgroundCapture(runtime, incoming);
   }
 
-  private adoptStagedMedia(incoming: IncomingMessage, runtime: ProfileRuntime): void {
+  private adoptStagedMedia(incoming: AdmittedMessage, runtime: ProfileRuntime): void {
     if (!incoming.mediaPath || !path.isAbsolute(incoming.mediaPath)) return;
     const staged = this.inspectStagedMedia(incoming.mediaPath);
     if (!staged) {
@@ -423,7 +373,26 @@ export class GatewayMessageRouter {
   }
 }
 
-function trustedDirectory(directory: string, trustedBaseDir?: string): TrustedDirectory | undefined {
+export type IncomingMessageLike = {
+  channel?: string;
+  chatId: string;
+  userId: string;
+  chatType?: ChatType;
+  eventId?: string;
+};
+
+export function transportIdentityOf(incoming: IncomingMessageLike): TransportIdentity {
+  return {
+    channel: incoming.channel ?? '',
+    chatId: incoming.chatId,
+    userId: incoming.userId,
+    chatType: incoming.chatType,
+    eventId: incoming.eventId ?? '',
+  };
+}
+
+function trustedDirectory(directory: string | undefined, trustedBaseDir?: string): TrustedDirectory | undefined {
+  if (!directory) return undefined;
   const absolute = path.resolve(directory);
   try {
     const stat = fs.lstatSync(absolute);

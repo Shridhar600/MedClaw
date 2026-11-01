@@ -1,7 +1,7 @@
 import { EventEmitter } from 'events';
 import { installGlobalSafetyNet, reportFatalStartupError } from '../src/index';
 
-describe('Global safety net (RES-P1-3)', () => {
+describe('Global safety net', () => {
   it('logs sanitized unhandledRejection and continues (does not throw nor exit)', () => {
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     const exitSpy = jest.spyOn(process, 'exit').mockImplementation((() => {

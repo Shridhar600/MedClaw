@@ -1,18 +1,14 @@
 // src/memory/memory-engine.ts
 import * as fs from 'fs';
 import * as path from 'path';
-import { secureMkdir, secureWrite, secureAppend } from '../security';
+import { secureMkdir, secureWriteViaTmp, secureAppend } from '../security';
 
-// Methods are async by interface even though they use synchronous fs operations.
-// This keeps callers future-proof if we switch to fs.promises without API changes.
 export class MemoryEngine {
   constructor(
     private readonly workspace: string,
     private readonly profileId: string = 'default',
   ) {
     secureMkdir(workspace);
-    // Eagerly resolve the real workspace path to prevent a TOCTOU window
-    // between construction and the first resolve() call.
     void this.realWorkspace;
   }
 
@@ -27,9 +23,6 @@ export class MemoryEngine {
   }
 
   private resolve(relativePath: string): string {
-    // SEC-m1: absolute paths are explicitly rejected. path.join would otherwise
-    // normalize an absolute path inside the workspace (no escape, but
-    // surprising — callers expect absolute paths to be refused).
     if (path.isAbsolute(relativePath)) {
       throw new Error('Absolute paths are not allowed');
     }
@@ -38,8 +31,6 @@ export class MemoryEngine {
     if (!full.startsWith(this.workspace + path.sep) && full !== this.workspace) {
       throw new Error(`Path traversal detected: ${relativePath}`);
     }
-    // Symlink/TOCTOU guard — resolve the parent directory (or file itself) to
-    // detect symlinks that point outside the real workspace root.
     const checkTarget = fs.existsSync(full) ? full : this.nearestExistingParent(full);
     const realTarget = fs.realpathSync(checkTarget);
     const realRoot = this.realWorkspace;
@@ -77,7 +68,7 @@ export class MemoryEngine {
   async writeFile(relativePath: string, content: string): Promise<void> {
     const fullPath = this.resolve(relativePath);
     secureMkdir(path.dirname(fullPath));
-    secureWrite(fullPath, content);
+    secureWriteViaTmp(fullPath, content);
   }
 
   async appendToFile(relativePath: string, content: string): Promise<void> {

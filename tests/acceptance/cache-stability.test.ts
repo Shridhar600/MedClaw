@@ -3,11 +3,6 @@ import type { WorkspaceReader, SafetyReader } from '../../src/context2';
 import type { AssemblerRecall } from '../../src/context2/assembler';
 import type { Clock } from '../../src/ports';
 
-// P2 E2.4 / PLAT-22 — prefix-cache friendliness. The cacheStable prefix (SAFETY + L2 skeleton) must be
-// BYTE-IDENTICAL across consecutive same-mode turns even when the clock advances and recall changes,
-// so the provider's prefix cache stays warm. Only the volatile tail (ACTIVE FACTS / RECALL / RUNTIME)
-// moves. We assert stability and log the cache-hit ratio (prefix bytes / total bytes).
-
 const SKELETON: Record<string, string> = {
   'SOUL.md': '# Soul\nYou are a careful health companion.',
   'USER.md': '# User\nName: Arjun. Timezone: Asia/Kolkata.',
@@ -26,7 +21,7 @@ function prefixOf(report: { sections: { content: string }[]; cacheBoundaryIndex:
   return report.sections.slice(0, report.cacheBoundaryIndex).map(s => s.content).join('\n');
 }
 
-describe('P2 cache-hit stability (PLAT-22)', () => {
+describe('cache-hit stability', () => {
   it('keeps the cacheStable prefix byte-identical across turns as the clock + recall change', async () => {
     const clock = mutableClock('2026-08-24T09:00:00.000Z');
     const assembler = new ContextAssembler({ reader, safety, maxChars: 20000, clock });
@@ -43,18 +38,16 @@ describe('P2 cache-hit stability (PLAT-22)', () => {
     expect(p2).toBe(p1); // byte-identical cached prefix
     expect(report1.sections.slice(0, report1.cacheBoundaryIndex).every(s => s.cacheStable)).toBe(true);
 
-    // The volatile tail actually differs (proves the boundary is doing work, not that nothing changed).
     expect(report2.content).not.toBe(report1.content);
 
-    // Cache-hit ratio: fraction of the assembled prompt that stayed in the warm prefix.
     const ratio = p2.length / report2.content.length;
     // eslint-disable-next-line no-console
-    console.log(`[cache-metric] PLAT-22 prefix-stable=${p2.length}B / total=${report2.content.length}B → cache-hit ratio ${(ratio * 100).toFixed(1)}%`);
+    console.log(`[cache-metric] prefix-stable=${p2.length}B / total=${report2.content.length}B → cache-hit ratio ${(ratio * 100).toFixed(1)}%`);
     expect(ratio).toBeGreaterThan(0);
     expect(ratio).toBeLessThanOrEqual(1);
   });
 
-  it('no clock-derived text leaks into the cached prefix (PLAT-22)', async () => {
+  it('no clock-derived text leaks into the cached prefix', async () => {
     const clock = mutableClock('2026-08-24T09:00:00.000Z');
     const assembler = new ContextAssembler({ reader, safety, maxChars: 20000, clock });
     const report = await assembler.assemble('default', 'chat', { ledger: '', hits: [], checkNotes: '' });

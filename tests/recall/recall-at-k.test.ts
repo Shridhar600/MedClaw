@@ -2,14 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { RecallEngine, DEFAULT_RECALL_CONFIG } from '../../src/recall';
 import type { FactRecord, ChunkWithScore } from '../../src/ports';
-import { FakeFactMirror, FakeVectorIndex, FakeKeywordIndex, FakeEmbedding, FakeChunkStats, fixedClock } from './fakes';
-
-// P2 Wave B / Task B3.2 — golden recall@k measurement (the R3 minimum). Deterministic: mocked/
-// frozen scores (no live Ollama) + injected clock (fixed ageDays). Expected ids are authored from
-// SCENARIO semantics (specs/09 style), NOT from whatever the engine returns today — so the suite
-// catches a systematic scoring/threshold/suppression bug, not snapshot drift. ≥50% of cases come
-// from OUTSIDE the knee/diabetes families (risk #9). The per-case floor (recall@3 = 1.0 for these
-// curated cases) is the regression baseline; retune consciously.
+import { FakeFactMirror, currentFactsOf, FakeVectorIndex, FakeKeywordIndex, FakeEmbedding, FakeChunkStats, fixedClock } from './fakes';
 
 interface FixtureChunk {
   id: string; content: string; lane: string; createdAt: string; cosine: number; bm25n: number;
@@ -56,11 +49,13 @@ describe('recall@k golden set (measurement minimum)', () => {
   const mrrs: number[] = [];
 
   it.each(fixtures.map(f => [f.name, f] as const))('%s — expected chunks in top-3', async (_name, f) => {
+    const factMirror = new FakeFactMirror(f.facts.map(frec));
     const engine = new RecallEngine({
+      factMirror,
+      currentFacts: currentFactsOf(factMirror),
       embedding: new FakeEmbedding(f.degrade ? { throwErr: true } : { vector: [0.1, 0.2, 0.3] }),
       vectorIndex: new FakeVectorIndex(f.chunks.map(c => toHit(c, c.cosine))),
       keywordIndex: new FakeKeywordIndex(f.chunks.map(c => toHit(c, c.bm25n))),
-      factMirror: new FakeFactMirror(f.facts.map(frec)),
       chunkStats: new FakeChunkStats(),
       clock: fixedClock(f.clock),
       config: DEFAULT_RECALL_CONFIG,

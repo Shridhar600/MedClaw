@@ -1,8 +1,7 @@
-// src/providers/ollama.ts
 import type { ImageAttachment, LLMProvider, LLMResponse, Message, TokenUsage, ToolSchema } from './types';
 import type { ProviderConfig } from '../config/types';
+import { PROVIDER_REQUEST_TIMEOUT_MS, firstChoice, parseToolArguments } from './request';
 
-/** Map the OpenAI-compat wire `usage` object onto our TokenUsage (undefined when absent). */
 function toTokenUsage(usage: {
   prompt_tokens?: number;
   completion_tokens?: number;
@@ -25,7 +24,7 @@ export class OllamaProvider implements LLMProvider {
   private baseUrl: string;
   private model: string;
 
-  constructor(config: ProviderConfig) {
+  constructor(config: ProviderConfig, private readonly timeoutMs = PROVIDER_REQUEST_TIMEOUT_MS) {
     this.baseUrl = config.baseUrl ?? 'http://localhost:11434/v1';
     this.model = config.model;
     this.modelName = config.model;
@@ -44,6 +43,7 @@ export class OllamaProvider implements LLMProvider {
     const response = await fetch(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(this.timeoutMs),
       body: JSON.stringify(body),
     });
 
@@ -72,7 +72,7 @@ export class OllamaProvider implements LLMProvider {
       };
     };
 
-    const message = data.choices[0].message;
+    const message = firstChoice(data.choices).message;
     const usage = toTokenUsage(data.usage);
 
     if (message.tool_calls && message.tool_calls.length > 0) {
@@ -81,7 +81,7 @@ export class OllamaProvider implements LLMProvider {
         toolCalls: message.tool_calls.map((tc) => ({
           id: tc.id,
           name: tc.function.name,
-          arguments: JSON.parse(tc.function.arguments) as Record<string, unknown>,
+          arguments: parseToolArguments(tc.function.arguments),
         })),
         usage,
       };
@@ -103,6 +103,7 @@ export class OllamaProvider implements LLMProvider {
     const response = await fetch(`${this.nativeBaseUrl()}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(this.timeoutMs),
       body: JSON.stringify({
         model: this.model,
         messages: requestMessages,
@@ -133,7 +134,7 @@ export class OllamaProvider implements LLMProvider {
           id: tc.id ?? `ollama_vision_tool_call_${i}`,
           name: tc.function.name,
           arguments: typeof tc.function.arguments === 'string'
-            ? JSON.parse(tc.function.arguments) as Record<string, unknown>
+            ? parseToolArguments(tc.function.arguments)
             : tc.function.arguments,
         })),
       };
@@ -146,6 +147,7 @@ export class OllamaProvider implements LLMProvider {
     const response = await fetch(`${this.baseUrl}/embeddings`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(this.timeoutMs),
       body: JSON.stringify({ model: this.model, input: text }),
     });
 
@@ -155,7 +157,7 @@ export class OllamaProvider implements LLMProvider {
     }
 
     const data = await response.json() as { data: Array<{ embedding: number[] }> };
-    return data.data[0].embedding;
+    return firstChoice(data.data).embedding;
   }
 
   private nativeBaseUrl(): string {

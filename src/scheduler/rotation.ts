@@ -38,9 +38,6 @@ export function rotateFileIfNeeded(filePath: string, config?: Partial<RotationCo
     }
   }
 
-  // Rename-first: move the active file out of the way so concurrent
-  // appenders can recreate the original path safely while we compress
-  // the staged content.
   const stagingPath = filePath + '.rotating';
   fs.renameSync(filePath, stagingPath);
 
@@ -51,13 +48,10 @@ export function rotateFileIfNeeded(filePath: string, config?: Partial<RotationCo
     fs.unlinkSync(stagingPath);
     return true;
   } catch (error) {
-    // Restore the staged file back to the original path so no data is lost.
+    // Restore the staged file; if even that fails it stays as `<file>.rotating` for manual recovery.
     try {
       fs.renameSync(stagingPath, filePath);
-    } catch {
-      // If even the restore fails, there is nothing more we can safely do
-      // here; the staging file is left on disk for manual recovery.
-    }
+    } catch { /* leaves stagingPath in place */ }
     return false;
   }
 }

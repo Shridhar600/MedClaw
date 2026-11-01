@@ -26,13 +26,12 @@ jest.mock('pdf-parse', () => {
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { createMedicalTools, type MedicalContextProvider } from '../../src/tools/medical-tools';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import type { LLMProvider, LLMResponse, TextResponse } from '../../src/providers/types';
 import type { Tool } from '../../src/tools/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
-// Mock LLMProvider factory
 function createMockProvider(responses: TextResponse[], options: { vision?: boolean } = {}): LLMProvider {
   let callCount = 0;
   const provider: LLMProvider = {
@@ -131,10 +130,9 @@ describe('Medical Tools', () => {
   let mockSearch: MedicalContextProvider;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-medical-tools-'));
+    tmpDir = makeTestTemp('redacted-medical-tools-');
     engine = new MemoryEngine(tmpDir);
 
-    // Set up workspace files for health context
     fs.mkdirSync(path.join(tmpDir, 'conditions'), { recursive: true });
     fs.writeFileSync(
       path.join(tmpDir, 'SOUL.md'),
@@ -221,7 +219,6 @@ describe('Medical Tools', () => {
 
       expect(result.isError).toBeFalsy();
       expect(result.content[0].text).toContain('Medical response');
-      // Verify medical provider was called
       expect(mockMedicalProvider.chat).toHaveBeenCalled();
     });
 
@@ -355,7 +352,6 @@ describe('Medical Tools', () => {
     });
 
     it('calls medical provider with report content', async () => {
-      // Create a mock report file
       const reportsDir = path.join(tmpDir, 'reports');
       fs.mkdirSync(reportsDir, { recursive: true });
       const reportPath = path.join(reportsDir, 'test-report.txt');
@@ -374,7 +370,6 @@ describe('Medical Tools', () => {
 
       expect(result.isError).toBeFalsy();
       expect(mockMedicalProvider.chat).toHaveBeenCalled();
-      // The medical provider should receive the report content
       const chatCalls = (mockMedicalProvider.chat as jest.Mock).mock.calls;
       expect(chatCalls.length).toBeGreaterThan(0);
       const messages = chatCalls[0][0];
@@ -520,7 +515,7 @@ describe('Medical Tools', () => {
       expect(mockMainProvider.chat).not.toHaveBeenCalled();
     });
 
-    it('does not echo a raw provider error message into the analyze-report result (F-2 PHI split)', async () => {
+    it('does not echo a raw provider error message into the analyze-report result (PHI split)', async () => {
       const reportPath = path.join(tmpDir, 'reports');
       fs.mkdirSync(reportPath, { recursive: true });
       fs.writeFileSync(path.join(reportPath, 'photo.png'), Buffer.from('iVBORw0KGgo=', 'base64'));

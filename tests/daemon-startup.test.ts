@@ -1,13 +1,13 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
+import { makeTestTemp } from './helpers/test-temp';
 
 describe('daemon startup config guard', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-daemon-startup-'));
+    tmpDir = makeTestTemp('redacted-daemon-startup-');
   });
 
   afterEach(() => {

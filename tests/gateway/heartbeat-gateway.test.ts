@@ -1,44 +1,37 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { SessionManager } from '../../src/gateway/session';
-import type { AppConfig } from '../../src/config/types';
-import type { ProfileId } from '../../src/profiles/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { HeartbeatJob } from '../../src/scheduler/types';
 import { HeartbeatStore } from '../../src/scheduler/store';
 import { HeartbeatScheduler } from '../../src/scheduler/runtime';
-import { ProfileRegistry } from '../../src/profiles/registry';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
+import {} from '../helpers/test-config';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('Gateway heartbeat integration', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-heartbeat-gateway-'));
+    tmpDir = makeTestTemp('redacted-heartbeat-gateway-');
   });
 
   afterEach(() => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  /**
-   * RR2-B1 setup migration: the dispatch handler requires an explicit owner runtime, and the
-   * destination guard reads the gateway's profile registry. Fixture: pair the job's chat to
-   * the attached runtime's profile so the valid-job assertions keep their original meaning.
-   */
-  function pairChatToDefaultRuntime(gateway: Gateway, chatId: string): void {
-    const baseDir = path.join(tmpDir, 'profiles-base');
-    fs.mkdirSync(baseDir, { recursive: true });
-    const registry = new ProfileRegistry(baseDir);
-    registry.getOrCreateDefaultProfile();
-    registry.pairChatToProfile(chatId, 'default' as ProfileId);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).profileRegistry = registry;
+  async function boundGateway(config: EffectiveConfig): Promise<Gateway> {
+    const owner = await bindOwnerFixture(fixtureOwner(tmpDir).ownerRecord, fixtureOwner(tmpDir).ownerId, 'chat-1');
+    return new Gateway(config, owner.gatewayDeps);
   }
 
-  function makeConfig(overrides?: Partial<AppConfig>): AppConfig {
+  function makeConfig(overrides?: Partial<EffectiveConfig>): EffectiveConfig {
     return {
+    schemaVersion: 2,
+    ...ownerSelection(fixtureOwner(tmpDir)),
       providers: {
         main: { type: 'ollama', model: 'qwen3.5:9b', baseUrl: 'http://localhost:11434/v1' },
         medical: { type: 'ollama', model: 'qwen3.5:9b', baseUrl: 'http://localhost:11434/v1' },
@@ -47,23 +40,21 @@ describe('Gateway heartbeat integration', () => {
       channels: { telegram: { enabled: false, botToken: '' } },
       tools: { allow: ['*'], deny: [] },
       memory: {
-        workspace: path.join(tmpDir, 'workspace'),
+        workspace: fixtureOwner(tmpDir).workspace,
         search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
         bootstrapMaxChars: 20000,
       },
       sessions: {
-        softResetAfterMinutes: 240,
-        hardResetAfterMinutes: 1440,
-        compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+        compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
       },
       heartbeat: {
         enabled: true,
         timezone: 'Asia/Kolkata',
-        storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+        storePath: fixtureOwner(tmpDir).storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 3, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-        audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+        audit: { path: fixtureOwner(tmpDir).auditLogPath },
         policy: {
           quietHours: { enabled: true, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,
@@ -73,7 +64,7 @@ describe('Gateway heartbeat integration', () => {
           },
         },
       },
-      agent: { maxIterations: 15, disclaimerEnabled: true },
+      agent: { maxIterations: 15 },
       ...overrides,
     };
   }
@@ -83,11 +74,11 @@ describe('Gateway heartbeat integration', () => {
       heartbeat: {
         enabled: true,
         timezone: 'Asia/Kolkata',
-        storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+        storePath: fixtureOwner(tmpDir).storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 3, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-        audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+        audit: { path: fixtureOwner(tmpDir).auditLogPath },
         policy: {
           quietHours: { enabled: false, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,
@@ -98,7 +89,7 @@ describe('Gateway heartbeat integration', () => {
         },
       },
     });
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     const runtime = attachGatewayTestRuntime(gateway, config);
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn().mockResolvedValue({
@@ -107,7 +98,7 @@ describe('Gateway heartbeat integration', () => {
       usedTools: [],
       healthResponse: false,
     });
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send };
@@ -133,7 +124,6 @@ describe('Gateway heartbeat integration', () => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
-    pairChatToDefaultRuntime(gateway, job.chatId);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleScheduledJob(job, runtime);
@@ -151,11 +141,11 @@ describe('Gateway heartbeat integration', () => {
       heartbeat: {
         enabled: false,
         timezone: 'Asia/Kolkata',
-        storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+        storePath: fixtureOwner(tmpDir).storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 3, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-        audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+        audit: { path: fixtureOwner(tmpDir).auditLogPath },
         policy: {
           quietHours: { enabled: true, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,
@@ -166,7 +156,7 @@ describe('Gateway heartbeat integration', () => {
         },
       },
     });
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     attachGatewayTestRuntime(gateway, config);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
@@ -192,17 +182,14 @@ describe('Gateway heartbeat integration', () => {
       policyKey: 'defaults:morning-check-in',
     });
 
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     attachGatewayTestRuntime(gateway, config);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).agentLoop = { run: jest.fn() };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
-    // RR2-B1 setup migration: the guarded policy reconcile refuses unpaired chats; pair
-    // the persisted job's chat so the HEARTBEAT.md sync assertions keep their meaning.
-    pairChatToDefaultRuntime(gateway, 'chat-1');
+    (gateway as any).sessions = new SessionManager(path.join(tmpDir, 'sessions'));
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).initializeScheduler();
@@ -217,7 +204,7 @@ describe('Gateway heartbeat integration', () => {
 
   it('does not send a scheduled message when delivery policy suppresses it', async () => {
     const config = makeConfig();
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     const runtime = attachGatewayTestRuntime(gateway, config);
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn().mockResolvedValue({
@@ -241,7 +228,6 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
-    pairChatToDefaultRuntime(gateway, 'chat-1');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send };
@@ -276,11 +262,11 @@ describe('Gateway heartbeat integration', () => {
       heartbeat: {
         enabled: true,
         timezone: 'Asia/Kolkata',
-        storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+        storePath: fixtureOwner(tmpDir).storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 3, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-        audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+        audit: { path: fixtureOwner(tmpDir).auditLogPath },
         policy: {
           quietHours: { enabled: false, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,
@@ -291,7 +277,7 @@ describe('Gateway heartbeat integration', () => {
         },
       },
     });
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     const runtime = attachGatewayTestRuntime(gateway, config);
     const send = jest.fn().mockResolvedValue(undefined);
     const run = jest.fn().mockResolvedValue({
@@ -300,7 +286,7 @@ describe('Gateway heartbeat integration', () => {
       usedTools: [],
       healthResponse: false,
     });
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
       async () => undefined,
@@ -316,7 +302,6 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
-    pairChatToDefaultRuntime(gateway, 'chat-1');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send };
@@ -349,19 +334,16 @@ describe('Gateway heartbeat integration', () => {
       'utf8',
     );
 
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     attachGatewayTestRuntime(gateway, config);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).agentLoop = { run: jest.fn().mockResolvedValue({ text: 'ok', trace: [] }) };
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
     await sessions.recordTurn('chat-1', [{ role: 'user', content: 'Seed startup chat.' }]);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).sessions = sessions;
-    // RR2-B1 setup migration: the guarded policy reconcile refuses unpaired chats; pair
-    // the startup chat so the policy-job creation assertions keep their meaning.
-    pairChatToDefaultRuntime(gateway, 'chat-1');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).initializeScheduler();
@@ -387,11 +369,11 @@ describe('Gateway heartbeat integration', () => {
       heartbeat: {
         enabled: true,
         timezone: 'Asia/Kolkata',
-        storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+        storePath: fixtureOwner(tmpDir).storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 3, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-        audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+        audit: { path: fixtureOwner(tmpDir).auditLogPath },
         policy: {
           quietHours: { enabled: false, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,
@@ -402,9 +384,9 @@ describe('Gateway heartbeat integration', () => {
         },
       },
     });
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     const runtime = attachGatewayTestRuntime(gateway, config);
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
@@ -425,7 +407,6 @@ describe('Gateway heartbeat integration', () => {
     await sessions.recordTurn('chat-1', [{ role: 'user', content: 'Seed policy chat.' }]);
     const sessionState = sessions.getOrCreateSessionState('chat-1');
     sessionState.lastActiveAt = new Date(Date.now() - (2 * 60 * 60 * 1000));
-    pairChatToDefaultRuntime(gateway, 'chat-1');
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).initializeScheduler();
 
@@ -459,11 +440,11 @@ describe('Gateway heartbeat integration', () => {
       heartbeat: {
         enabled: true,
         timezone: 'Asia/Kolkata',
-        storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+        storePath: fixtureOwner(tmpDir).storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 3, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-        audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+        audit: { path: fixtureOwner(tmpDir).auditLogPath },
         policy: {
           quietHours: { enabled: false, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,
@@ -474,9 +455,9 @@ describe('Gateway heartbeat integration', () => {
         },
       },
     });
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     const runtime = attachGatewayTestRuntime(gateway, config);
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
       async () => undefined,
@@ -497,7 +478,6 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
-    pairChatToDefaultRuntime(gateway, 'chat-1');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockRejectedValue(new Error('send failed')) };
@@ -531,11 +511,11 @@ describe('Gateway heartbeat integration', () => {
       heartbeat: {
         enabled: true,
         timezone: 'Asia/Kolkata',
-        storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+        storePath: fixtureOwner(tmpDir).storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 2, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-        audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+        audit: { path: fixtureOwner(tmpDir).auditLogPath },
         policy: {
           quietHours: { enabled: false, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,
@@ -546,9 +526,9 @@ describe('Gateway heartbeat integration', () => {
         },
       },
     });
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     const runtime = attachGatewayTestRuntime(gateway, config);
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
       async () => undefined,
@@ -569,7 +549,6 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
-    pairChatToDefaultRuntime(gateway, 'chat-1');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockRejectedValue(new Error('send failed')) };
@@ -606,11 +585,11 @@ describe('Gateway heartbeat integration', () => {
       heartbeat: {
         enabled: true,
         timezone: 'Asia/Kolkata',
-        storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+        storePath: fixtureOwner(tmpDir).storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 2, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-        audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+        audit: { path: fixtureOwner(tmpDir).auditLogPath },
         policy: {
           quietHours: { enabled: false, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,
@@ -621,9 +600,9 @@ describe('Gateway heartbeat integration', () => {
         },
       },
     });
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     const runtime = attachGatewayTestRuntime(gateway, config);
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
       async (job) => {
@@ -646,7 +625,6 @@ describe('Gateway heartbeat integration', () => {
       source: 'system',
       kind: 'routine',
     });
-    pairChatToDefaultRuntime(gateway, 'chat-1');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockRejectedValue(new Error('send failed')) };
@@ -680,11 +658,11 @@ describe('Gateway heartbeat integration', () => {
       heartbeat: {
         enabled: true,
         timezone: 'Asia/Kolkata',
-        storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+        storePath: fixtureOwner(tmpDir).storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 1, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-        audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+        audit: { path: fixtureOwner(tmpDir).auditLogPath },
         policy: {
           quietHours: { enabled: false, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,
@@ -695,9 +673,9 @@ describe('Gateway heartbeat integration', () => {
         },
       },
     });
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     const runtime = attachGatewayTestRuntime(gateway, config);
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
       async () => undefined,
@@ -718,7 +696,6 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
-    pairChatToDefaultRuntime(gateway, 'chat-1');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockRejectedValue(new Error('send failed')) };
@@ -746,8 +723,6 @@ describe('Gateway heartbeat integration', () => {
 
     const refreshed = await scheduler.getStore().get(job.id);
     expect(refreshed?.deliveryState).toBe('dead-letter');
-    // lastError/deadLetterReason are persisted to disk and must be PHI-safe:
-    // summarizeErrorForLog keeps the error name but strips the message body.
     expect(refreshed?.deadLetterReason).toContain('Error');
     expect(refreshed?.deadLetterReason).not.toContain('send failed');
 
@@ -796,14 +771,14 @@ describe('Gateway heartbeat integration', () => {
       deadLetterReason: 'retry budget exhausted',
     });
 
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     attachGatewayTestRuntime(gateway, config);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).agentLoop = { run: jest.fn().mockResolvedValue({ text: 'ok', trace: [] }) };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    (gateway as any).sessions = new SessionManager(path.join(tmpDir, 'sessions'));
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).initializeScheduler();
@@ -832,11 +807,11 @@ describe('Gateway heartbeat integration', () => {
         heartbeat: {
           enabled: true,
           timezone: 'UTC',
-          storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+          storePath: fixtureOwner(tmpDir).storePath,
           recovery: { enabled: true, windowMinutes: 60 },
           retry: { maxRetries: 2, backoffMinutes: 5 },
           rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-          audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+          audit: { path: fixtureOwner(tmpDir).auditLogPath },
           policy: {
             quietHours: { enabled: false, start: '22:00', end: '07:00' },
             skipIfChatActiveWithinMinutes: 60,
@@ -860,7 +835,7 @@ describe('Gateway heartbeat integration', () => {
       });
       jest.setSystemTime(new Date('2026-04-19T08:30:00.000Z'));
 
-      const gateway = new Gateway(config);
+      const gateway = await boundGateway(config);
       attachGatewayTestRuntime(gateway, config);
       const send = jest.fn().mockResolvedValue(undefined);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -875,8 +850,7 @@ describe('Gateway heartbeat integration', () => {
         }),
       };
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (gateway as any).sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
-      pairChatToDefaultRuntime(gateway, 'chat-1');
+      (gateway as any).sessions = new SessionManager(path.join(tmpDir, 'sessions'));
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await (gateway as any).initializeScheduler();
@@ -896,11 +870,11 @@ describe('Gateway heartbeat integration', () => {
       heartbeat: {
         enabled: true,
         timezone: 'UTC',
-        storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+        storePath: fixtureOwner(tmpDir).storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 2, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 1, maxPerChatTriggersPerMinute: 1 },
-        audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+        audit: { path: fixtureOwner(tmpDir).auditLogPath },
         policy: {
           quietHours: { enabled: false, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,
@@ -911,10 +885,10 @@ describe('Gateway heartbeat integration', () => {
         },
       },
     });
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     const runtime = attachGatewayTestRuntime(gateway, config);
     const send = jest.fn().mockResolvedValue(undefined);
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
       async (job) => {
@@ -967,7 +941,6 @@ describe('Gateway heartbeat integration', () => {
     (gateway as any).sessions = sessions;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).scheduler = scheduler;
-    pairChatToDefaultRuntime(gateway, 'chat-1');
 
     await scheduler.runNow(firstJob.id);
     await scheduler.runNow(secondJob.id);

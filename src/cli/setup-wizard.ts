@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { buildReadinessSummaryLines, showRedactedConfigSummary } from './admin';
+import { buildReadinessSummaryLines, printableEndpoint, showRedactedConfigSummary } from './admin';
 import type { CliIO } from './prompts';
 import { askYesNo } from './prompts';
 import {
@@ -9,11 +9,15 @@ import {
   modelDefaultsForProvider,
   persistSetupArtifacts,
   providerLabel,
+  requireHttpEndpoint,
   SUPPORTED_ONBOARDING_PROVIDERS,
+  requireOwnerId,
   resolveNonInteractiveArgs,
   resolveSetupPath,
   requiredCloudEnv,
-} from './service-onboarding';
+} from './setup-config';
+import { OPENROUTER_DEFAULT_BASE_URL } from '../providers';
+import { LOCAL_OLLAMA_BASE_URL, validateConfig } from '../config';
 import {
   getMissingOllamaModels,
   verifyTelegramRuntime,
@@ -32,9 +36,10 @@ import {
 import type { SetupWizardState, CompletionAction, ReviewAction } from './wizard-types';
 import { checkSystemReadiness } from '../providers/healthcheck';
 import { probeOllamaCatalog } from '../providers/healthcheck';
-import { validateConfig } from '../config/validation';
-import type { AppConfig, ProviderConfig } from '../config/types';
+import type { EffectiveConfig, ProviderConfig } from '../config';
+import type { ServiceOnboardingArgs } from './setup-config';
 import { listWorkspaceTemplateFiles } from '../workspace/bootstrap';
+import { resolveOwnerPaths } from '../profiles';
 
 const TOTAL_STEPS = 5;
 
@@ -45,16 +50,13 @@ function shouldRunLiveChecks(io: CliIO, options?: SetupReadinessDependencies): b
   if (io.input) {
     return false; // injected IO (unit tests / programmatic callers)
   }
-  // Live network checks only for a real interactive terminal. A piped stdin
-  // (scripted onboard, CI) cannot answer validation re-prompts, and the
-  // checks would make non-interactive runs depend on network reachability.
   return process.stdin.isTTY === true;
 }
 
-function validateWritablePath(targetPath: string, kind: 'workspace' | 'config'): string[] {
+function validateWritablePath(targetPath: string, kind: 'state' | 'config'): string[] {
   const errors: string[] = [];
   try {
-    const directory = kind === 'workspace' ? targetPath : path.dirname(targetPath);
+    const directory = kind === 'state' ? targetPath : path.dirname(targetPath);
     let probeDirectory = directory;
     while (!fs.existsSync(probeDirectory)) {
       const parent = path.dirname(probeDirectory);
@@ -70,7 +72,7 @@ function validateWritablePath(targetPath: string, kind: 'workspace' | 'config'):
     fs.accessSync(probeDirectory, fs.constants.W_OK);
   } catch (error) {
     errors.push(
-      `${kind === 'workspace' ? 'Workspace' : 'Config directory'} is not writable: ${
+      `${kind === 'state' ? 'Owner state' : 'Config directory'} is not writable: ${
         error instanceof Error ? error.message : String(error)
       }`,
     );
@@ -78,14 +80,20 @@ function validateWritablePath(targetPath: string, kind: 'workspace' | 'config'):
   return errors;
 }
 
-function stateToArgs(state: SetupWizardState) {
+function stateToArgs(state: SetupWizardState): ServiceOnboardingArgs {
   return resolveNonInteractiveArgs({
     configPath: state.configPath,
-    workspace: state.workspace,
+    stateRoot: state.stateRoot,
+    ownerId: state.ownerId,
     provider: state.provider,
     mainModel: state.mainModel,
     medicalModel: state.medicalModel,
+    medicalProvider: state.medicalProvider,
+    medicalApiKey: state.medicalApiKey,
+    embeddingProvider: state.embeddingProvider,
     embeddingModel: state.embeddingModel,
+    embeddingUrl: state.embeddingUrl,
+    embeddingApiKey: state.embeddingApiKey,
     ollamaUrl: state.ollamaUrl,
     apiKey: state.apiKey,
     telegramEnabled: state.telegramEnabled,
@@ -101,7 +109,7 @@ async function buildReviewStateWithOptions(
   options: SetupReadinessDependencies = {},
 ): Promise<{
   args: ReturnType<typeof stateToArgs>;
-  config: AppConfig;
+  config: EffectiveConfig;
   validation: ReturnType<typeof validateConfig>;
   readiness: Awaited<ReturnType<typeof checkSystemReadiness>>;
   errors: string[];
@@ -128,17 +136,29 @@ async function runEnvironmentStep(io: CliIO, state: SetupWizardState): Promise<v
   renderStatus(io, 'OK', 'Setup wizard is ready');
 }
 
-async function runWorkspaceStep(io: CliIO, state: SetupWizardState): Promise<void> {
-  renderStepHeader(io, 2, TOTAL_STEPS, 'Workspace');
-  state.workspace = resolveSetupPath(await askValue(io, 'Workspace path', state.workspace));
-  const pathErrors = validateWritablePath(state.workspace, 'workspace');
+async function runStateStep(io: CliIO, state: SetupWizardState): Promise<void> {
+  renderStepHeader(io, 2, TOTAL_STEPS, 'Owner state');
+
+  state.stateRoot = resolveSetupPath(await askValue(io, 'Owner state root', state.stateRoot));
+  state.ownerId = (await askValue(io, 'Owner ID', state.ownerId)).trim();
+
+  try {
+    requireOwnerId(state.ownerId);
+    state.ownerId = state.ownerId.trim();
+  } catch (error) {
+    renderStatus(io, 'WARN', error instanceof Error ? error.message : String(error));
+  }
+
+  const ownerPaths = resolveOwnerPaths(state.stateRoot, requireOwnerId(state.ownerId));
+  const pathErrors = validateWritablePath(state.stateRoot, 'state');
   if (pathErrors.length === 0) {
-    renderStatus(io, 'OK', 'Workspace directory is writable.');
+    renderStatus(io, 'OK', 'Owner state directory is writable.');
   } else {
     for (const error of pathErrors) {
       renderStatus(io, 'WARN', error);
     }
   }
+  renderStatus(io, 'INFO', `Derived owner workspace: ${ownerPaths.workspace}`);
   renderStatus(io, 'INFO', `Template files: ${listWorkspaceTemplateFiles().join(', ')}`);
 }
 
@@ -155,13 +175,10 @@ async function runProviderStep(io: CliIO, state: SetupWizardState): Promise<void
   if (state.provider !== previousProvider) {
     const defaults = modelDefaultsForProvider(state.provider);
     state.mainModel = defaults.main;
-    state.medicalModel = defaults.medical;
-    state.embeddingModel = defaults.embeddings;
+    state.apiKey = undefined;
+    // Keep the local role endpoint: medical may still use it when main becomes cloud.
     if (state.provider === 'ollama') {
-      state.ollamaUrl = state.ollamaUrl ?? 'http://localhost:11434/v1';
-      state.apiKey = undefined;
-    } else {
-      state.ollamaUrl = undefined;
+      state.ollamaUrl = state.ollamaUrl ?? LOCAL_OLLAMA_BASE_URL;
     }
   }
 
@@ -182,10 +199,126 @@ async function runProviderStep(io: CliIO, state: SetupWizardState): Promise<void
 
   state.mainModel = await askValue(io, 'Main model', state.mainModel);
   state.medicalModel = await askValue(io, 'Medical model', state.medicalModel);
-  state.embeddingModel = await askValue(io, 'Embedding model', state.embeddingModel);
+
+  const medicalProvider = state.medicalProvider ?? 'ollama';
+  if (medicalProvider !== 'ollama') {
+    const requiredEnv = requiredCloudEnv(medicalProvider);
+    if (!state.medicalApiKey?.trim() && process.env[requiredEnv]?.trim()) {
+      renderStatus(io, 'INFO', `Using ${requiredEnv} from the environment for medical.`);
+    } else {
+      for (;;) {
+        state.medicalApiKey = await askSecret(io, `${providerLabel(medicalProvider)} medical API key`, state.medicalApiKey ?? '');
+        if (state.medicalApiKey?.trim()) break;
+        renderStatus(io, 'WARN', `${requiredEnv} or a pasted medical API key is required.`);
+      }
+    }
+  }
 
   if (state.provider === 'ollama') {
-    state.ollamaUrl = await askValue(io, 'Ollama URL', state.ollamaUrl ?? 'http://localhost:11434/v1');
+    state.ollamaUrl = await askEndpointValue(
+      io,
+      'Ollama URL',
+      state.ollamaUrl,
+      LOCAL_OLLAMA_BASE_URL,
+    );
+  }
+}
+
+async function askEndpointValue(
+  io: CliIO,
+  prompt: string,
+  current: string | undefined,
+  fallback: string,
+): Promise<string> {
+  const source = current ?? fallback;
+  const visibleDefault = printableEndpoint(source, fallback);
+  const answer = await askValue(io, prompt, visibleDefault);
+  if (answer === visibleDefault) {
+    return source;
+  }
+  return answer;
+}
+
+async function runEmbeddingStep(io: CliIO, state: SetupWizardState): Promise<void> {
+  renderSectionHeader(io, 'Embedding role (independent of the chat provider)');
+  const previous = state.embeddingProvider;
+  state.embeddingProvider = await askChoice<ProviderConfig['type']>(
+    io,
+    'Embedding provider',
+    SUPPORTED_ONBOARDING_PROVIDERS,
+    state.embeddingProvider,
+  );
+
+  if (state.embeddingProvider !== previous) {
+    state.embeddingModel = modelDefaultsForProvider(state.embeddingProvider).embeddings;
+    // A key and an endpoint belonging to the previous provider must not leak into the new role.
+    state.embeddingApiKey = undefined;
+    state.embeddingUrl = undefined;
+  }
+
+  if (state.embeddingProvider === 'ollama') {
+    for (;;) {
+      const answer = await askEndpointValue(
+        io,
+        'Local embedding URL',
+        state.embeddingUrl,
+        state.ollamaUrl ?? LOCAL_OLLAMA_BASE_URL,
+      );
+      // The same endpoint rule the non-interactive parser applies. An invalid answer re-prompts.
+      try {
+        state.embeddingUrl = requireHttpEndpoint('Embedding URL', answer);
+        break;
+      } catch (error) {
+        renderStatus(io, 'WARN', error instanceof Error ? error.message : String(error));
+      }
+    }
+  } else {
+    const requiredEnv = requiredCloudEnv(state.embeddingProvider);
+    const providerDefault =
+      state.embeddingProvider === 'openrouter' ? OPENROUTER_DEFAULT_BASE_URL : '';
+    for (;;) {
+      const answer = await askEndpointValue(
+        io,
+        'Embedding endpoint',
+        state.embeddingUrl,
+        providerDefault,
+      );
+      try {
+        // An empty endpoint is allowed here and means "use the provider's own default".
+        state.embeddingUrl = answer.trim() === ''
+          ? undefined
+          : requireHttpEndpoint('Embedding endpoint', answer);
+        break;
+      } catch (error) {
+        renderStatus(io, 'WARN', error instanceof Error ? error.message : String(error));
+      }
+    }
+    if (!process.env[requiredEnv]?.trim()) {
+      for (;;) {
+        state.embeddingApiKey = await askSecret(
+          io,
+          `${providerLabel(state.embeddingProvider)} embedding API key`,
+          state.embeddingApiKey ?? '',
+        );
+        if (state.embeddingApiKey?.trim()) {
+          break;
+        }
+        renderStatus(io, 'WARN', `${requiredEnv} or a pasted embedding API key is required.`);
+      }
+    } else {
+      renderStatus(io, 'INFO', `Using ${requiredEnv} from the environment for embeddings.`);
+    }
+  }
+
+  state.embeddingModel = await askValue(io, 'Embedding model', state.embeddingModel);
+
+  if (state.embeddingProvider !== 'ollama') {
+    renderStatus(
+      io,
+      'WARN',
+      'Remote embeddings send your text to a cloud endpoint. The recall latency budget '
+      + '(p50<=300ms / p95<=800ms) assumes local embeddings, and this is configured, not verified.',
+    );
   }
 }
 
@@ -217,10 +350,19 @@ async function runProviderChecks(
   }
 
   renderStatus(io, 'OK', 'Ollama reachable.');
-  const missingModels = getMissingOllamaModels(
-    [state.mainModel, state.medicalModel, state.embeddingModel],
-    runtime.models,
-  );
+  const mainUrl = state.ollamaUrl ?? LOCAL_OLLAMA_BASE_URL;
+  const modelsServedHere = [state.mainModel];
+  if ((state.medicalProvider ?? 'ollama') === 'ollama') {
+    modelsServedHere.push(state.medicalModel);
+  }
+  if (
+    state.embeddingProvider === 'ollama'
+    && (state.embeddingUrl ?? state.ollamaUrl ?? LOCAL_OLLAMA_BASE_URL) === mainUrl
+  ) {
+    modelsServedHere.push(state.embeddingModel);
+  }
+
+  const missingModels = getMissingOllamaModels(modelsServedHere, runtime.models);
   if (missingModels.length === 0) {
     renderStatus(io, 'OK', 'Selected Ollama models are installed.');
     return;
@@ -300,8 +442,19 @@ async function runReviewStep(
     { label: 'Workspace', value: review.config.memory.workspace },
     { label: 'Provider', value: review.config.providers.main.type },
     { label: 'Main model', value: review.config.providers.main.model },
+    { label: 'Medical provider', value: review.config.providers.medical.type },
     { label: 'Medical model', value: review.config.providers.medical.model },
+    { label: 'Medical key', value: review.config.providers.medical.apiKey ?? '', secret: true },
+    // The embedding role is reviewable as its own selection, not just a model name.
+    { label: 'Embedding provider', value: review.config.providers.embeddings.type },
     { label: 'Embedding model', value: review.config.providers.embeddings.model },
+    {
+      label: 'Embedding endpoint',
+      // Use the same sanitizer as the config summary so `user:password@` userinfo is never printed.
+      value: printableEndpoint(review.config.providers.embeddings.baseUrl, '(provider default)'),
+    },
+    // `secret: true` masks it through the shared renderer, so the embedding key is never echoed.
+    { label: 'Embedding key', value: review.config.providers.embeddings.apiKey ?? '', secret: true },
     { label: 'Telegram', value: review.config.channels.telegram.enabled ? 'enabled' : 'disabled' },
     { label: 'Telegram token', value: review.config.channels.telegram.botToken, secret: true },
     { label: 'Timezone', value: review.config.heartbeat.timezone },
@@ -332,11 +485,14 @@ async function runReviewStep(
 
 async function rerunSelectedStep(io: CliIO, state: SetupWizardState, action: ReviewAction): Promise<void> {
   switch (action) {
-    case 'workspace':
-      await runWorkspaceStep(io, state);
+    case 'state':
+      await runStateStep(io, state);
       return;
     case 'provider':
       await runProviderStep(io, state);
+      return;
+    case 'embeddings':
+      await runEmbeddingStep(io, state);
       return;
     case 'telegram':
       await runTelegramStep(io, state);
@@ -358,7 +514,7 @@ async function ensureReviewCanContinue(
 ): Promise<boolean> {
   const review = await buildReviewStateWithOptions(state, shouldRunLiveChecks(io, options), options);
   const pathErrors = [
-    ...validateWritablePath(state.workspace, 'workspace'),
+    ...validateWritablePath(state.stateRoot, 'state'),
     ...validateWritablePath(state.configPath, 'config'),
   ];
   const readinessFailures = [...review.readiness.providers, review.readiness.telegram]
@@ -388,7 +544,7 @@ async function ensureReviewCanContinue(
 
 async function runCompletionStep(
   io: CliIO,
-  config: AppConfig,
+  config: EffectiveConfig,
   configPath: string,
   options: SetupReadinessDependencies = {},
 ): Promise<CompletionAction> {
@@ -430,23 +586,25 @@ export async function runSetupWizard(
   io: CliIO,
   initial: SetupWizardState,
   options: SetupReadinessDependencies = {},
-): Promise<{ config?: AppConfig; action: CompletionAction; cancelled: boolean }> {
+): Promise<{ config?: EffectiveConfig; action: CompletionAction; cancelled: boolean }> {
   const state: SetupWizardState = {
     ...initial,
     configPath: resolveSetupPath(initial.configPath),
-    workspace: resolveSetupPath(initial.workspace),
+    stateRoot: resolveSetupPath(initial.stateRoot),
   };
 
   renderWizardBanner(io);
   await runEnvironmentStep(io, state);
-  await runWorkspaceStep(io, state);
+  await runStateStep(io, state);
   await runProviderStep(io, state);
   await runProviderChecks(io, state, options);
+  // A distinct step, so embeddings cannot be skipped and "Edit embeddings" re-entry uses the same path.
+  await runEmbeddingStep(io, state);
   await runTelegramStep(io, state);
   await runTelegramChecks(io, state, options);
   await runPreferencesStep(io, state);
 
-  let config: AppConfig | undefined;
+  let config: EffectiveConfig | undefined;
   let configPath: string | undefined;
   for (;;) {
     const action = await runReviewStep(io, state, options);
@@ -471,7 +629,7 @@ export async function runSetupWizard(
       break;
     } catch (error) {
       renderStatus(io, 'WARN', `Could not write setup files: ${error instanceof Error ? error.message : String(error)}`);
-      renderStatus(io, 'INFO', 'Adjust the workspace or config path and apply again.');
+      renderStatus(io, 'INFO', 'Apply again only with a fresh --state-root or --config target.');
     }
   }
 
