@@ -20,8 +20,6 @@ export type {
   OwnerStateRead,
   OwnerStateWriteResult,
   OwnerWriteReason,
-  PairingAttempts,
-  PairingCandidateChat,
   PairingCodePort,
   PairingResult,
   PairingResultKind,

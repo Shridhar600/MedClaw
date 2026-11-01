@@ -181,7 +181,6 @@ describe('owner enrollment: a record must exist before anything is served', () =
         ownerId: 'someone-else',
         createdAt: START.toISOString(),
         phase: 'unpaired',
-        attempts: { day: '2026-03-01', chats: [] },
       }),
       { mode: 0o600 },
     );
@@ -196,7 +195,6 @@ describe('owner enrollment: a record must exist before anything is served', () =
         version: 1,
         ownerId: OWNER_ID,
         createdAt: START.toISOString(),
-        attempts: { day: '2026-03-01', chats: [] },
       };
       if (phase !== undefined) document.phase = phase;
 
@@ -377,7 +375,7 @@ describe('owner enrollment: admission before any clinical work', () => {
   });
 });
 
-describe('owner enrollment: the attempt allowance is durable, reserved first, and daily', () => {
+describe('owner enrollment: the pairing allowance is per chat, per day, and in memory', () => {
   let root: string;
   let harness: Harness;
 
@@ -391,137 +389,69 @@ describe('owner enrollment: the attempt allowance is durable, reserved first, an
     removeTestTemp(root);
   });
 
-  async function issueCode(): Promise<string> {
-    const issued = await harness.reopen().issueChallenge();
+  async function issueCode(service = harness.reopen()): Promise<string> {
+    const issued = await service.issueChallenge();
     if (issued.kind !== 'issued') throw new Error('unreachable');
     return issued.plaintext;
   }
 
-  it('spends an attempt on a wrong code, so the allowance is reserved before verification', async () => {
+  it('allows three attempts per chat; the fourth is silent even with the right code until a restart', async () => {
     const service = harness.reopen();
-    await issueCode();
+    const code = await issueCode(service);
+    expect(await service.handlePairing(identity({ eventId: 'e1' }), WRONG_CODE)).toEqual({ kind: 'invalid' });
+    expect(await service.handlePairing(identity({ eventId: 'e2' }), 'hello, is anyone there?')).toEqual({ kind: 'prompt' });
+    expect(await service.handlePairing(identity({ eventId: 'e3' }), WRONG_CODE)).toEqual({ kind: 'invalid' });
 
-    expect(await service.handlePairing(identity({ eventId: 'e1' }), 'AAAAAAAA')).toEqual({
-      kind: 'invalid',
-    });
-
-    expect(harness.unpairedRecord()?.attempts.chats[0].attempts).toBe(1);
-  });
-
-  it('refuses the fourth attempt even when the code is correct, across a restart', async () => {
-    const service = harness.reopen();
-    const code = await issueCode();
-
-    for (const attempt of [1, 2, 3]) {
-      expect(await service.handlePairing(identity({ eventId: `e${attempt}` }), WRONG_CODE)).toEqual({
-        kind: 'invalid',
-      });
-    }
+    // A reissued code does not reset the allowance either.
+    const reissued = await issueCode(service);
+    expect(await service.handlePairing(identity({ eventId: 'e4' }), reissued)).toEqual({ kind: 'limited' });
     expect(harness.readRecord()?.phase).toBe('unpaired');
+    expect(code).not.toBe(reissued);
 
-    // Restart: a brand new service reading the same bytes must not hand out a 4th attempt.
-    const afterRestart = await harness.reopen().handlePairing(identity({ eventId: 'e4' }), code);
-
-    expect(afterRestart).toEqual({ kind: 'limited' });
-    expect(harness.readRecord()?.phase).toBe('unpaired');
-  });
-
-  it('gives a new UTC day a fresh allowance and expires the old rows', async () => {
-    const service = harness.reopen();
-    const code = await issueCode();
-    for (const attempt of [1, 2, 3]) {
-      await service.handlePairing(identity({ eventId: `e${attempt}` }), WRONG_CODE);
-    }
-    expect(await service.handlePairing(identity({ eventId: 'e4' }), code)).toEqual({ kind: 'limited' });
-
-    harness.clock.setTo(new Date('2026-03-02T10:00:00.000Z'));
-    const day2 = await harness.reopen().issueChallenge();
-    if (day2.kind !== 'issued') throw new Error('unreachable');
-
-    // A brand new day has a fresh allowance, so the 5th attempt of that day is judged on merit
-    // rather than refused by yesterday's exhausted limit.
-    expect(await harness.reopen().handlePairing(identity({ eventId: 'e5' }), day2.plaintext)).toEqual({
+    // The allowance lives in memory: a restarted daemon judges the next attempt on its merits.
+    expect(await harness.reopen().handlePairing(identity({ eventId: 'e5' }), reissued)).toEqual({
       kind: 'paired',
       boundOwnerId: OWNER_ID,
     });
   });
 
-  it('expires the previous day\'s rows rather than carrying the allowance forward', async () => {
-    const service = harness.reopen();
-    await issueCode();
-    for (const attempt of [1, 2, 3]) {
-      await service.handlePairing(identity({ eventId: `e${attempt}` }), WRONG_CODE);
-    }
-
-    harness.clock.setTo(new Date('2026-03-02T09:00:00.000Z'));
-    expect(await harness.reopen().handlePairing(identity({ eventId: 'e4' }), WRONG_CODE)).toEqual({
-      kind: 'invalid',
-    });
-
-    const record = harness.unpairedRecord();
-    expect(record?.attempts.day).toBe('2026-03-02');
-    expect(record?.attempts.chats).toHaveLength(1);
-    expect(record?.attempts.chats[0].attempts).toBe(1);
-  });
-
-  it('does not let a reissue reset today\'s allowance', async () => {
-    const service = harness.reopen();
-    for (const attempt of [1, 2, 3]) {
-      await service.handlePairing(identity({ eventId: `e${attempt}` }), WRONG_CODE);
-    }
-
-    const reissued = await service.issueChallenge();
-    if (reissued.kind !== 'issued') throw new Error('unreachable');
-
-    expect(await harness.reopen().handlePairing(identity({ eventId: 'e4' }), reissued.plaintext))
-      .toEqual({ kind: 'limited' });
-  });
-
   it('does not spend a second attempt for a redelivered transport event', async () => {
     const service = harness.reopen();
-    await issueCode();
-
-    const first = await service.handlePairing(identity({ eventId: 'same-event' }), WRONG_CODE);
-    const redelivered = await harness.reopen().handlePairing(identity({ eventId: 'same-event' }), WRONG_CODE);
-
-    expect(first).toEqual({ kind: 'invalid' });
-    expect(redelivered).toEqual({ kind: 'prompt' });
-    expect(harness.unpairedRecord()?.attempts.chats[0].attempts).toBe(1);
-  });
-
-  it('spends the same allowance on a non-code prompt, so there is no free prompt channel', async () => {
-    await issueCode();
-
-    for (const eventId of ['p1', 'p2', 'p3']) {
-      expect(await harness.reopen().handlePairing(identity({ eventId }), 'hello, is anyone there?'))
-        .toEqual({ kind: 'prompt' });
+    await issueCode(service);
+    expect(await service.handlePairing(identity({ eventId: 'same-event' }), WRONG_CODE)).toEqual({ kind: 'invalid' });
+    for (let i = 0; i < 5; i += 1) {
+      expect(await service.handlePairing(identity({ eventId: 'same-event' }), WRONG_CODE)).toEqual({ kind: 'prompt' });
     }
-    expect(await harness.reopen().handlePairing(identity({ eventId: 'p4' }), 'hello again?')).toEqual({
-      kind: 'limited',
-    });
+    expect(await service.handlePairing(identity({ eventId: 'e2' }), WRONG_CODE)).toEqual({ kind: 'invalid' });
   });
 
-  it('refuses a 257th candidate chat instead of evicting one that still holds its limit', async () => {
-    await issueCode();
+  it('gives a new UTC day a fresh allowance', async () => {
+    const service = harness.reopen();
+    await issueCode(service);
+    for (const attempt of [1, 2, 3]) await service.handlePairing(identity({ eventId: `e${attempt}` }), WRONG_CODE);
+    expect(await service.handlePairing(identity({ eventId: 'e4' }), WRONG_CODE)).toEqual({ kind: 'limited' });
 
+    harness.clock.setTo(new Date('2026-03-02T10:00:00.000Z'));
+    const day2 = await issueCode(service);
+    expect(await service.handlePairing(identity({ eventId: 'e5' }), day2)).toEqual({ kind: 'paired', boundOwnerId: OWNER_ID });
+  });
+
+  it('refuses a new candidate chat once the day\'s candidate table is full, without dropping tracked chats', async () => {
+    const service = harness.reopen();
+    await issueCode(service);
     for (let index = 0; index < PAIRING_MAX_CANDIDATE_CHATS; index += 1) {
-      const result = await harness.reopen().handlePairing(
+      const result = await service.handlePairing(
         identity({ chatId: `chat-${index}`, userId: `user-${index}`, eventId: `e-${index}` }),
         'hello',
       );
       expect(result).toEqual({ kind: 'prompt' });
     }
-
-    expect(harness.unpairedRecord()?.attempts.chats).toHaveLength(PAIRING_MAX_CANDIDATE_CHATS);
-
-    // The 257th is refused outright; nothing already tracked is dropped.
-    const saturatedRecord = harness.rawBytes();
-    expect(await harness.reopen().handlePairing(
+    expect(await service.handlePairing(
       identity({ chatId: 'chat-overflow', userId: 'user-overflow', eventId: 'e-overflow' }),
       'hello',
     )).toEqual({ kind: 'refused' });
-    expect(harness.rawBytes()).toEqual(saturatedRecord);
-    expect(harness.unpairedRecord()?.attempts.chats).toHaveLength(PAIRING_MAX_CANDIDATE_CHATS);
+    expect(await service.handlePairing(identity({ chatId: 'chat-0', userId: 'user-0', eventId: 'e-0b' }), 'hello'))
+      .toEqual({ kind: 'prompt' });
   });
 
   it('reports an expired code as expired rather than invalid', async () => {

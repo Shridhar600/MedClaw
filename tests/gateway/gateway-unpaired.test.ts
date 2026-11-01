@@ -119,7 +119,6 @@ describe('unpaired daemon boot', () => {
         ownerId: 'beta',
         createdAt: new Date('2026-06-01T12:00:00.000Z').toISOString(),
         phase: 'unpaired',
-        attempts: { day: '2026-06-01', chats: [] },
       }, null, 2)}\n`,
       { mode: 0o600 },
     );

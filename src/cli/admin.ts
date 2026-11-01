@@ -229,7 +229,7 @@ export async function issuePairingCode(options: AdminPaths = {}): Promise<string
     const issued = await admission.issueChallenge();
     if (issued.kind === 'issued') {
       return [
-        'Pairing code issued. Send this code from your own chat; it expires in 24 hours.',
+        'Pairing code issued. Send this code from your own chat; it expires in 1 hour.',
         '',
         `    ${issued.plaintext}`,
         '',

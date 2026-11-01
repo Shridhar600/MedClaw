@@ -315,17 +315,14 @@ describe('S1 routing: admission replaces the first-contact grant', () => {
     expect(counter.prompts).toEqual(['recorded:2']);
   });
 
-  it('does not consume a pairing attempt for a group message carrying the right code', async () => {
+  it('never pairs a group message, even one carrying the right code', async () => {
     const issued = await admission.issueChallenge();
     if (issued.kind !== 'issued') throw new Error('unreachable');
 
     await send(telegramMessage({ chatType: 'group', chatId: 'group-1', messageId: '4', text: issued.plaintext }));
 
     const read = store.read();
-    const chats = read.kind === 'available' && read.state.phase === 'unpaired'
-      ? read.state.attempts.chats
-      : [];
-    expect(chats).toEqual([]);
+    expect(read.kind === 'available' && read.state.phase).toBe('unpaired');
   });
 });
 

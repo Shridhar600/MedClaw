@@ -15,27 +15,16 @@
 export const PAIRING_CODE_SYMBOLS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 export const PAIRING_CODE_LENGTH = 8;
 /** A submitted code is exactly this many symbols from the alphabet above. */
-export const PAIRING_CODE_EXPIRY_MS = 24 * 60 * 60 * 1000;
+export const PAIRING_CODE_EXPIRY_MS = 60 * 60 * 1000;
 
-/**
- * Shared byte budget for the persisted owner record.
- *
- * ONE number, declared here because policy, writer and reader must agree on it: a writer that may
- * publish more bytes than the reader will accept is how one owner's own pairing traffic made the app's
- * record unreadable after a restart (S1 C03/R11 — at the ordinary 256-candidate/three-attempt bounds a
- * real day of traffic encodes to about 100 KiB, which the previous 64 KiB reader refused as
- * `too-large`). Policy enforces it on the ENCODED write before publication, the reader enforces it on
- * the bytes actually read, and Plan 15 §2.3 caps it at 256 KiB.
- *
- * It is a ceiling, not a promise: worst-case legal escaping still exceeds it (256 KiB holds every
- * ASCII-legal record, not every pathological Unicode one). A record that cannot fit is refused before
- * publication, with the previous readable bytes untouched — never truncated into a shorter lie.
- */
-export const OWNER_RECORD_MAX_BYTES = 256 * 1024;
+/** Byte budget for the persisted owner record, shared by the writer and the reader. */
+export const OWNER_RECORD_MAX_BYTES = 64 * 1024;
 
+// The pairing allowance is held in memory by the admission service and resets on restart: with a
+// 32^8 code space and a short expiry, a persisted table buys nothing for one owner.
 /** Attempts allowed per private chat per UTC day. The fourth attempt is silent. */
 export const PAIRING_ATTEMPTS_PER_CHAT_PER_DAY = 3;
-/** Candidate chats retained for the current day before new candidates are refused. */
+/** Candidate chats tracked for the current day before new candidates are refused. */
 export const PAIRING_MAX_CANDIDATE_CHATS = 256;
 /** Transport event IDs remembered per candidate chat, so a redelivered event costs no attempt. */
 export const PAIRING_MAX_EVENT_IDS_PER_CHAT = 3;
@@ -114,25 +103,6 @@ export interface TransportIdentity {
 
 // ── The owner record ─────────────────────────────────────────────────────────────────────
 
-/** One private chat's allowance for the current UTC day. */
-export interface PairingCandidateChat {
-  chatId: string;
-  senderId: string;
-  /** Attempts already RESERVED (reserved before verification, so a crash cannot refund). */
-  attempts: number;
-  /** Event IDs already counted, oldest first, bounded by `PAIRING_MAX_EVENT_IDS_PER_CHAT`. */
-  eventIds: string[];
-  firstSeenAt: string;
-  lastSeenAt: string;
-}
-
-/** The whole allowance for one UTC day. Replaced wholesale on day rollover. */
-export interface PairingAttempts {
-  /** UTC calendar day, `YYYY-MM-DD`. */
-  day: string;
-  chats: PairingCandidateChat[];
-}
-
 /** An issued, not-yet-consumed or already-consumed challenge. The plaintext is never stored. */
 export interface OwnerChallenge {
   /** Opaque salted SHA-256 verifier. Never the plaintext. */
@@ -163,7 +133,6 @@ export type OwnerState =
   | (OwnerRecordBase & {
       phase: 'unpaired';
       challenge?: OwnerChallenge;
-      attempts: PairingAttempts;
     })
   | (OwnerRecordBase & {
       phase: 'bound';

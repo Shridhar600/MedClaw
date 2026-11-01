@@ -73,7 +73,6 @@ function recordDocument(): string {
       ownerId: OWNER_ID,
       createdAt: '2026-03-01T10:00:00.000Z',
       phase: 'unpaired',
-      attempts: { day: '2026-03-01', chats: [] },
     },
     null,
     2,

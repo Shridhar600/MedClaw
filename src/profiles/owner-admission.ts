@@ -1,7 +1,7 @@
 // src/profiles/owner-admission.ts
 //
-// The enrollment state machine (plan 15 §2.3). One owner record, explicit phases, a bounded
-// per-day allowance, and no silent path to a clinical turn.
+// The enrollment state machine. One owner record, explicit phases, an in-memory per-chat daily
+// pairing allowance, and no silent path to a clinical turn.
 //
 // Two hard rules shape everything here:
 //
@@ -31,7 +31,6 @@ import {
   type OwnerWriteReason,
   type OwnerState,
   type OwnerStatePort,
-  type PairingCandidateChat,
   type PairingCodePort,
   type PairingResult,
   type TransportIdentity,
@@ -39,6 +38,13 @@ import {
 import type { DiagnosticEvent, DiagnosticSink, PairingDiagnosticReason } from '../ports/diagnostics';
 import { SILENT_DIAGNOSTIC_SINK, guardedDiagnosticSink } from '../ports/diagnostics';
 import { newUnpairedOwnerState, utcDayOf } from './owner-state';
+
+/** One candidate chat's pairing allowance for the current UTC day. */
+interface CandidateAttempts {
+  attempts: number;
+  /** Event IDs already counted, so a redelivered event costs no attempt. */
+  eventIds: string[];
+}
 
 /** What a pairing attempt produced: the user-facing result plus the diagnostic-only cause. */
 interface PairingOutcome {
@@ -210,6 +216,10 @@ export class OwnerAdmissionService {
    */
   private tail: Promise<unknown> = Promise.resolve();
 
+  /** Today's pairing allowance per candidate chat. In memory on purpose: a restart resets it. */
+  private allowanceDay = '';
+  private readonly allowance = new Map<string, CandidateAttempts>();
+
   /**
    * The sink every event in this module goes through, guarded once at construction.
    *
@@ -345,10 +355,7 @@ export class OwnerAdmissionService {
     return read.state.binding.pairingEventId === identity.eventId;
   }
 
-  /**
-   * Handle one pairing attempt. Serialized end to end, and the allowance is RESERVED before
-   * verification so a crash mid-attempt cannot refund it.
-   */
+  /** Handle one pairing attempt. Serialized end to end; the attempt is counted before verification. */
   async handlePairing(identity: TransportIdentity, text: string): Promise<PairingResult> {
     const startedAt = this.deps.clock.now().getTime();
     const { result, reason } = await this.pair(identity, text);
@@ -383,7 +390,7 @@ export class OwnerAdmissionService {
     if (read.kind === 'missing' || read.kind === 'unavailable') {
       return this.finish('unavailable', identity, undefined, 'record-unavailable');
     }
-    let state = read.state;
+    const state = read.state;
     if (state.ownerId !== this.deps.expectedOwnerId) {
       return this.finish('refused', identity, undefined, 'owner-mismatch');
     }
@@ -403,61 +410,30 @@ export class OwnerAdmissionService {
     }
 
     const today = utcDayOf(this.deps.clock.now());
-    const attempts = state.attempts.day === today
-      ? { day: state.attempts.day, chats: state.attempts.chats.map((chat) => ({ ...chat, eventIds: [...chat.eventIds] })) }
-      // Old-day rows expire; the allowance is keyed to the day, never carried forward.
-      : { day: today, chats: [] };
-
-    const candidate = attempts.chats.find((chat) => chat.chatId === identity.chatId);
+    if (this.allowanceDay !== today) {
+      this.allowanceDay = today;
+      this.allowance.clear();
+    }
+    const candidate = this.allowance.get(identity.chatId);
 
     if ((candidate?.attempts ?? 0) >= PAIRING_ATTEMPTS_PER_CHAT_PER_DAY) {
       // Spent allowance also silences failed-event replay; replay cannot reopen the prompt channel.
       return this.finish('limited', identity, undefined, 'daily-allowance-spent');
     }
-
     // A redelivered transport event is the same attempt, not a new one.
-    if (candidate?.eventIds.includes(identity.eventId)) {
-      // No reserve, no verification, no binding. The outcome class of the original attempt is
-      // unknowable from the stored record, so answer with the neutral prompt rather than
-      // guessing; a successful original has already bound and returned 'already-paired'.
-      return this.finish('prompt', identity);
-    }
-
-    const isNewCandidate = candidate === undefined;
-    if (isNewCandidate && attempts.chats.length >= PAIRING_MAX_CANDIDATE_CHATS) {
-      // Saturation refuses rather than evicting, because eviction would reset live limits.
-      // This new chat has spent no attempts; only an already-spent chat is silent.
+    if (candidate?.eventIds.includes(identity.eventId)) return this.finish('prompt', identity);
+    if (!candidate && this.allowance.size >= PAIRING_MAX_CANDIDATE_CHATS) {
+      // Bounded so strangers cannot grow it; this new chat has spent no attempts.
       return this.finish('refused', identity, undefined, 'candidate-capacity-reached');
     }
-
-    const now = this.deps.clock.now();
-    const reserved: PairingCandidateChat = {
-      chatId: identity.chatId,
-      senderId: identity.userId,
+    this.allowance.set(identity.chatId, {
       attempts: (candidate?.attempts ?? 0) + 1,
       eventIds: [...(candidate?.eventIds ?? []), identity.eventId].slice(-PAIRING_MAX_EVENT_IDS_PER_CHAT),
-      firstSeenAt: candidate?.firstSeenAt ?? now.toISOString(),
-      lastSeenAt: now.toISOString(),
-    };
-    if (candidate) {
-      attempts.chats[attempts.chats.indexOf(candidate)] = reserved;
-    } else {
-      attempts.chats.push(reserved);
-    }
+    });
 
     const submission = normalizeSubmission(text);
-    const nextState: OwnerState = { ...state, phase: 'unpaired', attempts };
-
-    // ── Reserve first, then verify ──────────────────────────────────────────────────────
-    const committed = await this.replace(nextState);
-    if (committed.kind !== 'committed') {
-      return this.finish('unavailable', identity, undefined, 'record-unavailable');
-    }
-    state = committed.state;
-
     if (submission === undefined) {
-      // A well-formed private message that is not a code still consumes the allowance, so the
-      // prompt channel cannot be used for free unlimited retries.
+      // A message that is not a code still counts, so the prompt channel is not free to retry.
       return this.finish('prompt', identity);
     }
 

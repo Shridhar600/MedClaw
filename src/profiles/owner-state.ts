@@ -8,16 +8,11 @@
 // that cannot be understood refuses serving; it never re-opens first-contact pairing.
 
 import {
-  PAIRING_ATTEMPTS_PER_CHAT_PER_DAY,
-  PAIRING_MAX_CANDIDATE_CHATS,
   PAIRING_MAX_EVENT_ID_LENGTH,
-  PAIRING_MAX_EVENT_IDS_PER_CHAT,
   PAIRING_MAX_ID_LENGTH,
   type OwnerBinding,
   type OwnerChallenge,
   type OwnerState,
-  type PairingAttempts,
-  type PairingCandidateChat,
 } from '../ports/owner-state';
 import { isValidProfileId } from './paths';
 
@@ -27,11 +22,9 @@ export type OwnerStateDecode =
   | { kind: 'owner-mismatch' }
   | { kind: 'invalid' };
 
-const OWNER_STATE_KEYS = ['version', 'ownerId', 'createdAt', 'phase', 'challenge', 'attempts', 'binding'] as const;
+const OWNER_STATE_KEYS = ['version', 'ownerId', 'createdAt', 'phase', 'challenge', 'binding'] as const;
 const CHALLENGE_KEYS = ['verifier', 'issuedAt', 'expiresAt'] as const;
 const BINDING_KEYS = ['channel', 'chatId', 'senderId', 'boundAt', 'pairingEventId'] as const;
-const ATTEMPTS_KEYS = ['day', 'chats'] as const;
-const CANDIDATE_KEYS = ['chatId', 'senderId', 'attempts', 'eventIds', 'firstSeenAt', 'lastSeenAt'] as const;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -50,9 +43,7 @@ function isBoundedId(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= PAIRING_MAX_ID_LENGTH;
 }
 
-/** `YYYY-MM-DD` in UTC. The allowance is keyed on this and nothing else. */
-const UTC_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
-
+/** `YYYY-MM-DD` in UTC. The pairing allowance is keyed on this. */
 export function utcDayOf(instant: Date): string {
   return instant.toISOString().slice(0, 10);
 }
@@ -67,53 +58,6 @@ function decodeChallenge(raw: unknown): OwnerChallenge | undefined {
     issuedAt: raw.issuedAt,
     expiresAt: raw.expiresAt,
   };
-}
-
-function decodeCandidate(raw: unknown): PairingCandidateChat | undefined {
-  if (!isPlainObject(raw) || !hasOnlyKeys(raw, CANDIDATE_KEYS)) return undefined;
-  if (!isBoundedId(raw.chatId) || !isBoundedId(raw.senderId)) return undefined;
-  if (
-    typeof raw.attempts !== 'number'
-    || !Number.isInteger(raw.attempts)
-    || raw.attempts < 0
-    || raw.attempts > PAIRING_ATTEMPTS_PER_CHAT_PER_DAY
-  ) {
-    return undefined;
-  }
-  if (!Array.isArray(raw.eventIds)) return undefined;
-  if (raw.eventIds.length > PAIRING_MAX_EVENT_IDS_PER_CHAT) return undefined;
-  for (const eventId of raw.eventIds) {
-    if (typeof eventId !== 'string' || eventId.length === 0 || eventId.length > PAIRING_MAX_EVENT_ID_LENGTH) {
-      return undefined;
-    }
-  }
-  if (!isIsoTimestamp(raw.firstSeenAt) || !isIsoTimestamp(raw.lastSeenAt)) return undefined;
-  return {
-    chatId: raw.chatId,
-    senderId: raw.senderId,
-    attempts: raw.attempts,
-    eventIds: [...raw.eventIds] as string[],
-    firstSeenAt: raw.firstSeenAt,
-    lastSeenAt: raw.lastSeenAt,
-  };
-}
-
-function decodeAttempts(raw: unknown): PairingAttempts | undefined {
-  if (!isPlainObject(raw) || !hasOnlyKeys(raw, ATTEMPTS_KEYS)) return undefined;
-  if (typeof raw.day !== 'string' || !UTC_DAY_PATTERN.test(raw.day)) return undefined;
-  if (!Array.isArray(raw.chats)) return undefined;
-  if (raw.chats.length > PAIRING_MAX_CANDIDATE_CHATS) return undefined;
-  const chats: PairingCandidateChat[] = [];
-  const seen = new Set<string>();
-  for (const entry of raw.chats) {
-    const candidate = decodeCandidate(entry);
-    if (!candidate) return undefined;
-    // A duplicate chat row would let one chat hold more than its allowance.
-    if (seen.has(candidate.chatId)) return undefined;
-    seen.add(candidate.chatId);
-    chats.push(candidate);
-  }
-  return { day: raw.day, chats };
 }
 
 function decodeBinding(raw: unknown): OwnerBinding | undefined {
@@ -156,16 +100,14 @@ export function decodeOwnerState(input: unknown, expectedOwnerId: string): Owner
     if (input.binding !== undefined) return { kind: 'invalid' };
     const challenge = decodeChallenge(input.challenge);
     if (challenge === undefined && input.challenge !== undefined) return { kind: 'invalid' };
-    const attempts = decodeAttempts(input.attempts);
-    if (!attempts) return { kind: 'invalid' };
     return {
       kind: 'ok',
-      state: { ...base, phase: 'unpaired', ...(challenge ? { challenge } : {}), attempts },
+      state: { ...base, phase: 'unpaired', ...(challenge ? { challenge } : {}) },
     };
   }
 
   if (input.phase === 'bound') {
-    if (input.challenge !== undefined || input.attempts !== undefined) return { kind: 'invalid' };
+    if (input.challenge !== undefined) return { kind: 'invalid' };
     const binding = decodeBinding(input.binding);
     if (!binding) return { kind: 'invalid' };
     return { kind: 'ok', state: { ...base, phase: 'bound', binding } };
@@ -197,7 +139,6 @@ export function encodeOwnerState(state: OwnerState): string {
       createdAt: state.createdAt,
       phase: state.phase,
       ...(state.challenge ? { challenge: state.challenge } : {}),
-      attempts: state.attempts,
     },
     null,
     2,
@@ -211,6 +152,5 @@ export function newUnpairedOwnerState(ownerId: string, createdAt: Date): OwnerSt
     ownerId,
     createdAt: createdAt.toISOString(),
     phase: 'unpaired',
-    attempts: { day: utcDayOf(createdAt), chats: [] },
   };
 }

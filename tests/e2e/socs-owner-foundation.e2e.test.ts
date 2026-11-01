@@ -30,7 +30,7 @@ import type { IncomingMessage } from '../../src/channels/types';
 import { CryptoPairingCodePort, FileOwnerStatePort, DirectoryLease, FsMediaStager, writeConfigDocument } from '../../src/runtime';
 import { InstallationService } from '../../src/runtime/installation';
 import { OwnerAdmissionService, asProfileId } from '../../src/profiles';
-import { PAIRING_MAX_CANDIDATE_CHATS, type TransportIdentity } from '../../src/ports/owner-state';
+import type { TransportIdentity } from '../../src/ports/owner-state';
 import type { MediaSourcePort, MediaStageResult } from '../../src/ports/media-source';
 import { systemClock } from '../../src/ports/defaults';
 import { loadRuntimeConfig } from '../../src/runtime/startup';
@@ -444,7 +444,7 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
     }
   }, 120_000);
 
-  it.each(['later event', 'spent failed-event replay'])('C06 R12 keeps %s silent across restart/reissue, with UTC rollover and emergency controls', async (attempt) => {
+  it.each(['later event', 'spent failed-event replay'])('C06 R12 keeps %s silent once the day\'s allowance is spent, with UTC rollover and emergency controls', async (attempt) => {
     expect((await setup()).code).toBe(0);
     let instant = new Date('2026-10-09T23:50:00.000Z');
     const clock: Clock = { now: () => new Date(instant) };
@@ -457,7 +457,7 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
     const provider = new ScriptedProvider([textResponse('Noted.')]);
     let builds = 0;
     const controls = { clock, codes, createProvider: (): LLMProvider => { builds += 1; return provider; } };
-    let daemon = await bootDaemon(provider, undefined, undefined, controls);
+    const daemon = await bootDaemon(provider, undefined, undefined, controls);
     const sent: string[] = [];
     const deliver = (id: string, text: string): Promise<void> => daemon.gateway.deliverMessage(
       telegramMessage(OWNER_CHAT, OWNER_USER, id, text), async reply => { sent.push(reply); },
@@ -471,13 +471,8 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
       await deliver('failed-2', wrong);
       await deliver('failed-3', wrong);
       expect(matches).toHaveBeenCalledTimes(3);
-      const reserved = JSON.parse(fs.readFileSync(fixture.ownerRecord, 'utf8'));
-      expect(reserved).toMatchObject({ phase: 'unpaired', attempts: { day: '2026-10-09', chats: [{ attempts: 3 }] } });
-      await daemon.shutdown();
-      const reissued = await admissionFor(undefined, clock, codes).issueChallenge();
-      if (reissued.kind !== 'issued') throw new Error('reissue not issued');
-      expect(JSON.parse(fs.readFileSync(fixture.ownerRecord, 'utf8')).attempts).toEqual(reserved.attempts);
-      daemon = await bootDaemon(provider, undefined, undefined, controls);
+      expect(JSON.parse(fs.readFileSync(fixture.ownerRecord, 'utf8')).phase).toBe('unpaired');
+      const reissued = issued;
       const lockedBytes = syntheticBytes(root);
       sent.length = 0;
       for (const id of attempt === 'later event' ? ['fourth', 'fifth'] : ['failed-1', 'failed-3']) {
@@ -505,67 +500,6 @@ describe('S1 owner spine: setup -> daemon -> stranger refused -> pair -> owner t
       expect(fs.readFileSync(fixture.ownerRecord)).toEqual(bound);
       expect(provider.chatCalls).toHaveLength(0);
       expect(daemon.gateway.runtimeInstance!.sessions!.getHistory(OWNER_CHAT)).toEqual([]);
-    } finally { await daemon.shutdown(); }
-  });
-
-  it('C09 C06 R12 reports candidate capacity without evicting limits, while spent chats stay silent', async () => {
-    expect((await setup()).code).toBe(0);
-    const clock: Clock = { now: () => new Date('2026-10-09T09:00:00.000Z') };
-    const codes = new CryptoPairingCodePort();
-    const matches = jest.spyOn(codes, 'matches');
-    const admission = admissionFor(undefined, clock, codes);
-    const issued = await admission.issueChallenge();
-    if (issued.kind !== 'issued') throw new Error('challenge not issued');
-    // Real reservations fill the bounded record; one retained chat has already spent its allowance.
-    for (let index = 0; index < PAIRING_MAX_CANDIDATE_CHATS; index += 1) {
-      for (let attempt = 0; attempt < (index === 0 ? 3 : 1); attempt += 1) {
-        expect(await admission.handlePairing(identityFor(`chat-${index}`, `user-${index}`, `${attempt}`), 'hello'))
-          .toEqual({ kind: 'prompt' });
-      }
-    }
-    const provider = new ScriptedProvider([textResponse('Noted.')]);
-    let builds = 0;
-    const events: DiagnosticEvent[] = [];
-    const daemon = await bootDaemon(provider, { emit: event => { events.push(event); } }, undefined, {
-      clock, codes, createProvider: () => { builds += 1; return provider; },
-    });
-    const sent: string[] = [];
-    const deliver = (chat: string, user: string, id: string, text: string): Promise<void> => daemon.gateway.deliverMessage(
-      telegramMessage(chat, user, id, text), async reply => { sent.push(reply); },
-    );
-    try {
-      const saturatedBytes = syntheticBytes(root);
-      await deliver('overflow-chat', 'overflow-user', 'first', issued.plaintext);
-      expect(syntheticBytes(root)).toEqual(saturatedBytes);
-      expect(matches).not.toHaveBeenCalled();
-      expect(builds).toBe(0);
-      expect(provider.chatCalls).toHaveLength(0);
-      expect(daemon.gateway.runtimeInstance).toBeUndefined();
-      expect(sent).toEqual([
-        'This chat is not recognized. This is a private health assistant; new chats cannot be added over this channel.',
-      ]);
-      sent.length = 0;
-      await deliver('chat-0', 'user-0', 'later', issued.plaintext);
-      await deliver('chat-0', 'user-0', '0', issued.plaintext);
-      expect(syntheticBytes(root)).toEqual(saturatedBytes);
-      expect(matches).not.toHaveBeenCalled();
-      expect(builds).toBe(0);
-      expect(sent).toEqual([]);
-      await deliver('overflow-chat', 'overflow-user', 'emergency', 'I cannot breathe');
-      expect(sent).toEqual([EMERGENCY_RESPONSE]);
-      expect(syntheticBytes(root)).toEqual(saturatedBytes);
-      expect(matches).not.toHaveBeenCalled();
-      // Saturation keeps the existing candidates eligible within their own allowance.
-      sent.length = 0;
-      await deliver('chat-1', 'user-1', 'valid', issued.plaintext);
-      expect(sent).toEqual(['Pairing complete. This chat is now connected to the owner.']);
-      expect(matches).toHaveBeenCalledTimes(1);
-      expect(JSON.parse(fs.readFileSync(fixture.ownerRecord, 'utf8')).phase).toBe('bound');
-      expect(builds).toBe(0);
-      expect(provider.chatCalls).toHaveLength(0);
-      const overflow = events.filter(event => event.stage === 'pairing' && event.outcome === 'refused');
-      expect(overflow).toEqual([expect.objectContaining({ reason: 'candidate-capacity-reached' })]);
-      expect(overflow[0]).not.toHaveProperty('attempts');
     } finally { await daemon.shutdown(); }
   });
 
