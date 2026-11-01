@@ -100,6 +100,7 @@ export type HeartbeatTurnResult =
 
 interface QueueEntry {
   execute: () => Promise<void>;
+  reject: (error: unknown) => void;
 }
 
 interface ChatQueue {
@@ -152,6 +153,10 @@ export class TurnCoordinator {
 
   private enqueue<T>(chatId: string, priority: SemaphorePriority, operation: () => Promise<T>): Promise<T> {
     const queue = this.queues.get(chatId) ?? { user: [], heartbeat: [], draining: false };
+    // The owner always outranks waiting check-ins: evict them rather than refuse the owner.
+    if (priority === 'user') {
+      for (const waiting of queue.heartbeat.splice(0)) waiting.reject(new HeartbeatPreemptedError());
+    }
     const waitingCount = queue.user.length + queue.heartbeat.length;
     if (waitingCount >= this.maxQueuedTurnsWaiting) {
       return Promise.reject(new TurnQueueFullError());
@@ -164,6 +169,7 @@ export class TurnCoordinator {
 
     const promise = new Promise<T>((resolve, reject) => {
       const entry: QueueEntry = {
+        reject,
         execute: async () => {
           try {
             resolve(await operation());

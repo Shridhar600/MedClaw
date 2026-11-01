@@ -182,6 +182,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
   const ledgerRecord: Tool = {
     name: 'ledger_record',
     group: 'group:ledger',
+    ownerTurnOnly: true,
     description: 'Record a structured health fact (medication, condition, symptom, appointment, metric, goal, allergy) into the versioned ledger. Writes both memory lanes and updates SAFETY.md for safety-relevant facts.',
     parameters: {
       type: 'object',
@@ -313,6 +314,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
   const ledgerUpdate: Tool = {
     name: 'ledger_update',
     group: 'group:ledger',
+    ownerTurnOnly: true,
     description: 'Confirm (or decline) a pending ledger change previously surfaced by ledger_record — a supersession, dispute resolution, retraction, or discontinuation.',
     parameters: {
       type: 'object',
@@ -399,6 +401,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
   const ledgerRemove: Tool = {
     name: 'ledger_remove',
     group: 'group:ledger',
+    ownerTurnOnly: true,
     description: 'Remove a health fact (e.g. discontinue a medication the user no longer takes). Meds and allergies ALWAYS ask the user for confirmation before applying; SAFETY.md updates on confirm (D8/DAD-11).',
     parameters: {
       type: 'object',

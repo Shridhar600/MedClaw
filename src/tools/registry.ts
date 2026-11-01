@@ -72,8 +72,8 @@ export class ToolRegistry {
     this.tools.set(tool.name, tool);
   }
 
-  getAvailable(): Tool[] {
-    return [...this.tools.values()].filter(t => this.isAllowed(t));
+  getAvailable(origin?: ToolExecutionContext['origin']): Tool[] {
+    return [...this.tools.values()].filter(t => this.isAllowed(t) && !this.ownerOnlyRefused(t, origin));
   }
 
   async execute(
@@ -84,6 +84,9 @@ export class ToolRegistry {
     const tool = this.tools.get(name);
     if (!tool) throw new Error(`Tool not found: ${name}`);
     if (!this.isAllowed(tool)) throw new Error(`Tool not allowed: ${name}`);
+    if (this.ownerOnlyRefused(tool, context?.origin)) {
+      return { content: [{ type: 'text', text: `${name} is only available in a turn the owner started.` }], isError: true };
+    }
     const validationError = validateParameters(tool, params);
     if (validationError) return validationError;
     try {
@@ -96,6 +99,10 @@ export class ToolRegistry {
       console.error(`[tool:${name}] Error:`, summarizeErrorForLog(e));
       return { content: [{ type: 'text', text: `Tool error: ${msg}` }], isError: true };
     }
+  }
+
+  private ownerOnlyRefused(tool: Tool, origin: ToolExecutionContext['origin']): boolean {
+    return tool.ownerTurnOnly === true && origin !== undefined && origin !== 'user';
   }
 
   private isAllowed(tool: Tool): boolean {

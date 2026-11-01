@@ -6,6 +6,9 @@ import { CapturePipeline, makeSafetyRenderer as makeSharedSafetyRenderer, type Q
 import { mutableClock, seqIdGen } from '../helpers/memcore-fixtures';
 import type { Tool } from '../../src/tools/types';
 import { makeTestTemp } from '../helpers/test-temp';
+import { AgentLoop } from '../../src/agent/agent-loop';
+import { ToolRegistry } from '../../src/tools/registry';
+import type { LLMProvider, LLMResponse, ToolSchema } from '../../src/providers/types';
 
 const DAY = '2026-08-20T10:00:00.000Z';
 
@@ -344,6 +347,48 @@ describe('ledger tools — owner lifecycle across restarts', () => {
     boot();
     expect((await ledger.getActive('metformin', 'medication'))!.fields.dose).toBe('500mg');
     expect(fs.readdirSync(`${tmp}/ledger`).filter(f => f.includes('.corrupt-'))).toHaveLength(0);
+  });
+
+  it('a background check-in can neither see nor use the ledger write and confirm tools', async () => {
+    await byName('ledger_record').execute({ entity: 'warfarin', type: 'medication', fields: { dose: '10mg' } });
+    const proposal = await byName('ledger_record').execute(
+      { entity: 'warfarin', type: 'medication', fields: { dose: '0mg' } },
+      { chatId: 'chat-1', turnId: 'owner-turn' },
+    );
+    const tokenId = tokenOf(proposal.content[0].text);
+
+    const registry = new ToolRegistry({ allow: ['*'], deny: [] });
+    for (const tool of tools) registry.register(tool);
+    const offered: string[][] = [];
+    const scripted: LLMResponse[] = [
+      { type: 'tool_call', toolCalls: [
+        { id: 'c1', name: 'ledger_update', arguments: { tokenId, confirm: true } },
+        { id: 'c2', name: 'ledger_remove', arguments: { entity: 'warfarin', type: 'medication' } },
+      ] },
+      { type: 'text', text: 'Checked in.' },
+    ];
+    const provider: LLMProvider = {
+      async chat(_messages, toolSchemas?: ToolSchema[]): Promise<LLMResponse> {
+        offered.push((toolSchemas ?? []).map((t) => t.function.name));
+        return scripted.shift()!;
+      },
+      async embed(): Promise<number[]> { return []; },
+    };
+    const loop = new AgentLoop(provider, registry, [], { maxIterations: 3, disclaimerEnabled: false });
+
+    const result = await loop.run('[Heartbeat Trigger] check in', [], { chatId: 'chat-1', origin: 'heartbeat', mode: 'heartbeat' });
+
+    expect(offered[0]).toEqual(expect.arrayContaining(['ledger_query']));
+    expect(offered[0]).not.toEqual(expect.arrayContaining(['ledger_update']));
+    expect(offered[0]).not.toEqual(expect.arrayContaining(['ledger_record']));
+    expect(offered[0]).not.toEqual(expect.arrayContaining(['ledger_remove']));
+    expect(result.trace.filter((m) => m.role === 'tool').every((m) => /owner/i.test(String(m.content)))).toBe(true);
+    expect((await ledger.getActive('warfarin', 'medication'))!.fields.dose).toBe('10mg');
+
+    // The owner can still confirm the same proposal in their next turn.
+    const owner = await byName('ledger_update').execute({ tokenId, confirm: true }, { chatId: 'chat-1', turnId: 'next-owner-turn' });
+    expect(owner.isError).toBeFalsy();
+    expect((await ledger.getActive('warfarin', 'medication'))!.fields.dose).toBe('0mg');
   });
 
   it('a SAFETY refresh failure after a confirmed change reports the change as applied', async () => {

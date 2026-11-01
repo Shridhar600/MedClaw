@@ -22,6 +22,8 @@ export interface ToolExecutionContext {
    *  parallel calls to the SAME tool with otherwise-identical arguments within one turn, so an
    *  idempotency key built from (chatId, turnId, toolCallId, params) never collides them. */
   toolCallId?: string;
+  /** Who started the turn. Absent means an owner turn. */
+  origin?: 'user' | 'heartbeat' | 'background';
 }
 
 export interface Tool {
@@ -29,6 +31,8 @@ export interface Tool {
   group: string;
   description: string;
   parameters: ToolParameters;
+  /** Only an owner turn may use this tool (medical writes and confirmations); background turns never see it. */
+  ownerTurnOnly?: boolean;
   execute(params: Record<string, unknown>, context?: ToolExecutionContext): Promise<ToolResult>;
 }
 

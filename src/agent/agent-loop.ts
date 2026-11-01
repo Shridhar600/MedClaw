@@ -89,7 +89,7 @@ export class AgentLoop {
     // the FINAL call (full accumulated context) is the value surfaced on the result.
     let lastPromptTokens: number | undefined;
 
-    const tools: ToolSchema[] = this.registry.getAvailable().map(t => ({
+    const tools: ToolSchema[] = this.registry.getAvailable(runContext?.origin).map(t => ({
       type: 'function',
       function: {
         name: t.name,

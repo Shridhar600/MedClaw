@@ -7,7 +7,7 @@ import type { IncomingMessage } from '../../src/channels/types';
 import { OnboardingFlow } from '../../src/onboarding/flow';
 import { ToolRegistry } from '../../src/tools/registry';
 import { HeartbeatPreemptedError, LLMSemaphore } from '../../src/tools/semaphore';
-import { TurnCoordinator, TurnQueueFullError } from '../../src/gateway/turn-coordinator';
+import { TurnCoordinator, TurnQueueFullError, type HeartbeatTurnResult } from '../../src/gateway/turn-coordinator';
 import type { LLMProvider, LLMResponse, Message } from '../../src/providers/types';
 import { DaemonShutdownError } from '../../src/shared/errors';
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
@@ -284,6 +284,34 @@ describe('TurnCoordinator heartbeat preemption', () => {
     expect(runtime.sessions.recordTurn.mock.calls[0][0]).toBe('chat-preempt');
     expect(runtime.sessions.recordTurn.mock.calls[0][2]).not.toBe('heartbeat');
     expect(provider.chat).toHaveBeenCalledTimes(1);
+  });
+
+  it('a user message evicts queued heartbeats instead of being refused when the queue is full', async () => {
+    const release = deferred();
+    const firstStarted = deferred();
+    runtime.agentLoop.run.mockImplementation(async (input: string) => {
+      if (input === 'hb-1') {
+        firstStarted.resolve();
+        await release.promise;
+      }
+      return response(`reply:${input}`);
+    });
+    const coordinator = new TurnCoordinator(runtime as unknown as ProfileRuntime, new LLMSemaphore());
+    const heartbeat = (input: string): Promise<HeartbeatTurnResult> => coordinator.runHeartbeat({
+      chatId: 'chat-full', input, egress: jest.fn().mockResolvedValue(undefined), afterDelivery: jest.fn().mockResolvedValue(undefined),
+    });
+
+    const active = heartbeat('hb-1');
+    await firstStarted.promise;
+    const queued = [heartbeat('hb-2'), heartbeat('hb-3')];
+    const egress = jest.fn().mockResolvedValue(undefined);
+    const user = coordinator.runUser(message('are my meds ok?', 'chat-full'), egress, noEmergency);
+    release.resolve();
+
+    expect(await user).toBe('reply:are my meds ok?');
+    expect((await active).status).toBe('sent');
+    expect((await Promise.all(queued)).map((r) => r.status)).toEqual(['preempted', 'preempted']);
+    expect(runtime.agentLoop.run.mock.calls.map((call) => call[0])).toEqual(['hb-1', 'are my meds ok?']);
   });
 
   it('does not abort a heartbeat after its provider call is already in flight', async () => {
