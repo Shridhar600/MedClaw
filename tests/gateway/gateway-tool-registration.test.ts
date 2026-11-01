@@ -8,15 +8,13 @@ import { makeTestTemp } from '../helpers/test-temp';
 
 const CHAT_BINDING = 'owner-chat';
 
-// RES-P2-1: one tool-group factory failure must NOT crash boot — remaining
-// groups still register.
 jest.mock('../../src/tools/memory-tools', () => ({
   createMemoryTools: jest.fn(() => {
     throw new Error('memory tools factory blew up PHI marker glucose');
   }),
 }));
 
-describe('Gateway boot tool-group degradation (RES-P2-1)', () => {
+describe('Gateway boot tool-group degradation', () => {
   let tmpDir: string;
 
   beforeEach(() => {
@@ -45,9 +43,7 @@ describe('Gateway boot tool-group degradation (RES-P2-1)', () => {
         bootstrapMaxChars: 20000,
       },
       sessions: {
-        softResetAfterMinutes: 240,
-        hardResetAfterMinutes: 1440,
-        compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+        compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
       },
       heartbeat: {
         enabled: false,
@@ -66,7 +62,7 @@ describe('Gateway boot tool-group degradation (RES-P2-1)', () => {
           },
         },
       },
-      agent: { maxIterations: 15, disclaimerEnabled: true },
+      agent: { maxIterations: 15 },
     };
   }
 
@@ -77,13 +73,11 @@ describe('Gateway boot tool-group degradation (RES-P2-1)', () => {
 
     await expect(gateway.start()).resolves.toBeUndefined();
 
-    // Boot continued despite the memory-tools factory throwing.
     const warned = warn.mock.calls.flat().map(String).join('\n');
     expect(warned).toContain('Memory tools unavailable');
     // PHI marker from the failure message never leaked (summarizeErrorForLog).
     expect(warned).not.toContain('glucose');
 
-    // The medical tool group (which did NOT throw) still registered its tools.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const registry = (gateway as any).agentLoop.registry;
     const available = registry.getAvailable() as Array<{ name: string }>;

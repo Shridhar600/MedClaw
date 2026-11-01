@@ -26,14 +26,6 @@ interface HeartbeatSchedulerOptions {
   recoveryEnabled?: boolean;
   recoveryWindowMinutes?: number;
   retryBackoffMinutes?: number;
-  /**
-   * Destination-ownership capability, closed over the owning profile's identity. Optional so
-   * standalone scheduler use stays path-agnostic; every daemon `ProfileRuntime` supplies it
-   * (a `canSchedule:true` factory path without one refuses scheduler activation). When present
-   * it gates createJob/updateJob/resume/start registration so a foreign-addressed record can
-   * never be created, re-pointed, or re-enabled unnoticed. `job.chatId` is a destination,
-   * never authority.
-   */
   canAddressChat?: (chatId: string) => boolean;
 }
 
@@ -71,11 +63,6 @@ export class HeartbeatScheduler {
     this.canAddressChat = options.canAddressChat;
   }
 
-  /**
-   * Is `chatId` an addressable destination for this profile's scheduler? With no guard
-   * (standalone use) every destination is allowed. A throwing lookup is a refusal, never an
-   * authorization.
-   */
   private isDestinationAddressable(chatId: string): boolean {
     if (!this.canAddressChat) return true;
     try {
@@ -96,8 +83,6 @@ export class HeartbeatScheduler {
     }
     this.tasks.clear();
     this.wakeupTimers.clear();
-    // No new launch can pass the stopping gate. Existing jobs are awaited without a
-    // time cap so callers never close their stores while a heartbeat still writes.
     await this.drainInFlight();
   }
 
@@ -390,8 +375,6 @@ export class HeartbeatScheduler {
   }
 
   private launchDetached(job: HeartbeatJob): void {
-    // Keep the catch at the detached boundary even though executeJob has its own
-    // state-machine guard. This protects future changes from bare void rejections.
     void this.executeJob(job).catch((error) => {
       void this.recordExecutionFailure(job.id, error);
     });
@@ -414,8 +397,6 @@ export class HeartbeatScheduler {
       if (!job.enabled) {
         continue;
       }
-      // A persisted foreign-addressed record must not come back live at boot: disable it and
-      // mark the error, as for invalid-cron records.
       if (!this.isDestinationAddressable(job.chatId)) {
         const refusalMessage = 'heartbeat job destination is not owned by this profile';
         await this.disableInvalidJob(job, refusalMessage);

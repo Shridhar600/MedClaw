@@ -1,14 +1,3 @@
-// tests/profiles/owner-enrollment.test.ts
-//
-// The S1 enrollment contract, exercised through the real collaborators: a real file-backed
-// owner record (`FileOwnerStatePort`), the real salted-SHA-256 code port, and a real service
-// reloaded from disk between attempts so restart behaviour is actually tested.
-//
-// Nothing here mocks the policy under test. The only controlled inputs are the clock (so UTC day
-// rollover and 24-hour expiry are provable) and deliberate write faults (so the commit/uncertain
-// branches are reachable at all).
-//
-// Temp data lives inside the workspace via `makeTestTemp`, never in `/tmp` or `$HOME`.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -70,11 +59,7 @@ function identity(overrides: Partial<TransportIdentity> = {}): TransportIdentity
 
 const START = new Date('2026-03-01T10:00:00.000Z');
 
-/**
- * A well-formed submission that is not the issued code. It must use only symbols from
- * `PAIRING_CODE_SYMBOLS` — the alphabet deliberately omits I, O, 0 and 1, so a code containing
- * one of those is not a code at all and would be answered with the prompt, not "invalid".
- */
+// `PAIRING_CODE_SYMBOLS` omits I, O, 0 and 1, so this is answered as "not a code" rather than invalid.
 const WRONG_CODE = 'AAAAAAAA';
 
 interface Harness {
@@ -135,7 +120,7 @@ describe('owner enrollment: a record must exist before anything is served', () =
   let harness: Harness;
 
   beforeEach(() => {
-    root = makeTestTemp('socs-s1-enrollment');
+    root = makeTestTemp('enrollment');
     harness = makeHarness(root);
   });
 
@@ -167,7 +152,6 @@ describe('owner enrollment: a record must exist before anything is served', () =
     expect(harness.store.read()).toEqual({ kind: 'unavailable', reason: 'invalid-document' });
     expect(harness.reopen().inspect(identity())).toEqual({ kind: 'refused', reason: 'unavailable' });
 
-    // Not renamed aside, not deleted, not replaced: an operator still sees what was there.
     expect(fs.readdirSync(path.dirname(harness.recordPath))).toEqual(['owner-access.json']);
     expect(fs.readFileSync(harness.recordPath)).toEqual(corrupt);
   });
@@ -221,7 +205,6 @@ describe('owner enrollment: a record must exist before anything is served', () =
     expect(fs.statSync(harness.recordPath).mode & 0o777).toBe(0o600);
     expect(fs.statSync(path.dirname(harness.recordPath)).mode & 0o777).toBe(0o700);
 
-    // 24-hour expiry, measured from issue.
     expect(new Date(issued.expiresAt).getTime() - START.getTime()).toBe(PAIRING_CODE_EXPIRY_MS);
   });
 
@@ -233,13 +216,9 @@ describe('owner enrollment: a record must exist before anything is served', () =
 
     await service.handlePairing(identity({ eventId: 'telegram:chat-1:9' }), WRONG_CODE);
 
-    // The closed contract now names the cause, which the old `<result>:<chatType>` channel could not:
-    // a wrong code and an expired code used to be indistinguishable in diagnostics.
     expect(harness.outcomes).toEqual([
       { stage: 'pairing', outcome: 'invalid', reason: 'code-mismatch', durationMs: expect.any(Number) },
     ]);
-    // Nothing identifier-shaped may appear. `chatType` is deliberately GONE from the contract now — it
-    // was the one chat-shaped field the old channel still emitted, and it was never needed.
     const serialized = JSON.stringify(harness.outcomes);
     expect(serialized).not.toContain('chat-1');
     expect(serialized).not.toContain('user-1');
@@ -253,7 +232,7 @@ describe('owner enrollment: admission before any clinical work', () => {
   let harness: Harness;
 
   beforeEach(async () => {
-    root = makeTestTemp('socs-s1-admission');
+    root = makeTestTemp('admission');
     harness = makeHarness(root);
     await harness.reopen().initialize();
   });
@@ -311,7 +290,6 @@ describe('owner enrollment: admission before any clinical work', () => {
         pairingEventId: 'telegram:chat-1:1',
       },
     });
-    // The consumed challenge and the allowance are gone with the phase change.
     expect(JSON.stringify(harness.readRecord())).not.toContain('verifier');
 
     expect(harness.reopen().inspect(identity())).toEqual({ kind: 'owner', ownerId: OWNER_ID });
@@ -351,7 +329,7 @@ describe('owner enrollment: admission before any clinical work', () => {
     expect(harness.rawBytes()).toEqual(bytesAfterBinding);
   });
 
-  it('refuses a reissue once bound, because rebinding is not supported in S1', async () => {
+  it('refuses a reissue once bound, because rebinding is not supported', async () => {
     const service = harness.reopen();
     const issued = await service.issueChallenge();
     if (issued.kind !== 'issued') throw new Error('unreachable');
@@ -380,7 +358,7 @@ describe('owner enrollment: the pairing allowance is per chat, per day, and in m
   let harness: Harness;
 
   beforeEach(async () => {
-    root = makeTestTemp('socs-s1-allowance');
+    root = makeTestTemp('allowance');
     harness = makeHarness(root);
     await harness.reopen().initialize();
   });
@@ -402,13 +380,11 @@ describe('owner enrollment: the pairing allowance is per chat, per day, and in m
     expect(await service.handlePairing(identity({ eventId: 'e2' }), 'hello, is anyone there?')).toEqual({ kind: 'prompt' });
     expect(await service.handlePairing(identity({ eventId: 'e3' }), WRONG_CODE)).toEqual({ kind: 'invalid' });
 
-    // A reissued code does not reset the allowance either.
     const reissued = await issueCode(service);
     expect(await service.handlePairing(identity({ eventId: 'e4' }), reissued)).toEqual({ kind: 'limited' });
     expect(harness.readRecord()?.phase).toBe('unpaired');
     expect(code).not.toBe(reissued);
 
-    // The allowance lives in memory: a restarted daemon judges the next attempt on its merits.
     expect(await harness.reopen().handlePairing(identity({ eventId: 'e5' }), reissued)).toEqual({
       kind: 'paired',
       boundOwnerId: OWNER_ID,
@@ -507,7 +483,7 @@ describe('owner enrollment: commit outcomes are distinguished from uncertainty',
   let recordPath: string;
 
   beforeEach(async () => {
-    root = makeTestTemp('socs-s1-commit');
+    root = makeTestTemp('commit');
     clock = new TestClock(START);
     const paths = ownerAt(root);
     recordPath = paths.ownerRecord;
@@ -593,18 +569,13 @@ describe('owner enrollment: commit outcomes are distinguished from uncertainty',
     const result: PairingResult = await service.handlePairing(identity(), code());
 
     expect(result).toEqual({ kind: 'unavailable' });
-    // Byte-for-byte, not merely "still unpaired": a pre-publication refusal must leave the previous
-    // record exactly as it was, which is what lets a caller honestly say so.
     expect(fs.readFileSync(recordPath)).toEqual(bytesBefore);
     const reread = new FileOwnerStatePort(recordPath, OWNER_ID).read();
     expect(reread.kind === 'available' && reread.state.phase).toBe('unpaired');
   });
 
   it('never reports a created record when the record was not published', async () => {
-    // R02, at the policy boundary. `initialize()` used to ignore its replacement result entirely and
-    // answer 'created' unconditionally, so real setup published a configuration document on top of a
-    // record that did not exist and printed success.
-    const freshRoot = makeTestTemp('socs-s1-init-refused');
+    const freshRoot = makeTestTemp('init-refused');
     try {
       const freshRecord = path.join(freshRoot, 'owner-access.json');
       const refused = await new OwnerAdmissionService({
@@ -614,8 +585,6 @@ describe('owner enrollment: commit outcomes are distinguished from uncertainty',
         expectedOwnerId: OWNER_ID,
       }).initialize();
 
-      // Definite pre-publication refusal, so it is stated as such — never as 'created', and never as
-      // the unreadable-record refusal that would send an operator looking for evidence to preserve.
       expect(refused).toBe('refused');
       expect(fs.existsSync(freshRecord)).toBe(false);
     } finally {
@@ -624,9 +593,7 @@ describe('owner enrollment: commit outcomes are distinguished from uncertainty',
   });
 
   it('reports an unconfirmed publication as uncertain, not as created', async () => {
-    // The record may be live and only its confirmation is lost. Calling that 'created' would claim a
-    // confirmation nobody has; calling it 'unavailable' would deny a record that may exist.
-    const freshRoot = makeTestTemp('socs-s1-init-uncertain');
+    const freshRoot = makeTestTemp('init-uncertain');
     try {
       const uncertain = await new OwnerAdmissionService({
         store: unacknowledgedStore(path.join(freshRoot, 'owner-access.json')),
@@ -642,8 +609,6 @@ describe('owner enrollment: commit outcomes are distinguished from uncertainty',
   });
 
   it('binds when an uncertain write turns out to have landed, instead of undoing it', async () => {
-    // The fault is thrown AFTER a successful replacement: the acknowledgement fails, the binding
-    // is real. The service must reload and report the truth.
     const real = new FileOwnerStatePort(recordPath, OWNER_ID);
     let boundWriteAcknowledged = false;
     const store: OwnerStatePort = {
@@ -677,24 +642,16 @@ describe('owner enrollment: commit outcomes are distinguished from uncertainty',
 
     const issued = await serviceOver(refusingStore()).issueChallenge();
 
-    // `unavailable`, not `uncertain`: a pre-publication refusal is DEFINITE, and reporting it as
-    // unconfirmed used to tell the operator to inspect a record that provably did not change. The
-    // closed cause travels with it rather than being collapsed into the read-failure word.
     expect(issued).toEqual({ kind: 'refused', reason: 'unavailable', writeReason: 'flush-failed' });
     const after = real.read();
     const verifierAfter = after.kind === 'available' && after.state.phase === 'unpaired'
       ? after.state.challenge?.verifier
       : undefined;
-    // The record still holds exactly the code that was issued earlier — never a code the caller
-    // was not shown.
     expect(verifierAfter).toBe(verifierBefore);
     expect(verifierAfter).toBeDefined();
   });
 
   it('reports an unconfirmed replacement as uncertain while keeping the new record readable', async () => {
-    // A REAL publication that only fails to confirm its own durability. The stored code changes, and
-    // since the plaintext is unrecoverable by design no code may be shown — the operator is told to
-    // reissue instead of being handed a code that does not match the record.
     const real = new FileOwnerStatePort(recordPath, OWNER_ID);
     const before = real.read();
     const verifierBefore = before.kind === 'available' && before.state.phase === 'unpaired'
@@ -723,7 +680,6 @@ describe('owner enrollment: commit outcomes are distinguished from uncertainty',
     const verifierAfter = after.kind === 'available' && after.state.phase === 'unpaired'
       ? after.state.challenge?.verifier
       : undefined;
-    // The replacement was RETAINED, not rolled back: the verifier really changed.
     expect(verifierAfter).toBeDefined();
     expect(verifierAfter).not.toBe(verifierBefore);
   });

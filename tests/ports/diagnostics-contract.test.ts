@@ -1,6 +1,3 @@
-// What a reader of the diagnostic log relies on: an event never carries an identifier, code or path;
-// a refusal always says why; the console line holds only allowlisted fields; and a failing sink can
-// never change a pairing or admission decision (the sink runs while a stranger is talking to the process).
 
 import type { DiagnosticSink, DiagnosticEvent } from '../../src/ports/diagnostics';
 import { CryptoPairingCodePort, FileOwnerStatePort, ConsoleDiagnosticSink } from '../../src/runtime';
@@ -9,7 +6,6 @@ import type { Clock } from '../../src/ports/clock';
 import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 import { ownerRecordPathFor } from '../helpers/owner-authority-fixture';
 
-// Synthetic markers: if any of these appears in a diagnostic, the contract has been breached.
 const OWNER_CHAT = 'stranger-owned-chat-9f3a';
 const SENDER = 'stranger-sender-4b2c';
 const OWNER_ID = 'sentry-owner-7f4c2a';

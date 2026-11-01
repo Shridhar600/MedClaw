@@ -1,10 +1,3 @@
-/**
- * Which channel this arrived on, and whether it was a one-to-one chat.
- *
- * Admission requires all three: a text message with no transport identity is refused rather than
- * treated as coming from somewhere known. They are optional on the wire type only; the admission
- * path treats an absent value as missing identity.
- */
 import type { MediaReference } from '../ports/media-source';
 
 export type { MediaReference };
@@ -19,28 +12,13 @@ export interface IncomingMessage {
   channel?: string;
   /** Whether this was a private chat. Group traffic never gains health state. */
   chatType?: ChatType;
-  /**
-   * Stable identity for this exact transport event (`telegram:<chatId>:<messageId>`), so a
-   * redelivery cannot spend a second pairing attempt.
-   */
   eventId?: string;
   /** Source message identity, when the channel provides one, for capture deduplication. */
   messageId?: string;
-  /**
-   * An OPAQUE handle to attached media. The transport emits this and nothing else: it has not
-   * fetched the bytes, resolved a URL or written a file. Retrieval happens only after the core has
-   * admitted the sender.
-   */
   media?: MediaReference;
   replyToMessageId?: string;
 }
 
-/**
- * The internal shape the core works with, after admission has staged any media.
- *
- * `mediaPath` is deliberately not part of the wire type. A transport must never be able to assert a
- * path; only the core's own stager may, and only after admission.
- */
 export interface AdmittedMessage extends IncomingMessage {
   /** Absolute staging path, set by the core's stager. Adopted into the workspace by the Router. */
   mediaPath?: string;

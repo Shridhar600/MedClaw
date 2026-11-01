@@ -1,11 +1,3 @@
-// tests/gateway/gateway-unpaired.test.ts
-//
-// The unpaired daemon, through the real `Gateway.start()` and the real admission service.
-//
-// The invariant this protects: "not paired yet" must mean *nothing clinical is built*. A boot that
-// quietly created a provider, a workspace or a runtime would be indistinguishable from serving on a
-// default identity — which is the S1 defect T3 exists to remove. Telegram stays disabled here, so
-// this touches no network and no live provider.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -30,7 +22,7 @@ describe('unpaired daemon boot', () => {
   let root: string;
 
   beforeEach(() => {
-    root = makeTestTemp('socs-s1-unpaired-boot');
+    root = makeTestTemp('unpaired-boot');
   });
 
   afterEach(() => {
@@ -59,21 +51,14 @@ describe('unpaired daemon boot', () => {
 
     try {
       expect(gateway.servesPairingOnly).toBe(true);
-      // Nothing clinical exists: no runtime, no manager, and therefore no index or scheduler.
       expect(gateway.runtimeInstance).toBeUndefined();
       expect(gateway.runtimeManager).toBeUndefined();
-      // No provider was created, so nothing clinical was bootstrapped into the workspace. The only
-      // thing under it is `.state`, which holds the owner RECORD that setup committed.
       expect(fs.readdirSync(fixture.workspace)).toEqual(['.state']);
       expect(fs.readdirSync(path.join(fixture.workspace, '.state'))).toEqual(['owner-access.json']);
 
-      // A local/dev conversation is NOT the bound Telegram chat, so it is answered with the
-      // pairing prompt rather than reaching a runtime — and pairing it must not build one either.
       const prompt = await gateway.handleTestMessage('local-chat', 'hello?', 'm1');
       expect(prompt).toMatch(/pairing code/i);
 
-      // A distinct transport event: the same event ID again would be a redelivery and must not
-      // spend a second attempt.
       const paired = await gateway.handleTestMessage('local-chat', issued.plaintext, 'm2');
       expect(paired).toMatch(/pairing complete/i);
       expect(gateway.runtimeInstance).toBeUndefined();
@@ -84,9 +69,8 @@ describe('unpaired daemon boot', () => {
     }
   }, 60_000);
 
-  it('C09 refuses a missing owner record with one terminal boot result', async () => {
+  it('refuses a missing owner record with one terminal boot result', async () => {
     const fixture = writeConfigFixture(root, { telegramEnabled: false });
-    // No record written at all.
     const store: OwnerStatePort = new FileOwnerStatePort(fixture.ownerRecord, fixture.ownerId);
     const admission = new OwnerAdmissionService({
       store,
@@ -108,8 +92,6 @@ describe('unpaired daemon boot', () => {
   }, 60_000);
 
   it('refuses to boot when the record on disk belongs to another owner', async () => {
-    // The CONFIG selects `alpha`; the RECORD was written for `beta`. That mismatch must refuse
-    // rather than being adopted, which is the whole point of matching identity on every read.
     const fixture = writeConfigFixture(root, { telegramEnabled: false, ownerId: 'alpha' });
     fs.mkdirSync(path.dirname(fixture.ownerRecord), { recursive: true, mode: 0o700 });
     fs.writeFileSync(

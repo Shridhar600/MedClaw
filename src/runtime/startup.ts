@@ -1,11 +1,3 @@
-// One configuration selection and one strict load, shared by the daemon and every retained
-// CLI command. Selection precedence is `--config` > `REDACTED_CONFIG_PATH` >
-// `home/.redacted/config.json`, and a missing flag value or unknown option is a usage
-// error rather than a silent fallback.
-//
-// Load refuses when the document is missing, unreadable, oversized, malformed, on an old
-// schema, or missing owner identity. A default never becomes an owner, and there is no
-// healthy-empty or quarantine-to-empty read behavior.
 
 import * as os from 'os';
 import * as path from 'path';
@@ -48,11 +40,6 @@ export interface ConfigSelectionInput {
   homeDir?: string;
 }
 
-/**
- * Resolve which configuration document to use. The flag wins; then a non-empty environment
- * variable; then the home default. A relative flag value resolves against the caller cwd,
- * which is what a shell user means by it.
- */
 export function selectConfigPath(input: ConfigSelectionInput = {}): string {
   const env = input.env ?? process.env;
   const homeDir = input.homeDir ?? os.homedir();
@@ -73,11 +60,6 @@ export interface GlobalOptionParse {
   rest: string[];
 }
 
-/**
- * Global options are recognised only BEFORE the command. Once a bare token (the command name) is seen,
- * everything after it belongs to that command's own parser. An unrecognised flag before the command is
- * refused, so a typo in the global position is not silently forwarded.
- */
 export function parseGlobalOptions(argv: ReadonlyArray<string>): GlobalOptionParse {
   let configPath: string | undefined;
   let help = false;
@@ -105,8 +87,6 @@ export function parseGlobalOptions(argv: ReadonlyArray<string>): GlobalOptionPar
         continue;
       }
       if (token.startsWith('-')) {
-        // Name only — never the text after '=', which is a value and may be a secret. A token that
-        // is not a long option is never a supported name, so it is not echoed at all.
         if (!token.startsWith('--')) {
           throw new ConfigSelectionError(
             `Unknown option at position ${index + 1}. Run \`medclaw --help\` for the supported options.`,
@@ -128,13 +108,6 @@ export interface LoadRuntimeConfigOptions {
   homeDir?: string;
 }
 
-/**
- * Read, validate and derive the runtime configuration.
- *
- * Every refusal names an allowlisted reason and keeps the original document untouched.
- * Derived owner paths come from `resolveOwnerPaths`, so the document has exactly one path
- * authority.
- */
 export async function loadRuntimeConfig(options: LoadRuntimeConfigOptions = {}): Promise<EffectiveConfig> {
   const homeDir = options.homeDir ?? os.homedir();
   const selected = selectConfigPath({ flagValue: options.configPath, env: process.env, homeDir });

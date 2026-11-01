@@ -65,11 +65,6 @@ describe('Gateway reconciler debounce', () => {
     jest.restoreAllMocks();
   });
 
-  /**
-   * OLD -> NEW: built `await boundGateway(config)` with no admission. Under S1 that makes the destination guard
-   * fail closed, so scheduled work is suppressed. Binding a real owner keeps these tests on the same
-   * authority production uses.
-   */
   async function boundGateway(config: EffectiveConfig): Promise<Gateway> {
     const owner = fixtureOwner(tmpDir);
     const bound = await bindOwnerFixture(owner.ownerRecord, owner.ownerId, 'chat-1');
@@ -93,9 +88,7 @@ describe('Gateway reconciler debounce', () => {
         bootstrapMaxChars: 20000,
       },
       sessions: {
-        softResetAfterMinutes: 240,
-        hardResetAfterMinutes: 1440,
-        compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+        compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
       },
       heartbeat: {
         enabled: true,
@@ -114,14 +107,14 @@ describe('Gateway reconciler debounce', () => {
           },
         },
       },
-      agent: { maxIterations: 15, disclaimerEnabled: true },
+      agent: { maxIterations: 15 },
     };
   }
 
   async function setupGatewayWithScheduler() {
     const config = makeConfig();
     const gateway = await boundGateway(config);
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
     const mockScheduler = {
       listJobs: jest.fn().mockResolvedValue([]),
     };
@@ -131,12 +124,6 @@ describe('Gateway reconciler debounce', () => {
     });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).resolvedMemoryWorkspace = config.memory.workspace;
-    // RR2-B1 setup migration: the policy-reconcile path refuses chats the resolving profile
-    // does not own; pair the fixture chats so the debounce/timer assertions keep their meaning.
-    // S1: this used to build a `ProfileRegistry`, pair 'chat-1' to the default profile and assign it to
-    // `gateway.profileRegistry`. That field no longer exists — admission replaced it — so the block was
-    // write-only scaffolding that granted nothing. The real authority is the bound owner record supplied
-    // through `bindGatewayOwner` at construction.
     return { gateway, config };
   }
 
@@ -160,10 +147,6 @@ describe('Gateway reconciler debounce', () => {
   });
 
   it('two different chatIds get independent debounce timers, and only the BOUND chat may reconcile', async () => {
-    // OLD -> NEW: this asserted two independent timers AND that both chats reconciled. Under S1 only the
-    // bound owner destination may reconcile — the destination guard authorizes exactly one chat. The
-    // debounce mechanism is unchanged and still per-chat; what changed is that a second chat can no longer
-    // reach reconciliation. Both halves are now asserted, which is strictly more than before.
     const { gateway } = await setupGatewayWithScheduler();
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -174,12 +157,10 @@ describe('Gateway reconciler debounce', () => {
     jest.advanceTimersByTime(30_000);
     await Promise.resolve();
 
-    // Independent timers: the bound chat's own debounce elapsed and ran exactly once.
     expect(mockReconcile).toHaveBeenCalledTimes(1);
 
     const chatIds = mockBuildDesired.mock.calls.map((call: unknown[]) => (call[0] as { chatId: string }).chatId);
     expect(chatIds).toContain('chat-1');
-    // The unbound chat got its own timer but was refused by the destination guard.
     expect(chatIds).not.toContain('chat-B');
   });
 
@@ -223,16 +204,9 @@ describe('Gateway reconciler debounce', () => {
     const runtime = attachGatewayTestRuntime(gateway, config, {
       agentLoop: { run: jest.fn().mockResolvedValue({ text: 'ok', trace: [] }) },
     });
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
     await sessions.recordTurn('chat-1', [{ role: 'user', content: 'Seed startup chat.' }]);
     (runtime as any).sessions = sessions;
-    // RR2-B1 setup migration: pair the startup chat so the guarded policy reconcile runs.
-    {
-      // S1: this used to build a `ProfileRegistry`, pair 'chat-1' to the default profile and assign it to
-    // `gateway.profileRegistry`. That field no longer exists — admission replaced it — so the block was
-    // write-only scaffolding that granted nothing. The real authority is the bound owner record supplied
-    // through `bindGatewayOwner` at construction.
-    }
 
     await (gateway as any).initializeScheduler();
 
@@ -253,12 +227,10 @@ describe('Gateway reconciler debounce', () => {
     const timers = (gateway as any).reconcileTimers as Map<string, ReturnType<typeof setTimeout>>;
     const timer = timers.get('chat-1');
     expect(timer).toBeDefined();
-    // Sinon fake timers implement hasRef(); an unref'd timeout reports false.
-    // This pins the actual unref() contract, not just the timer's existence.
     expect((timer as unknown as { hasRef(): boolean }).hasRef()).toBe(false);
   });
 
-  it('stop() clears pending debounce timers', async () => {
+  it('stop clears pending debounce timers', async () => {
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     jest.spyOn(console, 'log').mockImplementation(() => undefined);
 

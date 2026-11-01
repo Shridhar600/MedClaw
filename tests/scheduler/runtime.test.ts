@@ -95,8 +95,6 @@ describe('HeartbeatScheduler', () => {
       const scheduler = new HeartbeatScheduler(store, trigger);
       await scheduler.start();
 
-      // recordFailure's store.update now fails too — executeJob is invoked
-      // fire-and-forget from cron ticks, so nothing may escape it.
       jest.spyOn(store, 'update').mockRejectedValue(new Error('disk full'));
 
       await expect(scheduler.runNow(job.id)).resolves.toBeUndefined();
@@ -172,7 +170,7 @@ describe('HeartbeatScheduler', () => {
   });
 
   it('sanitizes a persisted cron validation failure in startup logs and lastError', async () => {
-    const marker = 'RR2_A1_PRIVATE_CRON_MARKER';
+    const marker = 'PRIVATE_CRON_MARKER';
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     let scheduler: HeartbeatScheduler | undefined;
     try {
@@ -184,7 +182,7 @@ describe('HeartbeatScheduler', () => {
         prompt: 'Should be disabled on startup.',
         source: 'system',
         kind: 'routine',
-        policyKey: 'defaults:rr2-a1-invalid',
+        policyKey: 'defaults:invalid-policy',
       });
       await store.update(job.id, { cron: marker });
 
@@ -368,7 +366,6 @@ describe('HeartbeatScheduler', () => {
     }
   });
 
-  // ── CORR-M1: executeJob overlap guard ────────────────────────────────
   it('overlapping executeJob calls for the same job run the trigger ONCE; markRun runs ONCE; state stays coherent', async () => {
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
@@ -422,8 +419,7 @@ describe('HeartbeatScheduler', () => {
     }
   });
 
-  // ── RES-P2-3: stop() drains inFlight ─────────────────────────────────
-  it('stop() waits for a blocked inFlight executeJob to finish before resolving', async () => {
+  it('stop waits for a blocked inFlight executeJob to finish before resolving', async () => {
     const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
     try {
       const store = new HeartbeatStore(storePath);
@@ -448,15 +444,12 @@ describe('HeartbeatScheduler', () => {
       const scheduler = new HeartbeatScheduler(store, trigger, 'UTC');
       await scheduler.start();
 
-      // Kick off an inFlight executeJob without awaiting it.
       const runP = scheduler.runNow(job.id);
-      // Let executeJob enter the blocked trigger (await triggerGate).
       await Promise.resolve();
       await Promise.resolve();
 
       const stopP = scheduler.stop();
 
-      // While the job is still blocked, stop() must NOT resolve within 150ms.
       await expect(
         Promise.race([
           stopP.then(() => 'resolved'),
@@ -464,8 +457,6 @@ describe('HeartbeatScheduler', () => {
         ]),
       ).resolves.toBe('pending');
 
-      // Now release the blocked trigger; executeJob settles, inFlight clears,
-      // and stop() resolves.
       releaseTrigger();
       await expect(runP).resolves.toBeUndefined();
       await expect(stopP).resolves.toBeUndefined();
@@ -506,7 +497,6 @@ describe('HeartbeatScheduler', () => {
     await firstUpdateStarted.promise;
     const secondFailure = scheduler.recordFailure(job.id, 'second failure');
 
-    // Give an unsynchronized implementation a chance to read the same retryCount.
     await Promise.resolve();
     await Promise.resolve();
     releaseFirstUpdate.resolve();
@@ -563,7 +553,7 @@ describe('HeartbeatScheduler', () => {
   });
 });
 
-describe('HeartbeatScheduler destination-ownership guard (RR2-B1)', () => {
+describe('HeartbeatScheduler destination-ownership guard', () => {
   let tmpDir: string;
   let storePath: string;
 
@@ -616,7 +606,6 @@ describe('HeartbeatScheduler destination-ownership guard (RR2-B1)', () => {
 
   it('updateJob refuses re-enabling a foreign-addressed record; disabling it stays allowed', async () => {
     const store = new HeartbeatStore(storePath);
-    // Plant a foreign record directly through the store (bypassing the create guard).
     const planted = await store.create({
       title: 'Planted foreign job', chatId: 'other-profile-chat', cron: '0 8 * * *',
       prompt: 'x', source: 'agent', kind: 'routine',
@@ -630,7 +619,7 @@ describe('HeartbeatScheduler destination-ownership guard (RR2-B1)', () => {
     await scheduler.stop();
   });
 
-  it('start() disables a planted foreign-addressed record instead of registering it, and never triggers it', async () => {
+  it('start disables a planted foreign-addressed record instead of registering it, and never triggers it', async () => {
     const store = new HeartbeatStore(storePath);
     const planted = await store.create({
       title: 'Planted foreign job', chatId: 'other-profile-chat', cron: '0 8 * * *',

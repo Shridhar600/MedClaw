@@ -1,5 +1,3 @@
-// Public surface of the concrete runtime adapters. Each one is a bounded filesystem, crypto or
-// ownership implementation of a port declared in `src/ports/`. Policy lives in `src/profiles`.
 
 export {
   canonicalizeConfigPath,

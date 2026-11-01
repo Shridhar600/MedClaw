@@ -1,9 +1,6 @@
 import { chunkHasStaleEntity } from '../../src/recall';
 import type { FactRecord } from '../../src/ports';
 
-// E1.1 (CONTRA-06/08 substrate): a pure, DRY stale-entity predicate extracted from the recall
-// engine's Stage-2 suppression. A chunk is stale when it mentions an entity whose CURRENT HEAD is
-// terminal (retracted / discontinued / superseded). memory_search's status:active filter reuses it.
 function head(entity: string, status: string, extra: Partial<FactRecord> = {}): FactRecord {
   return {
     id: `${entity}-v1`, profileId: 'p1', entity, type: 'medication', version: 1,
@@ -32,7 +29,6 @@ describe('chunkHasStaleEntity', () => {
   });
 
   it('matches morphological variants (plural mentions)', () => {
-    // matchEntities singularizes both sides, so a plural mention still matches the entity word.
     expect(chunkHasStaleEntity('my UTIs cleared up', [head('uti', 'discontinued', { type: 'symptom' })])).toBe(true);
   });
 

@@ -46,7 +46,6 @@ describe('Memory Write Reindex', () => {
     const writeTool = tools.find(t => t.name === 'memory_write')!;
     await writeTool.execute({ path: 'health.md', content: 'blood sugar level 120', mode: 'overwrite' });
 
-    // Give indexer time to process (fire-and-forget)
     await new Promise(r => setTimeout(r, 200));
 
     const chunks = store.getChunksByPath('health.md');

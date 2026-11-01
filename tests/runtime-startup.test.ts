@@ -1,9 +1,3 @@
-// tests/runtime-startup.test.ts
-//
-// RETIRED -> the old first case asserted that `config.memory.workspace` equalled a path
-// persisted in the document. The workspace is now derived from the selected owner, so the
-// replacement asserts identity selection plus derivation, and additionally that the
-// selection precedence and the usage errors are real.
 import * as fs from 'fs';
 import * as path from 'path';
 import {
@@ -52,29 +46,18 @@ describe('runtime startup config resolution', () => {
     ).toBe(fromFlag);
   });
 
-  // RETIRED -> a missing `--config` value silently fell back to the home default and consumed
-  // the following token (the command) as its value.
   it('refuses a --config flag with no value instead of falling back', () => {
     expect(() => parseGlobalOptions(['--config'])).toThrow(ConfigSelectionError);
     expect(() => parseGlobalOptions(['--config', '--help'])).toThrow(/requires a path/);
     expect(() => selectConfigPath({ flagValue: '' })).toThrow(ConfigSelectionError);
   });
 
-  // RETIRED -> an unknown global flag fell through and was interpreted as the command, so
-  // `status --bogus` was silently ignored.
-  //
-  // S1 change (old -> new): global parsing now STOPS at the command, so that
-  // `medclaw onboard --yes --owner-id kiran` reaches `onboard`'s own parser instead of dying as an
-  // "unknown option" (which made `--yes` unreachable through `runCli` entirely). The protection this
-  // test protects is preserved one layer out: a command that declares no options of its own still
-  // refuses a stray flag, in `runCli` — see tests/cli/cli.test.ts.
   it('stops global parsing at the command so command options reach their own parser', () => {
     expect(parseGlobalOptions(['onboard', '--yes', '--owner-id', 'kiran'])).toEqual({
       configPath: undefined,
       help: false,
       rest: ['onboard', '--yes', '--owner-id', 'kiran'],
     });
-    // An unrecognised flag BEFORE the command is still refused, so a global typo is not forwarded.
     expect(() => parseGlobalOptions(['--bogus', 'status'])).toThrow(/Unknown option: --bogus/);
     expect(parseGlobalOptions(['--config', '/x/y.json', 'status'])).toEqual({
       configPath: '/x/y.json',
@@ -86,7 +69,6 @@ describe('runtime startup config resolution', () => {
   it('loads the home config and derives every owner path from the selected identity', async () => {
     const baseDir = path.join(tmpDir, 'state');
     const fixture = writeConfigFixture(tmpDir, { baseDir, ownerId: 'shridhar', raw: undefined });
-    // Move the document to the home default location so this exercises the fallback.
     fs.mkdirSync(path.dirname(defaultRuntimeConfigPath(tmpDir)), { recursive: true });
     fs.renameSync(fixture.configPath, defaultRuntimeConfigPath(tmpDir));
 
@@ -130,10 +112,7 @@ describe('runtime startup config resolution', () => {
   it('reports the selected path so a refusal names the document it refused', async () => {
     const fixture = writeConfigFixture(tmpDir, { raw: 'not json at all {' });
 
-    // A homeDir with no config document in it. Workspace-local, and strictly better than system temp:
-    // a shared temp directory could in principle hold a stray config, which would make this pass or
-    // fail for reasons unrelated to the behaviour under test.
-    const emptyHome = makeTestTemp('r14-empty-home');
+    const emptyHome = makeTestTemp('empty-home');
     await expect(loadRuntimeConfig({ configPath: fixture.configPath, homeDir: emptyHome })).rejects.toThrow(
       new RegExp(fixture.configPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
     );

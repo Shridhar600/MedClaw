@@ -1,9 +1,3 @@
-// Shared FactMirror contract (P2 Task A1). Any FactMirror adapter must pass this suite —
-// the rebuildable-from-Markdown mirror of the ledger that recall Stage 1 reads.
-//
-// NOT a test file itself (jest testMatch is **/*.test.ts) — it only exports the suite.
-// Import and invoke from an adapter's own *.test.ts with a factory that builds a fresh,
-// isolated adapter per call.
 
 import type { FactMirror, FactRecord } from '../../src/ports';
 
@@ -34,7 +28,7 @@ function fact(id: string, over: Partial<FactRecord> = {}): FactRecord {
 }
 
 export function runFactMirrorContract(makeMirror: MakeMirror): void {
-  describe('FactMirror contract (P2 A1)', () => {
+  describe('FactMirror contract', () => {
     let mirror: ContractMirror;
 
     beforeEach(() => {
@@ -65,7 +59,7 @@ export function runFactMirrorContract(makeMirror: MakeMirror): void {
       expect(rows[0].type).toBe('condition');
     });
 
-    it('round-trips authority / confidence / episodeId + fields (v2-M-2)', async () => {
+    it('round-trips authority / confidence / episodeId + fields', async () => {
       await mirror.upsert([
         fact('metformin', {
           authority: 'doctor',
@@ -102,7 +96,7 @@ export function runFactMirrorContract(makeMirror: MakeMirror): void {
       expect(rows.map(f => f.entity)).toEqual(['d']);
     });
 
-    it('excludes v0 quarantine sentinels (version < 1) from active queries (M-5 discipline)', async () => {
+    it('excludes v0 quarantine sentinels (version < 1) from active queries', async () => {
       await mirror.upsert([
         fact('ghostmed', { version: 0, status: 'active' }),
         fact('realmed', { version: 1, status: 'active' }),
@@ -121,9 +115,7 @@ export function runFactMirrorContract(makeMirror: MakeMirror): void {
       expect(rows.map(f => f.entity).sort()).toEqual(['fresh1', 'fresh2']);
     });
 
-    // --- queryPaused (recall Stage 1, KNEE-08 paused-with-pre_pause_summary) --------------
-
-    it('queryPaused yields only paused facts and carries pre_pause_summary (KNEE-08)', async () => {
+    it('queryPaused yields only paused facts and carries pre_pause_summary', async () => {
       await mirror.upsert([
         fact('gym-goal', { type: 'goal', status: 'paused', fields: { pre_pause_summary: '2x/week moderate' } }),
         fact('metformin', { type: 'medication', status: 'active' }),
@@ -143,8 +135,6 @@ export function runFactMirrorContract(makeMirror: MakeMirror): void {
       const goals = await collect(mirror.queryPaused('goal'));
       expect(goals.map(f => f.entity)).toEqual(['gym-goal']);
     });
-
-    // --- queryEntityHeads (recall Stage 2 suppression CONTRA-10 + stale fail-closed KNEE-10) -
 
     it('queryEntityHeads prefers an active lifecycle winner over a higher terminal version', async () => {
       await mirror.upsert([
@@ -172,7 +162,7 @@ export function runFactMirrorContract(makeMirror: MakeMirror): void {
       expect(heads.map(h => h.entity).sort()).toEqual(['real']);
     });
 
-    it('queryEntityHeads resolves a version tie to a single deterministic head (latest createdAt) (F11)', async () => {
+    it('queryEntityHeads resolves a version tie to a single deterministic head (latest createdAt)', async () => {
       await mirror.upsert([
         fact('dup-a', { entity: 'dupe', version: 2, status: 'superseded', createdAt: '2026-01-01T00:00:00.000Z' }),
         fact('dup-b', { entity: 'dupe', version: 2, status: 'active', createdAt: '2026-02-01T00:00:00.000Z' }),

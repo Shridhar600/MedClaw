@@ -72,9 +72,6 @@ describe('setup readiness', () => {
   });
 
   it('never prints endpoint credentials in a start-preflight blocker', async () => {
-    // Cold re-review E1 preflight path: the configured endpoint can carry `user:password@`, and the
-    // missing-model blocker interpolated it raw. The host must remain visible; the credentials must
-    // not.
     const config = getDefaultConfig();
     config.memory.workspace = workspacePath;
     config.channels.telegram.enabled = false;

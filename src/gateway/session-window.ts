@@ -1,20 +1,8 @@
-// The rolling context window, persisted separately from the append-only day-file archive. Disk holds
-// verbatim JSONL day files that are never rewritten; the window file is just the pointer into that
-// archive plus the compaction summary. On restart the day-file tail is replayed from `verbatimFrom`.
-//
-// An absent or corrupt window file is not an error: it yields a fresh empty window pointing at the
-// EOF of the latest day file (`{file:'',line:0}` only when no day files exist). `loadWindow` never
-// throws and never logs window content (`summaryBlock` is a PHI session summary).
 
 import * as fs from 'fs';
 import * as path from 'path';
 import { secureWriteViaTmp, summarizeErrorForLog } from '../security';
 
-/**
- * A stable pointer into the append-only day-file archive: a day-file basename plus a 1-based
- * physical non-empty line number. Anchors never change once assigned, because the archive is never
- * rewritten.
- */
 export interface Anchor {
   file: string;
   line: number;
@@ -49,10 +37,6 @@ export interface SessionWindow {
 
 const DAY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.jsonl$/;
 
-/**
- * The single shared day key: UTC `YYYY-MM-DD`, matching `NarrativeStore`'s daily-log convention.
- * Every caller must agree on the day boundary, so never use local time.
- */
 export function dateKey(now: Date): string {
   return now.toISOString().slice(0, 10);
 }
@@ -62,10 +46,6 @@ export function saveWindow(filePath: string, window: SessionWindow): void {
   secureWriteViaTmp(filePath, JSON.stringify(window));
 }
 
-/**
- * Load the window state. Returns `null` for an absent, unreadable, corrupt, or wrong-shape file — the
- * caller resolves the fresh-window default (see `resolveWindow`). Never throws; never logs content.
- */
 export function loadWindow(filePath: string): SessionWindow | null {
   let raw: string;
   try {
@@ -87,11 +67,6 @@ export function loadWindow(filePath: string): SessionWindow | null {
   }
 }
 
-/**
- * The physical non-empty line count of a JSONL day file. A malformed line still occupies its slot,
- * so an anchor's `line` is a stable physical position. This is the single definition of "day-file
- * line count". Returns 0 for an absent/unreadable file.
- */
 export function countDayFileLines(filePath: string): number {
   let count = 0;
   forEachNonEmptyLine(filePath, () => { count += 1; });
@@ -100,10 +75,6 @@ export function countDayFileLines(filePath: string): number {
 
 const READ_CHUNK_BYTES = 64 * 1024;
 
-/**
- * Visit non-empty LF-delimited physical lines without materializing the file. The line number is the
- * 1-based non-empty physical slot used by session anchors; malformed JSON is deliberately opaque here.
- */
 function forEachNonEmptyLine(filePath: string, visit: (raw: string, line: number) => void): boolean {
   let fd: number | undefined;
   try {
@@ -124,8 +95,6 @@ function forEachNonEmptyLine(filePath: string, visit: (raw: string, line: number
 
     // eslint-disable-next-line no-constant-condition
     while (true) {
-      // Keep each chunk alive while a logical line spans the next read. Reusing one buffer would
-      // overwrite the earlier slice before Buffer.concat() sees it.
       const chunk = Buffer.allocUnsafe(READ_CHUNK_BYTES);
       const bytesRead = fs.readSync(fd, chunk, 0, chunk.length, position);
       if (bytesRead === 0) break;
@@ -184,17 +153,9 @@ export interface ArchiveLine {
   raw: string;
 }
 
-/**
- * The EOF-exclusive anchor `k` non-empty archive lines back from the end, so `readLinesAfter`
- * returns exactly the last `k` lines. `k <= 0` gives the archive EOF; `k` at or beyond the archive
- * size clamps to the archive start; an empty archive gives `{file:'',line:0}`. A boundary exactly
- * on a day-file edge rolls to the next file's start (line 0).
- */
 export function walkBackAnchor(sessionsDir: string, k: number): Anchor {
   const files = listDayFiles(sessionsDir);
   if (files.length === 0) return { file: '', line: 0 };
-  // The recovery path may inspect the whole archive, but it keeps memory bounded: only one integer
-  // count per day file is retained, never an archive-sized line array or string.
   const counts = files.map((f) => countDayFileLines(path.join(sessionsDir, f)));
   const total = counts.reduce((a, b) => a + b, 0);
   const pre = Math.max(0, total - k); // number of pre-tail lines to skip from the archive start
@@ -212,11 +173,6 @@ export function anchorBefore(anchor: Anchor): Anchor {
   return { file: anchor.file, line: Math.max(0, anchor.line - 1) };
 }
 
-/**
- * Every non-empty archive line strictly after `from`, through EOF, in chronological order, each with
- * its physical `{file, line}` anchor and raw JSON text. Malformed lines are kept as raw because they
- * occupy their physical slot; the caller parses `raw` and skips failures.
- */
 export function readLinesAfter(sessionsDir: string, from: Anchor): ArchiveLine[] {
   const out: ArchiveLine[] = [];
   for (const f of listDayFiles(sessionsDir)) {
@@ -279,25 +235,15 @@ export function deriveWindowAnchor(
   return { anchor: walkBackAnchor(sessionsDir, k), source: 'fallback' };
 }
 
-/**
- * The EOF anchor of the newest day file in `sessionsDir`: `{ file: <basename>, line: <non-empty line
- * count> }`. `{file:'',line:0}` when the directory is missing or holds no `YYYY-MM-DD.jsonl` files.
- */
 export function latestDayFileEof(sessionsDir: string): Anchor {
   const tail = latestDayFileTail(sessionsDir);
   return { file: tail.file, line: tail.line };
 }
 
-/**
- * The window to boot with: the persisted window when present and valid, otherwise a fresh empty
- * window anchored at the latest day file's EOF.
- */
 export function resolveWindow(filePath: string, sessionsDir: string): SessionWindow {
   const persisted = loadWindow(filePath);
   if (persisted && isValidAnchor(persisted.verbatimFrom, sessionsDir)) return persisted;
 
-  // A pending summary is durable work; keep it even when the cursor is invalid so a torn or stale
-  // window cannot discard a summary that still needs to reach its sink.
   return {
     summaryBlock: '',
     verbatimFrom: latestDayFileEof(sessionsDir),
@@ -330,11 +276,6 @@ function isArchiveTailShape(v: unknown): v is ArchiveTail {
   return o.file !== '' || (o.line === 0 && o.byteLength === 0);
 }
 
-/**
- * Validate a persisted cursor against the archive it claims to point into. The cursor is an
- * EOF-exclusive physical slot, so line zero is valid only for an existing day file and line equal
- * to the physical non-empty count is valid at EOF. `{file:'',line:0}` is reserved for an empty archive.
- */
 function isValidAnchor(anchor: Anchor, sessionsDir: string): boolean {
   if (!Number.isInteger(anchor.line) || anchor.line < 0) return false;
   const dayFiles = listDayFiles(sessionsDir);

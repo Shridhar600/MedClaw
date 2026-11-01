@@ -1,6 +1,3 @@
-// Unicode homoglyph normalization. A credential label written with Cyrillic/Greek lookalikes is
-// visually identical to the ASCII form but evades an ASCII-only label regex. Map the common
-// lookalikes to their ASCII equivalents before scanning (small explicit map, no dependency).
 const HOMOGLYPH_MAP: Record<string, string> = {
   // Cyrillic smalls
   а: 'a', е: 'e', о: 'o', р: 'p', с: 'c', х: 'x', у: 'y', і: 'i', ѕ: 's',
@@ -16,18 +13,11 @@ function normalizeHomoglyphs(content: string): string {
   return content.replace(HOMOGLYPH_PATTERN, (ch) => HOMOGLYPH_MAP[ch] ?? ch);
 }
 
-// Scan-only normalization: strips Unicode default-ignorable code points (zero-width controls, word
-// joiners, soft hyphen, variation selectors) from the detector's copy so they cannot split a label.
-// The stored content is unchanged.
 function stripDefaultIgnorableCodePoints(content: string): string {
   return content.replace(/\p{Default_Ignorable_Code_Point}/gu, '');
 }
 
 const CREDENTIAL_PATTERNS: RegExp[] = [
-  // Label + value. The filler `[^A-Za-z0-9_-]{0,100000}` lets the scanner catch a label and value
-  // separated by non-alphanumeric padding (a split-append bypass: label, thousands of '#', value).
-  // Bounded so a benign label far from a long token in a large health note is less likely to
-  // false-positive; 100000 comfortably spans realistic padding.
   /(?:api[_-]?key|apikey|secret|token|password)\s*[:=]\s*['"]?[^A-Za-z0-9_-]{0,100000}[A-Za-z0-9_-]{16,}/i,
   /(?:-----BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY-----)/i,
   /(?:ghp_|gho_|github_pat_)[A-Za-z0-9_]{36,}/,
@@ -36,8 +26,6 @@ const CREDENTIAL_PATTERNS: RegExp[] = [
 ];
 
 export function contentContainsCredentials(content: string): { matched: boolean; pattern: string } {
-  // Remove default-ignorable code points and normalize homoglyphs to ASCII, then lowercase so
-  // invisible splits and case-variant labels (ApiKey, API_KEY) collapse before patterns run.
   const normalized = normalizeHomoglyphs(stripDefaultIgnorableCodePoints(content)).toLowerCase();
   for (const pattern of CREDENTIAL_PATTERNS) {
     if (pattern.test(normalized)) {

@@ -1,11 +1,3 @@
-// tests/security/phi-leak-sweep.test.ts
-//
-// SEC-M1 regression deliverable: for each runtime-proven PHI leak site, drive
-// the failure path with a PHI marker injected into the error message and
-// assert (a) the marker never reaches console output and (b) the sanitized
-// name/frame DOES reach console. Pattern follows tests/scheduler/runtime.test.ts
-// 'sanitized lastError'. These tests FAIL on the reverted (pre-W3F-B) source
-// because the raw error object/message was logged directly.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -28,10 +20,9 @@ import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 
 const PHI = 'glucose-PHI-marker-142857';
 
-describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () => {
+describe('PHI leak sweep — raw error objects never reach console', () => {
   afterEach(() => jest.restoreAllMocks());
 
-  // ── medical-tools.ts: medical provider + main provider both fail → two logs.
   it('medgemma_query logs a sanitized frame, never the PHI-bearing provider error', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
@@ -70,21 +61,16 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
     const tmpDir = makeTestTemp('phi-sess-');
     try {
       const provider: LLMProvider = {
-        chat: jest.fn().mockRejectedValue(new Error(`compact summary failed: ${PHI}`)),
+        chat: jest.fn().mockRejectedValue(Object.assign(new Error(`compact summary failed: ${PHI}`), { status: 400 })),
         embed: jest.fn().mockResolvedValue([0.1]),
       };
       const registry = new ToolRegistry({ allow: ['*'], deny: [] });
       const manager = new SessionManager(
-        240,
-        1440,
         tmpDir,
         provider,
         registry,
-        { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 2 },
+        { enabled: true, memoryFlush: true, keepRecentTurns: 2 },
       );
-      // I3 added bounded retries to compaction LLM calls; this test asserts log
-      // sanitization, so use a single fast attempt to stay inside the timeout.
-      manager.setCompactionRetryPolicy({ attempts: 1 });
       const chatId = 'chat-phi';
       for (let i = 0; i < 6; i++) {
         await manager.addTurn(chatId, { role: 'user', content: `u${i}` }, { role: 'assistant', content: `a${i}` });
@@ -92,8 +78,6 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
       await expect(manager.runCompaction(chatId)).resolves.toBeUndefined();
 
       const warnText = warnSpy.mock.calls.flat().map(String).join('\n');
-      // The PHI marker in the provider error must never reach console; the
-      // flush (line 222) and compact (line 255) catches both log the frame.
       expect(warnText).not.toContain(PHI);
       expect(warnText).not.toContain('compact summary failed');
       expect(warnText).toContain('session');
@@ -168,8 +152,6 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
     registry.register(throwingTool);
     const result = await registry.execute('leaky', {});
-    // The full tool error text is still returned to the agent (persisted into
-    // the 0600 session JSONL), but the console log must be sanitized.
     expect((result.content[0] as { text: string }).text).toContain(PHI);
     const errorText = errorSpy.mock.calls.flat().map(String).join('\n');
     expect(errorText).not.toContain(PHI);
@@ -179,17 +161,8 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
 
   // ── destructive fs op on owner data logs a sanitized frame, never the PHI-bearing error.
   it('staged-media unlink failure reaches the real boot consumer with only closed fields', async () => {
-    // OLD -> NEW. This drove `ProfileRegistry.deleteProfile`, which renamed a PHI subtree to `.trash` and
-    // logged through `summarizeErrorForLog` when the rename failed. The registry is deleted. The INVARIANT
-    // is not: a destructive filesystem operation on owner data must never put the underlying error — which
-    // carries a path and whatever the OS appended — into a log line.
-    //
-    // The surviving analogue is real boot cleanup. The consumer reports closed fields, so even a
-    // filename-bearing filesystem error never reaches operator output.
     const errorSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const fsReal = jest.requireActual<typeof import('fs')>('fs');
-    // Workspace-local (gitignored `.test-tmp/`), never `os.tmpdir()` — `os.tmpdir()` is a symlink on
-    // macOS, which routes the sweep down its symlink branch instead of the unlink path under test.
     const staging = makeTestTemp('phi-staging');
     const fixture = writeConfigFixture(staging);
     const authority = composeOwnerAuthority({ ownerId: asProfileId(fixture.ownerId)!, ownerPaths: { ownerRecord: fixture.ownerRecord } });
@@ -212,7 +185,6 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
       expect(warnText).toBe('[gateway] Media staging cleanup partial: reason=io-failed inspected=1 removed=0');
       expect(gateway.stagingCleanupResult).toEqual({ kind: 'partial', reason: 'io-failed', inspected: 1, removed: 0 });
       expect(fs.readFileSync(artifact, 'utf8')).toBe('data');
-      // …and no filesystem path leaked either: the frame names the code location, not the owner's tree.
       expect(warnText).not.toContain(staging);
     } finally {
       await gateway.stop();
@@ -232,7 +204,6 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
       const tools = createMemoryTools(engine, undefined, failingIndexer as unknown as Parameters<typeof createMemoryTools>[2]);
       const writeTool = tools.find((t) => t.name === 'memory_write')!;
       await writeTool.execute({ path: 'note.md', content: 'a benign health note', mode: 'overwrite' });
-      // The reindex runs fire-and-forget; allow the rejected promise to settle.
       await new Promise((r) => setImmediate(r));
 
       const warnText = warnSpy.mock.calls.flat().map(String).join('\n');
@@ -250,9 +221,6 @@ describe('SEC-M1 PHI leak sweep — raw error objects never reach console', () =
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const tmpDir = makeTestTemp('phi-audit-');
     try {
-      // Force the rotation check to throw on the first append (appendCount === 1
-      // triggers a rotation check). Inject a PHI-bearing throw via the rotation
-      // module that audit-log imports.
       jest.isolateModules(() => {
         jest.doMock('../../src/scheduler/rotation', () => ({
           rotateFileIfNeeded: jest.fn().mockImplementation(() => {

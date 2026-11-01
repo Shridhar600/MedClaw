@@ -1,14 +1,3 @@
-// src/memcore/curiosity-queue.ts
-//
-// Minimal durable curiosity queue: open follow-up / hypothesis items in
-// `curiosity.md`. The store surface is add/list/resolve; there is no picking logic.
-//
-// This store persists only the current `CuriosityItem` fields. A `- resolvedAt:` line is a
-// storage-level marker appended on resolve (so resolution history survives and `list()` simply
-// excludes resolved items); it is not a `CuriosityItem` field.
-//
-// The single-file format degrades safely: a corrupt block is skipped with a
-// sanitized warning, never a crash.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -53,18 +42,12 @@ export class CuriosityQueue {
       try {
         items.push(toItem(block));
       } catch (err) {
-        // PHI-safe: the block id is parsed from a `## <heading>` content line, so it
-        // must never be logged. A corrupt heading could carry health content.
         console.warn(`[curiosity-queue] corrupt curiosity item skipped: ${summarizeErrorForLog(err)}`);
       }
     }
     return items;
   }
 
-  /**
-   * Mark an item resolved (durable). Returns true when an unresolved item was
-   * found and marked; false for an unknown or already-resolved id.
-   */
   async resolve(id: string): Promise<boolean> {
     const lines = this.readRaw().split('\n');
     // Locate the target block by its `## <id>` heading.
@@ -83,8 +66,6 @@ export class CuriosityQueue {
     for (let i = start; i < end; i++) {
       if (/^- resolvedAt:/.test(lines[i])) return false;
     }
-    // Insert the marker at the end of the block, preserving every other line verbatim
-    // (unknown keys and free-floating content survive).
     let insertAt = end;
     while (insertAt > start + 1 && lines[insertAt - 1].trim() === '') insertAt--;
     lines.splice(insertAt, 0, `- resolvedAt: ${this.clock.now().toISOString()}`);
@@ -99,8 +80,6 @@ export class CuriosityQueue {
       const nodeErr = err as NodeJS.ErrnoException;
       if (nodeErr.code === 'ENOENT') return '';
       console.warn(`[curiosity-queue] read failed: ${summarizeErrorForLog(err)}`);
-      // A readable empty queue is valid; an unreadable existing queue is not.
-      // Refuse every read-modify-write or listing operation until the source is readable.
       throw err;
     }
   }

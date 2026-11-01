@@ -41,18 +41,9 @@ const STAGED_MEDIA_FAILURE_RESPONSE = 'Failed to store uploaded file. Please try
 export interface GatewayMessageRouterDeps {
   config: EffectiveConfig;
   runtime?: ProfileRuntime;
-  /**
-   * The owner-scoped staging lane, or `undefined` when this Gateway has no owner workspace to stage
-   * into. `undefined` is a safe state: nothing can be adopted and nothing is deleted.
-   */
   stagingDir: string | undefined;
   stagingBaseDir?: string;
   buildBootStatusText: () => string;
-  /**
-   * Per-profile runtime resolution, injected by the Gateway. When absent, every dispatch uses
-   * `deps.runtime`. A rejection is treated like `undefined` (canned degraded reply, never a throw),
-   * so a misbehaving resolver cannot crash the daemon.
-   */
   resolveRuntime?: (profileId: ProfileId) => Promise<ProfileRuntime | undefined>;
   /** The only authority for "who may talk to this owner". Required; there is no fallback path. */
   admission: OwnerAdmissionService;
@@ -87,8 +78,6 @@ export class GatewayMessageRouter {
 
   async route(incoming: AdmittedMessage, egress: TurnEgress): Promise<string | undefined> {
     const { text } = incoming;
-    // Admission runs before anything else, including the empty-message check, so a request from a
-    // chat that is not the owner cannot consume a reply slot.
     const admission = this.deps.admission;
     const identity = transportIdentityOf(incoming);
     const decision = admission.inspect(identity);
@@ -107,10 +96,6 @@ export class GatewayMessageRouter {
     // Admission has proved this chat is the bound owner, so the owner identity is the only dispatch target.
     const admittedOwnerId = this.deps.ownerId;
 
-    // A redelivered pairing event from the bound owner is still a pairing message, not a health
-    // question: answer "pairing complete" instead of starting a clinical turn. Deliberately narrow:
-    // only the event that actually established the binding qualifies, because a well-formed-code
-    // test would also match ordinary health words such as `headache`.
     if (admission.isRedeliveredPairingEvent(identity)) {
       this.deleteStagedMedia(incoming.mediaPath);
       return this.emitSafely(egress, PAIRING_COMPLETE_TEXT, 'Failed to answer redelivered pairing event');
@@ -161,11 +146,6 @@ export class GatewayMessageRouter {
     }
   }
 
-  /**
-   * An unpaired owner: pairing and emergency guidance only. Emergency text from a chat that is not
-   * yet bound stays canned, provider-free and unpersisted, because there is no owner runtime to
-   * record it into. Pairing text is never treated as clinical content.
-   */
   private async routePairing(
     incoming: AdmittedMessage,
     egress: TurnEgress,
@@ -178,8 +158,6 @@ export class GatewayMessageRouter {
       return this.emitSafely(egress, emergency, 'Failed to send emergency response');
     }
 
-    // A message that is not a well-formed code gets the generic prompt and still consumes the same
-    // daily allowance, so there is no free unlimited prompt channel.
     const result = await this.deps.admission.handlePairing(identity, incoming.text);
     const reply = PAIRING_RESULT_TEXT[result.kind];
     if (reply === undefined) return undefined;
@@ -187,20 +165,11 @@ export class GatewayMessageRouter {
   }
 
   private emergencyResponse(input: string): string | undefined {
-    // Inspect the raw text verbatim. Lines that look like `User id:` or `Uploaded media path:` can
-    // be user-authored, so they must not be stripped; real metadata fields are never concatenated
-    // into this input.
     return isEmergencyInput(input, this.deps.config.emergency?.keywords)
       ? EMERGENCY_RESPONSE
       : undefined;
   }
 
-  /**
-   * Build the model input. The transport sender id is deliberately not included: it is needed only
-   * for authorization, which admission has already decided, and sending it to the provider would add
-   * a re-identification channel. `mediaPath` and `replyToMessageId` stay because they are
-   * attachment and thread structure, not identity.
-   */
   private buildAgentInput(incoming: AdmittedMessage): string {
     const parts: string[] = [incoming.text];
     if (incoming.mediaPath) parts.push('', `Uploaded media path (relative to workspace): ${incoming.mediaPath}`);
@@ -208,11 +177,6 @@ export class GatewayMessageRouter {
     return parts.join('\n');
   }
 
-  /**
-   * Resolve the runtime owning `profileId`, once per turn. Falls back to `deps.runtime` when no
-   * resolver is present. A rejection degrades to `undefined` with a sanitized log, so the caller
-   * emits the canned degraded reply and never throws.
-   */
   private async resolveRuntimeFor(profileId: ProfileId): Promise<ProfileRuntime | undefined> {
     const resolver = this.deps.resolveRuntime;
     if (!resolver) return this.deps.runtime;
@@ -245,9 +209,6 @@ export class GatewayMessageRouter {
     emergency: string,
     admittedOwnerId?: ProfileId,
   ): Promise<string> {
-    // An emergency from an admitted owner records into the owner runtime. An unadmitted chat never
-    // reaches here: `route()` sends provider-free canned guidance without resolving a runtime or
-    // persisting a turn. No admitted owner id means no runtime.
     const runtime = admittedOwnerId ? await this.resolveRuntimeFor(admittedOwnerId) : undefined;
     const emergencyIncoming = { ...incoming };
     if (path.isAbsolute(emergencyIncoming.mediaPath ?? '')) {
@@ -420,12 +381,6 @@ export type IncomingMessageLike = {
   eventId?: string;
 };
 
-/**
- * Normalize an inbound message into the transport identity admission requires. A missing or
- * over-long field is carried through as-is so the admission service, not this adapter, decides it
- * is missing identity. `chatType` is never defaulted: assuming `'private'` would grant owner
- * health access to a transport that omitted the field.
- */
 export function transportIdentityOf(incoming: IncomingMessageLike): TransportIdentity {
   return {
     channel: incoming.channel ?? '',

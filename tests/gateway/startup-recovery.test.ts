@@ -89,9 +89,7 @@ describe('Gateway scheduler recovery wiring', () => {
         bootstrapMaxChars: 20_000,
       },
       sessions: {
-        softResetAfterMinutes: 240,
-        hardResetAfterMinutes: 1440,
-        compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+        compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
       },
       heartbeat: {
         enabled: true,
@@ -110,9 +108,7 @@ describe('Gateway scheduler recovery wiring', () => {
           },
         },
       },
-      agent: { maxIterations: 5, disclaimerEnabled: false },
-      // RR2-B1 setup migration: the destination-ownership guard reads the profile registry,
-      // so the fixture persists a default profile with the recovered job's chat pre-paired.
+      agent: { maxIterations: 5 },
       profiles: { baseDir: path.join(tmpDir, 'profiles-base'), defaultProfileId: 'default' },
     };
   }
@@ -174,8 +170,6 @@ describe('Gateway scheduler recovery wiring', () => {
       runScheduledJob: (job: HeartbeatJob) => Promise<void>;
       sideEffectLookup?: (entity: string) => Promise<string[]>;
     }) => {
-      // Reproduce the old construction-time recovery callback. On the fixed path
-      // Gateway passes false and performs recovery after it owns the runtime.
       capturedSideEffectLookup = deps.sideEffectLookup;
       if (deps.canSchedule) await deps.runScheduledJob(job);
       return runtime;
@@ -185,10 +179,6 @@ describe('Gateway scheduler recovery wiring', () => {
   it('does not drop a recovered heartbeat while ProfileRuntime.create is in progress', async () => {
     const { Gateway } = await import('../../src/gateway/gateway');
     const config = makeConfig();
-    // OLD -> NEW: persisted a REGISTRY pairing before boot. S1's destination guard authorizes the
-    // `OwnerState.binding.chatId`, not `profiles.json`, so a registry pairing authorizes nothing and this
-    // recovered heartbeat would be suppressed. Bind a real owner record instead — through the same
-    // composition production uses.
     const ownerRecord = path.join(tmpDir, 'owner-workspace', '.state', 'owner-access.json');
     const bound = await bindOwnerFixture(ownerRecord, 'default', 'chat-1');
     installRuntime(config);

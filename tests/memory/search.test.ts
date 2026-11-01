@@ -56,8 +56,6 @@ describe('MemorySearch', () => {
     });
 
     it('computes combined score from both vector and keyword results', async () => {
-      // Query embedding matches a.md exactly → cosine similarity = 1.0
-      // BM25 also matches a.md for "diabetes" query
       const mockProvider: LLMProvider = {
         chat: jest.fn(),
         embed: jest.fn().mockResolvedValue([1.0, 0.0, 0.0]),
@@ -67,11 +65,8 @@ describe('MemorySearch', () => {
       store.upsertChunk({ id: 'b.md:0', path: 'b.md', content: 'knee injury recovery exercises', embedding: [0.0, 1.0, 0.0], startLine: 1, endLine: 1 });
 
       const results = await search.search('diabetes', 2);
-      // a.md appears in both vector (cosine=1.0) and keyword (bm25) results
       const aResult = results.find(r => r.path === 'a.md');
       expect(aResult).toBeDefined();
-      // Vector component: 0.7 * 1.0 = 0.7, keyword component > 0
-      // Combined must be > 0.7 (keyword adds something) and < 1.0
       expect(aResult!.score).toBeGreaterThan(0.7);
       expect(aResult!.score).toBeLessThanOrEqual(1.0);
     });
@@ -144,7 +139,6 @@ describe('MemorySearch', () => {
         embed: jest.fn().mockResolvedValue([1.0, 0.0, 0.0]),
       };
       const search = new MemorySearch(store, mockProvider, { vector: 0.7, keyword: 0.3 });
-      // No chunks inserted
 
       const results = await search.search('diabetes', 5);
       expect(results).toEqual([]);
@@ -195,12 +189,9 @@ describe('MemorySearch', () => {
         embed: jest.fn().mockRejectedValue(new Error('embedder unavailable')),
       };
       const search = new MemorySearch(store, mockProvider, { vector: 0.7, keyword: 0.3 });
-      // No chunks inserted — keyword search returns nothing, vector fails
 
       const results = await search.search('diabetes', 5);
       expect(results).toEqual([]);
-      // Both vector and keyword failed; status 'failed' is computed internally but
-      // not surfacable on an empty array. The contract is: no crash, empty return.
     });
 
     it('returns status "full" when vector succeeds even if keyword returns nothing', async () => {

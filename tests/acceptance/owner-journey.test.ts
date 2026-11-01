@@ -1,6 +1,3 @@
-// The single owner's journey through a real Gateway: onboard, record a medication, change it, confirm the
-// change, restart the daemon, ask about it, and receive a background check-in. Only the chat model is
-// scripted; everything else (ledger, SAFETY.md, recall, sessions, scheduler path) is the shipped code.
 import * as fs from 'fs';
 import * as path from 'path';
 import type { Gateway } from '../../src/gateway/gateway';
@@ -39,6 +36,7 @@ describe('owner journey (real Gateway)', () => {
         return text('Done.');
       }
       const said = String(last.content);
+      if (said.startsWith('List the well-known common side effects')) return text('["dry cough","dizziness"]');
       if (said.includes('[Heartbeat Trigger]')) {
         return toolCall('ledger_record', { entity: 'metformin', type: 'medication', fields: { dose: '0mg' } });
       }
@@ -60,8 +58,9 @@ describe('owner journey (real Gateway)', () => {
     for (const [i, answer] of onboarding.entries()) await say(gateway, answer, `onboard-${i}`);
     expect(safety()).toContain('lisinopril');
     expect(safety()).toContain('penicillin');
+    const medsAfterOnboarding = fs.readFileSync(path.join(workspace, 'ledger', 'medications.md'), 'utf8');
+    expect(medsAfterOnboarding).toMatch(/lisinopril[\s\S]*dry cough/);
 
-    // Record, then change a medication: the change waits for the owner's confirmation in a later turn.
     await say(gateway, 'I started metformin 500mg', 'm1');
     await say(gateway, 'My doctor raised my metformin to 1000mg', 'm2');
     expect(pendingToken).toMatch(/^[0-9a-f]{12}$/);
@@ -70,7 +69,6 @@ describe('owner journey (real Gateway)', () => {
     expect(safety()).toContain('1000mg');
     expect(safety()).not.toContain('500mg');
 
-    // Restart the daemon: the next reply carries the current facts and the earlier conversation.
     await gateway.stop();
     gateway = await startLiveGateway(root, model);
     await say(gateway, 'What medications am I on?', 'm4');
@@ -80,7 +78,6 @@ describe('owner journey (real Gateway)', () => {
     expect(afterRestart.system).toContain('penicillin');
     expect(afterRestart.messages.some((m) => String(m.content).includes('My doctor raised my metformin'))).toBe(true);
 
-    // A background check-in sees the same memory but cannot change a medical fact.
     const sent: string[] = [];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const internals = gateway as any;
@@ -97,6 +94,8 @@ describe('owner journey (real Gateway)', () => {
     const checkIn = model.calls[callsBefore];
     expect(checkIn.tools).not.toEqual(expect.arrayContaining(['ledger_record']));
     expect(checkIn.tools).not.toEqual(expect.arrayContaining(['ledger_update']));
+    expect(checkIn.tools).not.toEqual(expect.arrayContaining(['memory_write']));
+    expect(checkIn.tools).not.toEqual(expect.arrayContaining(['safety_note']));
     expect(checkIn.system).toContain('1000mg');
     expect(sent).toEqual([expect.stringContaining('Done.')]);
     expect(safety()).toContain('1000mg');

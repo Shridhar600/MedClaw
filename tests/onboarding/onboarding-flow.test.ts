@@ -18,7 +18,6 @@ describe('OnboardingFlow', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  // forka #5: timezone answer validation — never store a raw phrase as the zone.
   async function driveToTimezone(flow: OnboardingFlow, tzAnswer: string): Promise<string> {
     await flow.handle('hello');   // -> name prompt
     await flow.handle('Arjun');   // -> age prompt
@@ -87,7 +86,6 @@ describe('OnboardingFlow', () => {
     expect(state.answers.timezone).toBe('Asia/Kolkata');
   });
 
-
   it('completes after confirmation and writes durable profile files', async () => {
     const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
 
@@ -110,7 +108,9 @@ describe('OnboardingFlow', () => {
     expect(state.status).toBe('complete');
     expect(state.completedAt).toBeDefined();
     expect(fs.readFileSync(path.join(tmpDir, 'USER.md'), 'utf8')).toContain('Name: Arjun');
-    expect(fs.readFileSync(path.join(tmpDir, 'HEALTH_PROFILE.md'), 'utf8')).toContain('Active conditions: Type 2 diabetes');
+    const profile = fs.readFileSync(path.join(tmpDir, 'HEALTH_PROFILE.md'), 'utf8');
+    expect(profile).toContain('Age: 31');
+    expect(profile).not.toContain('Type 2 diabetes');
   });
 
   it('accepts confirmation even when old gateway metadata polluted the saved answers', async () => {
@@ -182,9 +182,7 @@ describe('OnboardingFlow', () => {
     expect(result.response).toContain('I am an AI health companion, not a doctor');
   });
 
-  // ── RR2-A2: raw-input boundary + future-intent/denial regressions ──
-
-  it('inspects raw metadata-looking lines before the onboarding sanitizer (RR2-A2)', async () => {
+  it('inspects raw metadata-looking lines before the onboarding sanitizer', async () => {
     const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
 
     const result = await flow.handle('User id: I want to kill myself');
@@ -194,7 +192,7 @@ describe('OnboardingFlow', () => {
     expect((await new OnboardingStore(tmpDir).load()).status).toBe('not_started');
   });
 
-  it('bypasses future-intent crisis wording without changing onboarding state (RR2-A2)', async () => {
+  it('bypasses future-intent crisis wording without changing onboarding state', async () => {
     const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
 
     const result = await flow.handle('I will kill myself tonight');
@@ -204,7 +202,7 @@ describe('OnboardingFlow', () => {
     expect((await new OnboardingStore(tmpDir).load()).status).toBe('not_started');
   });
 
-  it('does not bypass for an explicit whole-message denial (RR2-A2)', async () => {
+  it('does not bypass for an explicit whole-message denial', async () => {
     const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
 
     const result = await flow.handle("I'm not suicidal.");
@@ -213,7 +211,7 @@ describe('OnboardingFlow', () => {
     expect(result.response).toContain('Before we start');
   });
 
-  it('still escalates a denial mixed with another warning sign (RR2-A2)', async () => {
+  it('still escalates a denial mixed with another warning sign', async () => {
     const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
 
     const result = await flow.handle("I'm not suicidal, but I will kill myself tonight");
@@ -274,9 +272,7 @@ describe('OnboardingFlow', () => {
     }
   });
 
-  // ── I1: slot-drift hardening — echo-back + per-slot validation ──────────
-
-  describe('slot echo-back (I1)', () => {
+  describe('slot echo-back', () => {
     it('echoes the captured name when asking the next question', async () => {
       const flow = new OnboardingFlow(new OnboardingStore(tmpDir), tmpDir, 'Asia/Kolkata');
       await flow.handle('hello');
@@ -298,7 +294,7 @@ describe('OnboardingFlow', () => {
     });
   });
 
-  describe('age validation (I1)', () => {
+  describe('age validation', () => {
     it('re-asks the age step when the answer has no number', async () => {
       const store = new OnboardingStore(tmpDir);
       const flow = new OnboardingFlow(store, tmpDir, 'Asia/Kolkata');
@@ -339,7 +335,7 @@ describe('OnboardingFlow', () => {
     });
   });
 
-  describe('name validation (I1)', () => {
+  describe('name validation', () => {
     it('re-asks the name step for sentence-length garbage', async () => {
       const store = new OnboardingStore(tmpDir);
       const flow = new OnboardingFlow(store, tmpDir, 'Asia/Kolkata');

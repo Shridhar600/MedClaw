@@ -27,9 +27,6 @@ describe('cli router', () => {
   it('keeps per-chat session archives isolated by chat id', async () => {
     const sessionsDir = makeTestTemp('redacted-cli-sessions-');
     try {
-      // Constructed exactly as production does (`src/gateway/runtime.ts`), rather than through the
-      // web-harness wrapper this test used to import. Same option, same isolation — one fewer
-      // indirection between the test and the thing it is testing.
       const sessions = new SessionManager({ sessionsPath: sessionsDir, perChatArchive: true });
       await sessions.recordTurn('chat-a', [{ role: 'user', content: 'private A' }]);
       await sessions.recordTurn('chat-b', [{ role: 'user', content: 'private B' }]);
@@ -71,10 +68,6 @@ describe('cli router', () => {
     expect(output.join('')).toContain('bogus');
   });
 
-  // RETIRED -> both cases hand-wrote a document with no `schemaVersion` and no owner identity,
-  // and one of them persisted `memory.workspace` / `heartbeat.storePath`. Those only loaded
-  // because decoding deep-merged onto defaults. Setup now selects identity and derives paths,
-  // so the fixtures write a real `schemaVersion: 2` document.
   it('routes config show through the admin surface', async () => {
     const home = createTempHome();
     try {
@@ -105,8 +98,6 @@ describe('cli router', () => {
   });
 
   it('never prints endpoint credentials in status output', async () => {
-    // Cold re-review: the readiness `configured: <url>` detail carried `user:password@` through to
-    // `medclaw status`. It is sanitized at the presentation boundary.
     const home = createTempHome();
     try {
       const fixture = writeConfigFixture(home.tmpDir, {
@@ -125,7 +116,6 @@ describe('cli router', () => {
       const printed = output.join('');
       expect(printed).not.toContain('url-user');
       expect(printed).not.toContain('url-password');
-      // The status line remains useful: the endpoint host is still shown.
       expect(printed).toContain('proxy.example');
     } finally {
       home.restore();
@@ -137,8 +127,6 @@ describe('cli router', () => {
     ['config set with an option-shaped path', ['config', 'set', '--api-key=sk-config-set-secret', 'x']],
     ['config set with a single-dash path', ['config', 'set', '-sk-single-set-secret', 'x']],
   ])('never echoes a secret-shaped token from %s', async (_label, argv) => {
-    // Cold re-review E3 residual: `config` is exempt from the stray-option gate, so its own
-    // subcommand/path echoes had to be sanitized at the router.
     const home = createTempHome();
     try {
       const fixture = writeConfigFixture(home.tmpDir, {});
@@ -181,15 +169,7 @@ describe('cli router', () => {
     const home = createTempHome();
     try {
       const configPath = path.join(home.tmpDir, 'config.json');
-      // S1 change (old -> new): the wizard step that used to ask for a raw "Workspace path" now
-      // asks for the owner state root and then the owner id. The workspace is DERIVED from that
-      // pair, so there is no second path authority. This test previously answered with a workspace
-      // path; it now answers with a state root plus an owner id, and the resulting workspace is
-      // asserted where relevant so the derivation is proved, not assumed.
       const stateRoot = path.join(home.tmpDir, 'state');
-      // C04 (R05): the wizard gained a separate EMBEDDING step, so this piped stream carries two
-      // more answers. Every earlier answer keeps its original meaning and no assertion below
-      // was changed.
       const input = [
         stateRoot,
         'default',
@@ -234,8 +214,6 @@ describe('cli router', () => {
     try {
       const configPath = path.join(home.tmpDir, 'config.json');
       const stateRoot = path.join(home.tmpDir, 'state');
-      // Deliberately too few answers: the wizard must abort with a clear
-      // error, not spin in a re-prompt loop (the old Node-26 hang).
       const input = [stateRoot, 'default', 'ollama'].join('\n');
 
       const result = spawnSync(
@@ -262,15 +240,7 @@ describe('cli router', () => {
     const home = createTempHome();
     try {
       const configPath = path.join(home.tmpDir, 'config.json');
-      // S1 change (old -> new): the wizard step that used to ask for a raw "Workspace path" now
-      // asks for the owner state root and then the owner id. The workspace is DERIVED from that
-      // pair, so there is no second path authority. This test previously answered with a workspace
-      // path; it now answers with a state root plus an owner id, and the resulting workspace is
-      // asserted where relevant so the derivation is proved, not assumed.
       const stateRoot = path.join(home.tmpDir, 'state');
-      // C04 (R05): the wizard gained a separate EMBEDDING step, so this piped stream carries two
-      // more answers. Every earlier answer keeps its original meaning and no assertion below
-      // was changed.
       const input = [
         stateRoot,
         'default',

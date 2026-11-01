@@ -1,10 +1,4 @@
-// PHI-safe error formatting for logs and persisted error fields.
-//
-// Deliberately excludes error.message: agent/session/provider errors in this
-// domain can echo user health content (PHI) into their messages, and neither
-// console logs nor on-disk error fields (e.g. heartbeat lastError) may carry
-// it (see gateway-media-flow PHI-guard tests). The top stack frame gives the
-// debuggable location without the message body.
+// Excludes error.message: domain errors echo user health content, and no log or errno field may carry PHI.
 export function summarizeErrorForLog(error: unknown): string {
   if (error instanceof Error) {
     const frame = error.stack?.split('\n')[1]?.trim();

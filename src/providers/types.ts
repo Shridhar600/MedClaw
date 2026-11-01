@@ -73,10 +73,5 @@ export interface AgentRunResult {
   trace: Message[];
   usedTools: string[];
   healthResponse: boolean;
-  /**
-   * The last provider call's `usage.promptTokens` this turn. A ReAct turn makes several calls and the
-   * final one carries the full accumulated context, so it is the window-fill signal. `undefined` when
-   * the provider omitted usage; callers then fall back to a chars/4 estimate.
-   */
   lastPromptTokens?: number;
 }

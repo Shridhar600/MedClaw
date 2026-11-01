@@ -8,9 +8,6 @@ import { ownerSelection, fixtureOwner } from '../helpers/test-config';
 import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
 
-// Owner turns through a real Gateway with the agent loop and session store stubbed:
-// upload hand-off, upload failure, persist-before-send, and PHI-free logs on failure paths.
-
 const UPLOAD_FAILED = 'Failed to download uploaded file report.pdf';
 const AGENT_OK = { text: 'processed', trace: [{ role: 'assistant', content: 'processed' }], usedTools: [], healthResponse: false };
 
@@ -27,9 +24,7 @@ function makeConfig(): EffectiveConfig {
     tools: { allow: ['*'], deny: [] },
     memory: { workspace: owner.workspace, search: { hybridWeights: { vector: 0.7, keyword: 0.3 } }, bootstrapMaxChars: 20000 },
     sessions: {
-      softResetAfterMinutes: 240,
-      hardResetAfterMinutes: 1440,
-      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+      compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
     },
     heartbeat: {
       enabled: false,
@@ -48,7 +43,7 @@ function makeConfig(): EffectiveConfig {
         },
       },
     },
-    agent: { maxIterations: 15, disclaimerEnabled: true },
+    agent: { maxIterations: 15 },
   };
 }
 

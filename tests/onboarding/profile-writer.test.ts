@@ -39,8 +39,8 @@ describe('writeOnboardingProfile', () => {
     expect(user).toContain('Reminder preferences: Morning reminders');
     expect(profile).toContain('Keep this health edit.');
     expect(profile).toContain('Age: 31');
-    expect(profile).toContain('Active conditions: Type 2 diabetes');
-    expect(profile).toContain('Current medications: Metformin');
+    expect(profile).not.toMatch(/Type 2 diabetes|Metformin/);
+    expect(profile).toContain('health ledger');
   });
 
   it('replaces only the managed onboarding section on repeated writes', async () => {

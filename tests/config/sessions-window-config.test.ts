@@ -1,8 +1,6 @@
 import { DEFAULT_SESSION_WINDOW, cloneStoredDefaults } from '../../src/config/defaults';
 
-describe('sessions.window config defaults (spec 14 §3 / DD10)', () => {
-  // Asserted against the single exported authority so `src/gateway/session.ts` can read the
-  // same constant instead of repeating `?? 35/50/80/10` inline as a second authority.
+describe('sessions.window config defaults', () => {
   it('provides the window trigger defaults 35 / 50 / 80 / 10', () => {
     expect(DEFAULT_SESSION_WINDOW).toEqual({
       pruneAtPercent: 35,

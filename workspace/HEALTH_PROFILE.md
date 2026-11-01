@@ -1,23 +1,13 @@
 # Health Profile
 
-> This file is ALWAYS loaded. Keep it under 2,000 tokens. For detailed info, use the conditions/ and medications/ files.
+> This file is ALWAYS loaded. Keep it under 2,000 tokens. Conditions, medications, allergies, lab values and
+> appointments live in the health ledger (`ledger_record`), never here.
 
 ## Basic Info
 - **Name**: [User's name]
 - **Age**: [Age]
 - **Gender**: [Gender]
 - **Timezone**: Asia/Kolkata
-
-## Active Conditions
-<!-- The agent will update this as conditions are identified -->
-- None recorded yet
-
-## Current Medications
-<!-- The agent will update this as medications are added -->
-- None recorded yet
-
-## Known Allergies
-- None recorded yet
 
 ## Recent Reports
 <!-- Last 3 reports with key findings -->

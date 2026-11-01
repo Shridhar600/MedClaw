@@ -1,8 +1,7 @@
 import { isEmergencyInput } from '../../src/safety/emergency-detector';
 
-// RR2-A2 behavioral table. Inputs are hardcoded literals from the brief — never
-// generated from BUILT_IN_EMERGENCY_KEYWORDS (that would only test self-consistency).
-describe('emergency-detector RR2-A2 policy', () => {
+// Literals, never generated from BUILT_IN_EMERGENCY_KEYWORDS: that would only test self-consistency.
+describe('emergency-detector policy table', () => {
   it.each([
     'I will kill myself tonight',
     "I'm going to kill myself",
@@ -69,6 +68,15 @@ describe('emergency-detector RR2-A2 policy', () => {
     expect(isEmergencyInput(input)).toBe(true);
   });
 
+  it.each([
+    "I'm having chest pains",
+    'chest pains and dizziness since morning',
+    'I had two seizures today',
+    'He has had heart attacks before and it feels the same',
+  ])('escalates plural phrasing: %s', (input) => {
+    expect(isEmergencyInput(input)).toBe(true);
+  });
+
   it('never treats a bare action word as a trigger', () => {
     expect(isEmergencyInput('Please kill this process')).toBe(false);
     expect(isEmergencyInput('I cut vegetables')).toBe(false);
@@ -99,11 +107,9 @@ describe('emergency-detector RR2-A2 policy', () => {
     expect(() =>
       isEmergencyInput('not suicidal', [null, undefined, 42, '', '   ', 'a.*b', '(x|y)', 'NOT SUICIDAL']),
     ).not.toThrow();
-    // 'a.*b' / '(x|y)' are literals: they must not match arbitrary text.
     expect(isEmergencyInput('axxxb', ['a.*b'])).toBe(false);
     expect(isEmergencyInput('a.*b', ['a.*b'])).toBe(true);
     expect(isEmergencyInput('x', ['(x|y)'])).toBe(false);
-    // The independent literal 'NOT SUICIDAL' still triggers inside the denial statement.
     expect(
       isEmergencyInput('not suicidal', [null, undefined, 42, '', '   ', 'a.*b', '(x|y)', 'NOT SUICIDAL']),
     ).toBe(true);

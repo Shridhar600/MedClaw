@@ -14,7 +14,6 @@ function tmp(): { dir: string; dbPath: string; sessionsDir: string } {
   return { dir, dbPath: path.join(dir, 'search.db'), sessionsDir };
 }
 
-// A day-file JSONL line matches SessionManager.serializeEntry: {timestamp, role, content, chatId}.
 function entry(role: string, content: string | null, ts: string): string {
   return JSON.stringify({ timestamp: ts, role, content, chatId: 'chat1' });
 }
@@ -45,7 +44,7 @@ describe('SqliteSessionIndex', () => {
     });
   });
 
-  test('PLAT-20: an exact clinical phrase is returned verbatim and every token matches', () => {
+  test('an exact clinical phrase is returned verbatim and every token matches', () => {
     const { dbPath, sessionsDir } = tmp();
     const idx = new SqliteSessionIndex({ dbPath, sessionsDir });
     idx.indexTurn('chat1', '2026-06-01.jsonl', 7, 'user', '2026-06-01T09:00:00.000Z', 'metformin 500mg twice daily');
@@ -55,7 +54,6 @@ describe('SqliteSessionIndex', () => {
     expect(phrase.hits[0].snippet).toBe('metformin 500mg twice daily');
     expect(phrase.hits[0].line).toBe(7);
 
-    // Each keyword token also matches on its own (FTS tokenization keeps 500mg one token).
     for (const token of ['metformin', '500mg', 'twice', 'daily']) {
       expect(idx.search(token).hits).toHaveLength(1);
     }
@@ -116,7 +114,7 @@ describe('SqliteSessionIndex', () => {
     expect(res.hits).toHaveLength(1);
   });
 
-  test('rebuilds from day files at construction when the index is empty (A-MF4)', () => {
+  test('rebuilds from day files at construction when the index is empty', () => {
     const { dbPath, sessionsDir } = tmp();
     fs.writeFileSync(
       path.join(sessionsDir, '2026-08-27.jsonl'),
@@ -135,7 +133,6 @@ describe('SqliteSessionIndex', () => {
 
   test('rebuildFromDayFiles skips malformed and empty lines but keeps physical line numbers aligned', () => {
     const { dbPath, sessionsDir } = tmp();
-    // line 1 valid, line 2 malformed (occupies its slot), line 3 valid, line 4 null content (no text to index).
     fs.writeFileSync(
       path.join(sessionsDir, '2026-08-27.jsonl'),
       [
@@ -149,14 +146,11 @@ describe('SqliteSessionIndex', () => {
     const idx = new SqliteSessionIndex({ dbPath, sessionsDir });
     idx.rebuildFromDayFiles();
 
-    // The valid entry AFTER the malformed slot must resolve to physical line 3 (not 2) — this is the
-    // anchor-alignment guarantee that keeps rebuild consistent with the incremental append path.
     const hit = idx.search('atorvastatin');
     const warfarin = idx.search('warfarin');
     idx.close();
     expect(hit.hits).toHaveLength(1);
     expect(hit.hits[0].line).toBe(3);
-    // warfarin is still at line 1.
     expect(warfarin.hits[0].line).toBe(1);
   });
 
@@ -239,9 +233,7 @@ describe('SqliteSessionIndex', () => {
     }
   });
 
-  // X-1: two chats sharing a day-file basename + line number must NOT collide, and a scoped search must
-  // never surface another chat's health content.
-  test('two chats with the same {file,line} do not collide and search is chat-scoped (X-1)', () => {
+  test('two chats with the same {file,line} do not collide and search is chat-scoped', () => {
     const { dbPath, sessionsDir } = tmp();
     const idx = new SqliteSessionIndex({ dbPath, sessionsDir });
     const ts = '2026-08-27T10:00:00.000Z';
@@ -260,9 +252,7 @@ describe('SqliteSessionIndex', () => {
     expect(crossFromA.hits).toHaveLength(0); // scoped — no cross-chat disclosure
   });
 
-  // H10: search.db and its WAL sidecars must be 0600 (they hold verbatim PHI), hardened by the adapter
-  // itself — not merely by whatever opened the file first.
-  test('hardens search.db and its WAL sidecars to 0600 (H10)', () => {
+  test('hardens search.db and its WAL sidecars to 0600', () => {
     const { dbPath, sessionsDir } = tmp();
     const idx = new SqliteSessionIndex({ dbPath, sessionsDir });
     idx.indexTurn('chat1', '2026-08-27.jsonl', 1, 'user', '2026-08-27T10:00:00.000Z', 'metoprolol note');
@@ -274,9 +264,7 @@ describe('SqliteSessionIndex', () => {
     idx.close();
   });
 
-  // H8: a dropped derived FTS table (corruption) must be reset + rebuilt from the archive on the next
-  // search, never silently return healthy-looking empty results.
-  test('a dropped FTS table self-heals from the archive on the next search (H8)', () => {
+  test('a dropped FTS table self-heals from the archive on the next search', () => {
     const { dbPath, sessionsDir } = tmp();
     fs.writeFileSync(
       path.join(sessionsDir, '2026-08-27.jsonl'),
@@ -286,7 +274,6 @@ describe('SqliteSessionIndex', () => {
     const idx = new SqliteSessionIndex({ dbPath, sessionsDir });
     expect(idx.search('tramadol', { chatId: 'chat1' }).hits).toHaveLength(1);
 
-    // Simulate corruption: drop the derived FTS table out from under the open connection.
     (idx as unknown as { db: { exec(sql: string): void } }).db.exec('DROP TABLE session_turns_fts');
 
     const healed = idx.search('tramadol', { chatId: 'chat1' });
@@ -296,25 +283,20 @@ describe('SqliteSessionIndex', () => {
     expect(healed.hits).toHaveLength(1); // reset + rebuilt, not a silent empty result
   });
 
-  // H5: a swallowed incremental-index failure durably marks the index dirty, so the NEXT construction
-  // rebuilds from the archive and closes the hole even though the db is non-empty.
-  test('a durable dirty marker forces a boot rebuild even when the index is non-empty (H5)', () => {
+  test('a durable dirty marker forces a boot rebuild even when the index is non-empty', () => {
     const { dir, dbPath, sessionsDir } = tmp();
-    // First index: only line 1 landed (line 2's write was "lost"); mark dirty durably, then close.
     const idx1 = new SqliteSessionIndex({ dbPath }); // no sessionsDir ⇒ no boot rebuild
     idx1.indexTurn('chat1', '2026-08-27.jsonl', 1, 'user', '2026-08-27T10:00:00.000Z', 'omeprazole daily');
     idx1.markDirty();
     idx1.close();
     expect(fs.existsSync(path.join(dir, 'search.db.session-dirty'))).toBe(true);
 
-    // The archive on disk has BOTH lines (line 2 was written to the day file but never indexed).
     fs.writeFileSync(
       path.join(sessionsDir, '2026-08-27.jsonl'),
       entry('user', 'omeprazole daily', '2026-08-27T10:00:00.000Z') + '\n' +
         entry('user', 'simvastatin nightly', '2026-08-27T10:01:00.000Z') + '\n',
     );
 
-    // Fresh index over the same (non-empty) db + archive: the dirty marker forces a rebuild that fills the hole.
     const idx2 = new SqliteSessionIndex({ dbPath, sessionsDir });
     const res = idx2.search('simvastatin', { chatId: 'chat1' });
     const cleared = fs.existsSync(path.join(dir, 'search.db.session-dirty'));

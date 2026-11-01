@@ -1,13 +1,3 @@
-// src/ports/owner-state.ts
-//
-// Interface-only enrollment records and IO seams. Nothing here imports an app
-// module: `ownerId` is a plain string so this file stays inside the v2-core boundary and does
-// not reach up into `src/profiles`.
-//
-// Policy (the state machine, the limits and the messages) lives in
-// `src/profiles/owner-admission.ts`; raw-document validation lives in
-// `src/profiles/owner-state.ts`. This file only declares the shapes and the fixed budgets that
-// both sides must agree on.
 
 // ── Fixed budgets. Owning-module constants, not configuration knobs. ───────────────────────
 
@@ -20,8 +10,6 @@ export const PAIRING_CODE_EXPIRY_MS = 60 * 60 * 1000;
 /** Byte budget for the persisted owner record, shared by the writer and the reader. */
 export const OWNER_RECORD_MAX_BYTES = 64 * 1024;
 
-// The pairing allowance is held in memory by the admission service and resets on restart: with a
-// 32^8 code space and a short expiry, a persisted table buys nothing for one owner.
 /** Attempts allowed per private chat per UTC day. The fourth attempt is silent. */
 export const PAIRING_ATTEMPTS_PER_CHAT_PER_DAY = 3;
 /** Candidate chats tracked for the current day before new candidates are refused. */
@@ -50,50 +38,21 @@ export type AdmissionReason =
 /** Why an owner record could not be read. Never an exception payload and never a path. */
 export type OwnerReadReason = 'unreadable' | 'too-large' | 'invalid-document' | 'owner-mismatch';
 
-// ── Publication ──────────────────────────────────────────────────────────────────────────
-//
-// Publication truth belongs here, at the seam that owns the rename, not in policy. Guessing it
-// from an errno (`EACCES`/`EPERM`/`EROFS`/`ENOSPC`/`EIO` meaning "definitely did not happen") is
-// unsound in both directions: those same codes are raised after a rename has landed, and any
-// other code, including a lost acknowledgement, leaves the outcome unknown. Only the adapter
-// knows which side of the rename it failed on.
-
 /** Why a replacement was not confirmed published. A closed set: never an errno, message or path. */
 export type OwnerWriteReason = 'too-large' | 'write-failed' | 'flush-failed';
 
 export type OwnerStateWriteResult =
   /** The replacement is published and its required flush is confirmed. */
   | { status: 'committed' }
-  /**
-   * Published, or possibly published: a later step failed, so confirmation is incomplete. The NEW
-   * bytes are the file's content and are readable. Never restore, delete or deny them, and never
-   * claim the previous record is unchanged — reload authoritative state instead.
-   */
   | { status: 'uncertain'; reason: OwnerWriteReason }
-  /**
-   * Not published, and known not to be. Existing bytes are unchanged and a missing record is still
-   * missing. Cleanup owns only this attempt's unpublished temp file.
-   */
   | { status: 'failed'; reason: OwnerWriteReason };
 
 // ── Transport identity ────────────────────────────────────────────────────────────────────
 
-/**
- * Who is speaking and which exact message this is. `eventId` must be stable across transport
- * redelivery (`telegram:<chatId>:<messageId>`) so a duplicate cannot spend a second attempt.
- */
 export interface TransportIdentity {
   channel: string;
   chatId: string;
   userId: string;
-  /**
-   * The chat type the transport asserted, or `undefined` when it asserted none.
-   *
-   * The key stays required so every producer must state the field explicitly, but `undefined` is
-   * representable on purpose: otherwise absence would have to be faked as `'private'`, the one
-   * chat type that grants owner health access. `undefined` is refused as
-   * `missing-transport-identity`, never treated as private.
-   */
   chatType: 'private' | 'group' | 'supergroup' | 'channel' | 'local' | undefined;
   eventId: string;
 }
@@ -154,11 +113,7 @@ export type OwnerStateRead =
 export interface OwnerStatePort {
   /** Fresh read every call. No mtime cache, no quarantine-to-empty. */
   read(): OwnerStateRead;
-  /**
-   * One atomic whole-record replacement (binding + challenge consumption together), reporting
-   * whether it actually published. Implementations MUST refuse before touching the filesystem when
-   * the encoded document exceeds `OWNER_RECORD_MAX_BYTES`.
-   */
+  /** MUST refuse before touching the filesystem when the encoded document exceeds `OWNER_RECORD_MAX_BYTES`. */
   replace(next: OwnerState): Promise<OwnerStateWriteResult>;
 }
 

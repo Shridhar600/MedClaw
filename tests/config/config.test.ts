@@ -1,11 +1,3 @@
-// tests/config/config.test.ts
-//
-// T1 assertion migration. Retired assertions and the stronger contract that replaces each
-// one are recorded inline as `RETIRED -> ...` so the mapping stays auditable.
-//
-// The flow under test is the real one: a document on disk is read through the bounded
-// adapter, decoded by the same decoder the daemon uses, and the owner paths are derived.
-// Nothing here asserts only a string shape.
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -104,7 +96,6 @@ describe('stored config decoding', () => {
     expect(issueCodes(result)).toContain('invalid-schema-version');
   });
 
-  // The derived path keys are not settings: each is refused like any unknown key.
   it.each([
     ['memory.workspace', (doc: Record<string, unknown>) => { (doc.memory as Record<string, unknown>).workspace = '/tmp/x'; }],
     ['heartbeat.storePath', (doc: Record<string, unknown>) => { (doc.heartbeat as Record<string, unknown>).storePath = '/tmp/x.json'; }],
@@ -133,9 +124,7 @@ describe('stored config decoding', () => {
     expect(({} as Record<string, unknown>).injected).toBeUndefined();
   });
 
-  // `heartbeat.audit = null` used to crash the loader with a TypeError. The key is refused first,
-  // and a malformed known branch is refused by type instead.
-  it('refuses the malformed heartbeat branch that used to crash the loader with a TypeError', () => {
+  it('refuses the malformed heartbeat branch without crashing the loader', () => {
     const retired = decode(validDoc(tmpDir, (doc) => { doc.heartbeat = { audit: null }; }), tmpDir);
 
     expect(issueCodes(retired)).toContain('unknown-field');
@@ -206,10 +195,6 @@ describe('stored config decoding', () => {
     expect(result.config.profiles.baseDir).not.toContain('~');
   });
 
-  // R04: this is the concrete mistake the bounded cloud-endpoint rule keeps refusing — a cloud role
-  // that inherited the known LOCAL Ollama default. It is deliberately narrower than "no cloud base
-  // URL": the decoder used to refuse EVERY cloud baseUrl, which made supported OpenRouter setup
-  // (plan 15 §2.1, "cloud provider selection never inherits a local base URL") unsavable.
   it('refuses a cloud provider that still carries the known local Ollama base URL', () => {
     const result = decode(validDoc(tmpDir, (doc) => {
       const providers = doc.providers as { main: unknown };
@@ -221,9 +206,6 @@ describe('stored config decoding', () => {
   });
 
   it('accepts an explicitly supplied cloud endpoint on a cloud role', () => {
-    // R04 RED-first: before the repair this returned invalid-url, because `checkProviderBaseUrl`
-    // refused any baseUrl on a non-ollama role. The endpoint here is the one setup itself writes for
-    // OpenRouter, so this is the supported-setup path, not a hypothetical one.
     const result = decode(validDoc(tmpDir, (doc) => {
       const providers = doc.providers as { main: unknown };
       providers.main = {
@@ -241,19 +223,14 @@ describe('stored config decoding', () => {
   });
 
   it('refuses every spelling of the local Ollama endpoint on a cloud role', async () => {
-    // Cold-review finding 4. An exact-string guard refused `http://localhost:11434/v1` but accepted
-    // `http://localhost:11434/v1/` and `HTTP://LOCALHOST:11434/v1` — the SAME endpoint in a
-    // trivially different spelling, which is how a shallow guard stops being a guard.
     for (const spelling of [
       'http://localhost:11434/v1',
       'http://localhost:11434/v1/',
       'HTTP://LOCALHOST:11434/v1',
       'http://LocalHost:11434/v1/',
       'http://localhost.:11434/v1',
-      // Userinfo does not make it a different endpoint: it still points at local Ollama.
       'http://user:pass@localhost:11434/v1',
       'http://user@localhost:11434/v1',
-      // Percent-escapes are an alternative spelling of the same path.
       'http://localhost:11434/%76%31',
       'http://localhost:11434/%76%31/',
     ]) {
@@ -269,9 +246,6 @@ describe('stored config decoding', () => {
   });
 
   it('still allows a self-hosted proxy endpoint on a cloud role', async () => {
-    // The bound is narrow on purpose. A blanket ban on cloud base URLs was finding R04, and PD-8
-    // makes self-hosted paths first-class, so a private/loopback endpoint at a DIFFERENT address is
-    // a legal operator choice and must not be refused.
     const result = decode(validDoc(tmpDir, (doc) => {
       (doc.providers as { main: unknown }).main = {
         type: 'openai', model: 'gpt-4o', apiKey: 'sk', baseUrl: 'http://127.0.0.1:8080/v1',
@@ -280,8 +254,6 @@ describe('stored config decoding', () => {
 
     expect(result.kind).toBe('valid');
 
-    // 127.0.0.1 is intentionally NOT treated as the same NAME as `localhost`, even though they
-    // resolve to the same host, so a proxy bound there survives as a legal cloud endpoint.
     const loopback = decode(validDoc(tmpDir, (doc) => {
       (doc.providers as { main: unknown }).main = {
         type: 'openai', model: 'gpt-4o', apiKey: 'sk', baseUrl: 'http://127.0.0.1:11434/v1',
@@ -291,8 +263,6 @@ describe('stored config decoding', () => {
   });
 
   it('still refuses a non-http cloud endpoint and a wrongly typed baseUrl', () => {
-    // The repair relaxes WHICH cloud endpoints are allowed; it must not weaken structural
-    // validation. Both of these were refused before the repair and must stay refused.
     const badScheme = decode(validDoc(tmpDir, (doc) => {
       (doc.providers as { main: unknown }).main = {
         type: 'openai', model: 'gpt-4o', apiKey: 'sk', baseUrl: 'ftp://example.invalid/v1',
@@ -311,8 +281,6 @@ describe('stored config decoding', () => {
   });
 
   it('accepts an explicit https embedding endpoint alongside a local main provider', () => {
-    // R05 relevance: the roles are independent, so a remote embedding endpoint must be loadable
-    // while main stays on-device. This failed the same blanket rejection before the repair.
     const result = decode(validDoc(tmpDir, (doc) => {
       const providers = doc.providers as { embeddings: unknown };
       providers.embeddings = {
@@ -380,9 +348,6 @@ describe('stored config decoding', () => {
     expect(result.config.heartbeat.rateLimit.maxPerChatTriggersPerMinute).toBe(2);
   });
 
-  // RETIRED -> the old rule required a token only when enabled, and the shipped default
-  // (enabled with an empty token) was therefore undecodable. The rule is unchanged; the
-  // default is now disabled, which is the truthful pairing-pending state.
   it('requires a bot token exactly when telegram is enabled', () => {
     const disabledNoToken = decode(validDoc(tmpDir), tmpDir);
     expect(disabledNoToken.kind).toBe('valid');
@@ -420,9 +385,6 @@ describe('effective config assembly', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  // RETIRED -> `memory.workspace` came from the document and was asserted to equal it.
-  // The workspace is now derived from the selected owner, so the assertion is stronger:
-  // it proves identity selection determines every path, and the document cannot move them.
   it('derives every owner path from the selected identity, ignoring any stored path', async () => {
     const fixture = writeConfigFixture(tmpDir, { ownerId: 'shridhar' });
     const config = await loadRuntimeConfig({ configPath: fixture.configPath, homeDir: tmpDir });
@@ -475,9 +437,6 @@ describe('effective config assembly', () => {
     expect(fs.statSync(target).mode & 0o777).toBe(0o400);
   });
 
-  // RETIRED -> `validateConfig` reported prose messages ("... is required"). The rules are
-  // the same; the contract is now an allowlisted code plus field, and the same rule set
-  // refuses the document at decode time.
   it('reports the same rules as allowlisted issue codes', () => {
     const config = getDefaultConfig();
     config.channels.telegram.enabled = true;

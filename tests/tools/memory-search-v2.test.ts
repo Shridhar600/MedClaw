@@ -6,8 +6,6 @@ import type { SearchResult } from '../../src/memory/types';
 import type { Tool } from '../../src/tools/types';
 import { makeTestTemp } from '../helpers/test-temp';
 
-// Task 12.7: memory_search v2 — optional `lane` filter (path-prefix) + the existing
-// full|keyword-only|failed quality flag. `status` is accepted but a documented no-op (P2).
 describe('memory_search v2 (lane filter)', () => {
   let tmpDir: string;
   let engine: MemoryEngine;

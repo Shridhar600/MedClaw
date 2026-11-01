@@ -80,7 +80,6 @@ interface RecordFactParams {
   verbatim?: string;
   visibility?: string;
   resume?: boolean;
-  // Cross-entity links a new fact may declare (the tool/capture layer supplies target ids).
   replaces?: string;
   replacedBy?: string;
   corrects?: string;
@@ -96,7 +95,7 @@ export class LedgerStore {
   private tokens = new Map<string, StoredToken>();
   private readonly factsCache = new Map<FactType, LedgerFactsCache>();
   private readonly pendingIndexDeltas = new Map<FactType, LedgerIndexDelta[]>();
-  /** Damaged files, keyed by type, with the fingerprint already preserved as a `.corrupt-` copy. */
+  /** Damaged files by type; each fingerprint was preserved as a `.corrupt-` copy. */
   private readonly damaged = new Map<FactType, LedgerFileFingerprint>();
 
   constructor(private rootDir: string, private clock: Clock = systemClock) {
@@ -156,9 +155,7 @@ export class LedgerStore {
     const content = rawBytes.toString('utf8');
     const facts = parseLedgerFile(content, { type, profileId: path.basename(this.rootDir) });
     const hasQuarantineFact = facts.some((fact) => fact.version === 0 && fact.fields._quarantine !== undefined);
-    // A file with no usable facts, or one containing a malformed block, is damaged. Its readable
-    // facts stay visible; the file is read-only (writeFacts refuses) until the owner repairs it,
-    // so no later write can silently drop the damaged block.
+    // A damaged file stays readable but read-only until the owner repairs it.
     if ((facts.length === 0 && content.trim() !== '') || hasQuarantineFact) {
       this.markDamaged(type, fp, rawBytes, fingerprint);
       return facts.filter((fact) => fact.version >= 1 && fact.fields._quarantine === undefined);
@@ -168,7 +165,6 @@ export class LedgerStore {
     return this.cloneFacts(facts);
   }
 
-  /** Record a damaged file, preserving its exact bytes once per distinct content. */
   private markDamaged(type: FactType, fp: string, rawBytes: Buffer, fingerprint: LedgerFileFingerprint): void {
     const known = this.damaged.get(type);
     if (known && this.sameFingerprint(known, fingerprint)) return;
@@ -178,19 +174,16 @@ export class LedgerStore {
     this.damaged.set(type, fingerprint);
   }
 
-  /** Every change path reads through here: a damaged file is read-only until the owner repairs it. */
   private async readForChange(type: FactType): Promise<LedgerFact[]> {
     const facts = await this.readFacts(type);
     if (this.damaged.has(type)) throw new LedgerUnreadableError();
     return facts;
   }
 
-  /** Ledger file names found damaged by the most recent read of each type. */
   damagedFiles(): string[] {
     return [...this.damaged.keys()].map((type) => TYPE_TO_FILE[type]);
   }
 
-  /** Copy corrupt source bytes to a secure sidecar so read-only callers retain usable facts. */
   private quarantineCorruptFile(fp: string, rawBytes: Buffer): boolean {
     try {
       const sidecar = `${fp}.corrupt-${this.clock.now().getTime()}`;
@@ -239,7 +232,7 @@ export class LedgerStore {
     this.pendingIndexDeltas.set(type, pending);
   }
 
-  /** Consume source deltas for the Gateway's background indexer. */
+  /** One-shot: consuming clears the queued deltas. */
   takeIndexDelta(type: FactType): LedgerIndexDelta | undefined {
     const pending = this.pendingIndexDeltas.get(type);
     if (!pending || pending.length === 0) return undefined;
@@ -301,18 +294,7 @@ export class LedgerStore {
     this.pendingIndexDeltas.delete(type);
   }
 
-  /**
-   * Stamp the reciprocal `replacedBy`/`correctedBy` on the target of every fact that declares
-   * `replaces`/`corrects: <ref>`. `ref` resolves by fact id first, else by entity name to the target
-   * entity's head as of the source fact's `createdAt`.
-   *
-   * The as-of anchor keeps re-runs stable: reconcile fires on every write, and a version of the target
-   * created later (a discontinue/restart) must never become the link target.
-   *
-   * Runs at the single write chokepoint, so applied/confirm/discontinue paths all get it. Idempotent,
-   * self-healing and type-scoped. The reverse field is single-valued: when two facts replace one
-   * target, the last same-file source in append order wins.
-   */
+  // Anchored at the source fact's createdAt, so a later version never becomes the link target.
   private static resolveByName(facts: LedgerFact[], entity: string, source: LedgerFact): LedgerFact | undefined {
     const byEntity = new Map<string, LedgerFact[]>();
     for (const f of facts) {
@@ -350,6 +332,7 @@ export class LedgerStore {
       ?? LedgerStore.resolveByName(facts, reference, source);
   }
 
+  // Reverse links are single-valued: the last same-file source in append order wins.
   private static reconcileReverseLinks(facts: LedgerFact[]): void {
     const byId = new Map(facts.map(f => [f.id, f]));
     const stamp = (ref: string | undefined, source: LedgerFact, field: 'replacedBy' | 'correctedBy'): void => {
@@ -375,8 +358,7 @@ export class LedgerStore {
   }
 
   private activeVersion(facts: LedgerFact[], entity: string): LedgerFact | null {
-    // v0 facts are parse-error quarantine sentinels, never real active facts. Exclude them so a
-    // corrupt block cannot surface as a ghost active fact.
+    // v0 facts are quarantine sentinels, never active.
     const active = facts.filter(f => f.entity === entity && f.status === 'active' && f.version >= 1);
     if (active.length === 0) return null;
     if (active.length > 1) throw new Error('multiple-active-versions');
@@ -392,8 +374,7 @@ export class LedgerStore {
   }
 
   private conflictsWith(cur: LedgerFact, fields: Record<string, string | number | string[]>): boolean {
-    // Compare canonical forms: a stored number and its re-typed string twin are the same value
-    // after one Markdown round-trip, never a conflict.
+    // Compare canonical forms: a re-typed number never counts as a conflict.
     const canonicalCur = canonicalFields(cur.fields);
     for (const [key, value] of Object.entries(fields)) {
       if (key in canonicalCur) {
@@ -413,9 +394,7 @@ export class LedgerStore {
     fieldsOverride?: Record<string, string | number | string[]>,
     preserveCurrentProvenance = false,
   ): LedgerFact {
-    // A superseding version merges the prior active/paused fact's fields with the proposal, so a
-    // non-conflicting add or single-key change never drops carried fields (dose, known_side_effects,
-    // started). An explicit fieldsOverride already carries the intended merged set.
+    // Merge onto the current fields so carried fields are never dropped.
     const fields = fieldsOverride
       ? fieldsOverride
       : (current ? { ...current.fields, ...params.fields } : { ...params.fields });
@@ -441,9 +420,7 @@ export class LedgerStore {
       status,
       fields,
       provenance: pf,
-      // Medications and allergies are always safety-relevant: the SAFETY.md net and the
-      // retract/discontinue confirmation must not depend on a caller/model flag. Other types honor
-      // the caller's flag.
+      // Med/allergy are always safety-relevant, regardless of any caller or model flag.
       safetyRelevant: isMedOrAllergy(params.type) || current?.safetyRelevant === true || params.safetyRelevant === true,
       episodeId: params.episodeId ?? current?.episodeId,
       language: params.language ?? current?.language ?? 'en',
@@ -471,7 +448,7 @@ export class LedgerStore {
     if (!cur) {
       const reopened = this.reopenDispute(allFacts, p.entity, p.type);
       if (reopened) return reopened;
-      // The entity may have only terminal versions (stopped, retracted): continue its chain.
+      // Only terminal versions remain: start a new active version on the same chain.
       const fact = this.makeFact(p, this.nextVersion(allFacts, p.entity), 'active', now);
       allFacts.push(fact);
       await this.writeFacts(p.type, allFacts, [fact]);
@@ -495,9 +472,7 @@ export class LedgerStore {
     }
 
     if (!active) {
-      // cur is paused and resume was requested: supersede the paused version with an active one.
-      // Resuming a med/allergy still requires confirmation: the resume flag must never bypass the
-      // med-class gate, matching every other conflicting med path.
+      // The resume flag must never bypass the med/allergy confirmation gate.
       if (isMedOrAllergy(p.type)) {
         const v = this.nextVersion(allFacts, p.entity);
         const proposed = this.makeFact(p, v, 'active', now, cur);
@@ -529,8 +504,7 @@ export class LedgerStore {
     const provRank = AUTHORITY_RANK[p.provenance.source];
     const curRank = AUTHORITY_RANK[active.provenance.source];
 
-    // Authority-rank auto-apply never applies to med/allergy facts: a conflicting change to a
-    // safety-class fact always needs confirmation, regardless of provenance rank.
+    // A conflicting med/allergy change always needs confirmation, whatever the provenance rank.
     if (provRank > curRank && !isMedOrAllergy(p.type)) {
       const v = this.nextVersion(allFacts, p.entity);
       active.status = 'superseded';
@@ -544,10 +518,8 @@ export class LedgerStore {
       const vA = this.nextVersion(allFacts, p.entity);
       const vB = vA + 1;
       active.status = 'disputed';
-      // The two heads carry the two competing values. Head A = the new claim, preserving prior fields.
+      // Head A carries the new claim; head B preserves the old one verbatim.
       const disputeA = this.makeFact(p, vA, 'disputed', now, active, { ...active.fields, ...p.fields });
-      // Head B = the old active claim re-presented with its own fields and provenance, so the user
-      // can restore it verbatim.
       const disputeB: LedgerFact = {
         ...active,
         id: `${p.entity}@v${vB}`,
@@ -580,11 +552,7 @@ export class LedgerStore {
     }
   }
 
-  /**
-   * A dispute outlives its token (15-minute expiry, daemon restart). When the entity has no
-   * active or paused version but still has two disputed heads, offer the same pair again with a
-   * fresh token instead of starting a parallel chain.
-   */
+  /** Re-offers an unresolved disputed pair with a fresh token after expiry or restart. */
   private reopenDispute(facts: LedgerFact[], entity: string, type: FactType): RecordFactResult | null {
     const heads = facts
       .filter(f => f.entity === entity && f.status === 'disputed' && f.version >= 1)
@@ -614,8 +582,7 @@ export class LedgerStore {
     }
 
     const now = this.clock.now().toISOString();
-    // Safety-relevant facts AND all med/allergy facts require confirmation to retract,
-    // regardless of the flag (aligns with discontinue's type-based guard).
+    // Safety-relevant and all med/allergy facts need confirmation to retract.
     if (cur.safetyRelevant || isMedOrAllergy(cur.type)) {
       const changeHash = hash(`retract:${entity}:${params.type}`);
       const baselineCurHash = factSnapshotHash(cur);
@@ -688,10 +655,7 @@ export class LedgerStore {
     return fact;
   }
 
-  /**
-   * Discontinue the active version of an entity. Med/allergy discontinuation is a safety-critical
-   * change and needs confirmation; other types apply directly. No active version is an idempotent noop.
-   */
+  /** Med/allergy discontinuation needs confirmation. */
   async discontinue(
     entity: string, type: FactType, provenance: Provenance,
     opts?: { reason?: string; replacedBy?: string },
@@ -743,11 +707,7 @@ export class LedgerStore {
     return fact;
   }
 
-  /**
-   * Restart a previously discontinued entity as a new active version carrying `restartOf` = the
-   * discontinued version's id. Med/allergy needs confirmation. Already-active or
-   * nothing-discontinued is an idempotent noop.
-   */
+  /** Med/allergy restarts need confirmation. */
   async restart(
     entity: string, type: FactType, provenance: Provenance,
     fields: Record<string, string | number | string[]>,
@@ -774,9 +734,6 @@ export class LedgerStore {
     return { kind: 'applied', fact };
   }
 
-  /**
-   * Pause the active version, carrying a `pre_pause_summary`. No active version is an idempotent noop.
-   */
   async pause(
     entity: string, type: FactType, provenance: Provenance,
     opts: { prePauseSummary: string },
@@ -809,7 +766,6 @@ export class LedgerStore {
     return { kind: 'applied', fact };
   }
 
-  /** All cross-entity link ids for an entity, deduped across its version chain. */
   async getCrossLinks(entity: string, type: FactType): Promise<{
     replaces: string[]; replacedBy: string[]; corrects: string[]; correctedBy: string[];
   }> {
@@ -850,10 +806,7 @@ export class LedgerStore {
     };
   }
 
-  /**
-   * Explicitly burn a token without applying its op (user declined), so it becomes unusable
-   * immediately instead of lingering for its full 15-minute window. Idempotent.
-   */
+  /** Burns a declined token immediately instead of letting it linger until expiry. */
   declineToken(tokenId: string): void {
     const stored = this.tokens.get(tokenId);
     if (!stored) return;
@@ -888,8 +841,7 @@ export class LedgerStore {
     }
 
     const op = stored.op;
-    // The token is marked used only after the op succeeds: a failed apply (transient IO, state
-    // drift) leaves it valid so the user can retry.
+    // The token is burned only after the op succeeds, so a failed apply leaves it valid for retry.
     try {
       const fact = await this.applyConfirmOp(op, options);
       stored.used = true;
@@ -907,24 +859,19 @@ export class LedgerStore {
   private async applyConfirmOp(op: PendingOp, options?: { winningVersion?: number }): Promise<LedgerFact> {
     if (op.kind === 'write') {
       const allFacts = await this.readForChange(op.type);
-      // Resolve the current version as active or paused (a paused-entity update has no active
-      // version, mirroring recordFact). Without this the paused-carry branch below is unreachable.
+      // A paused entity has no active version, so resolve either.
       const cur = this.activeVersion(allFacts, op.entity) ?? this.pausedVersion(allFacts, op.entity);
       if (!cur) throw new TokenRejectedError('no-active-version');
-      // Reject a stale token whose target state moved since the proposal: confirming blind would
-      // clobber a newer legitimate change.
+      // Confirming a token whose target moved would clobber a newer change.
       if (op.baselineCurHash !== undefined
         && factSnapshotHash(cur) !== op.baselineCurHash) {
         throw new TokenRejectedError('state-moved-since-proposal');
       }
       const now = this.clock.now().toISOString();
       const v = this.nextVersion(allFacts, op.entity);
-      // A confirmed resume (op.resume) reactivates a paused fact to 'active'; a plain paused-entity
-      // update stays 'paused'.
+      // Only an explicit resume reactivates a paused fact.
       const targetStatus: FactStatus = (cur.status === 'paused' && !op.resume) ? 'paused' : 'active';
-      // Merge the confirmed proposal onto the current fact's fields so the applied head retains
-      // carried fields (known_side_effects etc.); the proposal's keys win. Also covers the paused
-      // pre_pause_summary carry (kept below as belt-and-braces).
+      // Proposal keys win, but carried fields are kept.
       const writeFields = { ...cur.fields, ...op.fields };
 
       if (cur.status === 'paused'
@@ -946,8 +893,7 @@ export class LedgerStore {
         verbatim: op.verbatim,
         visibility: op.visibility,
         resume: op.resume,
-        // Carry the cross-entity links so the confirmed fact keeps its forward link and the reverse
-        // link gets stamped on the target (writeFacts -> reconcileReverseLinks).
+        // Carry links so the reverse link is stamped on the target.
         replaces: op.replaces,
         corrects: op.corrects,
       };
@@ -996,8 +942,7 @@ export class LedgerStore {
         throw new TokenRejectedError('dispute-version-not-offered');
       }
       const allFacts = await this.readForChange(op.type);
-      // At mint time the pre-dispute fact was flipped to `disputed`, so any current active version
-      // means a third write landed in the window; resolving now would create a double-active entity.
+      // A current active version means a third write landed in the window; resolving now would double-activate.
       if (allFacts.some(f => f.entity === op.entity && f.status === 'active')) {
         throw new TokenRejectedError('state-moved-since-proposal');
       }
@@ -1007,8 +952,7 @@ export class LedgerStore {
       if (!winner || !loser) throw new TokenRejectedError('dispute-incomplete');
       winner.status = 'active';
       loser.status = 'superseded';
-      // Retire the original pre-dispute fact too, otherwise it stays a permanent `disputed` zombie
-      // in the chain. The dispute heads carry the full competing content, so nothing is lost.
+      // Retire the original pre-dispute fact so it does not stay a `disputed` zombie.
       const original = allFacts.find(f => f.id === op.originalId && f.status === 'disputed' && f.version !== winner.version && f.version !== loser.version);
       if (original) original.status = 'superseded';
       await this.writeFacts(op.type, allFacts, [winner, loser]);
@@ -1028,8 +972,7 @@ export class LedgerStore {
 
     if (op.kind === 'restart') {
       const allFacts = await this.readForChange(op.type);
-      // Guard against a second restart token confirming into a second active version (two
-      // coexisting restart tokens would leave the entity unable to be retired).
+      // A second restart token must not create a second active version.
       if (this.activeVersion(allFacts, op.entity)) {
         throw new TokenRejectedError('entity-already-active');
       }
@@ -1060,30 +1003,19 @@ export class LedgerStore {
 
   async listByType(type: FactType): Promise<LedgerFact[]> {
     const allFacts = await this.readFacts(type);
-    // Exclude v0 parse-error quarantine sentinels from active listings.
+    // Exclude v0 quarantine sentinels.
     return allFacts.filter(f => f.status === 'active' && f.version >= 1);
   }
 
-  /**
-   * Every fact of a type: all entities, all versions, all statuses (including superseded,
-   * retracted and v0 sentinels). Re-mirroring a changed ledger file needs this, because the
-   * active-only listByType cannot show a now-superseded head. One read per type file.
-   */
   async listAllOfType(type: FactType): Promise<LedgerFact[]> {
     return this.readFacts(type);
   }
 
-  /** Every fact in one entity scope, including all versions and terminal states. */
   async listAllOfEntity(type: FactType, entity: string): Promise<LedgerFact[]> {
     const normalized = requireEntitySlug(entity);
     return (await this.readFacts(type)).filter((fact) => fact.entity === normalized);
   }
 
-  /**
-   * Entity names of this type that currently have more than one active version: a dual-active
-   * conflict the store did not auto-resolve (e.g. seeded or imported state). Surfaced to the agent
-   * so it can ask the user to clarify, rather than silently masking one head via getActive.
-   */
   async listActiveConflicts(type: FactType): Promise<string[]> {
     const allFacts = await this.readFacts(type);
     const counts = new Map<string, number>();
@@ -1093,7 +1025,6 @@ export class LedgerStore {
     return [...counts.entries()].filter(([, n]) => n > 1).map(([entity]) => entity);
   }
 
-  /** Every current fact (active or paused) across all types — what the agent treats as true now. */
   async listCurrent(): Promise<LedgerFact[]> {
     const out: LedgerFact[] = [];
     for (const type of Object.keys(TYPE_TO_FILE) as FactType[]) {
@@ -1104,17 +1035,11 @@ export class LedgerStore {
     return out;
   }
 
-  /**
-   * Every safety-relevant fact currently shown on SAFETY.md, active or resolved, across all types.
-   * The SafetyRenderer re-renders from this (broader than the active-only listByType). One read
-   * per type file.
-   */
   async listSafetyRelevant(): Promise<LedgerFact[]> {
     const out: LedgerFact[] = [];
     for (const type of Object.keys(TYPE_TO_FILE) as FactType[]) {
       for (const f of await this.readFacts(type)) {
-        // `disputed` facts stay visible to the SAFETY renderer (marked as under dispute) so a
-        // med/allergy never silently leaves the safety net while its dispute is unresolved.
+        // Disputed safety facts stay on the safety net until resolved.
         if (f.safetyRelevant && (f.status === 'active' || f.status === 'resolved' || f.status === 'disputed')) out.push(f);
       }
     }

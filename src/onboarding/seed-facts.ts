@@ -1,6 +1,5 @@
 import type { OnboardingAnswers } from './types';
 
-/** One structured fact taken from an onboarding answer. */
 export interface SeedFact {
   entity: string;
   type: 'condition' | 'medication' | 'allergy';
@@ -27,7 +26,7 @@ function medication(item: string): SeedFact {
   return {
     entity: name.toLowerCase(),
     type: 'medication',
-    fields: { ...(dose ? { dose } : {}), known_side_effects: [] },
+    fields: dose ? { dose } : {},
   };
 }
 
@@ -39,7 +38,6 @@ function allergy(item: string): SeedFact {
   return { entity: name.toLowerCase(), type: 'allergy', fields: reaction ? { reaction } : {} };
 }
 
-/** The structured facts in an owner's onboarding answers. Deterministic; no model call. */
 export function onboardingSeedFacts(answers: OnboardingAnswers): SeedFact[] {
   return [
     ...listItems(answers.conditions).map((item): SeedFact => ({ entity: item.toLowerCase(), type: 'condition', fields: {} })),

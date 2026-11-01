@@ -3,7 +3,6 @@ import type { LLMProvider, LLMResponse, Message } from '../../src/providers/type
 import { ToolRegistry } from '../../src/tools/registry';
 import type { Tool } from '../../src/tools/types';
 
-// A provider that records every `messages` array it is handed and replays a fixed response.
 function recordingProvider(responses: LLMResponse[]): { provider: LLMProvider; seen: Message[][] } {
   const seen: Message[][] = [];
   let idx = 0;
@@ -17,10 +16,10 @@ function recordingProvider(responses: LLMResponse[]): { provider: LLMProvider; s
   return { provider, seen };
 }
 
-const CFG = { maxIterations: 15, disclaimerEnabled: false };
+const CFG = { maxIterations: 15 };
 
-describe('AgentLoop — per-turn assembly + <used> feedback (C3)', () => {
-  it('builds the system prompt via the supplier on EVERY turn (per-turn D9 assembly)', async () => {
+describe('AgentLoop — per-turn assembly + <used> feedback', () => {
+  it('builds the system prompt via the supplier on EVERY turn (per-turn assembly)', async () => {
     const calls: { mode: string; msg: string }[] = [];
     const prepare: PrepareSystem = async (mode, msg) => {
       calls.push({ mode, msg });
@@ -37,7 +36,7 @@ describe('AgentLoop — per-turn assembly + <used> feedback (C3)', () => {
     expect(seen[1][0]).toEqual({ role: 'system', content: 'SYS:second' });
   });
 
-  it('passes the turn mode from runContext to the supplier (Gateway owns the mode — H-4)', async () => {
+  it('passes the turn mode from runContext to the supplier (the Gateway owns the mode)', async () => {
     const calls: string[] = [];
     const prepare: PrepareSystem = async (mode) => { calls.push(mode); return { messages: [] }; };
     const { provider } = recordingProvider([{ type: 'text', text: 'ok' }]);
@@ -48,7 +47,7 @@ describe('AgentLoop — per-turn assembly + <used> feedback (C3)', () => {
     expect(calls).toEqual(['heartbeat']);
   });
 
-  it('parses and STRIPS the <used> tag and records usage (B7 / H-3)', async () => {
+  it('parses and STRIPS the <used> tag and records usage', async () => {
     let recorded: string[] | null = null;
     const prepare: PrepareSystem = async () => ({ messages: [], recordUsed: async (ids) => { recorded = ids; } });
     const { provider } = recordingProvider([{ type: 'text', text: 'Here is your answer.\n<used>c1,c2</used>' }]);
@@ -73,14 +72,14 @@ describe('AgentLoop — per-turn assembly + <used> feedback (C3)', () => {
     expect(called).toBe(false);
   });
 
-  it('strips <used> BEFORE appending the disclaimer / classifying health (H-3 ordering)', async () => {
+  it('strips <used> BEFORE appending the disclaimer / classifying health (ordering)', async () => {
     const prepare: PrepareSystem = async () => ({
       messages: [],
       recordUsed: async () => undefined,
       healthContextTouched: true,
     });
     const { provider } = recordingProvider([{ type: 'text', text: 'Your glucose note looks stable.\n<used>c9</used>' }]);
-    const loop = new AgentLoop(provider, new ToolRegistry({ allow: ['*'], deny: [] }), prepare, { maxIterations: 15, disclaimerEnabled: true });
+    const loop = new AgentLoop(provider, new ToolRegistry({ allow: ['*'], deny: [] }), prepare, { maxIterations: 15 });
 
     const result = await loop.run('how is my glucose');
 
@@ -90,7 +89,7 @@ describe('AgentLoop — per-turn assembly + <used> feedback (C3)', () => {
     expect(result.text).toContain('I am an AI health companion');
   });
 
-  it('executes ALL tool calls in one assistant turn and appends each result in order (C4.1)', async () => {
+  it('executes ALL tool calls in one assistant turn and appends each result in order', async () => {
     const mkTool = (name: string): Tool => ({
       name, group: 'group:test', description: name,
       parameters: { type: 'object', properties: {}, required: [] },
@@ -109,12 +108,10 @@ describe('AgentLoop — per-turn assembly + <used> feedback (C3)', () => {
 
     expect(result.text).toBe('both done');
     expect([...result.usedTools].sort()).toEqual(['ping', 'pong']);
-    // One assistant tool-request (carrying BOTH calls) → two tool results in order → final assistant.
     expect(result.trace.map((m) => m.role)).toEqual(['assistant', 'tool', 'tool', 'assistant']);
     expect(result.trace[0].tool_calls!.map((t) => t.id)).toEqual(['a', 'b']);
     expect(result.trace[1].tool_call_id).toBe('a');
     expect(result.trace[2].tool_call_id).toBe('b');
-    // The second provider call sees a valid history: assistant(tool_calls=2) then both tool messages.
     const second = seen[1];
     const asst = second.find((m) => m.role === 'assistant' && Array.isArray(m.tool_calls))!;
     expect(asst.tool_calls!.length).toBe(2);
@@ -122,7 +119,7 @@ describe('AgentLoop — per-turn assembly + <used> feedback (C3)', () => {
     expect(toolMsgs.map((m) => m.tool_call_id)).toEqual(['a', 'b']);
   });
 
-  it('an unknown tool name in a parallel batch yields an error result, not a whole-turn abort (M-2)', async () => {
+  it('an unknown tool name in a parallel batch yields an error result, not a whole-turn abort', async () => {
     const pingTool: Tool = {
       name: 'ping', group: 'group:test', description: 'ping',
       parameters: { type: 'object', properties: {}, required: [] },
@@ -144,7 +141,6 @@ describe('AgentLoop — per-turn assembly + <used> feedback (C3)', () => {
     expect(result.trace[1].content).toBe('ping-result');
     expect(result.trace[2].tool_call_id).toBe('b');
     expect(String(result.trace[2].content)).toMatch(/error|not found/i);
-    // The follow-up provider call still sees valid history: one tool result per tool_call_id, in order.
     expect(seen[1].filter((m) => m.role === 'tool').map((m) => m.tool_call_id)).toEqual(['a', 'b']);
   });
 

@@ -10,13 +10,10 @@ import { resolveOwnerPaths } from '../../src/profiles';
 import type { ProfileId } from '../../src/profiles/types';
 import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 
-
 describe('Gateway onboarding integration', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    // OLD -> NEW: was `os.tmpdir()`. R-14 / the founder's no-outside-workspace rule: synthetic data
-    // belongs in the gitignored `.test-tmp/` root.
     tmpDir = makeTestTemp('gateway-onboarding');
   });
 
@@ -41,9 +38,7 @@ describe('Gateway onboarding integration', () => {
         bootstrapMaxChars: 20000,
       },
       sessions: {
-        softResetAfterMinutes: 240,
-        hardResetAfterMinutes: 1440,
-        compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+        compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
       },
       heartbeat: {
         enabled: false,
@@ -62,7 +57,7 @@ describe('Gateway onboarding integration', () => {
           },
         },
       },
-      agent: { maxIterations: 15, disclaimerEnabled: true },
+      agent: { maxIterations: 15 },
     };
   }
 
@@ -121,19 +116,10 @@ describe('Gateway onboarding integration', () => {
     const response = await gateway.handleTestMessage('chat-1', 'Can I eat daal chawal?');
 
     expect(response).toBe('normal agent');
-    // S1 change (old -> new): `handleTestMessage` now presents an explicit local transport identity
-    // instead of an empty one, because S1 admission refuses a message with no transport identity
-    // and omitting it made this path untestable and its refusals meaningless. The extra
-    // M9 (closed): the transport sender id is no longer appended to the prompt. It is a chat-shaped
-    // identifier needed only for authorization — which admission has already decided — and appending it
-    // shipped it to the provider on every turn and into the persisted session window. The authz decision
-    // still reads the whole transport identity; only the prompt payload changed. This assertion is the
-    // regression proof that the identifier does NOT reappear.earing in the captured agent input; the
-    // clinical text, the history and the turn options are unchanged.
     expect(run).toHaveBeenCalledWith(
       'Can I eat daal chawal?',
       [],
-      { chatId: 'chat-1', mode: 'chat', turnId: undefined },
+      { chatId: 'chat-1', origin: 'user', mode: 'chat', turnId: undefined },
     );
   });
 

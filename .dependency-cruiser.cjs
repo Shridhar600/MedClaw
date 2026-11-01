@@ -85,7 +85,7 @@ module.exports = {
         'their own directory, and external packages. This rule blocks ' +
         'imports from legacy (v1) modules.',
       from: {
-        path: '^src/(memcore|profiles|recall|context2|capture|subagents|indexstore|security)/',
+        path: '^src/(memcore|profiles|recall|context2|capture|indexstore|security)/',
       },
       to: {
         path: '^src/(agent|channels|cli|config|gateway|media|memory|onboarding|providers|runtime|scheduler|tools|workspace)/',

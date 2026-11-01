@@ -1,5 +1,3 @@
-// Typed rejection for confirmation-token failures. Carries a fixed-vocabulary reason only: never
-// entity names, field values, or raw provider/error text (PHI must not reach session logs).
 
 /** Safe rejection reasons — fixed vocabulary, PHI-free by construction. */
 export type TokenRejectionReason =

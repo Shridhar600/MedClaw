@@ -1,10 +1,3 @@
-// tests/memcore/safety-view.test.ts
-//
-// SafetyView — SAFETY.md rendered VIEW (plan Task 4). Acceptance: CONTRA-03, CONTRA-04,
-// DAD-11, C6a (no dates anywhere in the file).
-//
-// Imports the store DIRECTLY (not via the memcore barrel) — the orchestrator owns the
-// barrel consolidation pass after Wave B.
 import * as fs from 'fs';
 import * as path from 'path';
 import { SafetyView, SafetyRemovalRefusedError } from '../../src/memcore/safety-view';
@@ -44,7 +37,7 @@ describe('SafetyView.render', () => {
     expect(fs.statSync(path.dirname(safetyFile())).mode & 0o777).toBe(0o700);
   });
 
-  it('emits NO date token anywhere in the file (C6a/G3) even when facts carry dates', async () => {
+  it('emits NO date token anywhere in the file even when facts carry dates', async () => {
     const sv = new SafetyView(tmpDir);
     const md = await sv.render([
       fact('penicillin', 'allergy', {
@@ -91,7 +84,7 @@ describe('SafetyView Critical Events', () => {
 
     expect(md).toContain('chest pain episode'); // summary rendered
     expect(md).toContain('advised ER'); // action rendered
-    expect(md).not.toMatch(/\d{4}-\d{2}-\d{2}/); // C6a: no date token anywhere in SAFETY.md
+    expect(md).not.toMatch(/\d{4}-\d{2}-\d{2}/); // No date token anywhere in SAFETY.md
     expect(fs.statSync(safetyFile()).mode & 0o777).toBe(0o600);
   });
 
@@ -105,7 +98,6 @@ describe('SafetyView Critical Events', () => {
     expect(md).toContain('second event');
     expect(md).toContain('monitored');
 
-    // removeEntry only targets machine-section entries; a Critical Event is not one.
     const after = await sv.removeEntry('first event', { userConfirmed: true });
     expect(after).toContain('first event');
   });
@@ -147,7 +139,7 @@ describe('SafetyView ## Notes (user) preservation', () => {
 });
 
 describe('SafetyView.removeEntry', () => {
-  it('REFUSES removal of a base allergy entry without user confirmation (CONTRA-03/04)', async () => {
+  it('REFUSES removal of a base allergy entry without user confirmation', async () => {
     const sv = new SafetyView(tmpDir);
     await sv.render([fact('penicillin', 'allergy', { status: 'active', safetyRelevant: true })]);
 
@@ -161,7 +153,7 @@ describe('SafetyView.removeEntry', () => {
     expect((await sv.read())!).toContain('penicillin');
   });
 
-  it('REFUSES removal of a base medication entry without user confirmation (CONTRA-04 med-class)', async () => {
+  it('REFUSES removal of a base medication entry without user confirmation', async () => {
     const sv = new SafetyView(tmpDir);
     await sv.render([fact('metformin', 'medication', { status: 'active', safetyRelevant: true, fields: { dose: '850mg 1x/day' } })]);
 
@@ -212,7 +204,6 @@ describe('SafetyView corrupt-file degradation', () => {
       expect(md).not.toContain('rotten bytes'); // raw bytes NOT inline — side-filed
       expect(warnSpy).toHaveBeenCalled();
       expect(md).not.toMatch(/\d{4}-\d{2}-\d{2}/);
-      // corrupt bytes preserved in a sidecar, never destroyed
       const sidecar = fs.readdirSync(tmpDir).find(n => n.includes('SAFETY.md.quarantine'));
       expect(sidecar).toBeDefined();
       expect(fs.readFileSync(path.join(tmpDir, sidecar!), 'utf-8')).toContain('rotten bytes');
@@ -237,7 +228,6 @@ describe('SafetyView corrupt-file degradation', () => {
     expect(second).toContain('PARSE-ERROR'); // pointer survives the re-render
     expect(second).not.toContain('- oats'); // bytes not inline
     expect(second).toContain('penicillin');
-    // the bytes remain preserved in the sidecar across renders
     expect(fs.readdirSync(tmpDir).some(n => n.includes('SAFETY.md.quarantine'))).toBe(true);
     jest.restoreAllMocks();
   });
@@ -256,10 +246,8 @@ describe('SafetyView.read', () => {
     expect(md).toBe(await fs.promises.readFile(safetyFile(), 'utf-8'));
   });
 
-  it('throws on a non-ENOENT read error — the always-injected constitution fails closed (H-1)', async () => {
+  it('throws on a non-ENOENT read error — the always-injected constitution fails closed', async () => {
     const sv = new SafetyView(tmpDir);
-    // A present-but-unreadable SAFETY.md (EISDIR here, same class as EACCES) must NOT degrade to
-    // null — that would let a turn ship with no safety constitution. It must throw so the caller aborts.
     fs.mkdirSync(safetyFile());
     await expect(sv.read()).rejects.toThrow();
   });

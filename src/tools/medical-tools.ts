@@ -29,9 +29,6 @@ function wrapUntrustedReportAnalysis(text: string): string {
     + '\nEND UNTRUSTED REPORT ANALYSIS';
 }
 
-/**
- * Assemble health context only from the status-aware provider supplied by the composition root.
- */
 export async function assembleHealthContext(
   medicalContextProvider: MedicalContextProvider | undefined,
   query: string
@@ -48,8 +45,6 @@ export async function assembleHealthContext(
         status,
       };
     } catch (error) {
-      // Graceful degradation: stale legacy/profile context is never substituted, and the outage
-      // remains visible to the medical provider instead of looking like an empty healthy profile.
       console.warn('[medical-tools] health context unavailable:', summarizeErrorForLog(error));
       return {
         content: '[health-context-status: provider-unavailable]\nNo verified active health context is available.',
@@ -63,9 +58,6 @@ export async function assembleHealthContext(
   };
 }
 
-/**
- * Build the medical query prompt with context and safety framing.
- */
 function buildMedicalQueryPrompt(
   healthContext: string,
   userQuestion: string
@@ -95,9 +87,6 @@ When responding:
   ];
 }
 
-/**
- * Build the report analysis prompt with context and safety framing.
- */
 function buildReportAnalysisPrompt(
   healthContext: string,
   report: ProcessedReport,
@@ -239,9 +228,6 @@ export function createMedicalTools(
           };
         }
 
-        // Graceful degradation only when the fallback provider is local.
-        // Provider error messages can echo user health context (PHI) — log the
-        // sanitized frame only, never the raw error.
         console.warn('[medgemma_query] Medical provider failed, falling back to local main LLM:', summarizeErrorForLog(error));
 
         try {
@@ -349,9 +335,6 @@ export function createMedicalTools(
           };
         }
 
-        // Graceful degradation only when the fallback provider is local.
-        // Provider error messages can echo user health context (PHI) — log the
-        // sanitized frame only, never the raw error.
         console.warn('[medgemma_analyze_report] Medical provider failed, falling back to local main LLM:', summarizeErrorForLog(error));
 
         try {
@@ -437,8 +420,6 @@ function isLocalHostname(hostname: string): boolean {
 }
 
 function isImageOnlyFailure(error: unknown): boolean {
-  // Only a MedClaw-generated media validation error can be an "image-only" failure; a raw provider
-  // error whose message happens to contain these words must not be misclassified.
   if (!(error instanceof MediaValidationError)) return false;
   return error.message.includes('vision')
     || error.message.includes('image input')
@@ -446,9 +427,6 @@ function isImageOnlyFailure(error: unknown): boolean {
 }
 
 function buildReportErrorMessage(error: unknown, report: ProcessedReport | undefined): string {
-  // Only echo a MedClaw-generated validation error's message (it describes the file/config,
-  // never health content). A raw provider error can echo the prompt (PHI), so it gets no detail,
-  // just the canned framing.
   const detail = error instanceof MediaValidationError ? ` ${error.message}` : '';
   if (!report) {
     return `Error: Report processing failed.${detail}`;

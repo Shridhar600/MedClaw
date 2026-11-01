@@ -1,13 +1,9 @@
-// A real grammY document update drives the real Gateway: channel, admission, Router, media source, stager
-// and runtime are real. Only grammY, the Bot API `getFile`, the file-body fetch and the provider are faked.
 
 import * as fs from 'fs';
 import * as path from 'path';
 
 import type { LLMResponse } from '../../src/providers/types';
 
-// Telegram chat/user ids are NUMERIC on the wire and reach the core as strings. The owner is bound to
-// exactly the ids the fake update carries, so admission genuinely matches rather than being bypassed.
 const OWNER_CHAT = '777';
 const OWNER_USER = '42';
 const STRANGER_CHAT = '999';
@@ -33,8 +29,6 @@ jest.mock('grammy', () => ({
   })),
 }));
 
-// Imported after the mock so the channel picks up the fake Bot.
-// eslint-disable-next-line @typescript-eslint/no-var-requires
 import { Gateway } from '../../src/gateway';
 import { TelegramMediaSource } from '../../src/channels';
 import { composeOwnerAuthority } from '../../src/runtime';
@@ -52,10 +46,6 @@ function handlerFor(event: string): Handler {
   return call[1] as Handler;
 }
 
-/**
- * A grammY-shaped TEXT update. Onboarding is a real multi-step flow and `skip` is a supported answer, so
- * completing it through the same inbound path is real behaviour rather than a bypass.
- */
 function textUpdate(text: string, overrides: { chatId?: number; userId?: number; messageId?: number } = {}) {
   const from = { id: Number(overrides.userId ?? 42), is_bot: false, first_name: 'Owner' };
   const chat = { id: Number(overrides.chatId ?? 777), type: 'private' };
@@ -69,8 +59,6 @@ function textUpdate(text: string, overrides: { chatId?: number; userId?: number;
 
 /** Build a grammY-shaped update for a document, as the real Bot API delivers it. */
 function documentUpdate(overrides: { fileId?: string; fileName?: string; caption?: string; chatId?: number; userId?: number } = {}) {
-  // grammY's Context reads `ctx.chat`, `ctx.from` and `ctx.message` off the update, and the document off
-  // the message — so the nesting here mirrors a real Bot API update rather than a flat fixture.
   const from = { id: Number(overrides.userId ?? 42), is_bot: false, first_name: 'Owner' };
   const chat = { id: Number(overrides.chatId ?? 777), type: 'private' };
   return {
@@ -118,7 +106,7 @@ describe('a real Telegram attachment reaches the owner runtime (transport -> cor
     jest.spyOn(console, 'log').mockImplementation((...a: unknown[]) => { logs.push(a.map(String).join(' ')); });
     jest.spyOn(console, 'warn').mockImplementation((...a: unknown[]) => { logs.push(a.map(String).join(' ')); });
     jest.spyOn(console, 'error').mockImplementation((...a: unknown[]) => { logs.push(a.map(String).join(' ')); });
-    root = makeTestTemp('socs-s1-telegram-media-e2e');
+    root = makeTestTemp('telegram-media-e2e');
   });
 
   afterEach(() => {
@@ -163,7 +151,6 @@ describe('a real Telegram attachment reaches the owner runtime (transport -> cor
       },
     });
 
-    // The provider is the only stubbed collaborator, so the prompt the model receives is the real composed one.
     const prompts: string[] = [];
     const scriptedProvider = {
       modelName: 'scripted',
@@ -190,29 +177,21 @@ describe('a real Telegram attachment reaches the owner runtime (transport -> cor
 
     await gateway.start();
     try {
-      // The owner is bound, so a real boot builds the runtime. Telegram is on, so the channel exists.
       expect(gateway.servesPairingOnly).toBe(false);
       expect(gateway.runtimeInstance).toBeDefined();
 
-      // The first ordinary owner message starts in-chat onboarding, which is canned and therefore makes
-      // no provider call. Answer it the way a real owner would — `skip` is supported — so the document
-      // below is the turn that actually reaches the agent.
       await handlerFor('message:text')(textUpdate('skip', { messageId: 1 }));
       prompts.length = 0;
 
-      // Drive the REAL transport handler with a real document update.
       await handlerFor('message:document')(documentUpdate());
 
-      // The Bot API was asked to resolve the file, and the body was actually fetched.
       expect(mockGetFile).toHaveBeenCalledWith('opaque-file-id');
       expect(fetchCount()).toBe(1);
 
-      // The turn reached the agent with the owner's caption AND an adopted attachment path.
       const prompt = prompts.join('\n');
       expect(prompt).toContain('Please read this');
       expect(prompt).toMatch(/Uploaded media path \(relative to workspace\): reports\//);
 
-      // The adopted file is real, inside the owner's own workspace, and owner-only.
       const relative = /Uploaded media path \(relative to workspace\): (\S+)/.exec(prompt)![1];
       const absolute = path.resolve(fixture.workspace, relative);
       const stat = fs.statSync(absolute);
@@ -222,8 +201,6 @@ describe('a real Telegram attachment reaches the owner runtime (transport -> cor
       // The transport's file name never became a path component.
       expect(path.basename(absolute)).not.toBe('lab-report.pdf');
 
-      // The owner got a real reply, not a refusal.
-      // grammY's api.sendMessage(chat_id, text, other) — the text is positional, not an object.
       expect(mockSendMessage).toHaveBeenCalledWith(
         OWNER_CHAT,
         expect.stringContaining('Report summarised.'),
@@ -236,7 +213,6 @@ describe('a real Telegram attachment reaches the owner runtime (transport -> cor
       expect(allLogs).not.toContain('123:fixture-token');
       expect(allLogs).not.toContain('api.telegram.org');
 
-      // The staging lane is drained once the attachment was adopted.
       expect(fs.readdirSync(fixture.mediaStaging)).toEqual([]);
     } finally {
       await gateway.stop();
@@ -249,11 +225,9 @@ describe('a real Telegram attachment reaches the owner runtime (transport -> cor
     try {
       await handlerFor('message:document')(documentUpdate({ chatId: Number(STRANGER_CHAT), userId: Number(STRANGER_USER), caption: PHI }));
 
-      // THE property: an unauthenticated sender caused no Bot API call, no fetch and no file.
       expect(mockGetFile).not.toHaveBeenCalled();
       expect(fetchCount()).toBe(0);
 
-      // And the only thing they got was the canned refusal — never the marker, never a clinical answer.
       const replies = mockSendMessage.mock.calls.map((c) => String(c[1]));
       expect(replies.join(' ')).toMatch(/not connected to this assistant/i);
       expect(replies.join(' ')).not.toContain(PHI);
@@ -312,7 +286,6 @@ describe('a real Telegram attachment reaches the owner runtime (transport -> cor
       expect(fs.readFileSync(path.join(reports, beforeReports[0]))).toEqual(firstBytes);
       expect(prompts).toHaveLength(beforePrompts);
 
-      // Same source, cached stager, record and filesystem: a real restart must re-arm intake.
       await gateway.start();
       await handlerFor('message:document')(documentUpdate({ fileId: 'retry' }));
       const afterReports = entries(reports);

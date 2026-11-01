@@ -18,16 +18,9 @@ describe('Profile-scoped store isolation', () => {
   let profileB: ProfileId;
 
   beforeEach(() => {
-    // Workspace-local (gitignored `.test-tmp/`), never `os.tmpdir()` — R-14 and the founder's
-    // no-outside-workspace rule.
     tmpDir = makeTestTemp('profile-isolation');
     baseDir = path.join(tmpDir, 'base');
     fs.mkdirSync(baseDir, { recursive: true });
-    // OLD -> NEW: `new ProfileRegistry(baseDir).createProfile('alpha'/'beta')` used to mint two identity
-    // ids. Two identities are still the right SHAPE for a store-isolation proof — it is the only way to
-    // show two stores do not share a byte — but the ids now come from the owner-id grammar and the paths
-    // from the pure derivation. Nothing here creates a serving identity: S1 serves one owner, and this
-    // suite proves the underlying stores stay separable for whoever builds them next.
     profileA = asProfileId('alpha')!;
     profileB = asProfileId('beta')!;
     for (const id of [profileA, profileB]) {
@@ -95,15 +88,14 @@ describe('Profile-scoped store isolation', () => {
     it('sessions recorded for profile A are absent from profile B directory', async () => {
       const sessA = ownerPaths(profileA).sessions;
       const sessB = ownerPaths(profileB).sessions;
-      const mgrA = new SessionManager(240, 1440, sessA, undefined, undefined, undefined, profileA);
-      new SessionManager(240, 1440, sessB, undefined, undefined, undefined, profileB);
+      const mgrA = new SessionManager(sessA, undefined, undefined, undefined, profileA);
+      new SessionManager(sessB, undefined, undefined, undefined, profileB);
 
       await mgrA.recordTurn('chat-1', [
         { role: 'user', content: 'A private data' },
         { role: 'assistant', content: 'A response' },
       ]);
 
-      // P2b/D1.6: the day-file archive replaces the active file. Registry mode ⇒ flat `<date>.jsonl`.
       const dayFileName = new Date().toISOString().slice(0, 10) + '.jsonl';
       const filesA = fs.readdirSync(sessA).filter(f => f.endsWith('.jsonl'));
       const filesB = fs.readdirSync(sessB).filter(f => f.endsWith('.jsonl'));
@@ -119,8 +111,8 @@ describe('Profile-scoped store isolation', () => {
     it('two profiles can have sessions for the same chatId without collision', async () => {
       const sessA = ownerPaths(profileA).sessions;
       const sessB = ownerPaths(profileB).sessions;
-      const mgrA = new SessionManager(240, 1440, sessA, undefined, undefined, undefined, profileA);
-      const mgrB = new SessionManager(240, 1440, sessB, undefined, undefined, undefined, profileB);
+      const mgrA = new SessionManager(sessA, undefined, undefined, undefined, profileA);
+      const mgrB = new SessionManager(sessB, undefined, undefined, undefined, profileB);
 
       await mgrA.recordTurn('shared-chat', [
         { role: 'user', content: 'Profile A context' },

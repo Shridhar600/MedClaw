@@ -25,9 +25,6 @@ export interface LedgerFact {
   version: number;
   supersedes?: string;
   supersededBy?: string;
-  // Cross-entity links (distinct from same-entity supersedes/supersededBy).
-  // replaces/replacedBy = clinical substitution (naproxen replaces ibuprofen).
-  // corrects/correctedBy = mistaken-entity correction.
   replaces?: string;
   replacedBy?: string;
   corrects?: string;
@@ -76,8 +73,6 @@ export interface NarrativeNote {
   createdAt: string;
 }
 
-// `missing-data`: the nightly transcript sweep files these when a user-mentioned entity had no same-day
-// ledger event ("Did I miss logging X yesterday?"). Medication-lexicon hits are critical.
 export type CuriosityKind = 'follow-up' | 'medication-reminder' | 'lab-correlation' | 'information-gap' | 'insight' | 'missing-data';
 
 export interface CuriosityItem {
@@ -91,12 +86,6 @@ export interface CuriosityItem {
   dueAt?: string;
 }
 
-/**
- * Input for a NEW ledger fact captured during a turn. The store assigns id/version/
- * createdAt; the caller supplies the semantic content + provenance. Cross-entity link
- * ids (`replaces`/`corrects`) are the TARGET fact ids the caller resolved. `text` is the
- * human-readable narrative log line — omit it to log the entity name.
- */
 export interface LedgerFactInput {
   entity: string;
   type: FactType;
@@ -119,10 +108,6 @@ export interface NarrativeNoteInput {
   date?: string;
 }
 
-/**
- * Input for a metric reading. Recorded as a `metric`-type ledger fact whose
- * `fields` always carry a `date` plus a narrative note.
- */
 export interface MetricPointInput {
   entity: string;
   fields: Record<string, string | number | string[]>;
@@ -141,10 +126,6 @@ export interface LedgerCorrectionInput {
   note: string;
 }
 
-/**
- * A normalized inbound capture event, discriminated by `kind`. Each payload is an
- * INPUT shape (not a stored record) — the pipeline resolves ids/anchors when it writes.
- */
 export type CaptureEvent =
   | { kind: 'ledger-fact'; payload: LedgerFactInput }
   | { kind: 'narrative-note'; payload: NarrativeNoteInput }
@@ -153,17 +134,12 @@ export type CaptureEvent =
   | { kind: 'ledger-correction'; payload: LedgerCorrectionInput };
 
 export type PendingOp =
-  | { kind: 'write'; entity: string; type: FactType; fields: Record<string, string | number | string[]>; provenance: Provenance; safetyRelevant?: boolean; episodeId?: string; language?: string; verbatim?: string; visibility?: string; resume?: boolean; /** Cross-entity links (E1.2): carried through confirm so a confirmed write stamps the reverse link. */ replaces?: string; corrects?: string; /** Hash of the current fact at proposal time (CH): verified at confirm to reject stale-token clobbers. */ baselineCurHash?: string }
+  | { kind: 'write'; entity: string; type: FactType; fields: Record<string, string | number | string[]>; provenance: Provenance; safetyRelevant?: boolean; episodeId?: string; language?: string; verbatim?: string; visibility?: string; resume?: boolean; /** Carried through confirm so a confirmed write stamps the reverse link. */ replaces?: string; corrects?: string; /** Verified at confirm to reject stale-token clobbers. */ baselineCurHash?: string }
   | { kind: 'retract'; entity: string; type: FactType; provenance: Provenance; baselineCurHash: string }
   | { kind: 'dispute'; entity: string; type: FactType; versionA: number; versionB: number; originalId: string }
   | { kind: 'discontinue'; entity: string; type: FactType; provenance: Provenance; reason?: string; replacedBy?: string; baselineCurHash: string }
   | { kind: 'restart'; entity: string; type: FactType; provenance: Provenance; fields: Record<string, string | number | string[]>; restartOf: string; baselineCurHash: string };
 
-/**
- * Result of a lifecycle mutation (discontinue / restart / pause). `noop` is an
- * idempotent no-change outcome (e.g. discontinue with no active version), so the
- * tool layer can report it without a null-fact sentinel.
- */
 export type LedgerMutationResult =
   | { kind: 'applied'; fact: LedgerFact }
   | { kind: 'needs-confirmation'; fact: LedgerFact; token: ConfirmationToken }

@@ -21,9 +21,7 @@ export function liveGatewayConfig(rootDir: string): EffectiveConfig {
     tools: { allow: ['*'], deny: [] },
     memory: { workspace: owner.workspace, search: { hybridWeights: { vector: 0.7, keyword: 0.3 } }, bootstrapMaxChars: 20000 },
     sessions: {
-      softResetAfterMinutes: 240,
-      hardResetAfterMinutes: 1440,
-      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+      compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
     },
     heartbeat: {
       enabled: false,
@@ -42,7 +40,7 @@ export function liveGatewayConfig(rootDir: string): EffectiveConfig {
         },
       },
     },
-    agent: { maxIterations: 6, disclaimerEnabled: true },
+    agent: { maxIterations: 6 },
   };
 }
 
@@ -83,5 +81,7 @@ export async function startLiveGateway(rootDir: string, model: LLMProvider): Pro
   }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (gateway as any).agentLoop.provider = model;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (gateway as any).sideEffectProvider = model;
   return gateway;
 }

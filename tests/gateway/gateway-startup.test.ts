@@ -43,9 +43,7 @@ describe('Gateway startup resilience', () => {
         bootstrapMaxChars: 20000,
       },
       sessions: {
-        softResetAfterMinutes: 240,
-        hardResetAfterMinutes: 1440,
-        compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+        compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
       },
       heartbeat: {
         enabled: false,
@@ -64,7 +62,7 @@ describe('Gateway startup resilience', () => {
           },
         },
       },
-      agent: { maxIterations: 15, disclaimerEnabled: true },
+      agent: { maxIterations: 15 },
     };
   }
 
@@ -76,8 +74,6 @@ describe('Gateway startup resilience', () => {
     await gateway.stop();
 
     expect(warn.mock.calls.flat().join('\n')).toContain('Memory index unavailable');
-    // Error NAME + code location are logged; the message body is deliberately
-    // excluded (may carry PHI — see summarizeErrorForLog).
     expect(warn.mock.calls.flat().join('\n')).toContain('Error (at ');
     expect(warn.mock.calls.flat().join('\n')).not.toContain('embedding provider unavailable');
   });

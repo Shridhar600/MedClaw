@@ -7,14 +7,9 @@ import type { LLMProvider, LLMResponse, Message } from '../../src/providers/type
 import { fixtureOwner, ownerSelection } from '../helpers/test-config';
 import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
 import { makeTestTemp } from '../helpers/test-temp';
+import { ownerTools } from '../helpers/owner-tools';
 
 const CHAT_BINDING = 'chat-1';
-
-// C3 — the prompt cutover: the live chat path builds its system prompt per turn through the v2
-// assembler with recall injected and SAFETY re-rendered EVERY turn (D9). These are gateway-level
-// integration tests over the REAL agentLoop + prepareSystem; only the chat PROVIDER is scripted so
-// we can read back the assembled system message it is handed. Embeddings are unavailable in the test
-// env, so every turn also exercises the recall keyword-only/degrade path (resilience).
 
 function makeConfig(tmpDir: string): EffectiveConfig {
 const owner = fixtureOwner(tmpDir);
@@ -34,9 +29,7 @@ const owner = fixtureOwner(tmpDir);
       bootstrapMaxChars: 20000,
     },
     sessions: {
-      softResetAfterMinutes: 240,
-      hardResetAfterMinutes: 1440,
-      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+      compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
     },
     heartbeat: {
       enabled: false,
@@ -55,12 +48,10 @@ const owner = fixtureOwner(tmpDir);
         },
       },
     },
-    agent: { maxIterations: 15, disclaimerEnabled: true },
+    agent: { maxIterations: 15 },
   };
 }
 
-/** Replace the chat provider on the live agentLoop with a capturing stub; returns the captured
- *  message arrays (each `chat()` call). Recall still uses the real (unavailable) embedding provider. */
 function captureProvider(gateway: Gateway): Message[][] {
   const seen: Message[][] = [];
   const scripted: LLMProvider = {
@@ -79,13 +70,12 @@ async function startGateway(tmpDir: string): Promise<Gateway> {
   await gateway.start();
   warn.mockRestore();
   log.mockRestore();
-  // Skip onboarding so chat turns reach the agent path.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (gateway.runtimeInstance!.turnCoordinator as any).handleOnboarding = async (): Promise<null> => null;
   return gateway;
 }
 
-describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
+describe('Gateway — per-turn recall + v2 assembly cutover', () => {
   let tmpDir: string;
   let gateway: Gateway;
   let workspace: string;
@@ -100,17 +90,17 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
   });
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const registryOf = (): any => (gateway as any).agentLoop.registry;
+  const registryOf = (): any => ownerTools((gateway as any).agentLoop.registry);
   const lastSystem = (seen: Message[][]): string => String(seen[seen.length - 1][0].content);
 
-  it('re-renders SAFETY into the running prompt after a mid-session mutation, no restart (D9)', async () => {
+  it('re-renders SAFETY into the running prompt after a mid-session mutation, no restart', async () => {
     gateway = await startGateway(tmpDir);
     const seen = captureProvider(gateway);
 
     await gateway.handleTestMessage('chat-1', 'hello there');
     expect(lastSystem(seen)).not.toContain('penicillin');
 
-    // Mid-session: record a safety-relevant allergy (D8 re-renders SAFETY.md).
+    // Mid-session: record a safety-relevant allergy, so the next render must include it.
     const res = await registryOf().execute('ledger_record', {
       entity: 'penicillin', type: 'allergy', fields: { reaction: 'hives' }, note: 'penicillin allergy, hives',
     });
@@ -121,7 +111,7 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
     expect(lastSystem(seen)).toContain('penicillin');
   });
 
-  it('injects Stage-1 active-ledger one-liners on a heartbeat turn but not full MEMORY (KNEE-02)', async () => {
+  it('injects Stage-1 active-ledger one-liners on a heartbeat turn but not full MEMORY', async () => {
     gateway = await startGateway(tmpDir);
     const seen = captureProvider(gateway);
 
@@ -130,7 +120,6 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
       note: 'knee MCL sprain',
     });
 
-    // Drive a heartbeat-mode turn directly (Gateway maps origin→mode for the scheduler path).
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).agentLoop.run('heartbeat check-in', [], { chatId: 'chat-1', origin: 'heartbeat', mode: 'heartbeat' });
 
@@ -182,7 +171,7 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
     expect(system).not.toContain('stable prose '.repeat(4_000));
   });
 
-  it('reports per-turn prompt mode in /status when the recall path is wired (L-2)', async () => {
+  it('reports per-turn prompt mode in /status when the recall path is wired', async () => {
     gateway = await startGateway(tmpDir);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const status = (gateway as any).buildBootStatusText();
@@ -203,15 +192,9 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
     expect(lastSystem(seen)).toContain('lisinopril');
   });
 
-  // The ledger write lands before SAFETY.md is re-rendered, so a render failure is not a write
-  // failure: the tool reports the fact as recorded and the view is marked dirty. The next read
-  // repairs it from the ledger, or fails closed if the repair fails too.
   it('SELF-HEALS on the next live turn after a TRANSIENT SAFETY publication failure', async () => {
     gateway = await startGateway(tmpDir);
     const seen = captureProvider(gateway);
-    // Fails exactly ONCE — the ledger_record write's own re-render. The ledger fact itself is
-    // still recorded successfully (recordFact runs before reRenderSafety); only the SAFETY
-    // projection publish glitched transiently.
     const renderSpy = jest.spyOn(SafetyView.prototype, 'render').mockRejectedValueOnce(new Error('render failure'));
     try {
       const result = await registryOf().execute('ledger_record', {
@@ -220,11 +203,8 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
       expect(result.isError).toBeFalsy();
       expect(fs.existsSync(path.join(workspace, '.state', 'safety-view.dirty'))).toBe(true);
 
-      // The mocked failure has been consumed — the self-heal's re-projection attempt succeeds.
       const reply = await gateway.handleTestMessage('chat-1', 'what should I know about antibiotics');
       expect(reply).not.toContain('trouble right now');
-      // The self-healed SAFETY.md carries the penicillin allergy that was already durably recorded
-      // in the ledger — proving the heal re-derived from REAL data, not stale/empty content.
       expect(fs.readFileSync(path.join(workspace, 'SAFETY.md'), 'utf8')).toContain('penicillin');
       expect(lastSystem(seen)).toContain('penicillin');
     } finally {
@@ -235,7 +215,6 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
   it('STILL fails closed on the next live turn when SAFETY publication fails PERSISTENTLY', async () => {
     gateway = await startGateway(tmpDir);
     const seen = captureProvider(gateway);
-    // Fails on EVERY call — the initial write AND the self-heal's retry attempt.
     const renderSpy = jest.spyOn(SafetyView.prototype, 'render').mockRejectedValue(new Error('render failure'));
     try {
       const result = await registryOf().execute('ledger_record', {
@@ -246,9 +225,6 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
 
       const providerCallsBefore = seen.length;
       const reply = await gateway.handleTestMessage('chat-1', 'what should I know about antibiotics');
-      // The self-heal attempt itself failed (render is STILL broken) — the C-03 invariant holds:
-      // fails closed, exactly once, never spins (the loop guard is unit-tested directly in
-      // tests/gateway/rs3-safety-self-heal.test.ts).
       expect(reply).toContain('trouble right now');
       expect(seen.length).toBe(providerCallsBefore);
     } finally {
@@ -257,8 +233,6 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
   });
 });
 
-// The ledger Markdown is the source of truth for what the agent believes is current. The owner can
-// hand-edit it, a derived index can lag, a file can be damaged — the next reply must follow the ledger.
 describe('Gateway — current facts follow the ledger', () => {
   let tmpDir: string;
   let gateway: Gateway;
@@ -274,7 +248,7 @@ describe('Gateway — current facts follow the ledger', () => {
   });
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const registryOf = (): any => (gateway as any).agentLoop.registry;
+  const registryOf = (): any => ownerTools((gateway as any).agentLoop.registry);
   const lastSystem = (seen: Message[][]): string => String(seen[seen.length - 1][0].content);
   const ledgerFile = (name: string): string => path.join(workspace, 'ledger', name);
 
@@ -313,10 +287,23 @@ describe('Gateway — current facts follow the ledger', () => {
     expect(fs.readFileSync(file, 'utf8')).toBe(damaged);
     expect(fs.readdirSync(path.dirname(file)).filter((f) => f.startsWith('medications.md.corrupt-'))).toHaveLength(1);
   });
+
+  it('an unreadable allergy file is named in SAFETY.md instead of silently dropping the allergies', async () => {
+    gateway = await startGateway(tmpDir);
+    const seen = captureProvider(gateway);
+    await registryOf().execute('ledger_record', { entity: 'penicillin', type: 'allergy', fields: { reaction: 'hives' } });
+    await gateway.handleTestMessage('chat-1', 'hello', 'm1');
+    expect(lastSystem(seen)).toContain('penicillin');
+
+    fs.writeFileSync(ledgerFile('allergies.md'), Buffer.from([0xff, 0xfe, 0x00, 0x41]));
+    await gateway.handleTestMessage('chat-1', 'can I take amoxicillin?', 'm2');
+
+    const safety = fs.readFileSync(path.join(workspace, 'SAFETY.md'), 'utf8');
+    expect(safety).toMatch(/allergies\.md[^\n]*damaged/);
+    expect(lastSystem(seen)).toMatch(/allergies\.md[^\n]*damaged/);
+  });
 });
 
-// Onboarding is the owner's first health record: the meds, allergies and conditions they give at setup
-// must land in the ledger, so SAFETY.md and every later reply carry them — not only a prose profile.
 describe('Gateway — onboarding seeds the health record', () => {
   let tmpDir: string;
   let gateway: Gateway;
@@ -379,8 +366,6 @@ describe('Gateway — onboarding seeds the health record', () => {
 
 const lastSystemOf = (seen: Message[][]): string => String(seen[seen.length - 1][0].content);
 
-// A secret pasted into chat (a caption, an onboarding answer, a plain message) is refused at the
-// door: it never reaches the provider and never lands in any file under the owner's state.
 describe('Gateway — secrets in inbound messages', () => {
   const SECRET = 'sk-abcdefghijklmnopqrstuvwxyz0123456789';
   let tmpDir: string;

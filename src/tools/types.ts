@@ -18,10 +18,9 @@ export interface ToolExecutionContext {
   chatId?: string;
   /** Opaque identity shared by every tool call in one AgentLoop.run invocation. */
   turnId?: string;
-  /** The provider's per-call id (OpenAI `tool_call.id`). It tells apart two parallel calls to the
-   *  same tool with identical arguments in one turn, so an idempotency key never collides them. */
+  /** Distinguishes parallel calls with identical args so idempotency keys never collide. */
   toolCallId?: string;
-  /** Who started the turn. Absent means an owner turn. */
+  /** Who started the turn. Owner-only tools need 'user'; absent is refused. */
   origin?: 'user' | 'heartbeat' | 'background';
 }
 
@@ -30,7 +29,7 @@ export interface Tool {
   group: string;
   description: string;
   parameters: ToolParameters;
-  /** Only an owner turn may use this tool (medical writes and confirmations); background turns never see it. */
+  /** Only an owner turn may use this tool; background turns never see it. */
   ownerTurnOnly?: boolean;
   execute(params: Record<string, unknown>, context?: ToolExecutionContext): Promise<ToolResult>;
 }

@@ -1,22 +1,3 @@
-// src/memcore/safety-view.ts
-//
-// SAFETY.md — the Safety Constitution. Always injected, code-enforced, agent add-only.
-// This is a rendered VIEW of the ledger: the machine sections (allergies, medications, conditions, …)
-// are regenerated on every render from the facts where `safetyRelevant && status ∈ {active,
-// resolved}`, plus disputed facts (marked).
-//
-// Non-machine content is never touched by the renderer:
-//   - `## Critical Events` (agent add-only) is preserved verbatim; there is no API to remove an event.
-//   - `## Notes (user)` and any other section (e.g. a seeded emergency contact) are preserved
-//     verbatim, because silently dropping hand-written content would be data loss.
-//
-// No date token is ever written to the file. A Critical Event carries a `date` for the caller's
-// bookkeeping, but the render omits it.
-//
-// Removing a base allergy/medication entry is refused in code without an explicit `userConfirmed`.
-// Removal is a view-side strip: the ledger fact must be retracted first, then the next render keeps
-// it out.
-
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
@@ -27,14 +8,12 @@ import { secureWriteViaTmp, summarizeErrorForLog, quarantineToSideFile, QUARANTI
 import type { FactType, LedgerFact } from './types';
 import { sanitizeSingleLine } from './sanitize';
 
-/** Thrown when base SAFETY.md entry removal is attempted without user confirmation. */
 export class SafetyRemovalRefusedError extends AppError {
   constructor(message: string) {
     super(message);
   }
 }
 
-/** A safety projection is known to be stale or could not be durably validated. */
 export class SafetyProjectionDirtyError extends AppError {
   constructor() {
     super('SAFETY.md projection is unavailable until it is successfully re-rendered');
@@ -46,7 +25,7 @@ interface SafetyProjectionState {
   contentHash: string;
 }
 
-/** A Critical Event. `date` is caller bookkeeping only; the render NEVER emits it. */
+/** `date` is caller bookkeeping only; the render never emits it. */
 export interface CriticalEvent {
   date: string;
   summary: string;
@@ -63,7 +42,8 @@ const MACHINE_SECTION_ORDER: { type: FactType; heading: string }[] = [
   { type: 'goal', heading: 'Goals' },
 ];
 
-const MACHINE_HEADINGS = new Set(MACHINE_SECTION_ORDER.map(m => m.heading));
+const DAMAGE_HEADING = 'Ledger damage';
+const MACHINE_HEADINGS = new Set([DAMAGE_HEADING, ...MACHINE_SECTION_ORDER.map(m => m.heading)]);
 const MED_OR_ALLERGY_HEADINGS = new Set(['Allergies', 'Medications']);
 const CRITICAL_EVENTS_HEADING = 'Critical Events';
 
@@ -86,12 +66,11 @@ function stableValue(value: unknown): unknown {
 }
 
 export class SafetyView {
-  // The clock is part of the stable constructor contract (mirrors the other memcore stores). Renders
-  // are date-free by design, so it is currently reserved.
   constructor(
     private readonly rootDir: string,
     private readonly clock: Clock = systemClock,
     private readonly source?: () => Promise<LedgerFact[]>,
+    private readonly damagedFiles: () => readonly string[] = () => [],
   ) {}
 
   private filePath(): string {
@@ -115,25 +94,25 @@ export class SafetyView {
     }
   }
 
-  /** Regenerate SAFETY.md from the given facts; preserve Critical Events, Notes, and any other hand-written content. */
+  /** Regenerates from facts; preserves Critical Events and any other hand-written content. */
   async render(facts: LedgerFact[]): Promise<string> {
-    // Mark before any read/replace so a process interruption during publication leaves a
-    // durable fail-closed signal for the next turn.
+    // Mark dirty before publishing so an interrupted render fails closed.
     this.markDirty();
     try {
       const { items } = this.load();
       const preamble = items.find(i => i.kind === 'preamble')?.lines ?? [];
       const rest = items.filter(i => i.kind !== 'preamble');
       const preserved = rest.filter(i => i.kind !== 'section' || !MACHINE_HEADINGS.has(i.heading));
+      const damaged = this.damagedFiles();
       const rebuilt: ParsedItem[] = [
         { kind: 'preamble', lines: preamble.length > 0 ? preamble : ['# Safety'] },
+        ...this.renderDamageSection(damaged),
         ...this.renderMachineSections(facts),
         ...preserved,
       ];
       const rendered = this.writeItems(rebuilt);
-      // The generation sidecar contains no health content. If it cannot be written, keep the
-      // dirty marker rather than serving a file whose source generation is unknown.
-      this.writeState(this.generationFor(facts), rendered);
+      // If the generation sidecar cannot be written, keep the dirty marker.
+      this.writeState(this.generationFor(facts, damaged), rendered);
       this.clearDirtyMarker();
       return rendered;
     } catch (e) {
@@ -142,10 +121,7 @@ export class SafetyView {
     }
   }
 
-  /**
-   * Append a Critical Event (agent add-only). The `date` is accepted for the caller's bookkeeping
-   * but is NEVER written to SAFETY.md. Returns the full rendered file.
-   */
+  /** Appends a Critical Event; its `date` is never written to the file. */
   async addCriticalEvent(ev: CriticalEvent): Promise<string> {
     const { items } = this.load();
     const bullet = `- ${sanitizeSingleLine(ev.summary)}${ev.action ? ` — ${sanitizeSingleLine(ev.action)}` : ''}`;
@@ -158,12 +134,7 @@ export class SafetyView {
     return this.writeItems(items);
   }
 
-  /**
-   * Remove a base (machine-section) entry from the rendered view. Removal of any machine-section
-   * entry, med/allergy class especially, is refused without an explicit `userConfirmed`. Critical
-   * Events are not machine sections, so no API can remove them. A no-op when the entity is absent.
-   * Returns the full rendered file.
-   */
+  /** Removes a machine-section entry; refused without `userConfirmed`, and the ledger fact must be retracted first. */
   async removeEntry(entity: string, opts: { userConfirmed: boolean }): Promise<string> {
     const { items } = this.load();
     const machine = items.filter(isMachineSection);
@@ -183,11 +154,7 @@ export class SafetyView {
     return this.writeItems(items);
   }
 
-  /**
-   * Current on-disk SAFETY.md, or null when the file does not exist yet (an empty constitution is
-   * allowed). ANY OTHER read error THROWS: this is the always-injected safety constitution, so it
-   * fails CLOSED and the caller aborts the turn rather than shipping a prompt with no SAFETY.
-   */
+  /** `null` only when the file does not exist; any other read error fails closed. */
   async read(): Promise<string | null> {
     if (this.dirtyMarkerExists()) {
       throw new SafetyProjectionDirtyError();
@@ -210,7 +177,7 @@ export class SafetyView {
         if (
           state === null
           || state.sourceGeneration === null
-          || state.sourceGeneration !== this.generationFor(facts)
+          || state.sourceGeneration !== this.generationFor(facts, this.damagedFiles())
           || state.contentHash !== this.contentHash(content)
         ) {
           this.markDirty();
@@ -226,7 +193,7 @@ export class SafetyView {
           const facts = await this.source();
           if (facts.length === 0) return null;
         } catch {
-          // An unavailable source is also a fail-closed condition below.
+          // Source unavailable: fail closed below.
         }
         this.markDirty();
         throw new SafetyProjectionDirtyError();
@@ -237,11 +204,18 @@ export class SafetyView {
     }
   }
 
-  // ---- internals ---------------------------------------------------------
+  private renderDamageSection(damaged: readonly string[]): ParsedItem[] {
+    if (damaged.length === 0) return [];
+    return [{
+      kind: 'section',
+      heading: DAMAGE_HEADING,
+      lines: [...damaged].sort().map((file) =>
+        `- WARNING: ledger/${file} is damaged and could not be read in full. Entries from it may be missing below; ask the owner before relying on this list.`),
+    }];
+  }
 
   private renderMachineSections(facts: LedgerFact[]): ParsedItem[] {
-    // `disputed` facts stay on SAFETY.md (marked) so a safety-relevant fact never silently leaves
-    // the always-injected net while its dispute is open.
+    // Disputed facts stay visible so nothing leaves the safety net while its dispute is open.
     const eligible = facts.filter(f =>
       f.safetyRelevant && (f.status === 'active' || f.status === 'resolved' || f.status === 'disputed'));
     const byEntity = new Map<string, LedgerFact[]>();
@@ -292,17 +266,11 @@ export class SafetyView {
 
   private entityRegex(entity: string): RegExp {
     const escaped = entity.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    // Match the WHOLE entity segment of a bullet: `- <entity>` end-of-line, or
-    // `- <entity> — <dose>`. Must NOT match a longer, distinct entity that merely
-    // shares the prefix (`- penicillin` must never hit `- penicillin G`).
+    // Match the whole entity segment: `penicillin` must not hit `penicillin G`.
     return new RegExp(`^-\\s*${escaped}(?:\\s+—|\\s*$)`);
   }
 
-  /**
-   * Load the current file. On a corrupt read (read error or replacement characters) warn with a
-   * sanitized message and build from a fresh skeleton, preserving salvageable raw bytes in a
-   * quarantine side file. Never crashes.
-   */
+  /** Corrupt reads fall back to a skeleton, keeping salvageable bytes in a quarantine side file. */
   private load(): { items: ParsedItem[] } {
     const fp = this.filePath();
     let raw: string;
@@ -336,8 +304,7 @@ export class SafetyView {
   private quarantinedItems(salvaged: string | null): ParsedItem[] {
     const items = this.freshItems();
     if (salvaged) {
-      // Salvaged bytes go to a 0600 SIDE file; only a constant, date-free pointer is inlined into
-      // the always-injected SAFETY.md, so there is no injection surface.
+      // Salvaged bytes stay in a 0600 side file; only a constant pointer is inlined.
       items.push({ kind: 'quarantine', lines: [quarantineToSideFile(this.filePath(), salvaged)] });
     }
     return items;
@@ -353,7 +320,6 @@ export class SafetyView {
     while (i < lines.length) {
       const line = lines[i];
       if (line.startsWith(QUARANTINE_POINTER_PREFIX)) {
-        // The quarantine pointer is a single self-contained comment line.
         items.push({ kind: 'quarantine', lines: [line] });
         current = null;
         i += 1;
@@ -372,8 +338,7 @@ export class SafetyView {
       current.lines.push(line);
       i += 1;
     }
-    // Blank lines between blocks are structural separators (assemble re-adds them) — keep
-    // parsed blocks clean so preserved bodies and event appends stay tidy across re-renders.
+    // Blank lines are block separators that assemble re-adds, so trim them per block.
     for (const item of items) {
       if (item.kind !== 'quarantine') item.lines = this.trimOuterBlank(item.lines);
     }
@@ -449,7 +414,7 @@ export class SafetyView {
     return crypto.createHash('sha256').update(content).digest('hex');
   }
 
-  private generationFor(facts: LedgerFact[]): string {
+  private generationFor(facts: LedgerFact[], damaged: readonly string[]): string {
     const canonical = facts
       .map(f => ({
         id: f.id,
@@ -462,7 +427,7 @@ export class SafetyView {
         provenance: stableValue(f.provenance),
       }))
       .sort((a, b) => `${a.type}::${a.entity}::${a.id}`.localeCompare(`${b.type}::${b.entity}::${b.id}`));
-    return crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+    return crypto.createHash('sha256').update(JSON.stringify({ facts: canonical, damaged: [...damaged].sort() })).digest('hex');
   }
 
   private assembleText(items: ParsedItem[]): string {

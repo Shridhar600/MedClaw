@@ -1,10 +1,3 @@
-// tests/cli/admin.test.ts
-//
-// T1 assertion migration for the retained local admin surfaces. Retired assertions record
-// the stronger contract that replaced them.
-//
-// The protected flow is real: a document on disk → the retained command → a decoded,
-// validated replacement → an honest commit outcome → the persisted bytes.
 import fs = require('fs');
 import * as os from 'os';
 import * as path from 'path';
@@ -191,8 +184,6 @@ describe('cli admin surfaces', () => {
     const field = 'heartbeat.policy.defaults.morningCheckIn.cron';
     let jobId: string | undefined;
     try {
-      // Actual installed conversion: five/six fields, names, lists, reversed/chained ranges,
-      // weekday aliases and a large step divisor that does not amplify range allocation.
       for (const expression of [
         '0 8 * * *', '0 */15 8-10 * January,Sep Monday-Friday',
         '0 30-0/15 10-8 * Dec-Jan Fri-Mon', '0 8 * * 0,7',
@@ -233,8 +224,6 @@ describe('cli admin surfaces', () => {
     const ownerBefore = fs.readFileSync(fixture.ownerRecord);
     const selectedBefore = await loadRuntimeConfig({ configPath: fixture.configPath });
 
-    // Execute the installed range converter verbatim except for a finite per-validation brake.
-    // Never allocate the requested billion-entry range, even on received code or an inverse.
     const converterPath = require.resolve('node-cron/src/convert-expression/range-conversion');
     const converterSource = fs.readFileSync(converterPath, 'utf8');
     expect(Buffer.byteLength(converterSource)).toBeLessThan(16 * 1024);
@@ -307,7 +296,6 @@ describe('cli admin surfaces', () => {
                 ...selectedBefore, heartbeat: { ...selectedBefore.heartbeat, ...invalid.heartbeat },
               });
               observations.push({ label, key, enabled, libraryCalls, expansionSteps });
-              // These remain meaningful on the inverse, but the causal assertion below runs first.
               observations.push({ label, key, enabled, refused: exit === 1 && !validation.valid,
                 fieldOnly: [output, loadMessage, ...validation.errors].every((message) =>
                   message.includes(field) && message.includes('[invalid-cron]') && !message.includes(expression)),
@@ -318,7 +306,6 @@ describe('cli admin surfaces', () => {
           }
         }
       });
-      // Removing the preflight must fail here because the actual expanding library was entered.
       expect(observations.filter((item) => 'libraryCalls' in item && (item.libraryCalls !== 0 || item.expansionSteps !== 0))).toEqual([]);
       for (const observation of observations.filter((item) => 'refused' in item)) {
         expect(observation).toMatchObject({ refused: true, fieldOnly: true, editPreserved: true, loadPreserved: true, ownerPreserved: true });
@@ -337,8 +324,6 @@ describe('cli admin surfaces', () => {
     await lease.release();
   });
 
-  // RETIRED -> `setConfigValue` mutated and saved with no validation, so
-  // `agent.maxIterations 0` persisted and the agent loop then ran zero times.
   it('refuses a value that the serving decoder would reject and keeps the prior bytes', async () => {
     const before = fs.readFileSync(configPath, 'utf8');
 
@@ -360,9 +345,6 @@ describe('cli admin surfaces', () => {
     expect(fs.readFileSync(configPath, 'utf8')).toBe(before);
   });
 
-  // RETIRED -> `config set memory.workspace <path>` and
-  // `config set profiles.defaultProfileId other` both succeeded, letting a plain config
-  // command relocate state or change the serving identity.
   it.each([
     ['memory.workspace'],
     ['heartbeat.storePath'],
@@ -373,7 +355,7 @@ describe('cli admin surfaces', () => {
   ])('refuses %s because it selects identity or is derived', async (field) => {
     const before = fs.readFileSync(configPath, 'utf8');
 
-    await expect(setConfigValue(configPath, field, '/tmp/socs-s1-hijack')).rejects.toThrow(
+    await expect(setConfigValue(configPath, field, '/tmp/hijack')).rejects.toThrow(
       /Cannot set/,
     );
     expect(fs.readFileSync(configPath, 'utf8')).toBe(before);
@@ -393,9 +375,6 @@ describe('cli admin surfaces', () => {
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
 
-  // RETIRED -> the old writer performed rename-then-chmod with no try/catch and reported an
-  // ordinary failure, so a caller saw an error for a write that had already landed, with no
-  // way to tell whether the old bytes survived.
   it('reports an uncertain commit honestly and does not restore the old bytes', async () => {
     const message = await setConfigValue(configPath, 'agent.maxIterations', '7', {
       sync: failingDirectoryFlush,
@@ -424,8 +403,6 @@ describe('cli admin surfaces', () => {
     expect(text).toContain('Age: 34');
   });
 
-  // RETIRED -> an unreadable file was reported identically to a missing one, so an outage
-  // rendered as a healthy empty state.
   it('distinguishes an unreadable workspace file from a missing one', async () => {
     const oversize = path.join(workspacePath, 'USER.md');
     fs.writeFileSync(oversize, 'x'.repeat(256 * 1024 + 1), 'utf8');
@@ -454,8 +431,6 @@ describe('cli admin surfaces', () => {
     expect(text).toContain('chat-1');
   });
 
-  // RETIRED -> an absent job store printed "No heartbeat jobs configured." on a machine that
-  // had never been set up.
   it('says which owner the empty job list belongs to when no store exists yet', async () => {
     const text = await listHeartbeats({ storePath: path.join(tmpDir, 'absent', 'jobs.json') });
 
@@ -464,7 +439,6 @@ describe('cli admin surfaces', () => {
   });
 
   it('reports each selected heartbeat snapshot truthfully without file or directory mutation', async () => {
-    // Positive control: the detector must observe directory-only and content/mode changes.
     const detector = path.join(tmpDir, 'detector');
     fs.mkdirSync(detector);
     fs.writeFileSync(path.join(detector, 'sentinel'), 'before');
@@ -513,7 +487,6 @@ describe('cli admin surfaces', () => {
       expect(output).not.toContain('SECRET_HEALTH_MARKER');
       expect(inspectionSnapshot(selected)).toEqual(before);
 
-      // Status is a second reader of the same store, and must not invoke recovery either.
       output = '';
       expect(await runCli(['--config', fixture.configPath, 'status'], {
         stdout: (text) => { output += text; }, stderr: (text) => { output += text; },
@@ -529,7 +502,6 @@ describe('cli admin surfaces', () => {
   it('bounds actual opened heartbeat reads when metadata understates the file, and closes on refusal', async () => {
     const fixture = writeConfigFixture(path.join(tmpDir, 'inspect-opened-bound'));
     fs.mkdirSync(path.dirname(fixture.storePath), { recursive: true });
-    // Still valid JSON, so removing only the actual byte bound would yield healthy-empty.
     fs.writeFileSync(fixture.storePath, `[]${' '.repeat(256 * 1024)}`);
     const before = inspectionSnapshot(path.dirname(fixture.storePath));
     const realOpen = fs.openSync;
@@ -565,7 +537,6 @@ describe('cli admin surfaces', () => {
     const readSpy = jest.spyOn(fs, 'readSync').mockImplementation(((fd: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number | null) => {
       if (opened.has(fd)) {
         if (readFault) throw new Error('SECRET_IO_MARKER');
-        // Exercise short reads rather than assuming one read fills the budget.
         const bytes = realRead(fd, buffer, offset, Math.min(length, 4096), position);
         readBytes += bytes;
         return bytes;

@@ -1,8 +1,3 @@
-// src/indexstore/fact-record.ts
-//
-// Pure mapping LedgerFact (memcore domain) -> FactRecord (ports). Used by both the live
-// write-path mirror population and the rebuild-from-Markdown path. Type-only memcore import
-// keeps the sqlite adapter itself decoupled from the domain (type contracts only).
 
 import type { LedgerFact } from '../memcore';
 import type { FactRecord } from '../ports';

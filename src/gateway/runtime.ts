@@ -4,7 +4,7 @@ import { createHash } from 'crypto';
 import * as cron from 'node-cron';
 import type { EffectiveConfig } from '../config/types';
 import type { ProfileId } from '../profiles';
-import { WriteQueue, replayJournal } from '../profiles';
+import { WriteQueue, reconcileJournal } from '../profiles';
 import {
   LedgerStore,
   NarrativeStore,
@@ -75,11 +75,7 @@ import {
 const INDEX_EMBED_TIMEOUT_MS = 500;
 const INDEX_EMBED_COOLDOWN_MS = 1_000;
 const HEARTBEAT_CURIOSITY_LIMIT = 5;
-/**
- * The overall budget `drainAndClose()` gives its full drain sequence before abandoning whatever is still
- * running and proceeding to `closeStore()`, so one hung operation (e.g. a provider call with no timeout)
- * cannot stall shutdown forever.
- */
+// One hung operation must not stall shutdown forever.
 const SHUTDOWN_DRAIN_BUDGET_MS = 10_000;
 
 type SignalEmbeddingProvider = LLMProvider & {
@@ -140,14 +136,7 @@ function dueCuriosityItems(items: CuriosityItem[], now: Date): CuriosityItem[] {
     .slice(0, HEARTBEAT_CURIOSITY_LIMIT);
 }
 
-/**
- * A safety read that detects projection drift (`SafetyProjectionDirtyError`) attempts ONE on-demand
- * re-projection from the authoritative Markdown before failing the turn, via a new top-level
- * `MutationCoordinator` op. It wraps a read path and is never called from inside a running write op. The
- * retry after a successful heal calls `safetyView.read()` directly, so a persistent failure fails closed
- * once and never spins. It lives here because it needs both the concrete `SafetyView` and the
- * `MutationCoordinator`; `SafetyView` itself must not call back into the write lock.
- */
+// One heal attempt on projection drift, outside any write op; a second failure fails closed.
 export function makeSelfHealingSafetyReader(
   safetyView: SafetyView,
   listSafetyRelevant: () => Promise<LedgerFact[]>,
@@ -185,19 +174,11 @@ export interface ProfileRuntimeDeps {
   semaphore: LLMSemaphore;
   canSchedule?: boolean;
   runScheduledJob?: (job: HeartbeatJob) => Promise<void>;
-  /**
-   * Destination-ownership capability for this runtime's scheduler. Required whenever `canSchedule` is true:
-   * a factory path that cannot prove which chats belong to this profile refuses scheduler activation rather
-   * than constructing an unguarded production scheduler.
-   */
+  /** Required when `canSchedule` is set: without it the scheduler refuses to start. */
   canAddressChat?: (chatId: string) => boolean;
   sideEffectLookup?: (entity: string) => Promise<string[]>;
   reconcile?: (chatId: string) => Promise<void>;
-  /**
-   * How the embedding and medical providers are constructed. Supplied by whoever owns the
-   * lifecycle; defaults to the real factory. Absent it, `create` builds real providers — the
-   * seam exists so a real runtime can be built with controlled providers, NOT to avoid them.
-   */
+  /** Overrides the real provider factory for callers that need controlled providers. */
   createProvider?: ProviderFactory;
 }
 
@@ -217,7 +198,7 @@ export class ProfileRuntime {
   episodeStore?: EpisodeStore;
   curatedMemory?: CuratedMemory;
   writeQueue?: WriteQueue;
-  /** The single writer every model-facing mutation routes through: wraps `writeQueue` with re-entrancy protection. */
+  /** The single writer every model-facing mutation routes through. */
   mutationCoordinator?: MutationCoordinator;
   capturePipeline?: CapturePipeline;
   indexer?: MemoryIndexerType;
@@ -236,33 +217,22 @@ export class ProfileRuntime {
   sweepInFlight?: Promise<NightlySweepResult>;
   sweepStopping = false;
 
-  /**
-   * The single source-of-truth lifecycle state, a one-way progression `running -> stopping -> closed`.
-   * `stopping`/`closed` below are derived from it.
-   */
+  /** One-way progression: `running -> stopping -> closed`. */
   private lifecycleState: 'running' | 'stopping' | 'closed' = 'running';
 
-  /**
-   * Drain-phase continuations that have been started and not yet really settled.
-   *
-   * `drainAndClose()` abandons a phase at the shared budget, but the phase keeps running and can still touch
-   * owner resources (the nightly sweep's `curiosity.md` write is the concrete case), so it must stay visible
-   * to `getShutdownDisposition()` until its own `finally` runs. A closed lifecycle state, a cleared store
-   * field and a `Promise.race` timeout winner are not settlement.
-   */
+  // A phase abandoned at the drain budget keeps running and can still touch owner resources.
   private readonly unsettledDrainWork = new Set<Promise<unknown>>();
 
-  /** `true` from the moment `beginStopping()` runs through `closed` (inclusive). Never resets once past `running`. */
   get stopping(): boolean {
     return this.lifecycleState !== 'running';
   }
 
-  /** `true` only once `drainAndClose()` has finished `closeStore()`. */
   get closed(): boolean {
     return this.lifecycleState === 'closed';
   }
 
   promptMode: 'per-turn' | 'boot-cached' = 'boot-cached';
+  sideEffectLookup: (entity: string) => Promise<string[]> = () => Promise.resolve([]);
   sessionSummarySink?: (chatId: string, anchoredSummary: string) => Promise<void>;
 
   readonly reindexTails: Map<string, Promise<void>> = new Map();
@@ -286,31 +256,18 @@ export class ProfileRuntime {
     return this.closed;
   }
 
-  /** The explicit lifecycle state, for diagnostics and tests. */
   getLifecycleState(): 'running' | 'stopping' | 'closed' {
     return this.lifecycleState;
   }
 
-  /**
-   * Whether this runtime still has real work that can touch owner resources.
-   *
-   * `isClosed()` answers "did `closeStore()` run"; this answers "has everything that started actually
-   * finished". The second question gates installation-ownership release: a runtime that closed its stores
-   * while a drain phase was abandoned at the budget still has a continuation running, so it reports `pending`.
-   *
-   * Reported sources, all instance-local: unsettled drain phases, the nightly sweep promise, and the tracked
-   * in-flight, background and reindex operation sets. Work that never settles means retained ownership, not a
-   * promise that shutdown completes.
-   */
+  /** Whether started work can still touch owner resources; `pending` retains ownership. */
   getShutdownDisposition(): 'pending' | 'quiescent' {
     if (this.unsettledDrainWork.size > 0) return 'pending';
     if (this.sweepInFlight !== undefined) return 'pending';
     if (this.inFlightOperations.size > 0) return 'pending';
     if (this.backgroundOperations.size > 0) return 'pending';
     if (this.reindexTails.size > 0) return 'pending';
-    // A drain that began but never reached `closeStore()` has not released anything. Every phase body catches
-    // internally, so this is unreachable today; it keeps a future phase from turning that into a false
-    // `quiescent` over still-open handles. `pending` is the safe direction: it retains ownership.
+    // Unreachable today; keeps a future phase from reporting quiescent over still-open handles.
     if (this.stopping && !this.closed) return 'pending';
     return 'quiescent';
   }
@@ -372,8 +329,7 @@ export class ProfileRuntime {
     runtime.registry = registry;
 
     try {
-      // `memory_write` routes through the single-writer. The coordinator does not exist yet at this point, so
-      // pass a lazy accessor read at execute time; passing the instance directly would capture `undefined`.
+      // Lazy: the coordinator does not exist yet, and capturing it directly would pass undefined.
       for (const tool of createMemoryTools(memory, search, indexer, profileId, () => runtime.factMirror, () => runtime.mutationCoordinator)) {
         registry.register(tool);
       }
@@ -416,14 +372,13 @@ export class ProfileRuntime {
         },
       });
       runtime.writeQueue = writeQueue;
-      // The isShutdown port keys on `isClosed()` (post-closeStore), not `isStopping()`: an in-flight mutation
-      // that started before stop() must still be allowed to drain. A port keeps `src/capture` free of gateway imports.
+      // Keyed on isClosed(), not isStopping(): a mutation that started before stop() must still drain.
       const mutationCoordinator = new MutationCoordinator(writeQueue, () => runtime.isClosed());
       runtime.mutationCoordinator = mutationCoordinator;
 
       try {
-        await replayJournal(journalPath, (label) => {
-          console.warn('[gateway] unresolved write-queue intent at boot:', label);
+        await reconcileJournal(journalPath, (record) => {
+          console.warn('[gateway] unresolved write-queue intent at boot:', record.label);
         });
       } catch (e) {
         console.warn('[gateway] write-queue journal reconciliation failed:', summarizeErrorForLog(e));
@@ -437,6 +392,7 @@ export class ProfileRuntime {
         memoryWorkspace,
         systemClock,
         () => ledgerStore.listSafetyRelevant(),
+        () => ledgerStore.damagedFiles(),
       );
       runtime.safetyView = safetyView;
       const episodeStore = new EpisodeStore(memoryWorkspace);
@@ -471,14 +427,7 @@ export class ProfileRuntime {
         (Object.entries(TYPE_TO_FILE) as [FactType, string][]).map(([t, f]) => [f, t]),
       );
 
-      // Tier-1: synchronous, local-only derivation, called from inside the same write-lock op that produced the
-      // change, so the write and its projections land atomically relative to any read. Everything here is local
-      // (SQLite/fs, no network or LLM): FactMirror update, the pending-chunk-delta buffer and the index-dirty
-      // checkpoint. `takeIndexDelta` is a one-shot consume, taken exactly once here; its `entities` list drives an
-      // entity-scoped `replaceScope` (avoiding whole-type rewrites on every mutation), with a whole-type
-      // `replaceType` fallback only when no delta is available. A FactMirror-write failure warns and continues:
-      // recall reads current facts from the ledger itself, the next mutation retries, and boot rebuilds fully.
-      // It must never abort the write itself.
+      // Runs inside the write-lock op, so write and projections land atomically; must never abort the write.
       const tier1Rederive = {
         rederive: async (relPaths: string[]): Promise<void> => {
           if (runtime.stopping || runtime.closed) return;
@@ -515,13 +464,10 @@ export class ProfileRuntime {
           }
         },
       };
-      /** Adapter for ledger-tools' confirm/discontinue paths, which key by FactType: reuses the Tier-1 closure above. */
       const tier1RederiveType = (type: FactType): Promise<void> =>
         tier1Rederive.rederive([`ledger/${TYPE_TO_FILE[type]}`]);
 
-      // Tier-2 (async, off the write lock): embeddings never run inside the single-writer lock. Only the
-      // embedding-triggering background reindex remains here; the delta, FactMirror and dirty-marker
-      // bookkeeping run in Tier-1.
+      // Embeds never run inside the single-writer lock.
       const tier2Rederive = {
         rederive: async (relPaths: string[]): Promise<void> => {
           if (runtime.stopping || runtime.closed) return;
@@ -593,8 +539,7 @@ export class ProfileRuntime {
           chunkStats,
           clock: systemClock,
           config: DEFAULT_RECALL_CONFIG,
-          // Current facts come straight from the ledger (the source of truth, cached by file
-          // fingerprint). Recall is ports-only, so the composition root supplies the read.
+          // Recall is ports-only; the composition root supplies the ledger read.
           currentFacts: async (): Promise<CurrentFacts> => ({
             facts: (await ledgerStore.listCurrent()).map(ledgerFactToRecord),
             damagedFiles: ledgerStore.damagedFiles(),
@@ -673,13 +618,14 @@ export class ProfileRuntime {
               ['SAFETY.md', 'HEALTH_PROFILE.md', 'active-ledger', 'recall', 'check', 'curiosity'].includes(section.key)),
           };
         };
-        console.log('[gateway] Per-turn recall + v2 context assembler ready (D9)');
+        console.log('[gateway] Per-turn recall + v2 context assembler ready');
       } catch (e) {
         console.warn('[gateway] Recall/v2-assembler unavailable; chat uses the boot-cached prompt:', summarizeErrorForLog(e));
       }
 
       try {
-        const sideEffects = sideEffectLookup ?? ((): Promise<string[]> => Promise.resolve([]));
+        if (sideEffectLookup) runtime.sideEffectLookup = sideEffectLookup;
+        const sideEffects = runtime.sideEffectLookup;
         for (const tool of createLedgerTools({
           pipeline,
           ledger: ledgerStore,
@@ -728,8 +674,6 @@ export class ProfileRuntime {
 
     const sessions = new SessionManager({
       sessionsPath,
-      softResetMinutes: config.sessions.softResetAfterMinutes,
-      hardResetMinutes: config.sessions.hardResetAfterMinutes,
       provider: mainProvider,
       toolRegistry: registry,
       compaction: config.sessions.compaction,
@@ -741,8 +685,7 @@ export class ProfileRuntime {
     runtime.sessions = sessions;
     runtime.turnCoordinator = new TurnCoordinator(runtime, semaphore, reconcile);
 
-    // Same gate predicate as the MutationCoordinator wiring above: closed, not stopping, so
-    // recordTurn/recordPromptUsage/runCompaction can still drain a turn that started before stop().
+    // Keyed on closed, not stopping: a turn that started before stop() must still drain.
     sessions.setShutdownGate(() => runtime.isClosed());
     sessions.setBackgroundRunner((fn) => semaphore.run('background', fn));
     if (runtime.sessionSummarySink) {
@@ -766,8 +709,7 @@ export class ProfileRuntime {
     }
 
     if (deps.canSchedule && deps.runScheduledJob && config.heartbeat.enabled) {
-      // Refuse scheduler activation without a destination-ownership guard: never construct an unguarded
-      // production scheduler (fail closed, sanitized, no throw).
+      // Never construct an unguarded production scheduler: fail closed, sanitized, no throw.
       if (!deps.canAddressChat) {
         console.warn(
           '[gateway] Heartbeat scheduler not activated: no destination ownership guard ' +
@@ -800,11 +742,7 @@ export class ProfileRuntime {
   async initializeScheduler(options: {
     schedulerPaths: { storePath: string; auditLogPath: string };
     runScheduledJob: (job: HeartbeatJob) => Promise<void>;
-    /**
-     * Required for production: the destination-ownership capability closed over this runtime's profileId.
-     * Threaded into the scheduler so job creation/update/resume/start can refuse foreign destinations, and the
-     * dispatch trigger stays owner-bound.
-     */
+    /** Required for production: closes over this runtime's profileId so the scheduler refuses foreign destinations. */
     canAddressChat: (chatId: string) => boolean;
   }): Promise<void> {
     if (!this.config.heartbeat?.enabled) {
@@ -850,19 +788,7 @@ export class ProfileRuntime {
     this.sweepStopping = true;
   }
 
-  /**
-   * Drains the shutdown sequence (stop producers, drain in-flight/sweep/compactions/background/write-queue,
-   * close every SQLite handle once) under a bounded overall budget. `withBudget` computes one shared deadline
-   * (`SHUTDOWN_DRAIN_BUDGET_MS`) and races each phase against the time remaining. A phase still running at the
-   * deadline is abandoned (never awaited further, but still started so it makes best-effort progress) and
-   * recorded in `stillPending` for one sanitized warning; later phases are abandoned immediately, going
-   * straight to `closeStore()`.
-   *
-   * This is corruption-safe: `better-sqlite3` is synchronous, so no SQL statement is ever mid-execution across
-   * an `await`. An abandoned op's next DB call either completes cleanly or throws an already-caught
-   * "database is closed" error / hits the write gate. A fast drain is unaffected: every phase gets the full
-   * remaining budget, not a per-phase slice.
-   */
+  /** Bounded drain: a phase still running at the shared deadline is abandoned but stays tracked. */
   async drainAndClose(): Promise<void> {
     if (this.closed) return;
     this.beginStopping();
@@ -871,9 +797,7 @@ export class ProfileRuntime {
     const stillPending: string[] = [];
 
     const withBudget = async (label: string, work: () => Promise<void>): Promise<void> => {
-      // Register the phase's continuation the moment it starts, and unregister it only when it really settles.
-      // An abandoned phase keeps running, so `getShutdownDisposition()` must keep reporting `pending` (and the
-      // installation must keep its leases) until the phase's own settlement.
+      // Keep abandoned phases visible until their own settlement: they can still touch owner resources.
       const register = (started: Promise<void>): Promise<void> => {
         this.unsettledDrainWork.add(started);
         void started.then(
@@ -884,9 +808,9 @@ export class ProfileRuntime {
       };
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
-        // Budget already exhausted by an earlier phase: fire this phase for best-effort background progress,
-        // but do not make shutdown wait on it.
+        // Best-effort only: do not make shutdown wait on it.
         stillPending.push(label);
+        // Safe to abandon: better-sqlite3 is synchronous, so no statement is mid-await.
         void register(work());
         return;
       }
@@ -896,9 +820,7 @@ export class ProfileRuntime {
         timer.unref?.();
       });
       try {
-        // `register`'s own rejection callback already observes the phase promise, so a phase that rejects after
-        // being abandoned does not become an unhandled rejection. `firstError` keeps the first real failure; the
-        // label names which phase failed.
+        // `register` observes the phase promise, so an abandoned rejection is not unhandled.
         const outcome = await Promise.race([
           register(work()).then(
             () => 'done' as const,

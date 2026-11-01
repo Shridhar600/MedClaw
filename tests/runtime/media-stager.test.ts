@@ -1,5 +1,3 @@
-// The bounded media path through the real `FsMediaStager`, a real streaming source and a real disk.
-// Every assertion is about bytes on disk, the typed outcome, or what the staging directory is left holding.
 
 import * as fs from 'fs';
 import crypto from 'crypto';
@@ -202,7 +200,6 @@ describe('FsMediaStager: bounded streaming into owner-scoped staging', () => {
     const source: MediaSourcePort = {
       open: (ref, signal) => {
         opens += 1;
-        // Neither the first (never settles) nor the second (stalled stream) honours the signal.
         if (opens === 1) return new Promise<OpenedMedia>(() => { /* wedged open */ });
         if (opens === 2) return blockingSource().source.open(ref, signal);
         return good.source.open(ref, signal);

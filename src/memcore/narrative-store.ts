@@ -1,12 +1,3 @@
-// src/memcore/narrative-store.ts
-//
-// The narrative lane: append-only daily logs at `memory/YYYY-MM-DD.md`. This is the lossless record of what
-// the user said and the anchor target the structured ledger points back to. Writes are additive — a prior entry
-// is never mutated or removed. The day-granularity date lives in the file header only; individual entries carry
-// a HH:MM time.
-//
-// A verbatim user quote is stored exactly, blockquoted, and tagged with its language, so nothing is paraphrased
-// away before the agent sees it.
 
 import * as fs from 'fs';
 import { isUtf8 } from 'node:buffer';
@@ -79,10 +70,6 @@ export class NarrativeStore {
     if (!DATE_RE.test(date)) throw new PathContainmentError('invalid-component');
   }
 
-  /**
-   * Append a narrative entry. `date` (YYYY-MM-DD) overrides the clock-derived day so the narrative and ledger
-   * lanes agree on the same day. Returns the on-disk anchor of the entry's primary line.
-   */
   async append(entry: { text: string; language?: string; verbatim?: string; date?: string }): Promise<NarrativeAppendResult> {
     const now = this.clock.now();
     const date = entry.date ?? this.dayOf(now);
@@ -125,10 +112,6 @@ export class NarrativeStore {
     return { date, anchor, lineStart };
   }
 
-  /**
-   * Record a ledger cross-reference under `## Ledger writes` (`- <entity> → <factId>`), so a narrative day can
-   * point at the structured facts captured that day.
-   */
   async appendLedgerAnchor(date: string, entity: string, factId: string): Promise<string> {
     const entryLine = `- ${entity} → ${factId}`;
     const cached = this.loadCache(date);
@@ -158,11 +141,6 @@ export class NarrativeStore {
     return `memory/${date}.md#L${lineStart}`;
   }
 
-  /**
-   * Append a compaction summary block under `## Session summary` in the chat-scoped state lane. The bullets carry
-   * `sessions/<file>#L<n>` anchors back to verbatim day-file lines. Reuses the heading if it already exists for
-   * that chat and day.
-   */
   async appendSessionSummary(chatId: string, date: string, summary: string): Promise<string> {
     const fp = this.sessionSummaryPath(chatId, date);
     const entryLines = summary
@@ -192,8 +170,6 @@ export class NarrativeStore {
     }
   }
 
-  // ---- internals ---------------------------------------------------------
-
   private dayOf(d: Date): string {
     return d.toISOString().slice(0, 10);
   }
@@ -202,10 +178,6 @@ export class NarrativeStore {
     return d.toISOString().slice(11, 16);
   }
 
-  /**
-   * Return the pending source delta for a day. The Gateway consumes this after
-   * the source write and indexes only the newly appended lines.
-   */
   takeIndexDelta(date: string): NarrativeIndexDelta | undefined {
     const pending = this.pendingIndexDeltas.get(date);
     if (!pending || pending.length === 0) return undefined;

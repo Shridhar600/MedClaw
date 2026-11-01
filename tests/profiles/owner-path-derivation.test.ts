@@ -1,21 +1,3 @@
-// tests/profiles/owner-path-derivation.test.ts
-//
-// S1 replacement for the derivable half of `registry.test.ts`.
-//
-// `ProfileRegistry` derived six owner paths and validated the owner-ID grammar. It is deleted, and the same
-// derivation now lives in `resolveOwnerPaths` (pure, no disk) plus `OWNER_ID_PATTERN`. Those invariants are
-// worth keeping — a wrong path silently splits one owner's state across two directories, and a loose ID
-// grammar is a path-traversal surface — so they are asserted here against the function that now owns them.
-//
-// Retired, deliberately: `registry.test.ts`'s CRUD, corrupt-file quarantine, migration/sentinel and
-// default-profile-creation expectations. Plan 15 §5 directs exactly this — "retire fixtures-only
-// migration/default creation/registry CRUD expectations; preserve path containment, selected identity,
-// non-mutating damaged reads and restart evidence in new real flows". Damaged-record reads are covered
-// against the real record in `owner-enrollment` / `owner-admission-routing`, and restart plus containment
-// in `gateway-owner-resource-containment`.
-//
-// This asserts the DERIVATION. It cannot tell you the paths exist on disk; that needs a real boot, and
-// `gateway-owner-resource-containment.test.ts` does exactly that through `startDaemon()`.
 
 import * as path from 'path';
 
@@ -48,9 +30,6 @@ describe('owner path derivation', () => {
   });
 
   it('puts EVERY derived resource inside the owner workspace — containment, not convention', () => {
-    // This is the invariant the deleted migration branch broke: its fallback wrote `search.db` and
-    // `sessions` one level ABOVE the workspace, outside the leased directory. Asserting each path is
-    // lexically inside the workspace is the cheap guard against that ever returning.
     const ownerDir = paths.workspace;
     const outside = Object.entries(paths)
       .filter(([name]) => name !== 'profileId' && name !== 'workspace')
@@ -67,25 +46,17 @@ describe('owner path derivation', () => {
   });
 
   it('reads no disk and writes nothing: derivation is pure', () => {
-    // Calling it again with the same inputs must return an identical bundle, and must not have created
-    // the workspace — a pure function cannot. (No mock: the assertion is that the path does not exist.)
     const again = resolveOwnerPaths(BASE, 'my-profile-1' as ProfileId);
     expect(again).toEqual(paths);
     expect(() => resolveOwnerPaths(BASE, 'default' as ProfileId)).not.toThrow();
   });
 
   it('refuses a relative or unnormalized base directory rather than guessing', () => {
-    // A caller programming error, not a runtime condition: resolving `~/.redacted` relative to the
-    // process CWD would put one owner's state wherever the daemon happened to be launched from, and a
-    // `.`/`..` segment means the caller and the daemon disagree about which directory is the owner's.
     expect(() => resolveOwnerPaths('relative/base', 'default' as ProfileId)).toThrow(/absolute normalized/);
     expect(() => resolveOwnerPaths('./base', 'default' as ProfileId)).toThrow(/absolute normalized/);
     expect(() => resolveOwnerPaths(`${BASE}/./x`, 'default' as ProfileId)).toThrow(/absolute normalized/);
     expect(() => resolveOwnerPaths(`${BASE}/x/../y`, 'default' as ProfileId)).toThrow(/absolute normalized/);
 
-    // A trailing separator IS accepted: `path.normalize` preserves it on POSIX, so it is already
-    // normalized, and it resolves to the same bundle as the bare form. Asserted rather than assumed —
-    // I initially wrote this as a refusal and the code disagreed.
     expect(resolveOwnerPaths(`${BASE}/`, 'default' as ProfileId)).toEqual(
       resolveOwnerPaths(BASE, 'default' as ProfileId),
     );
@@ -93,8 +64,6 @@ describe('owner path derivation', () => {
 });
 
 describe('owner id grammar', () => {
-  // OLD -> NEW: these were `ProfileRegistry.validateProfileId` assertions. The grammar is unchanged and
-  // is now shared with the config decoder, so both refuse the same identities by construction.
   const accepted = ['default', 'a', 'my-profile-1', 'trailing-', '0start', 'a'.repeat(64)];
   const rejected = [
     '', 'Upper', '-leading', 'has space', 'has/slash', 'has\\backslash', '..', 'a'.repeat(65),
@@ -110,12 +79,10 @@ describe('owner id grammar', () => {
   it.each(rejected)('rejects %j', (id) => {
     expect(OWNER_ID_PATTERN.test(id)).toBe(false);
     expect(isValidProfileId(id)).toBe(false);
-    // `asProfileId` narrows to `undefined` rather than throwing, so a decoder can reject without a try/catch.
     expect(asProfileId(id)).toBeUndefined();
   });
 
   it('refuses traversal sequences outright — the ID is a path segment', () => {
-    // The grammar is the only thing standing between a configured owner id and `<base>/profiles/../..`.
     for (const id of ['..', '../etc', 'a/../../b', '.', './x']) {
       expect(asProfileId(id)).toBeUndefined();
     }

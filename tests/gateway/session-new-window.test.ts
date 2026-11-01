@@ -25,7 +25,7 @@ afterAll(() => {
   for (const d of tmpDirs) fs.rmSync(d, { recursive: true, force: true });
 });
 
-describe('/new window-archive (DD9)', () => {
+describe('/new window-archive', () => {
   it('clears the in-context window but the day-file archive continues with contiguous line numbers', async () => {
     const sessionsPath = tmpSessions();
     const mgr = new SessionManager({ sessionsPath });
@@ -43,7 +43,7 @@ describe('/new window-archive (DD9)', () => {
     expect(countDayFileLines(dayFile)).toBe(6);
   });
 
-  it('does not create the retired archive/ or summaries/ directories (day files are the archive)', async () => {
+  it('does not create archive/ or summaries/ directories (day files are the archive)', async () => {
     const sessionsPath = tmpSessions();
     const mgr = new SessionManager({ sessionsPath });
     await mgr.recordTurn('chat1', turn);
@@ -60,7 +60,6 @@ describe('/new window-archive (DD9)', () => {
     await mgr.recordTurn('chat1', turn);
     await mgr.resetSession('chat1');
 
-    // Fresh manager over the same dir: nothing to replay (verbatimFrom at EOF ⇒ empty tail).
     const mgr2 = new SessionManager({ sessionsPath });
     expect(mgr2.getHistory('chat1')).toEqual([]);
   });

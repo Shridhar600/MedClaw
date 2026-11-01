@@ -1,21 +1,3 @@
-// src/runtime/adapters/config-file.ts
-//
-// Bounded filesystem access to the persisted configuration document.
-//
-// Three properties this adapter guarantees:
-//
-//  1. The read cap is enforced on the opened read, not on a `stat`: a file that
-//     grows between stat and read is still refused.
-//  2. A config symlink resolves to its target before anything is written, and a
-//     hard-linked config (`nlink > 1`) is refused outright.
-//  3. A write reports `committed` / `uncertain` / `failed`. `failed` means the
-//     replacement never happened and the original bytes are intact. `uncertain` means the
-//     rename did land but a later durability step failed: the caller must not claim the
-//     old bytes remain, must not blindly restore them, and must not claim crash
-//     durability the flush evidence does not support.
-//
-// The filesystem sync step is injected so the uncertainty boundary is provable in a real
-// flow without a real power loss.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -44,10 +26,6 @@ export type ConfigWriteStatus = 'committed' | 'uncertain' | 'failed';
 
 export interface ConfigWriteOutcome {
   status: ConfigWriteStatus;
-  /**
-   * True only when the replacement never reached the filesystem, so the previous bytes
-   * are still the file's content. False for `committed` and for `uncertain`.
-   */
   originalBytesPreserved: boolean;
   reason?: ConfigFileReason;
 }
@@ -86,14 +64,6 @@ export interface CanonicalPathResult {
   refusal?: ConfigFileReason;
 }
 
-/**
- * Resolve the path that actually holds the bytes.
- *
- * An existing path is canonicalized with `realpath`, so a symlinked config resolves to its target.
- * A fresh path (no document yet, as in first-run setup) is resolved through its nearest existing
- * ancestor: the ancestor is `realpath`ed and the remaining components are re-attached below it. That
- * keeps the lease key, the reported path and the written bytes pointing at the same object.
- */
 export function canonicalizeConfigPath(targetPath: string): CanonicalPathResult {
   const absolute = path.resolve(targetPath);
   try {
@@ -107,19 +77,9 @@ export function canonicalizeConfigPath(targetPath: string): CanonicalPathResult 
     if (code !== 'ENOENT') return { canonicalPath: absolute, refusal: 'unreadable' };
   }
 
-  // Fresh path: `missing` means "no document selected" to the reader and never blocks the writer,
-  // which only refuses hard links and non-regular targets.
   return { canonicalPath: resolveFreshTarget(absolute) ?? absolute, refusal: 'missing' };
 }
 
-/**
- * The path a not-yet-existing target will occupy: the `realpath` of its nearest existing ancestor
- * directory plus the components below it.
- *
- * Every component comes from `path.basename` of an absolute, normalized path, so it can be neither a
- * separator nor `.`/`..`. `undefined` means no usable ancestor could be resolved; the caller keeps
- * the lexical path.
- */
 function resolveFreshTarget(absolute: string): string | undefined {
   const remainder: string[] = [];
   let current = absolute;
@@ -144,10 +104,6 @@ function resolveFreshTarget(absolute: string): string | undefined {
   }
 }
 
-/**
- * Read the document with the cap enforced on the opened descriptor. A file that exceeds
- * the cap is refused as `too-large` rather than being loaded into memory first.
- */
 export function readConfigFile(targetPath: string): ConfigReadResult {
   const { canonicalPath, refusal } = canonicalizeConfigPath(targetPath);
   if (refusal === 'missing') return { kind: 'missing', canonicalPath };
@@ -187,8 +143,6 @@ export function readConfigFile(targetPath: string): ConfigReadResult {
 function ownerOnlyMode(existingPath: string): number {
   try {
     const existing = fs.statSync(existingPath).mode & 0o777;
-    // Keep a narrower owner-only mode the operator chose; otherwise use 0o600. Never
-    // preserve a group/other bit and never preserve 0o000.
     const noGroupOrOther = (existing & ~0o600) === 0;
     if (noGroupOrOther && existing !== 0) return existing;
   } catch {
@@ -197,14 +151,6 @@ function ownerOnlyMode(existingPath: string): number {
   return 0o600;
 }
 
-/**
- * Replace the document atomically and report the real outcome.
- *
- * Order: parent directory, temp file at 0o600, file flush, rename, directory flush, final
- * mode. A failure before the rename leaves the original bytes intact (`failed`). A failure
- * after it is `uncertain`: the new bytes are in place but durability is unproven, so the
- * caller reports that instead of asserting the old content or restoring blindly.
- */
 export function writeConfigFile(
   targetPath: string,
   contents: string,

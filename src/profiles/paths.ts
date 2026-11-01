@@ -1,9 +1,3 @@
-// Pure owner-path derivation: no disk access, no config-file read, typed values in. One bundle, one
-// selected owner, no fallbacks: a path is either derived from the canonical owner base directory
-// and the validated owner ID, or it does not exist.
-//
-// The config lease is deliberately NOT part of `OwnerPaths`: it belongs to a separate canonical
-// config resource resolved by installation wiring.
 
 import * as path from 'path';
 import type { ProfileId } from './types';
@@ -51,11 +45,6 @@ function requireAbsoluteNormalized(baseDir: string, ownerId: ProfileId): void {
   }
 }
 
-/**
- * Derive every owner resource path from one base directory and one owner ID.
- * Throws only on a caller programming error (relative base directory, invalid owner ID);
- * a caller that must refuse rather than throw should validate first.
- */
 export function resolveOwnerPaths(canonicalBaseDir: string, ownerId: ProfileId): OwnerPaths {
   requireAbsoluteNormalized(canonicalBaseDir, ownerId);
   const workspace = path.join(canonicalBaseDir, 'profiles', ownerId);

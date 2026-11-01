@@ -32,7 +32,7 @@ function countingProvider(): { provider: LLMProvider; calls: () => number } {
   };
 }
 
-const compaction = { enabled: true, triggerAtTokenPercent: 80, memoryFlush: false, keepRecentTurns: 2 };
+const compaction = { enabled: true, memoryFlush: false, keepRecentTurns: 2 };
 
 async function seed(mgr: SessionManager, chatId: string, turns: number): Promise<void> {
   for (let i = 0; i < turns; i++) {
@@ -47,7 +47,7 @@ afterAll(() => {
   for (const d of tmpDirs) fs.rmSync(d, { recursive: true, force: true });
 });
 
-describe('prepareHistory real-token triggers (spec 14 §3, A-MF3)', () => {
+describe('prepareHistory real-token triggers', () => {
   it('emergency (≥80%) compacts SYNCHRONOUSLY before returning the window', async () => {
     const sessionsPath = tmpSessions();
     const { provider } = countingProvider();
@@ -77,7 +77,7 @@ describe('prepareHistory real-token triggers (spec 14 §3, A-MF3)', () => {
     const p1 = await mgr.prepareHistory('chat1');
     expect(p1.length).toBe(before); // not yet compacted — the pipeline is deferred (LLM runs off-queue)
 
-    await mgr.awaitCompaction('chat1'); // deterministically wait for the background pipeline to apply
+    await mgr.drainCompactions(); // wait for the background pipeline to apply
     const p2 = await mgr.prepareHistory('chat1'); // the background compaction has landed
     warn.mockRestore();
     expect(p2.length).toBeLessThan(before);
@@ -96,7 +96,7 @@ describe('prepareHistory real-token triggers (spec 14 §3, A-MF3)', () => {
     expect(calls()).toBe(0);
   });
 
-  it('the same token reading triggers at most one compaction (A-MF3 in-flight / consume-once)', async () => {
+  it('the same token reading triggers at most one compaction (in-flight / consume-once)', async () => {
     const sessionsPath = tmpSessions();
     const { provider, calls } = countingProvider();
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
@@ -110,7 +110,7 @@ describe('prepareHistory real-token triggers (spec 14 §3, A-MF3)', () => {
     expect(calls()).toBe(1); // the second call sees the reading already consumed
   });
 
-  it('A-M3 escape valve: emergency ALWAYS runs even with compaction.enabled=false (no-LLM truncate)', async () => {
+  it('escape valve: emergency ALWAYS runs even with compaction.enabled=false (no-LLM truncate)', async () => {
     const sessionsPath = tmpSessions();
     const { provider, calls } = countingProvider();
     const mgr = new SessionManager({

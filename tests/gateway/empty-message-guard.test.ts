@@ -1,9 +1,3 @@
-// tests/gateway/empty-message-guard.test.ts
-//
-// PROD-P1-6: an empty or whitespace-only text message (with no media) must
-// produce a short canned reply, never run the agent, and never write a session
-// turn. Both gateway entry paths are covered: handleMessage (channel path) and
-// handleTestMessage (test/CLI path).
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -14,14 +8,6 @@ import { ownerSelection, fixtureOwner } from '../helpers/test-config';
 import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
 
-/**
- * Per-suite owner root, INSIDE the workspace (`gitignored .test-tmp/`).
- *
- * OLD -> NEW: this used `sharedFixtureOwner()`, one hard-coded `/tmp` directory shared by every suite.
- * That was outside the workspace, and once S1 made admission bind exactly one chat per owner record, the
- * first suite to bind there owned it for all later callers — so this suite's chats were silently refused.
- * Each suite now derives and removes its own owner workspace.
- */
 let suiteRoot = '';
 const suiteOwner = (): ReturnType<typeof fixtureOwner> => fixtureOwner(suiteRoot);
 
@@ -42,9 +28,7 @@ function makeConfig(): EffectiveConfig {
       bootstrapMaxChars: 20000,
     },
     sessions: {
-      softResetAfterMinutes: 240,
-      hardResetAfterMinutes: 1440,
-      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+      compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
     },
     heartbeat: {
       enabled: false,
@@ -63,11 +47,11 @@ function makeConfig(): EffectiveConfig {
         },
       },
     },
-    agent: { maxIterations: 15, disclaimerEnabled: true },
+    agent: { maxIterations: 15 },
   };
 }
 
-describe('PROD-P1-6 empty/whitespace message guard', () => {
+describe('empty/whitespace message guard', () => {
   beforeEach(() => {
     suiteRoot = makeTestTemp('empty-message-guard');
   });
@@ -146,8 +130,6 @@ describe('PROD-P1-6 empty/whitespace message guard', () => {
         mediaPath: 'reports/lab.txt',
       });
 
-      // A media-bearing empty-text message goes through the normal agent path,
-      // not the empty guard.
       expect(run).toHaveBeenCalledTimes(1);
       expect(recordTurn).toHaveBeenCalledTimes(1);
       expect(send).toHaveBeenCalledTimes(1);

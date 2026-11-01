@@ -7,7 +7,7 @@ let dir: string;
 beforeEach(() => { dir = makeTestTemp('redacted-daylines-'); });
 afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
-describe('SessionManager.readDayFileLines (D4.4 sweep seam)', () => {
+describe('SessionManager.readDayFileLines', () => {
   it("returns today's raw JSONL lines across all chats", async () => {
     const sm = new SessionManager({ sessionsPath: dir, perChatArchive: true });
     await sm.recordTurn('chatA', [{ role: 'user', content: 'took naproxen' }]);
@@ -17,7 +17,6 @@ describe('SessionManager.readDayFileLines (D4.4 sweep seam)', () => {
     expect(today.length).toBe(2);
     expect(today.some(l => l.includes('naproxen'))).toBe(true);
     expect(today.some(l => l.includes('headache'))).toBe(true);
-    // every returned line is a raw, parseable archive line
     for (const l of today) expect(() => JSON.parse(l)).not.toThrow();
   });
 
@@ -27,7 +26,7 @@ describe('SessionManager.readDayFileLines (D4.4 sweep seam)', () => {
     expect(sm.readDayFileLines(new Date('2000-01-01T00:00:00.000Z'))).toEqual([]);
   });
 
-  it('stamps explicit origin on chat and heartbeat turns (A-H1/C-56)', async () => {
+  it('stamps explicit origin on chat and heartbeat turns', async () => {
     const sm = new SessionManager({ sessionsPath: dir, perChatArchive: true });
     await sm.recordTurn('c1', [{ role: 'user', content: 'chat turn' }]);             // default 'chat'
     await sm.recordTurn('c1', [{ role: 'user', content: 'hb turn' }], 'heartbeat');  // daemon-authored

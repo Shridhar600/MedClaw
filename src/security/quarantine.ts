@@ -1,6 +1,3 @@
-// Side-file quarantine for corrupt store bytes. SAFETY.md and MEMORY.md are injected verbatim into the
-// LLM prompt, so salvaged (possibly attacker-influenced) bytes must never be inlined there. The raw bytes
-// go to a 0600 side file; only a constant, date-free, content-free pointer is inlined.
 
 import { createHash } from 'crypto';
 import { secureWrite } from './secure-fs';
@@ -12,12 +9,6 @@ export const QUARANTINE_POINTER = '<!-- PARSE-ERROR: prior unreadable content qu
 /** Prefix stores match to detect (and preserve) a quarantine pointer line across re-renders. */
 export const QUARANTINE_POINTER_PREFIX = '<!-- PARSE-ERROR:';
 
-/**
- * Write `rawBytes` to `<filePath>.quarantine-<contentHash>` at 0600 and return the
- * constant pointer to inline into the rendered file. Warn-and-continue on failure
- * (never throw — the caller is already degrading). The hash suffix (not a timestamp)
- * keeps the sidecar name date-free and dedupes identical corrupt content.
- */
 export function quarantineToSideFile(filePath: string, rawBytes: string | Buffer): string {
   try {
     // Keep Buffer input byte-for-byte so invalid UTF-8 never changes while being quarantined.

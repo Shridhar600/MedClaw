@@ -10,7 +10,6 @@ const MEDICAL_TOOLS = new Set(['medgemma_query', 'medgemma_analyze_report']);
 
 interface AgentConfig {
   maxIterations: number;
-  disclaimerEnabled: boolean;
 }
 
 interface AgentRunContext {
@@ -29,10 +28,6 @@ export interface PreparedSystem {
   healthContextTouched?: boolean;
 }
 
-/**
- * Builds the system prompt fresh for a turn. Recall + assembly happen inside; SAFETY is re-rendered every turn.
- * A thrown InvariantViolationError aborts the turn (medical-safety).
- */
 export type PrepareSystem = (mode: AssemblerMode, userMessage: string) => Promise<PreparedSystem>;
 
 export class AgentLoop {
@@ -46,8 +41,6 @@ export class AgentLoop {
     private readonly config: AgentConfig,
     private readonly semaphore?: LLMSemaphore,
   ) {
-    // A static Message[] becomes a constant supplier; a function is used per turn (per-turn assembly, not a
-    // boot-cached system prompt).
     this.prepareSystem = typeof systemSource === 'function'
       ? systemSource
       : async () => ({ messages: systemSource });
@@ -75,9 +68,6 @@ export class AgentLoop {
     conversationHistory: Message[],
     runContext?: AgentRunContext,
   ): Promise<AgentRunResult> {
-    // Per-turn system assembly: SAFETY + recall are rebuilt for this turn. A SAFETY-invariant violation here throws
-    // and aborts this turn (medical-safety > resilience); the Gateway's outer handler turns it into a safe fallback
-    // reply, so the daemon never crashes.
     const mode: AssemblerMode = runContext?.mode ?? 'chat';
     const prepared = await this.prepareSystem(mode, userMessage);
     const messages: Message[] = [
@@ -87,8 +77,6 @@ export class AgentLoop {
     ];
     const trace: Message[] = [];
     const usedTools: string[] = [];
-    // The last provider call's promptTokens is the window-fill signal. Overwritten each call so the final call
-    // (full accumulated context) is the value surfaced on the result.
     let lastPromptTokens: number | undefined;
 
     const tools: ToolSchema[] = this.registry.getAvailable(runContext?.origin).map(t => ({
@@ -102,14 +90,9 @@ export class AgentLoop {
 
     for (let iteration = 0; iteration < this.config.maxIterations; iteration++) {
       const response = await this.provider.chat(messages, tools);
-      // The last provider call's reading wins: assign every iteration (undefined included). If the final call omits
-      // usage, surface `undefined` (chars/4 estimate downstream), not a stale earlier count that under-reports the
-      // largest (final) prompt and skips a trigger.
       lastPromptTokens = response.usage?.promptTokens;
 
       if (response.type === 'text') {
-        // The <used> tag is parsed + stripped before health-classification / disclaimer / persist / send; a
-        // missing or garbled tag is simply no signal, never an error.
         const { ids: usedIds, stripped: rawText } = parseUsedTag(response.text);
         if (usedIds.length > 0 && prepared.recordUsed) {
           try { await prepared.recordUsed(usedIds); } catch { /* recordUsage is best-effort + guarded */ }
@@ -129,13 +112,9 @@ export class AgentLoop {
         };
       }
 
-      // Tool calls — execute all the model requested this turn; never drop the tail. OpenAI strict ordering: one
-      // assistant message carrying every tool_call, then one `tool` result per call (in request order). Executed
-      // sequentially.
       const calls = response.toolCalls;
       for (const c of calls) usedTools.push(c.name);
-      // Tool args routinely carry PHI (memory content, health queries, report paths) — log the tool
-      // name(s) only, never the arguments.
+      // Tool arguments routinely carry PHI: log names only, never the arguments.
       console.log(`[agent] Tool call: ${calls.map(c => c.name).join(', ')}`);
 
       const toolRequestMessage: Message = {
@@ -151,13 +130,8 @@ export class AgentLoop {
       trace.push(toolRequestMessage);
 
       for (const c of calls) {
-        // Per-call isolation: registry.execute throws for an unknown/denied tool name (e.g. a hallucinated name in a
-        // parallel batch). Catch it and surface an error result matched to this tool_call_id so every call still gets
-        // exactly one `tool` message (OpenAI ordering stays valid) and the good calls' work is not discarded.
         let resultText: string;
         try {
-          // Thread the provider's per-call id through so a tool can build a collision-free idempotency key for two
-          // parallel same-tool calls in this turn.
           const toolResult = await this.registry.execute(c.name, c.arguments, { ...runContext, toolCallId: c.id });
           resultText = toolResult.content.map(r => r.text).join('\n');
         } catch (e) {

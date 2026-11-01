@@ -1,35 +1,11 @@
-// src/channels/telegram-media-source.ts
-//
-// The production `MediaSourcePort`: retrieves Telegram attachment bytes after admission.
-//
-// Three properties this must have, and why:
-//
-// 1. **It is only ever reached after admission.** The Gateway calls it from `admitAndStage`, after
-//    `admission.inspect()` has returned `owner`. Nothing in the channel calls it. That ordering is the
-//    entire security value of the seam; this file must not be reachable from a message handler.
-// 2. **It streams and never buffers whole.** The body is a `ReadableStream` exposed as an
-//    `AsyncIterable`, and the caller's byte counter is what stops it, so the size cap is enforced
-//    while streaming, not after the whole body is in memory. A lying or absent `file_size` cannot
-//    get past it.
-// 3. **It carries no authority.** The `fileId` is treated as opaque. It is never logged, never placed
-//    in a path, and never used to build a filename.
 
 import type { MediaReference, MediaSourcePort, OpenedMedia } from '../ports';
 import { MEDIA_MAX_FILE_BYTES, MEDIA_INTAKE_TIMEOUT_MS } from '../ports';
 import { summarizeErrorForLog } from '../security';
 import type { Api } from 'grammy';
 
-/**
- * The narrow slice of grammY's API this adapter needs. Keeps the adapter testable without a bot.
- *
- * `file_path` is optional because grammY's generated type says so, but the Bot API always returns it on
- * success — so it is treated as required here and a missing one is a `source-failed`, never a fetch
- * against `"undefined"`.
- */
 export interface TelegramFileApi {
   /** Resolve a transport file id to its Bot API path plus the transport's size claim. */
-  // grammY's Node declarations use its abort-controller shim. Its runtime consumes the standard
-  // abort state/listener methods, so both that API and native-signal injected edges fit this seam.
   getFile(fileId: string, signal?: AbortSignal | Parameters<Api['getFile']>[1]): Promise<{ file_path?: string; file_size?: number }>;
 }
 
@@ -64,8 +40,6 @@ export class TelegramMediaSource implements MediaSourcePort {
       throw new Error(`unsupported media channel: ${ref.channel}`);
     }
 
-    // The advertised size is a claim, not a guarantee. When it ALONE already exceeds the cap we refuse
-    // before opening a stream, so an oversized attachment costs nothing.
     const advertised = ref.advertisedBytes;
     if (typeof advertised === 'number' && advertised > MEDIA_MAX_FILE_BYTES) {
       throw new OversizedMediaError();
@@ -85,8 +59,6 @@ export class TelegramMediaSource implements MediaSourcePort {
       }
       release();
     };
-    // This one timer covers metadata, body start and consumption. The caller's core timer also
-    // includes queue wait, so this adapter can shorten the lifetime but can never extend it.
     const timer = setTimeout(onAbort, this.timeoutMs);
     timer.unref?.();
     signal.addEventListener('abort', onAbort, { once: true });
@@ -106,8 +78,6 @@ export class TelegramMediaSource implements MediaSourcePort {
       }
       const url = `https://api.telegram.org/file/bot${this.token}/${file.file_path}`;
       const fetching = this.fetchImpl(url, controller.signal).then(response => {
-        // An injected fetch may ignore cancellation. Observe its loser and release a late body
-        // without acquiring a reader, even after open() has already refused.
         if (controller.signal.aborted) {
           if (response.body) void response.body.cancel().catch(() => undefined);
           throwIfAborted(controller.signal);
@@ -123,8 +93,6 @@ export class TelegramMediaSource implements MediaSourcePort {
       return {
         advertisedBytes: effectiveAdvertised,
         chunks: streamToChunks(body, controller.signal, release),
-        // Cancellation is requested synchronously; an uncooperative external cancel promise is
-        // observed, not allowed to hold the core's intake slot indefinitely.
         cancel: async (): Promise<void> => { onAbort(); },
       };
     } catch (error) {
@@ -135,12 +103,6 @@ export class TelegramMediaSource implements MediaSourcePort {
   }
 }
 
-/**
- * A refused-too-large advertisement, distinguishable from a transport failure without parsing a message.
- *
- * The core checks the reference advertisement and actual streamed bytes separately. A failed
- * transport metadata lookup (including an unusable size claim) remains a source failure there.
- */
 export class OversizedMediaError extends Error {
   constructor() {
     super('advertised attachment size exceeds the per-file limit');
@@ -148,13 +110,6 @@ export class OversizedMediaError extends Error {
   }
 }
 
-/**
- * Expose a `ReadableStream` as the `AsyncIterable<Uint8Array>` the stager consumes.
- *
- * No buffering and no whole-body accumulation: each chunk is handed over as it arrives so the caller's
- * running byte total can stop the transfer at the cap. The reader is always released, so an early exit
- * at the cap does not leave the socket open.
- */
 async function* streamToChunks(
   body: ReadableStream<Uint8Array>,
   signal: AbortSignal,

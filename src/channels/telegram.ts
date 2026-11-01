@@ -9,10 +9,7 @@ export function telegramEventId(chatId: number | string, messageId: number | str
   return `${TELEGRAM_CHANNEL_NAME}:${chatId}:${messageId}`;
 }
 
-/**
- * grammY reports the chat kind; anything it does not recognise is treated as a non-private chat,
- * because the safe failure for admission is "not one-to-one".
- */
+/** Unknown kinds fall back to a non-private chat: admission fails closed. */
 export function telegramChatType(raw: string): ChatType {
   switch (raw) {
     case 'private':
@@ -28,28 +25,21 @@ export function telegramChatType(raw: string): ChatType {
   }
 }
 
+// No filesystem authority: containment belongs to `FsMediaStager`.
 export class TelegramChannel implements Channel {
   readonly name = 'telegram';
   private bot: Bot;
   private messageHandler?: (msg: IncomingMessage) => Promise<void>;
-  // Reconnect state for the polling lifecycle. A network blip or a bad token makes bot.start()
-  // reject; an unhandled rejection would kill the daemon, so it is caught and retried.
+  // A rejected start() would kill the daemon, so it is caught and retried.
   private running = false;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private reconnectDelayMs = 1000;
   private readonly maxReconnectMs = 60_000;
   private startOptions?: PollingOptions;
 
-  /**
-   * @param botToken Bot token. Used for polling only.
-   *
-   * The channel emits an opaque `MediaReference` and never fetches, writes or names a file, so it
-   * has no filesystem authority to contain. Containment belongs to `FsMediaStager`.
-   */
   constructor(botToken: string) {
     this.bot = new Bot(botToken);
-    // grammY's error boundary: errors thrown by handlers or middleware and not caught there would
-    // otherwise crash the polling loop. Sanitized via summarizeErrorForLog (PHI-safe).
+    // Uncaught handler errors would crash the polling loop; log sanitized.
     this.bot.catch((botError) => {
       console.error('[telegram] Bot error boundary:', summarizeErrorForLog(botError));
     });
@@ -74,23 +64,19 @@ export class TelegramChannel implements Channel {
             : undefined,
         });
       } catch (e) {
-        // Handler errors can carry PHI-bearing user text through grammY's error boundary, so log
-        // only the sanitized frame.
+        // Handler errors can carry PHI; log the sanitized frame only.
         console.error('[telegram] Handler error:', summarizeErrorForLog(e));
         throw e; // allow grammY to retry
       }
     });
 
-    // Handle document/photo uploads (medical reports)
     this.bot.on('message:document', async (ctx) => {
       if (!this.messageHandler) return;
       const document = ctx.message.document;
       const fileId = document.file_id;
       const fileName = document.file_name ?? 'document';
 
-      // METADATA ONLY. No `getFile`, no remote fetch, no local write happens here: an unauthenticated
-      // sender must not be able to make this process download or store anything. The core asks the
-      // injected media source for bytes only after admission.
+      // Metadata only: an unauthenticated sender must never make this process fetch or store bytes.
       try {
         await this.messageHandler({
           chatId: String(ctx.chat.id),
@@ -106,7 +92,7 @@ export class TelegramChannel implements Channel {
             kind: 'document',
             displayName: fileName,
             mime: document.mime_type ?? undefined,
-            // `file_size` is the transport's claim. It is inspected, never trusted as the cap.
+            // The transport's size claim is never trusted as the cap.
             advertisedBytes: typeof document.file_size === 'number' ? document.file_size : undefined,
           },
           replyToMessageId: ctx.message.reply_to_message?.message_id
@@ -125,7 +111,7 @@ export class TelegramChannel implements Channel {
       const fileId = photo.file_id;
       const fileName = `photo-${fileId}.jpg`;
 
-      // METADATA ONLY, same reason as the document handler above.
+      // Metadata only, same as the document handler.
       try {
         await this.messageHandler({
           chatId: String(ctx.chat.id),
@@ -154,19 +140,25 @@ export class TelegramChannel implements Channel {
   }
 
   async send(chatId: string, message: OutgoingMessage): Promise<void> {
-    await this.bot.api.sendMessage(chatId, message.text, {
-      parse_mode: message.parseMode ?? 'Markdown',
-      reply_parameters: message.replyToMessageId
-        ? { message_id: Number(message.replyToMessageId) }
-        : undefined,
-    });
+    const reply_parameters = message.replyToMessageId
+      ? { message_id: Number(message.replyToMessageId) }
+      : undefined;
+    try {
+      await this.bot.api.sendMessage(chatId, message.text, {
+        parse_mode: message.parseMode ?? 'Markdown',
+        reply_parameters,
+      });
+    } catch (e) {
+      // Unbalanced model Markdown: resend the same words unformatted.
+      if (!/can't parse entities/i.test(e instanceof Error ? e.message : String(e))) throw e;
+      await this.bot.api.sendMessage(chatId, message.text, { reply_parameters });
+    }
   }
 
   async connect(): Promise<void> {
     console.log('[telegram] Starting bot polling...');
     this.running = true;
-    // grammY's PollingOptions has no built-in backoff, so reconnect with exponential backoff is
-    // handled by startPolling()'s rejection handler.
+    // Backoff is handled by the rejection handler below; PollingOptions has none.
     this.startOptions = {
       onStart: (info) => console.log(`[telegram] Bot @${info.username} connected`),
     };
@@ -175,16 +167,14 @@ export class TelegramChannel implements Channel {
 
   private startPolling(): void {
     if (!this.running) return;
-    // bot.start() resolves only on stop(); a rejection is a polling startup failure (network blip,
-    // transient 5xx, bad token). Handle it explicitly so it never becomes an unhandled rejection.
+    // start() resolves only on stop(); a rejection is a startup failure, not an unhandled crash.
     void this.bot.start(this.startOptions).then(
       () => {
-        // Clean polling end: reset backoff so a later manual reconnect starts fresh.
+        // Clean end: reset the backoff.
         this.reconnectDelayMs = 1000;
       },
       (err: unknown) => {
-        // Token redaction is not enough: grammY/Telegram errors can echo message bodies (PHI).
-        // summarizeErrorForLog excludes the message body.
+        // Errors can echo message bodies (PHI); summarizeErrorForLog drops them.
         console.warn('[telegram] Polling start failed:', summarizeErrorForLog(err));
         if (!this.running) return;
         this.scheduleReconnect();

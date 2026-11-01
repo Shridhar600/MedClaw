@@ -1,4 +1,3 @@
-// tests/memory/memory-engine.test.ts
 import * as fs from 'fs';
 import * as path from 'path';
 import { MemoryEngine } from '../../src/memory/memory-engine';
@@ -61,9 +60,6 @@ describe('MemoryEngine', () => {
     await expect(engine.writeFile('../outside.txt', 'bad')).rejects.toThrow('Path traversal');
   });
 
-  // SEC-m1: absolute paths are explicitly rejected (defense-in-depth). path.join
-  // would otherwise normalize them inside the workspace, which is safe but
-  // surprising — callers expect absolute paths to be refused.
   it('rejects reading an absolute path with a clear error', async () => {
     await expect(engine.readFile('/etc/passwd')).rejects.toThrow('Absolute paths are not allowed');
   });

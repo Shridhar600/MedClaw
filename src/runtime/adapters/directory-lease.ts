@@ -1,22 +1,3 @@
-// Concrete local resource lease: a non-recursive `mkdir` at 0700 with private holder metadata.
-//
-// The claim is the `mkdir` itself. There is no staging directory and no rename, because POSIX
-// `rename(2)` replaces an existing EMPTY destination directory, which would let a leftover lease be
-// taken as this process's own ownership. Non-recursive `mkdir` refuses with EEXIST for every
-// existing entry (empty or populated directory, file, symlink, dangling symlink), and every one is
-// refused as `busy`, never taken.
-//
-// The claim becomes visible one syscall before the holder record lands, so a contender inside that
-// window cannot read the holder and reports `malformed-holder`. It refuses immediately: it never
-// steals, waits, clears or repairs the claim. An unreadable holder is busy and never auto-recovered.
-//
-// Known limits:
-//  - Only a local filesystem is covered. `mkdir` exclusivity is not portable to network filesystems,
-//    and Windows semantics are not addressed.
-//  - A kill or crash can leave a stale lease, or a claim whose holder record never landed. Clearing
-//    either is a deliberate operator action after the recorded process is confirmed gone; there is
-//    no TTL theft and no automatic unlock.
-//  - Hostile same-UID descriptor races are out of scope.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -39,12 +20,6 @@ export function leasePathFor(canonicalResourcePath: string): string {
   return `${canonicalResourcePath}.lease`;
 }
 
-/**
- * Whether a local process with this pid currently exists.
- *
- * Diagnostic only. A live, reused or unknown pid says nothing about whether a lease is stale, so
- * no automatic clearance is derived from it.
- */
 export function isLocalProcessAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -88,16 +63,11 @@ export class DirectoryLease implements ResourceLeasePort {
       };
     }
 
-    // The claim is one non-recursive `mkdir` at the lease path itself: it succeeds for exactly one
-    // caller and refuses with EEXIST for every existing entry, so an unknown lease is never
-    // replaced, cleared or repaired here.
     try {
       fs.mkdirSync(leasePath, { mode: DIR_MODE });
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === 'EEXIST' || code === 'ENOTEMPTY') {
-        // Something is already at the claim path. Leave it as it is and never treat it as free
-        // (a dangling symlink included, which `existsSync` would call absent).
         return this.describeBusy(target, leasePath);
       }
       if (code === 'ENOENT' || code === 'ENOTDIR') {
@@ -116,9 +86,6 @@ export class DirectoryLease implements ResourceLeasePort {
       };
     }
 
-    // `mkdir`'s mode is umask-affected, so set the owner-only mode here, before the holder write.
-    // A umask that strips owner bits would leave the claim at 0000: the holder write would fail and
-    // the failed-attempt cleanup could not read the directory it must remove.
     try {
       fs.chmodSync(leasePath, DIR_MODE);
     } catch {
@@ -132,16 +99,12 @@ export class DirectoryLease implements ResourceLeasePort {
         encoding: 'utf8',
         mode: FILE_MODE,
       });
-      // `writeFileSync`'s mode is umask-affected too. Release reads this file to check the token, so
-      // an unreadable record would make the caller's own lease impossible to release.
       try {
         fs.chmodSync(holderPath, FILE_MODE);
       } catch {
         // Mode hardening must not fail acquisition; exclusivity is already established.
       }
     } catch {
-      // The claim exists but is not a usable lease. Remove exactly the artifact this attempt just
-      // created, never another holder's, so the target stays retryable.
       removeClaimedLease(leasePath);
       return {
         kind: 'unavailable',
@@ -208,12 +171,6 @@ export function readHolder(leasePath: string): LeaseHolder | undefined {
   }
 }
 
-/**
- * Remove a lease only when the caller still owns it.
- *
- * Token-checked, so a foreign or replaced holder is never deleted. Idempotent: a second call with
- * the same token is a no-op. Returns whether this call removed the lease.
- */
 export function releaseLeaseIfOwned(leasePath: string, token: string): boolean {
   const holder = readHolder(leasePath);
   if (holder === undefined) return false;
@@ -238,21 +195,12 @@ function safeRemoveLeaseDir(leasePath: string): boolean {
   }
 }
 
-/**
- * Discard a claim this attempt just created and then failed to publish.
- *
- * Only ever called after a successful exclusive `mkdir`, so the directory is this caller's own
- * artifact. It is removed only when nothing unexpected remains inside it; anything else is left for
- * the operator rather than deleted on a guess.
- */
 function removeClaimedLease(leasePath: string): void {
   try {
     fs.rmSync(path.join(leasePath, HOLDER_FILE), { force: true });
   } catch {
     // Best effort: a leftover claim is visible and inspectable, never silently reused.
   }
-  // Restore owner-only mode first so the removal below can list the directory even if the umask
-  // created it narrower than intended.
   try {
     fs.chmodSync(leasePath, DIR_MODE);
   } catch {
@@ -271,16 +219,10 @@ function parentDirectoryState(leasePath: string): 'directory' | 'missing' | 'not
   }
 }
 
-/**
- * Local operator inspection of a lease. Reports the resource kind and recorded pid without
- * logging the lease path, so it is safe to print.
- */
 export function describeLeaseForLocalInspection(
   canonicalResourcePath: string,
 ): { present: boolean; resource?: LeaseHolder['kind']; pid?: number; pidAlive?: boolean; readable: boolean } {
   const leasePath = leasePathFor(canonicalResourcePath);
-  // `lstat`, not `existsSync`: acquisition treats a dangling symlink at the claim path as occupied,
-  // so inspection must not report the installation as free.
   let claimExists: boolean;
   try {
     fs.lstatSync(leasePath);

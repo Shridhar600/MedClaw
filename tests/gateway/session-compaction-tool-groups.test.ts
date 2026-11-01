@@ -9,19 +9,6 @@ import {
 } from '../../src/gateway/session';
 import { makeTestTemp } from '../helpers/test-temp';
 
-// -----------------------------------------------------------------------------
-// #16: compaction must never split an assistant+tool_calls / tool group.
-//
-// On the OpenAI provider, a `tool` message with no immediately-preceding
-// `assistant`+`tool_calls` (or a trailing `assistant`+`tool_calls` with no
-// following tool result) is a hard 400:
-//   "messages with role 'tool' must be a response to a preceding message with
-//    'tool_calls'"
-// This is masked on Ollama (lenient) and by text-only unit tests. These tests
-// use a STRICT mock provider that mimics OpenAI's validation so the failure is
-// reproducible in-process.
-// -----------------------------------------------------------------------------
-
 const OPENAI_TOOL_ORDERING_ERROR =
   "Invalid parameter: messages with role 'tool' must be a response to a preceding message with 'tool_calls'.";
 const OPENAI_TRAILING_TOOLCALLS_ERROR =
@@ -31,8 +18,6 @@ const OPENAI_TRAILING_TOOLCALLS_ERROR =
 function validateOpenAIOrdering(messages: Message[]): void {
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
-    // (1) Every `tool` message must trace back (through tool siblings) to an
-    //     assistant with tool_calls.
     if (m.role === 'tool') {
       let j = i - 1;
       while (j >= 0 && messages[j].role === 'tool') j--;
@@ -46,8 +31,6 @@ function validateOpenAIOrdering(messages: Message[]): void {
         throw new Error(OPENAI_TOOL_ORDERING_ERROR);
       }
     }
-    // (2) Every assistant with tool_calls must be IMMEDIATELY followed by a
-    //     tool response — whether mid-sequence (flush failure) or trailing.
     if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0) {
       const next = messages[i + 1];
       if (!next || next.role !== 'tool') {
@@ -62,11 +45,6 @@ interface RecordedCall {
   valid: boolean;
 }
 
-/**
- * Strict provider: records every chat() call and whether the messages were a
- * valid OpenAI sequence. Throws (like the real API) on an invalid sequence so
- * the session's own try/catch behaves as it would in production.
- */
 function makeStrictProvider(
   summaryText: string,
   modelName?: string,
@@ -95,7 +73,6 @@ function makeStrictProvider(
 /** Does any `tool` message lack a valid preceding assistant+tool_calls parent? */
 function hasDanglingTool(messages: Message[]): boolean {
   try {
-    // Reuse the strict check but only for the dangling-tool aspect.
     for (let i = 0; i < messages.length; i++) {
       if (messages[i].role !== 'tool') continue;
       let j = i - 1;
@@ -138,10 +115,6 @@ describe('Compaction never splits a tool-call group (#16)', () => {
     jest.restoreAllMocks();
   });
 
-  // Turn-aware compaction (H4) keeps the last keepRecentTurns TURNS, so we seed one older turn (to be
-  // summarized away) plus the split-inducing tool-group turn in the RECENT tail. This still proves #16
-  // (a compaction boundary never splits a tool group) and gives the flush a real older range.
-  //   [older, olderA, u1, a1, u2, asst(tc), tool, a2]  (keepRecentTurns=2 -> recent = [u1..a2])
   async function seedSplitInducingHistory(manager: SessionManager, chatId: string): Promise<void> {
     await manager.recordTurn(chatId, [
       { role: 'user', content: 'older turn to summarize' },
@@ -162,9 +135,8 @@ describe('Compaction never splits a tool-call group (#16)', () => {
   it('post-compaction history has no dangling tool at the head', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const provider = makeStrictProvider('summary of older turns', 'gpt-5.6-luna');
-    const manager = new SessionManager(240, 1440, tmpDir, provider, undefined, {
+    const manager = new SessionManager(tmpDir, provider, undefined, {
       enabled: true,
-      triggerAtTokenPercent: 80,
       memoryFlush: false,
       keepRecentTurns: 2,
     });
@@ -181,9 +153,8 @@ describe('Compaction never splits a tool-call group (#16)', () => {
   it('the NEXT turn after compaction is a valid OpenAI sequence (no 400)', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const provider = makeStrictProvider('summary of older turns', 'gpt-5.6-luna');
-    const manager = new SessionManager(240, 1440, tmpDir, provider, undefined, {
+    const manager = new SessionManager(tmpDir, provider, undefined, {
       enabled: true,
-      triggerAtTokenPercent: 80,
       memoryFlush: false,
       keepRecentTurns: 2,
     });
@@ -192,7 +163,6 @@ describe('Compaction never splits a tool-call group (#16)', () => {
 
     await manager.runCompaction(chatId);
 
-    // Simulate the agent loop's next turn against the strict provider.
     const nextTurn: Message[] = [
       ...manager.getHistory(chatId),
       { role: 'user', content: 'and my blood pressure?' },
@@ -216,9 +186,8 @@ describe('Compaction never splits a tool-call group (#16)', () => {
       execute: jest.fn(async () => 'ok'),
     } as unknown as import('../../src/tools/registry').ToolRegistry;
 
-    const manager = new SessionManager(240, 1440, tmpDir, provider, toolRegistry, {
+    const manager = new SessionManager(tmpDir, provider, toolRegistry, {
       enabled: true,
-      triggerAtTokenPercent: 80,
       memoryFlush: true,
       keepRecentTurns: 2,
     });
@@ -227,17 +196,14 @@ describe('Compaction never splits a tool-call group (#16)', () => {
 
     await manager.runCompaction(chatId);
 
-    // The flush call is the first chat() invocation (memoryFlush=true).
     expect(provider.calls.length).toBeGreaterThan(0);
     expect(provider.calls[0].valid).toBe(true);
     warnSpy.mockRestore();
   });
 
   it('the no-LLM compaction branch also produces a clean head', async () => {
-    // No provider -> the slice(-keepRecent) fast path.
-    const manager = new SessionManager(240, 1440, tmpDir, undefined, undefined, {
+    const manager = new SessionManager(tmpDir, undefined, undefined, {
       enabled: true,
-      triggerAtTokenPercent: 80,
       memoryFlush: false,
       keepRecentTurns: 2,
     });
@@ -310,19 +276,18 @@ describe('Token-budget compaction trigger (#15)', () => {
     expect(contextWindowFor('gpt-4o')).toBe(128000);
     expect(contextWindowFor('gpt-4.1')).toBe(128000);
     expect(contextWindowFor('llama3.2:3b')).toBe(128000);
-    expect(contextWindowFor('kimi-k2.5:cloud')).toBe(262144); // F5: shipped default model
+    expect(contextWindowFor('kimi-k2.5:cloud')).toBe(262144); // shipped default model
     expect(contextWindowFor('medgemma')).toBe(8192);
     expect(contextWindowFor(undefined)).toBe(8192);
   });
 
-  it('prepareHistory emergency-compacts an over-budget (≥80%) session synchronously (spec 14 §3)', async () => {
+  it('prepareHistory emergency-compacts an over-budget (≥80%) session synchronously', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
     // model undefined -> 8192 context window. A real reading of 7000 tokens ~= 85% ⇒ emergency (sync).
     const provider = makeStrictProvider('compacted summary', undefined);
-    const manager = new SessionManager(240, 1440, tmpDir, provider, undefined, {
+    const manager = new SessionManager(tmpDir, provider, undefined, {
       enabled: true,
-      triggerAtTokenPercent: 80,
       memoryFlush: false,
       keepRecentTurns: 2,
     });
@@ -348,9 +313,8 @@ describe('Token-budget compaction trigger (#15)', () => {
 
   it('prepareHistory does NOT compact an under-budget session', async () => {
     const provider = makeStrictProvider('should not be called', undefined);
-    const manager = new SessionManager(240, 1440, tmpDir, provider, undefined, {
+    const manager = new SessionManager(tmpDir, provider, undefined, {
       enabled: true,
-      triggerAtTokenPercent: 80, // legacy key, inert under spec-14 window triggers
       memoryFlush: false,
       keepRecentTurns: 2,
     });
@@ -359,8 +323,6 @@ describe('Token-budget compaction trigger (#15)', () => {
       { role: 'user', content: 'hi' },
       { role: 'assistant', content: 'hello' },
     ]);
-    // A REAL under-threshold reading (~0.1% of the 8192 default window) — proves the trigger is off
-    // because the fill is low, NOT merely because no reading was ever recorded (test-integrity fix).
     await manager.recordPromptUsage(chatId, 10);
 
     const prepared = await manager.prepareHistory(chatId);
@@ -369,15 +331,12 @@ describe('Token-budget compaction trigger (#15)', () => {
     expect((provider.chat as jest.Mock)).not.toHaveBeenCalled();
   });
 
-  // F2: an over-budget history that cannot shrink (single message larger than
-  // the budget) must NOT fire compaction on every turn — no rewrite-loop.
   it('does not fire the token trigger when no older turns can be split off', async () => {
     const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const provider = makeStrictProvider('summary', undefined); // 8192 window
-    const manager = new SessionManager(240, 1440, tmpDir, provider, undefined, {
+    const manager = new SessionManager(tmpDir, provider, undefined, {
       enabled: true,
-      triggerAtTokenPercent: 10, // budget ~819 tokens ~3276 chars
       memoryFlush: false,
       keepRecentTurns: 2,
     });
@@ -393,14 +352,9 @@ describe('Token-budget compaction trigger (#15)', () => {
   });
 });
 
-// The raw CJS fs module — spyable, unlike the ts-jest __importStar clone.
 const fsRealForFixes = jest.requireActual<typeof import('fs')>('fs');
 
-// F1: a torn append can leave an OpenAI-invalid history on disk (a trailing
-// assistant+tool_calls whose tool result line was lost). Reload must sanitize
-// it before it enters the live session map, or the first turn after restart
-// 400s and the session is dead until idle-reset/`/new`.
-describe('Reload sanitizes an OpenAI-invalid persisted history (F1)', () => {
+describe('Reload sanitizes an OpenAI-invalid persisted history', () => {
   let tmpDir: string;
 
   beforeEach(() => {
@@ -432,9 +386,8 @@ describe('Reload sanitizes an OpenAI-invalid persisted history (F1)', () => {
     fs.writeFileSync(jsonlPath, lines);
 
     const provider = makeStrictProvider('summary', 'gpt-5.6-luna');
-    const manager = new SessionManager(240, 1440, tmpDir, provider, undefined, {
+    const manager = new SessionManager(tmpDir, provider, undefined, {
       enabled: true,
-      triggerAtTokenPercent: 80,
       memoryFlush: false,
       keepRecentTurns: 10,
     });
@@ -442,24 +395,17 @@ describe('Reload sanitizes an OpenAI-invalid persisted history (F1)', () => {
     const history = manager.getHistory(chatId);
     const last = history[history.length - 1];
     expect(Boolean(last && last.role === 'assistant' && last.tool_calls)).toBe(false);
-    // The reloaded history is a valid OpenAI sequence for the very next turn.
     await expect(
       provider.chat([...history, { role: 'user', content: 'next' }]),
     ).resolves.toBeDefined();
   });
 });
 
-// F6 (P2b/D1.6, revised by the Wave-D panel M5): compaction persists via a best-effort WINDOW save (the
-// day-file archive is never rewritten — DD1). A failing window save must warn-and-continue (never reject
-// the turn). M5 / spec 14 §4: a plain compaction is candidate-then-swap — a FAILED save keeps the OLD
-// window (in memory too), so disk and memory never diverge. (The ≥80% emergency truncate is the sole
-// exception — it must reduce in memory regardless, as the overflow valve; covered in
-// session-compaction-panel-fixes.test.ts.)
-describe('Compaction window-save failure degrades gracefully (F6 / M5)', () => {
+describe('Compaction window-save failure degrades gracefully', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = makeTestTemp('redacted-compaction-f6-');
+    tmpDir = makeTestTemp('redacted-compaction-window-');
   });
 
   afterEach(() => {
@@ -467,11 +413,10 @@ describe('Compaction window-save failure degrades gracefully (F6 / M5)', () => {
     jest.restoreAllMocks();
   });
 
-  it('no-LLM branch: a failing window save does not reject and keeps the OLD window (M5)', async () => {
+  it('no-LLM branch: a failing window save does not reject and keeps the OLD window', async () => {
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const manager = new SessionManager(240, 1440, tmpDir, undefined, undefined, {
+    const manager = new SessionManager(tmpDir, undefined, undefined, {
       enabled: true,
-      triggerAtTokenPercent: 80,
       memoryFlush: false,
       keepRecentTurns: 2,
     });
@@ -486,17 +431,14 @@ describe('Compaction window-save failure degrades gracefully (F6 / M5)', () => {
     await expect(manager.runCompaction(chatId)).resolves.toBeUndefined(); // best-effort: never rejects
     writeSpy.mockRestore();
 
-    // M5 candidate-then-swap: the window save failed, so the compaction is NOT applied — the old window
-    // (all 4 turns) is retained in memory, matching disk. No memory/disk divergence.
     expect(manager.getHistory(chatId).map((m) => m.content)).toEqual(['u0', 'a0', 'u1', 'a1', 'u2', 'a2', 'u3', 'a3']);
   });
 
   it('olderTurns===0 branch: persist failure does not reject; history unchanged', async () => {
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const provider = makeStrictProvider('summary', 'gpt-5.6-luna');
-    const manager = new SessionManager(240, 1440, tmpDir, provider, undefined, {
+    const manager = new SessionManager(tmpDir, provider, undefined, {
       enabled: true,
-      triggerAtTokenPercent: 80,
       memoryFlush: false,
       keepRecentTurns: 10, // > history length -> olderTurns empty
     });
@@ -513,9 +455,3 @@ describe('Compaction window-save failure degrades gracefully (F6 / M5)', () => {
     expect(manager.getHistory(chatId).map((m) => m.content)).toEqual(before);
   });
 });
-
-// P2b/D3.6 (DD9): the F9 archive-summary PHI test is RETIRED with its feature — generateSummary +
-// the summaries/ side-file no longer exist. The surviving compaction pipeline never PERSISTS error
-// text: a summary failure keeps the old window (nothing written), and the daily-log summary copy runs
-// only on success (a real summary, no error). PHI-in-logs stays enforced by summarizeErrorForLog at
-// every compaction catch. (Was: "Session summary never persists a raw provider error".)

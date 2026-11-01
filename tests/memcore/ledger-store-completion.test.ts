@@ -33,7 +33,6 @@ describe('LedgerStore.discontinue', () => {
     expect(await store.getActive('metformin', 'medication')).toBeNull();
     const chain = await store.getChain('metformin', 'medication');
     expect(chain.map(f => f.version).sort()).toEqual([1, 2]);
-    // discontinued survives the disk round-trip with its reason intact
     const reread = chain.find(f => f.status === 'discontinued')!;
     expect(reread.discontinuedReason).toBe('doctor-discontinued');
   });
@@ -100,7 +99,7 @@ describe('LedgerStore.pause', () => {
     expect(res.fact.fields.pre_pause_summary).toBe('paused during travel');
   });
 
-  it('carries pre_pause_summary forward on a later non-resume write (A2)', async () => {
+  it('carries pre_pause_summary forward on a later non-resume write', async () => {
     await store.recordFact({ entity: 'weight-loss', type: 'goal', fields: { target: '-5kg' }, provenance: userProv });
     await store.pause('weight-loss', 'goal', userProv, { prePauseSummary: 'paused during travel' });
     const res = await store.recordFact({ entity: 'weight-loss', type: 'goal', fields: { target: '-3kg' }, provenance: userProv });
@@ -116,19 +115,16 @@ describe('LedgerStore.pause', () => {
   });
 });
 
-describe('LedgerStore cross-entity links (KNEE-04)', () => {
+describe('LedgerStore cross-entity links', () => {
   it('links a discontinued med to its replacement and surfaces the links', async () => {
     await store.recordFact({ entity: 'ibuprofen', type: 'medication', fields: { dose: '400mg' }, provenance: docProv, safetyRelevant: true });
     const ibuActive = (await store.getActive('ibuprofen', 'medication'))!;
 
-    // naproxen v1 declares it replaces ibuprofen (outgoing link on the new med)
     await store.recordFact({ entity: 'naproxen', type: 'medication', fields: { dose: '250mg' }, provenance: docProv, replaces: ibuActive.id });
 
-    // discontinue ibuprofen, pointing replacedBy at naproxen (incoming link on the old med)
     const disc = await store.discontinue('ibuprofen', 'medication', docProv, { reason: 'switched', replacedBy: 'naproxen@v1' });
     if (disc.kind === 'needs-confirmation') await store.confirm(disc.token.uuid);
 
-    // both survive the disk round-trip
     const naproxen = (await store.getActive('naproxen', 'medication'))!;
     expect(naproxen.replaces).toBe(ibuActive.id);
     const discontinued = (await store.getChain('ibuprofen', 'medication')).find(f => f.status === 'discontinued')!;

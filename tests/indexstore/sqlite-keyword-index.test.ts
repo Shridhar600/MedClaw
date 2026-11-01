@@ -7,8 +7,6 @@ import { makeTestTemp } from '../helpers/test-temp';
 
 const tmpDirs: string[] = [];
 
-// Each index gets its own isolated temp search.db (its own better-sqlite3 connection over
-// the P0-owned chunks/chunks_fts tables — D6). NEVER touches ~/.redacted.
 runKeywordIndexContract(() => {
   const dir = makeTestTemp('redacted-kwidx-');
   tmpDirs.push(dir);

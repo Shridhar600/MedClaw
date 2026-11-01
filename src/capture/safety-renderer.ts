@@ -1,8 +1,3 @@
-// src/capture/safety-renderer.ts
-//
-// The single SafetyRenderer adapter expression: the Gateway ships it and tests import it, so a
-// hand-rolled test adapter cannot drift from the shipped wiring. Dependencies stay structural:
-// capture never imports memcore concretes.
 
 import type { LedgerFact } from '../memcore';
 import type { SafetyRenderer } from './pipeline';

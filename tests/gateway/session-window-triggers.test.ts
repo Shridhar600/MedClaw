@@ -19,7 +19,7 @@ afterAll(() => {
   for (const d of tmpDirs) fs.rmSync(d, { recursive: true, force: true });
 });
 
-describe('SessionManager.recordPromptUsage (DD3 token signal)', () => {
+describe('SessionManager.recordPromptUsage (token signal)', () => {
   it('persists a real prompt-token reading on the window (not flagged estimated)', async () => {
     const sessionsPath = tmpSessions();
     const mgr = new SessionManager({ sessionsPath });
@@ -54,7 +54,6 @@ describe('SessionManager.recordPromptUsage (DD3 token signal)', () => {
     await mgr.recordTurn('chat1', [{ role: 'user', content: 'hello' }, { role: 'assistant', content: 'hi' }]);
     await mgr.recordPromptUsage('chat1', 4096);
 
-    // Fresh manager over the same dir → the resumed window carries the token reading.
     const mgr2 = new SessionManager({ sessionsPath });
     await mgr2.recordTurn('chat1', [{ role: 'user', content: 'more' }, { role: 'assistant', content: 'ok' }]);
     const w = loadWindow(path.join(sessionsPath, 'session-window.json'));
@@ -62,7 +61,7 @@ describe('SessionManager.recordPromptUsage (DD3 token signal)', () => {
   });
 });
 
-describe('windowTriggerFor — the spec 14 §3 threshold table (34/35/49/50/80)', () => {
+describe('windowTriggerFor — the threshold table (34/35/49/50/80)', () => {
   const t = { pruneAtPercent: 35, compactAtPercent: 50, emergencyAtPercent: 80 };
 
   it.each([
@@ -85,7 +84,6 @@ describe('windowTriggerFor — the spec 14 §3 threshold table (34/35/49/50/80)'
 describe('SessionManager.windowFillPercent', () => {
   it('reflects the recorded token reading against the effective context window', async () => {
     const sessionsPath = tmpSessions();
-    // No provider ⇒ contextWindowFor(undefined) = 8192. 4096/8192 = 50%.
     const mgr = new SessionManager({ sessionsPath });
     await mgr.recordTurn('chat1', [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'ok' }]);
     await mgr.recordPromptUsage('chat1', 4096);

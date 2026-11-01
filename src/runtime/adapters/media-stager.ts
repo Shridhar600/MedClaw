@@ -1,14 +1,3 @@
-// Bounded streaming of admitted owner media into the owner's own staging directory.
-//
-//   * The byte cap is enforced while streaming. A transport's advertised size is never trusted: it can
-//     under-report, and by the time `arrayBuffer()` resolves the memory is already spent.
-//   * Nothing is buffered whole. Chunks are written through a stream with backpressure.
-//   * Intake is bounded: one stage at a time and a 30-second total deadline. A second upload that arrives
-//     while one is staging is refused before a stream is opened.
-//   * A timeout or abort can occur after an owned partial is opened. Refusal cleanup waits for the owned
-//     writable to close before removing that partial. A source that finishes opening after the attempt
-//     ends is asked to cancel rather than streamed.
-//   * Cleanup is scoped to this operation's own partial file; other staged files are untouched.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -43,11 +32,6 @@ export interface MediaStagerOptions {
 export class FsMediaStager {
   private busy = false;
 
-  /**
-   * Guarded once here rather than at each emit, so an adapter that throws can never fail a download.
-   * Intake runs on a request a stranger can trigger, and a broken log must not turn into a failed
-   * upload or a stuck intake.
-   */
   private readonly sink: DiagnosticSink;
   private readonly clock: Clock;
 
@@ -104,8 +88,6 @@ export class FsMediaStager {
       catch (error) { return this.refuse('source-failed', error, startedAt); }
 
       try {
-        // Raced against the intake signal: `open()` may ignore its signal, and awaiting it bare would let a
-        // wedged source hold the only stage forever. A handle that arrives after we stopped waiting is cancelled.
         let abandoned = false;
         const openPromise = this.source.open(ref, intake).then((handle) => {
           if (abandoned) void handle.cancel().catch(() => undefined);
@@ -148,8 +130,6 @@ export class FsMediaStager {
         await withinIntake(pipeline(readableFrom(opened), counter, sink, { signal: intake }), intake);
       } catch (error) {
         const reason: MediaStageReason = counter.exceeded ? 'too-large' : intake.aborted ? abortReason() : 'source-failed';
-        // Closing our sink precedes unlink: a pending exclusive open must not create a new partial after
-        // cleanup has already looked for it. We do not await an uncooperative source iterator.
         sink.destroy();
         await sinkClosed;
         if (ownsPartial) this.unlinkQuietly(partialPath);
@@ -167,8 +147,6 @@ export class FsMediaStager {
       let published = false;
       try {
         fs.chmodSync(partialPath, 0o600);
-        // A same-lane hard link publishes without replacing an existing final artifact. Rename would
-        // overwrite a collision. The partial remains ours until this exclusive publication succeeds.
         fs.linkSync(partialPath, finalPath);
         published = true;
         fs.unlinkSync(partialPath);
@@ -215,10 +193,6 @@ export class FsMediaStager {
   }
 }
 
-/**
- * Fails the stream the moment the real byte total exceeds the cap, so an over-large upload stops
- * consuming disk and network instead of being discovered after the fact.
- */
 class ByteCap extends Transform {
   bytes = 0;
   exceeded = false;
@@ -244,10 +218,6 @@ function readableFrom(opened: OpenedMedia): AsyncIterable<Uint8Array> {
   return opened.chunks;
 }
 
-/**
- * Rejects as soon as `signal` aborts, and otherwise never settles. Racing this against `pipeline`
- * makes a bounded intake wait a real bound even when the source ignores its signal.
- */
 async function withinIntake<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   const onAbort = (): void => rejectAbort(abortError());
   let rejectAbort!: (error: Error) => void;

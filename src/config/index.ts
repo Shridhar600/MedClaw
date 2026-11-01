@@ -1,5 +1,3 @@
-// Public surface of the config policy layer; everything else is private.
-// No filesystem access lives behind this barrel.
 export { CONFIG_SCHEMA_VERSION } from './types';
 export type {
   AgentConfig,

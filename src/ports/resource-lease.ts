@@ -1,32 +1,10 @@
-// src/ports/resource-lease.ts
-//
-// Ownership seam for the two local resources a MedClaw installation contends on:
-// the selected configuration document and the selected owner workspace.
-//
-// Interface-only. The contract is deliberately small:
-//
-//  - there is no check-then-create, no TTL, no renewal and no steal;
-//  - a contended or unrecognised lease is `busy` with honest local-inspection guidance, never
-//    automatic recovery;
-//  - release is token-checked and idempotent, and can only ever remove the caller's own lease.
-//
-// Ports use plain strings so this file never imports an application module upward.
 
 /** Which local resource is being owned. */
 export type LeaseResourceKind = 'config' | 'owner';
 
 export interface LeaseTarget {
   kind: LeaseResourceKind;
-  /**
-   * Canonical path of the resource itself. Two aliases of the same file canonicalize to the same
-   * value, so they contend on the same lease.
-   */
   canonicalPath: string;
-  /**
-   * Explicit lease directory, when the resource already names its own lease location (the owner
-   * workspace lease is `<workspace>/.state/installation.lease`). When omitted the adapter uses
-   * `<canonicalPath>.lease`, which is what a configuration document wants.
-   */
   leasePath?: string;
 }
 
@@ -52,11 +30,6 @@ export interface LeaseBusy {
   resource: LeaseResourceKind;
   reason: LeaseBusyReason;
   holderState: LeaseHolderState;
-  /**
-   * Whether a process matching the recorded pid currently exists. This is diagnostic only:
-   * a live, reused or unknown pid is never proof that a lease is stale, and no automatic
-   * clearance is ever offered on the basis of it.
-   */
   recordedPidAlive?: boolean;
   /** Operator-facing next step. Never contains the lease path. */
   guidance: string;

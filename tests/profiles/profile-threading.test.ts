@@ -17,8 +17,6 @@ jest.mock('../../src/providers/types', () => ({}));
 const tmpDir = makeTestTemp('profile-threading-test');
 
 describe('profileId threading', () => {
-  // This root previously was a FIXED path under the system temp directory with no cleanup, so every run
-  // left a directory behind there and two concurrent runs would collide. It is now unique and removed.
   afterAll(() => {
     removeTestTemp(tmpDir);
   });
@@ -153,9 +151,6 @@ describe('selected owner identity', () => {
     expect(cloneStoredDefaults().profiles.defaultProfileId).toBe('default');
   });
 
-  // RETIRED -> `loadConfig` on an absent file returned full defaults, so a machine that had
-  // never been set up resolved to an owner. Serving now refuses instead; the default owner
-  // name exists only as a setup value.
   it('refuses to serve when no configuration document is selected', async () => {
     await expect(
       loadRuntimeConfig({ configPath: '/nonexistent/config.json', homeDir: tmpDir }),

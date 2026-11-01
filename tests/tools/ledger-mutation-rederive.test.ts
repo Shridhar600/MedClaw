@@ -9,10 +9,7 @@ import { makeTestTemp } from '../helpers/test-temp';
 
 const DAY = '2026-08-20T10:00:00.000Z';
 
-// E2/CONTRA-09 regression: the confirm (`ledger_update`) and direct-apply (`ledger_remove`) paths
-// bypass the capture pipeline, so they must fire `afterLedgerMutation` to re-derive the recall
-// mirror — otherwise a confirmed retraction keeps injecting the stale fact into the next turn.
-describe('ledger tools recall re-derive hook (E2 / CONTRA-09)', () => {
+describe('ledger tools recall re-derive hook', () => {
   let tmp: string;
   let tools: Tool[];
   let mutations: FactType[];

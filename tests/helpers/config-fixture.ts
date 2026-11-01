@@ -1,9 +1,3 @@
-// Shared entry fixture for configuration-driven tests.
-//
-// Plan 15 §5 requires regenerating entry fixtures through a shared helper rather than
-// hand-writing documents or bypassing a grant. Every fixture written here is a real
-// `schemaVersion: 2` document with explicit owner identity, so a test that consumes it is
-// exercising the same decoder the daemon uses.
 
 import * as fs from 'fs';
 import * as path from 'path';

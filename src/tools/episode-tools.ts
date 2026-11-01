@@ -1,7 +1,3 @@
-// src/tools/episode-tools.ts
-//
-// episode_manage — CRUD over EpisodeStore (create/update/link/close/get/list with pagination). Episodes group
-// related facts + narrative into a health arc.
 
 import type { Tool, ToolResult } from './types';
 import type { EpisodeStore, Episode, EpisodeStatus } from '../memcore';
@@ -13,11 +9,6 @@ const EPISODE_STATUSES: EpisodeStatus[] = ['open', 'resolving', 'resolved', 'reo
 export interface EpisodeToolsDeps {
   store: EpisodeStore;
   profileId: string;
-  /**
-   * Single-writer coordinator that serializes create/update/link/close against concurrent mutation of the same
-   * episode (a read-then-write lost-update race). Optional: when absent the tool calls the store directly, which
-   * degrades atomicity, never availability.
-   */
   queue?: QueuePort;
 }
 
@@ -33,11 +24,6 @@ function isPathContainmentError(error: unknown): boolean {
     || (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'ERR_PATH_CONTAINMENT');
 }
 
-/**
- * The episode lane persists caller-controlled text (title/note/regions/factIds) to a 0600 health file, so it
- * carries the same credential-rejection bar as every other write path (memory_write, ledger_record,
- * safety_note, capture). Returns a rejection or null.
- */
 function scanEpisodeInputs(...fields: (string | string[] | undefined)[]): ToolResult | null {
   const text = fields.flatMap(f => (f === undefined ? [] : Array.isArray(f) ? f : [f])).join('\n');
   const cred = contentContainsCredentials(text);
@@ -56,8 +42,6 @@ function renderEpisode(e: Episode): string {
 }
 
 export function createEpisodeTools(deps: EpisodeToolsDeps): Tool[] {
-  // Serialize every mutating action against the same per-profile single-writer used by every other memory-domain
-  // writer. Without an injected queue, run inline (fine for a single caller; loses atomicity under concurrency).
   const mutate = <T>(label: string, run: () => Promise<T>): Promise<T> =>
     deps.queue ? deps.queue.enqueue('turn', { label, scope: 'episode', run }) : run();
 

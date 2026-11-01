@@ -13,6 +13,6 @@ tokens in stable sections, per-section truncation).
   legacy `agent/context.ts` builder, which runs once at `Gateway.start()`; a violation
   aborts boot (medical-safety > resilience). There is no per-turn refresh yet.
 
-**Dependencies:** ports (fact-mirror, kv-cache), shared, memcore (types only)
+**Dependencies:** ports (fact-mirror), shared, memcore (types only)
 
 **Extraction notes:** No I/O except through ports. Invariant violations abort the turn/boot.

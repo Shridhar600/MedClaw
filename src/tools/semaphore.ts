@@ -1,6 +1,3 @@
-// Priority order (highest first): user > heartbeat > background. `background` is for work that
-// must never starve or collide with user turns (such as compaction LLM calls) and
-// deliberately sits below heartbeat so it does not consume heartbeat queue slots.
 export type SemaphorePriority = 'user' | 'heartbeat' | 'background';
 
 /** Typed overload sentinel. Callers must branch on the type, not the message. */
@@ -186,8 +183,6 @@ export class LLMSemaphore {
   }
 
   private nextJob(): QueueEntry {
-    // User remains ahead of heartbeat. A waiting background job receives one reserved turn after a
-    // bounded user burst, so a continuous stream of users cannot starve background maintenance forever.
     if (this.userQueue.length > 0) {
       if (this.backgroundQueue.length > 0
         && this.consecutivePriorityJobs >= this.maxConsecutiveUserJobsWithBackground) {

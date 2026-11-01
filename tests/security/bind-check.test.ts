@@ -14,8 +14,8 @@ describe('checkProviderBindAddresses', () => {
     expect(result.warnings[0]).toContain('not localhost');
   });
 
-  it('C09 keeps endpoint credentials, paths and arbitrary provider keys out of warnings', () => {
-    const markers = ['C09_user', 'C09_password', 'C09_path', 'C09_query', 'C09_map_key'];
+  it('keeps endpoint credentials, paths and arbitrary provider keys out of warnings', () => {
+    const markers = ['user-marker', 'password-marker', 'path-marker', 'query-marker', 'map-key-marker'];
     const result = checkProviderBindAddresses({ providers: {
       main: { baseUrl: `https://${markers[0]}:${markers[1]}@example.invalid/${markers[2]}?token=${markers[3]}` },
       [markers[4]]: { baseUrl: `http://0.0.0.0:11434/${markers[2]}` },
@@ -76,7 +76,7 @@ describe('checkProviderBindAddresses', () => {
     expect(result.warnings[0]).toContain('NOT localhost');
   });
 
-  it('accepts [::1] as localhost', () => {
+  it('accepts [:1] as localhost', () => {
     const config = {
       providers: {
         ollama: { baseUrl: 'http://[::1]:11434' },

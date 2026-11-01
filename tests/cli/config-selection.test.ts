@@ -1,6 +1,3 @@
-// Every CLI command operates on the installation the operator selected, through the precedence
-// `--config > REDACTED_CONFIG_PATH > ~/.redacted/config.json`, and a malformed invocation changes nothing.
-// Real `runCli` entry point and real fixtures on disk.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -60,8 +57,6 @@ describe('CLI honours the locked configuration selection order everywhere', () =
     homeConfigPath = homeFixture.configPath;
     homeOwnerRecord = homeFixture.ownerRecord;
 
-    // Only the selected installation gets an unpaired owner record, so a pairing code that lands
-    // anywhere else would have nothing to write into.
     const { FileOwnerStatePort } = await import('../../src/runtime/adapters/owner-state-file');
     const { CryptoPairingCodePort } = await import('../../src/runtime/adapters/pairing-code');
     const { OwnerAdmissionService, asProfileId } = await import('../../src/profiles');
@@ -132,7 +127,6 @@ describe('a malformed invocation refuses before any mutation and never echoes a 
     return { files: files.sort(), env: fs.readFileSync(envConfig, 'utf8'), home: fs.readFileSync(homeConfig, 'utf8') };
   };
 
-  // The explicitly selected target is fresh, so a parser that lets malformed input through really creates files.
   beforeEach(() => {
     root = makeTestTemp('cli-malformed');
     const homeDir = path.join(root, 'home');

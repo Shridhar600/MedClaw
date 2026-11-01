@@ -32,9 +32,7 @@ describe('verifyWorkspacePermissions', () => {
   });
 
   it('produces warning for non-existent path', () => {
-    // A path that does not exist. Workspace-local like everything else: the assertion under test is
-    // "no such directory", which is equally true inside `.test-tmp/` and does not need system temp.
-    const badPath = path.join(makeTestTemp('r14-absent-parent'), 'nonexistent-workspace-' + Date.now());
+    const badPath = path.join(makeTestTemp('absent-parent'), 'nonexistent-workspace-' + Date.now());
     const result = verifyWorkspacePermissions(badPath);
     expect(result.secure).toBe(false);
     expect(result.warnings.length).toBeGreaterThan(0);

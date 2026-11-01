@@ -1,11 +1,3 @@
-// tests/profiles/owner-admission-routing.test.ts
-//
-// The S1 access grant, proved through the real `GatewayMessageRouter` with the real
-// `OwnerAdmissionService`, a real file-backed record and the real code port.
-//
-// This suite is the direct answer to the captured RED: a stranger DM used to be paired to the
-// owner on first contact and answered with a clinical turn. Nothing here stubs admission, the
-// router's routing, or the record — the only controlled input is the clock.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -60,9 +52,7 @@ function ownerConfig(root: string): { config: EffectiveConfig; workspace: string
       bootstrapMaxChars: 20_000,
     },
     sessions: {
-      softResetAfterMinutes: 240,
-      hardResetAfterMinutes: 1440,
-      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+      compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
     },
     heartbeat: {
       enabled: false,
@@ -81,7 +71,7 @@ function ownerConfig(root: string): { config: EffectiveConfig; workspace: string
         },
       },
     },
-    agent: { maxIterations: 5, disclaimerEnabled: false },
+    agent: { maxIterations: 5 },
   } as EffectiveConfig;
   return { config, workspace: owner.workspace, storePath: owner.storePath, audit: owner.auditLogPath };
 }
@@ -95,7 +85,6 @@ function turnCounter(config: EffectiveConfig, workspace: string): TurnCounter {
     config,
     sessions: {
       recordTurn: async (...args: unknown[]) => {
-        // Both arguments are read only to prove a transcript write happened at all.
         void args;
         prompts.push(`recorded:${args.length}`);
       },
@@ -127,7 +116,7 @@ function telegramMessage(overrides: Partial<IncomingMessage> & { text: string })
   };
 }
 
-describe('S1 routing: admission replaces the first-contact grant', () => {
+describe('admission replaces the first-contact grant', () => {
   let root: string;
   let config: EffectiveConfig;
   let workspace: string;
@@ -138,7 +127,7 @@ describe('S1 routing: admission replaces the first-contact grant', () => {
   let sent: string[];
 
   beforeEach(async () => {
-    root = makeTestTemp('socs-s1-routing');
+    root = makeTestTemp('routing');
     ({ config, workspace } = ownerConfig(root));
     const paths = resolveOwnerPaths(root, asProfileId(OWNER_ID)!);
     store = new FileOwnerStatePort(paths.ownerRecord, OWNER_ID);
@@ -168,7 +157,7 @@ describe('S1 routing: admission replaces the first-contact grant', () => {
 
   const send = (message: IncomingMessage) => router.route(message, async (text) => { sent.push(text); });
 
-  it('refuses a stranger and never reaches a clinical turn (the captured RED)', async () => {
+  it('refuses a stranger and never reaches a clinical turn', async () => {
     const reply = await send(telegramMessage({
       chatId: 'stranger-chat',
       userId: 'stranger-user',
@@ -179,7 +168,6 @@ describe('S1 routing: admission replaces the first-contact grant', () => {
     expect(counter.prompts).toEqual([]);
     expect(sent.join(' ')).not.toMatch(/clinical/i);
     expect(reply).toMatch(/private health assistant for one person/i);
-    // And nothing about the stranger is written into the owner's record.
     const read = store.read();
     expect(read.kind === 'available' ? read.state.phase : 'unreadable').toBe('unpaired');
   });
@@ -199,7 +187,6 @@ describe('S1 routing: admission replaces the first-contact grant', () => {
     expect(pairingReply).toMatch(/pairing complete/i);
     expect(counter.prompts).toEqual([]);
 
-    // The very next ordinary owner message is captured, not swallowed by onboarding.
     const ownerReply = await send(telegramMessage({ chatId: 'chat-1', userId: 'user-1', messageId: '2', text: 'note: slept badly' }));
 
     expect(counter.prompts).toEqual(['clinical-turn']);
@@ -237,10 +224,6 @@ describe('S1 routing: admission replaces the first-contact grant', () => {
   });
 
   it('treats the owner\'s own eight-letter health words as narrative, not as a pairing code', async () => {
-    // The pairing alphabet is 32 symbols wide, so ordinary eight-letter health words satisfy
-    // "eight characters from the alphabet". The router used to test exactly that and answered
-    // "pairing complete" — so these messages were never answered, never recorded and never shown to
-    // the model. Each one below is a real symptom a real owner would type.
     const issued = await admission.issueChallenge();
     if (issued.kind !== 'issued') throw new Error('unreachable');
     await send(telegramMessage({ text: issued.plaintext }));
@@ -255,7 +238,6 @@ describe('S1 routing: admission replaces the first-contact grant', () => {
         text: word,
       }));
 
-      // It must be a real clinical turn, answered by the agent — not a pairing acknowledgement.
       expect(reply).toBe('Here is a clinical answer.');
       expect(reply).not.toMatch(/pairing complete/i);
       expect(counter.prompts).toEqual(['clinical-turn']);
@@ -296,9 +278,6 @@ describe('S1 routing: admission replaces the first-contact grant', () => {
 
     expect(reply).toMatch(/emergency|call|urgent|911|999/i);
     expect(counter.prompts).toEqual([]);
-    // Nothing about an unpaired chat reaches owner content: no transcript, no capture, and the
-    // record is still unpaired. (The `.state` directory itself exists — that is where the owner
-    // RECORD lives, created by setup, and is not evidence of persistence.)
     expect(fs.existsSync(path.join(workspace, '.state', 'sessions'))).toBe(false);
     const read = store.read();
     expect(read.kind === 'available' && read.state.phase).toBe('unpaired');
@@ -326,9 +305,9 @@ describe('S1 routing: admission replaces the first-contact grant', () => {
   });
 });
 
-describe('S1 routing: a group message never gains health state even when text looks clinical', () => {
+describe('a group message never gains health state even when text looks clinical', () => {
   it('refuses before the emergency detector can produce owner content', async () => {
-    const root = makeTestTemp('socs-s1-group');
+    const root = makeTestTemp('group');
     try {
       const { config, workspace } = ownerConfig(root);
       const paths = resolveOwnerPaths(root, asProfileId(OWNER_ID)!);

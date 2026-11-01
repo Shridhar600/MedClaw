@@ -3,12 +3,7 @@ import * as path from 'path';
 import { SessionManager } from '../../src/gateway/session';
 import { makeTestTemp } from '../helpers/test-temp';
 
-// P2b Wave D-1 / D1.2 — recordTurn also writes the append-only day-file archive
-// (<sessionsPath>/YYYY-MM-DD.jsonl, or <sessionsPath>/<chatId>/YYYY-MM-DD.jsonl in per-chat / no-registry
-// mode). Transitional DUAL-WRITE: the legacy active file + in-memory history stay intact (the read-path
-// switch is D1.5, active-write removal is D1.6). This step adds the day-file write + midnight rollover.
-
-describe('session day-file archive (D1.2)', () => {
+describe('session day-file archive', () => {
   let dir: string;
   beforeEach(() => {
     dir = makeTestTemp('sm-day-');
@@ -87,7 +82,7 @@ describe('session day-file archive (D1.2)', () => {
     expect(mode.toString(8)).toBe('600');
   });
 
-  it('D1.6: recordTurn no longer writes the legacy active file (dual-write ended)', async () => {
+  it('recordTurn writes only the day-file archive, never a legacy active file', async () => {
     jest.setSystemTime(new Date('2026-08-26T10:00:00.000Z'));
     const m = new SessionManager({ sessionsPath: dir });
     await m.recordTurn('c1', [{ role: 'user', content: 'hi' }]);
@@ -95,9 +90,8 @@ describe('session day-file archive (D1.2)', () => {
     expect(fs.existsSync(path.join(dir, '2026-08-26.jsonl'))).toBe(true);
   });
 
-  it('DD8: day files are never size-rotated (append-only; anchors stay stable)', async () => {
+  it('day files are never size-rotated (append-only; anchors stay stable)', async () => {
     jest.setSystemTime(new Date('2026-08-26T10:00:00.000Z'));
-    // A tiny rotation threshold would have rotated the old active file; day files must ignore it.
     const m = new SessionManager({ sessionsPath: dir, rotationConfig: { maxSizeBytes: 1, maxArchived: 3 } });
     for (let i = 0; i < 5; i++) {
       await m.recordTurn('c1', [{ role: 'user', content: 'x'.repeat(500) }]);

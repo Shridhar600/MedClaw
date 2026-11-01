@@ -19,14 +19,12 @@ describe('config publication', () => {
     const tmp = path.join(root, `.config.json.tmp-${process.pid}-${now}`);
     jest.spyOn(Date, 'now').mockReturnValue(now);
 
-    // Another file already sits at the temporary name: the write refuses and leaves it alone.
     fs.writeFileSync(tmp, 'unowned collision sentinel', { mode: 0o400 });
     await expect(setConfigValue(fixture.configPath, 'agent.maxIterations', '7')).rejects.toThrow(/configuration is unchanged/);
     expect(fs.readFileSync(fixture.configPath)).toEqual(configBefore);
     expect(fs.readFileSync(tmp, 'utf8')).toBe('unowned collision sentinel');
     fs.rmSync(tmp, { force: true });
 
-    // A failed flush leaves the old bytes and no temporary file behind.
     const stored = readConfigDocument(fixture.configPath, root).stored;
     stored.agent.maxIterations = 7;
     expect(writeConfigDocument(fixture.configPath, stored, { sync: {
@@ -35,7 +33,6 @@ describe('config publication', () => {
     expect(fs.readFileSync(fixture.configPath)).toEqual(configBefore);
     expect(fs.existsSync(tmp)).toBe(false);
 
-    // The next write succeeds with owner-only permissions.
     expect(await setConfigValue(fixture.configPath, 'agent.maxIterations', '8')).toContain('Restart the daemon');
     expect(readConfigDocument(fixture.configPath, root).stored.agent.maxIterations).toBe(8);
     expect(fs.statSync(fixture.configPath).mode & 0o777).toBe(0o600);

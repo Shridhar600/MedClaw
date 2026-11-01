@@ -1,13 +1,3 @@
-// src/recall/engine.ts
-//
-// RecallEngine: the per-turn automatic recall pipeline. Ports-only (no memcore imports; arch:check
-// enforces). Read-only except the stage-4 chunk_stats bump. Stages:
-//   1 ledger    - active clinical facts plus paused facts carrying a pre_pause_summary
-//   2 narrative - hybrid vector + keyword, scored (scoreChunk), thresholded on `raw`, suppressed by
-//                 ledger head status, top-K within budget
-//   3 entity    - deterministic side-effect correlation against active meds, as `CHECK:` lines
-//   4 feedback  - chunk_stats bump plus the <used> tag
-// Every embed call is wrapped in a timeout and degrades to keyword-only.
 
 import type { EmbeddingPort } from '../ports/embedding-port';
 import type { VectorIndex } from '../ports/vector-index';
@@ -31,12 +21,6 @@ export interface RecallConfig {
   finalTopK: number;
   preDecayFloor: number;
   healthLaneBoost: number;
-  /**
-   * The "health" lanes. One set serves three uses (split it if they ever need tuning apart):
-   *   (1) safety-threshold gate: safety_relevant && lane in healthLanes gets the 0.3 threshold;
-   *   (2) post-threshold content-type boost;
-   *   (3) auto-mute exemption (ledger|episode are never muted).
-   */
   healthLanes: string[];
   /** Lanes carrying versioned ledger-fact statements; newer-active suppression is scoped here. */
   ledgerLanes: string[];
@@ -74,12 +58,6 @@ export interface RecallDeps {
   chunkStats: ChunkStatsWriter;
   clock: Clock;
   config: RecallConfig;
-  /**
-   * The owner's current facts (active + paused), read from the ledger itself — the source of truth.
-   * Stages 1 and 3 use it so a lagging mirror can never misstate what is current. `damagedFiles`
-   * names ledger files that could not be fully read; they are flagged in context, never hidden.
-   * `src/recall/` is ports-only, so the composition root supplies this from the ledger store.
-   */
   currentFacts: () => Promise<CurrentFacts>;
 }
 
@@ -135,8 +113,6 @@ interface Stage2Result {
   indexStatus: IndexStatus;
 }
 
-// Mirror of src/memcore AUTHORITY_RANK (kept local — the engine is ports-only, cannot import the
-// memcore value). Keep in sync with src/memcore/types.ts if the ladder changes.
 const AUTHORITY_RANK: Record<string, number> = {
   doctor: 5, lab: 5, report: 4, sensor: 3, user: 2, inference: 1,
 };
@@ -168,18 +144,10 @@ function matchEntities(content: string, heads: FactRecord[]): FactRecord[] {
   });
 }
 
-/**
- * True when `content` mentions an entity whose current head is terminal
- * (retracted/discontinued/superseded). Exported so `memory_search`'s `status:active` filter applies
- * the identical rule as the Stage-2 stale-drop ({@link RecallEngine.isSuppressed}).
- * `heads` = `factMirror.queryEntityHeads()`.
- */
 export function chunkHasStaleEntity(content: string, heads: FactRecord[]): boolean {
   return matchEntities(content, heads).some(h => STALE_STATUSES.has(h.status));
 }
 
-// Stage-1 ledger fill priority when the budget is tight: safety rows first, then a clinical
-// ordering, so a critical allergy is never silently evicted by arbitrary order.
 const LEDGER_TYPE_PRIORITY: Record<string, number> = {
   allergy: 0, medication: 1, condition: 2, symptom: 3, appointment: 4, metric: 5, goal: 6,
 };
@@ -206,11 +174,6 @@ function normalizeMessageWords(s: string): Set<string> {
   return new Set(s.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).map(singular));
 }
 
-/**
- * Deterministic side-effect to symptom match: the side effect's head word plus at least one
- * qualifier word must appear in the message (single-word effects match on the head alone). This
- * matches "genital-yeast-infection" to "yeast infections" without matching "uti"/"dehydration".
- */
 function sideEffectMatches(sideEffect: string, msgWords: Set<string>): boolean {
   const words = sideEffect.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).map(singular);
   if (words.length === 0) return false;
@@ -276,9 +239,6 @@ export class RecallEngine {
   constructor(private deps: RecallDeps) {}
 
   async run(input: RecallInput, opts?: { narrative?: boolean }): Promise<RecallReport> {
-    // narrative:false (heartbeat/dream/subagent modes that render no narrative hits) runs the ledger
-    // stage only: no embed, no Stage-2/3, no bumpInjected. This avoids poisoning auto-mute with
-    // injected_count bumps for chunks that were never shown, and skips the embed budget.
     const includeNarrative = opts?.narrative ?? true;
     const current = await this.readCurrentFacts();
     const stage1 = this.stage1Ledger(current);
@@ -286,8 +246,6 @@ export class RecallEngine {
       ? await this.stage2Narrative(input)
       : { text: '', tokens: 0, hits: [], injectedChunkIds: [], indexStatus: 'full' };
     const stage3 = includeNarrative && current ? this.stage3Entity(input, current.facts) : '';
-    // Stage 4a: record that these chunks were injected (used_count bumped later via recordUsage
-    // when the model reports the <used> tag). Mirror-connection bookkeeping — never blocks the turn.
     if (stage2.injectedChunkIds.length > 0) {
       try {
         await this.deps.chunkStats.bumpInjected(stage2.injectedChunkIds);
@@ -308,10 +266,6 @@ export class RecallEngine {
     };
   }
 
-  /**
-   * Stage 4b: record that the model used these recall chunks this turn (from the stripped `<used>`
-   * tag; the AgentLoop parses it via {@link parseUsedTag}). Best-effort; never throws.
-   */
   async recordUsage(chunkIds: string[], at: string, injectedChunkIds?: readonly string[]): Promise<void> {
     const injected = injectedChunkIds === undefined ? undefined : new Set(injectedChunkIds);
     const accepted = [...new Set(chunkIds)].filter(id => injected === undefined || injected.has(id));
@@ -322,8 +276,6 @@ export class RecallEngine {
       console.warn('[recall] recordUsage failed:', summarizeErrorForLog(e));
     }
   }
-
-  // ---- Stage 1: active ledger + paused-with-summary --------------------------------------
 
   /** One ledger read per turn, shared by Stages 1 and 3. `null` means the ledger could not be read. */
   private async readCurrentFacts(): Promise<CurrentFacts | null> {
@@ -352,8 +304,6 @@ export class RecallEngine {
       const group = byEntity.get(key);
       if (group) group.push(f); else byEntity.set(key, [f]);
     }
-    // Priority order so a tight budget never silently evicts a safety row: safety/allergy first,
-    // then the clinical ordering, stable tiebreak by entity.
     const activeGroups = [...byEntity.values()].sort((a, b) =>
       ledgerRank(a[0]) - ledgerRank(b[0]) || a[0].entity.localeCompare(b[0].entity));
     const lines: string[] = [...warnings, ...activeGroups.map((group) => {
@@ -364,8 +314,6 @@ export class RecallEngine {
         .join(' | ');
       return `- CONFLICT: multiple active ${group[0].type} records for ${group[0].entity} — ${values}`;
     })];
-    // Paused facts that carry a pre_pause_summary; skip entities that already have an active head
-    // (active wins, no double-render).
     for (const f of current.facts) {
       if (f.status !== 'paused' || !config.ledgerTypes.includes(f.type)) continue;
       if (byEntity.has(`${f.type}::${f.entity}`)) continue;
@@ -396,8 +344,6 @@ export class RecallEngine {
     return { text, tokens: estimateTokens(text), truncated };
   }
 
-  // ---- Stage 2: hybrid narrative recall --------------------------------------------------
-
   private async stage2Narrative(input: RecallInput): Promise<Stage2Result> {
     const { config, clock } = this.deps;
     try {
@@ -407,8 +353,6 @@ export class RecallEngine {
       }
       const headRead = await this.loadEntityHeads();
       if (!headRead.available) {
-        // Head status is the safety filter. An unavailable mirror is not an empty mirror:
-        // suppress every candidate rather than allowing stale clinical narrative through.
         return { text: '', tokens: 0, hits: [], injectedChunkIds: [], indexStatus: 'failed' };
       }
       const heads = headRead.heads;
@@ -421,20 +365,12 @@ export class RecallEngine {
 
         const safetyRelevant = matched.some(m => m.safetyRelevant);
 
-        // On keyword-only degrade there is no cosine, so the keyword score stands in for the
-        // semantic signal; otherwise a bm25-only chunk caps at raw 0.3 and can never clear the 0.5
-        // threshold, and degrade would return nothing.
         const effectiveCosine = indexStatus === 'keyword-only' ? c.bm25n : c.cosine;
         const base = 0.7 * effectiveCosine + 0.3 * c.bm25n;
-        // Pre-decay floor: safety_relevant chunks are exempt so safety facts stay surface-able.
-        // The floor must not run before this carve-out.
         if (!safetyRelevant && base < config.preDecayFloor) continue;
 
         const inHealthLane = config.healthLanes.includes(c.lane);
 
-        // Auto-mute: a chunk injected far more than used is noise, so drop it, except safety_relevant
-        // chunks or ledger|episode lanes, which are never muted. The stat read is best-effort: a
-        // corrupt stats row must degrade to no-mute, never sink the turn.
         if (!safetyRelevant && !inHealthLane) {
           let stat = null;
           try {
@@ -455,8 +391,6 @@ export class RecallEngine {
         const threshold = safetyRelevant && inHealthLane ? config.safetyThreshold : config.scoreThreshold;
         if (raw < threshold) continue;
 
-        // Content-type bias is a post-threshold ranking multiplier: it cannot smuggle a sub-threshold
-        // chunk in; it only reorders survivors so health outranks rants.
         const boosted = inHealthLane ? ranking * config.healthLaneBoost : ranking;
         scored.push({ id: c.id, raw, ranking: boosted, lane: c.lane, content: c.content, safetyRelevant });
       }
@@ -472,22 +406,15 @@ export class RecallEngine {
     }
   }
 
-  /**
-   * Hybrid gather: embed (timeout-guarded), then vector KNN plus keyword match, merged by chunk id.
-   * Each arm is isolated so one arm's failure never discards the other's candidates. Status is
-   * 'failed' only when both arms are down and 'keyword-only' when the vector arm is unavailable.
-   */
   private async gatherCandidates(userMessage: string): Promise<{ candidates: Map<string, Candidate>; indexStatus: IndexStatus }> {
     const { config } = this.deps;
     const candidates = new Map<string, Candidate>();
-
-    // --- vector arm: embed (timeout-guarded); empty or failed embedding means vec unavailable ---
     let embedding: number[] | null = null;
     try {
       const vecs = await this.embedWithTimeout(userMessage);
       const v = vecs[0];
       if (v && v.length > 0) embedding = v;
-      else console.warn('[recall] empty embedding → keyword-only (specs/13 B3)');
+      else console.warn('[recall] empty embedding → keyword-only');
     } catch (e) {
       // An embed throw or 500ms timeout degrades to keyword-only.
       console.warn('[recall] embed failed → keyword-only:', summarizeErrorForLog(e));
@@ -507,8 +434,6 @@ export class RecallEngine {
         console.warn('[recall] vector query failed:', summarizeErrorForLog(e)); // keep the keyword arm
       }
     }
-
-    // --- keyword arm: independent try so a throw here preserves already-gathered vec candidates ---
     let keywordAvailable = false;
     try {
       for await (const h of this.deps.keywordIndex.match(userMessage, config.topKKeyword)) {
@@ -545,8 +470,6 @@ export class RecallEngine {
       for await (const h of this.deps.factMirror.queryEntityHeads()) heads.push(h);
       return { heads, available: true };
     } catch (e) {
-      // No heads is not an empty working mirror. A safety filter that cannot read its source
-      // must fail closed for this turn.
       console.warn('[recall] entity-heads load failed:', summarizeErrorForLog(e));
       return { heads: [], available: false };
     }
@@ -557,9 +480,6 @@ export class RecallEngine {
     const isLedgerLane = config.ledgerLanes.includes(chunk.lane);
     for (const m of matched) {
       if (STALE_STATUSES.has(m.status)) return true; // stale head status fails closed, all lanes
-      // Newer-active version suppression is scoped to ledger-fact chunks: a narrative adverse-event
-      // mention of an active med must not be dropped by a later dose update. Compared at day
-      // granularity so sub-day serialization drift can't flip the boundary.
       if (m.status === 'active' && isLedgerLane) {
         const headDay = RecallEngine.dayOf(m.createdAt);
         if (headDay !== null && chunkDay !== null && headDay > chunkDay) return true;
@@ -605,11 +525,6 @@ export class RecallEngine {
     return { kept, text, tokens: estimateTokens(text) };
   }
 
-  // ---- Stage 3: deterministic side-effect correlation ------------------------------------
-  //
-  // Data-driven from active meds' known_side_effects (no embeddings, no LLM). Surfaces a CHECK:
-  // line phrased as a possibility, never an alarm. Findings are context-only here.
-
   private stage3Entity(input: RecallInput, facts: FactRecord[]): string {
     const { clock, config } = this.deps;
     try {
@@ -621,8 +536,6 @@ export class RecallEngine {
         const sideEffects = med.fields['known_side_effects'];
         if (!Array.isArray(sideEffects)) continue;
         const started = typeof med.fields['started'] === 'string' ? (med.fields['started'] as string) : '';
-        // Only recent (90d) meds correlate: a long-standing med would fire CHECK on every mention and
-        // erode signal. Fail-open for undated/unparseable starts.
         if (!RecallEngine.isRecentMed(started, now, config.recentMedDays)) continue;
         for (const se of sideEffects) {
           if (typeof se !== 'string') continue;

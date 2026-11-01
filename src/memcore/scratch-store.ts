@@ -1,14 +1,3 @@
-// src/memcore/scratch-store.ts
-//
-// The agent's ephemeral notebook: freeform notes at `scratch/<id>.md` that self-destruct after a TTL (default
-// 30d). Notes are search-only and never auto-injected; before anything is promoted to durable memory it must
-// pass `scanForPromotion`:
-//   - credential branch reuses `contentContainsCredentials` from src/security;
-//   - injection branch uses the local `INJECTION_PATTERNS` const below, as defense-in-depth (a second net, not a
-//     substitute).
-//
-// The TTL sweep is driven entirely by the injected clock, never wall time, so tests advance a `mutableClock`
-// fixture instead of waiting. A corrupt scratch file is skipped with a sanitized warning and never deleted.
 
 import * as fs from 'fs';
 import type { Clock, IdGen } from '../ports';
@@ -35,13 +24,6 @@ export interface PromotionScanResult {
   pattern?: string;
 }
 
-/**
- * Prompt-injection patterns checked before scratch content is promoted to
- * durable memory. Defense-in-depth: the security module owns credential
- * detection; these catch instruction-override / role-smuggling language that
- * credentials scanning would never see. Blocking is the safe direction — a
- * false positive surfaces the note for the user instead of risking a prompt.
- */
 export const INJECTION_PATTERNS: RegExp[] = [
   // Direct instruction-override ("Ignore previous instructions…").
   /ignore\s+(?:all\s+|any\s+|your\s+)*(?:previous|prior|above|earlier)\s+(?:instructions|messages|prompts?|context|commands|rules)/i,
@@ -127,11 +109,6 @@ export class ScratchStore {
     return notes;
   }
 
-  /**
-   * Delete every note older than the TTL, judged by the INJECTED clock.
-   * Returns the number removed. Corrupt files are never deleted — they are
-   * skipped with a warning (unreadable data is preserved, not destroyed).
-   */
   async sweep(): Promise<number> {
     const now = this.clock.now().getTime();
     let removed = 0;
@@ -152,10 +129,6 @@ export class ScratchStore {
     return removed;
   }
 
-  /**
-   * Safety scan run before any scratch content is promoted to durable memory. Blocks on a credential pattern or a
-   * prompt-injection pattern; returns `{ ok: true }` for clean content. Pure — never mutates the note.
-   */
   scanForPromotion(content: string): PromotionScanResult {
     const cred = contentContainsCredentials(content);
     if (cred.matched) {
@@ -168,8 +141,6 @@ export class ScratchStore {
     }
     return { ok: true };
   }
-
-  // ---- internals ---------------------------------------------------------
 
   private listIds(): string[] {
     let names: string[];

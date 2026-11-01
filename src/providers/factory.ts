@@ -3,10 +3,6 @@ import type { LLMProvider } from './types';
 import { OllamaProvider } from './ollama';
 import { OpenAIProvider } from './openai';
 
-/**
- * Provider construction seam. Callers that own the lifecycle pass a factory in so a real runtime
- * can be built in tests without real providers; the default is the real `createProvider`.
- */
 export type ProviderFactory = (config: ProviderConfig) => LLMProvider;
 
 export function createProvider(config: ProviderConfig): LLMProvider {

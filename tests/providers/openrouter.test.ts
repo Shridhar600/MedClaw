@@ -1,8 +1,3 @@
-// tests/providers/openrouter.test.ts
-// OpenRouter = OpenAI-compatible router added as a first-class provider type.
-// Live-probed 2026-08-24:
-// tools work with mandatory reasoning; reasoning_effort:'none' is REJECTED;
-// reasoning_effort:'low' is valid; usage object comes back on every response.
 import { createProvider } from '../../src/providers/factory';
 import { OpenAIProvider } from '../../src/providers/openai';
 import { providerEnvVar } from '../../src/config/provider-env';
@@ -89,8 +84,6 @@ describe('OpenRouter provider integration', () => {
   });
 
   it("sends an explicit reasoningEffort:'low' even for a name-matched reasoning model", async () => {
-    // Explicit config must beat the gpt-5/o-series name heuristic (#13 workaround
-    // must stay overridable — stealth/ox-alpha REJECTS 'none').
     const provider = createProvider(makeConfig({ model: 'gpt-5.6-luna', reasoningEffort: 'low' }));
     await (provider as OpenAIProvider).chat([{ role: 'user', content: 'hi' }], [
       { type: 'function', function: { name: 't', description: 'd', parameters: { type: 'object', properties: {}, required: [] } } },

@@ -1,18 +1,3 @@
-// tests/gateway/gateway-production-boot.test.ts
-//
-// The production boot, through `startDaemon()` and nothing else.
-//
-// THE INVARIANT: `startDaemon()` with no injected collaborators must produce a Gateway that already
-// holds owner admission. This suite exists because T1–T4 proved the S1 policy only at layers the
-// production launcher never uses — `new GatewayMessageRouter({admission})`, `new Gateway(cfg,{admission})`
-// and `deps.createGateway` injection. Meanwhile `src/index.ts` built `new Gateway(c)` with an empty deps
-// object, so `if (this.admission)` skipped the entire refusal policy on every real boot and a stranger's
-// first DM still auto-paired into the owner's runtime (router.ts `getOrCreateForChat`). A green T3/T4
-// suite proved the policy was correct, not that the daemon applied it.
-//
-// So this suite boots exactly the way `npm start` does and then drives a real inbound stranger message
-// through the real Router and the real admission service. It asserts the owner is unreachable, not that a
-// helper returns the right shape. Telegram is disabled: no network, no live provider, no Bot API.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -25,11 +10,6 @@ import { makeTestTemp, removeTestTemp } from '../helpers/test-temp';
 import { writeConfigFixture } from '../helpers/config-fixture';
 import type { ConfigFixture } from '../helpers/config-fixture';
 
-/**
- * Seed an owner record through the SAME production composition the daemon uses, so a code issued here
- * is on the same clock the daemon will judge it against. Using a separate fixed-clock service would
- * only prove the two disagree about expiry.
- */
 async function seedUnpairedOwner(fixture: ConfigFixture): Promise<string> {
   const authority = composeOwnerAuthority({
     ownerId: fixture.ownerId as never,
@@ -47,7 +27,7 @@ describe('production boot composes owner authority', () => {
   let root: string;
 
   beforeEach(() => {
-    root = makeTestTemp('socs-s1-production-boot');
+    root = makeTestTemp('production-boot');
   });
 
   afterEach(() => {
@@ -57,11 +37,8 @@ describe('production boot composes owner authority', () => {
   it('refuses a stranger DM on a real startDaemon boot, without building the owner runtime', async () => {
     const fixture = writeConfigFixture(root, { telegramEnabled: false });
 
-    // Commit an unpaired owner record the way setup does, then read a code through the real service so
-    // the stranger's reply can be a genuine well-formed submission rather than a malformed string.
     const issuedPlaintext = await seedUnpairedOwner(fixture);
 
-    // Production entry point. No `createGateway`: the Gateway that runs is the one `src/index.ts` builds.
     const handle = await startDaemon({
       services: new InstallationService(new DirectoryLease()),
       homeDir: root,
@@ -71,35 +48,25 @@ describe('production boot composes owner authority', () => {
     try {
       const gateway = handle.gateway;
 
-      // The owner identity comes from ownership acquisition, never from a literal default.
       expect(handle.ownership.ownerId).toBe(fixture.ownerId);
 
-      // Unpaired means pairing-only. If this is false, the boot silently built a clinical runtime and
-      // the whole S1 promise is void.
       expect(gateway.servesPairingOnly).toBe(true);
       expect(gateway.runtimeInstance).toBeUndefined();
       expect(gateway.runtimeManager).toBeUndefined();
 
-      // Nothing clinical exists on disk. `.state` holds exactly the two legitimate artifacts: the
-      // owner RECORD setup committed, and the workspace LEASE this boot holds. No store, no sessions,
-      // no search index, no audit log.
       expect(fs.readdirSync(fixture.workspace)).toEqual(['.state']);
       expect(fs.readdirSync(path.join(fixture.workspace, '.state')).sort()).toEqual([
         'installation.lease',
         'owner-access.json',
       ]);
 
-      // THE behaviour under test: an unbound stranger's ordinary message must be refused by admission,
-      // not auto-paired and answered from the owner's clinical runtime.
       const reply = await gateway.handleTestMessage('stranger-chat', 'What is my blood pressure?', 's1');
       expect(reply).toMatch(/pairing code/i);
       expect(reply).not.toMatch(/blood pressure/i);
 
-      // And a stranger's well-formed code is a pairing attempt, never a clinical turn.
       const paired = await gateway.handleTestMessage('stranger-chat', issuedPlaintext, 's2');
       expect(paired).toMatch(/pairing complete/i);
 
-      // Binding a stranger's chat must still not conjure the owner runtime on this boot.
       expect(gateway.runtimeInstance).toBeUndefined();
       expect(gateway.runtimeManager).toBeUndefined();
       expect(fs.readdirSync(path.join(fixture.workspace, '.state')).sort()).toEqual([
@@ -107,14 +74,13 @@ describe('production boot composes owner authority', () => {
         'owner-access.json',
       ]);
 
-      // No session, no transcript, no capture: a stranger leaves no clinical trace.
       expect(fs.existsSync(path.join(fixture.workspace, '.state', 'sessions'))).toBe(false);
     } finally {
       await handle.shutdown();
     }
   }, 120_000);
 
-  it('C09 default output reports pairing and stop without raw incoming identities', async () => {
+  it('default output reports pairing and stop without raw incoming identities', async () => {
     const fixture = writeConfigFixture(root, { telegramEnabled: false });
     const code = await seedUnpairedOwner(fixture);
     const captured: unknown[][] = [];
@@ -123,13 +89,13 @@ describe('production boot composes owner authority', () => {
     try {
       const handle = await startDaemon({ homeDir: root, configPath: fixture.configPath });
       try {
-        expect(await handle.gateway.handleTestMessage('C09_raw_identity', code, 'C09_event')).toMatch(/pairing complete/i);
+        expect(await handle.gateway.handleTestMessage('raw_identity', code, 'event')).toMatch(/pairing complete/i);
         expect(JSON.parse(fs.readFileSync(fixture.ownerRecord, 'utf8')).phase).toBe('bound');
         expect(handle.gateway.runtimeInstance).toBeUndefined();
       } finally { await handle.shutdown(); }
       expect(fs.existsSync(fixture.workspaceLease)).toBe(false);
       const output = JSON.stringify(captured);
-      expect(output).not.toContain('C09_raw_identity');
+      expect(output).not.toContain('raw_identity');
       expect(output).not.toContain(code);
       expect(output).not.toContain(fixture.ownerRecord);
       expect(output).toContain('[diagnostic] stage=owner-admission outcome=pairing-only');
@@ -139,8 +105,6 @@ describe('production boot composes owner authority', () => {
   }, 120_000);
 
   it('refuses to start at all when the owner record is missing, naming local setup guidance', async () => {
-    // Config selects an owner; no record was ever committed. This is an interrupted setup, and the
-    // daemon must refuse rather than serve as if it were a fresh install.
     const fixture = writeConfigFixture(root, { telegramEnabled: false });
 
     await expect(

@@ -62,11 +62,6 @@ function nearestExistingPath(candidate: string): string {
   }
 }
 
-/**
- * Resolve one or more untrusted path components strictly inside an existing trusted base.
- * Existing path segments are lstat-checked so a pre-existing symlink cannot redirect a PHI path.
- * Missing final components are allowed when their nearest existing parent remains contained.
- */
 export function resolveContainedPath(baseDir: string, ...components: string[]): string {
   if (components.length === 0) throw new PathContainmentError('invalid-component');
   for (const component of components) validateComponent(component);

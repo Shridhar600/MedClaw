@@ -1,8 +1,7 @@
 import type { HeartbeatJob } from './types';
 import { isCronValidationWorkBounded } from '../config';
 
-// `node-cron` ships its matcher as CommonJS-only internal code. Reusing it keeps
-// recovery aligned with the same cron interpretation used by the live scheduler.
+// `node-cron` ships its matcher as CommonJS-only internal code; reusing it keeps recovery aligned.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const TimeMatcher = require('node-cron/src/time-matcher');
 
@@ -25,8 +24,6 @@ export function findMostRecentMissedRun(
     return undefined;
   }
 
-  // A failed startup disable can leave an unsafe record enabled on disk. TimeMatcher
-  // expands before validating too; do not rely on registration to have filtered it.
   if (!isCronValidationWorkBounded(job.cron)) return undefined;
 
   const matcher = new TimeMatcher(job.cron, job.timezone);

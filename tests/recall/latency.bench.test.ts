@@ -2,13 +2,6 @@ import { RecallEngine, DEFAULT_RECALL_CONFIG } from '../../src/recall';
 import type { FactRecord, ChunkWithScore } from '../../src/ports';
 import { FakeFactMirror, currentFactsOf, FakeVectorIndex, FakeKeywordIndex, FakeEmbedding, FakeChunkStats, fixedClock } from './fakes';
 
-// P2 Wave B / Task B3.3 — recall latency bench. Embeddings are MOCKED (instant), so this measures
-// the engine's OWN per-turn compute (hybrid merge + scoreChunk + suppression matching + render)
-// against a large index + many ledger entity heads — a regression guard against an accidental
-// O(n²) blow-up. The B1 p95≤800ms gate WITH LOCAL EMBEDDINGS (PLAT-18) is an integration concern
-// needing a live Ollama (deferred with the instrumentation program); P0 already proved 52ms raw KNN
-// over 5K chunks. This bench keeps the pure path far under the 800ms budget.
-
 const P95_BUDGET_MS = 800;
 
 function bigChunks(n: number): ChunkWithScore[] {

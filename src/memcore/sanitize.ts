@@ -1,6 +1,3 @@
-// Central single-line sanitizer for every Markdown render boundary that embeds caller- or
-// model-controlled text. Newlines could otherwise open a new heading or forge field lines on
-// re-parse, and a leading '#' could turn an embedded value into a heading.
 /** Collapse CR/LF/TAB runs to single spaces, strip leading '#' markers, trim. */
 export function sanitizeSingleLine(text: string): string {
   return text
@@ -9,12 +6,6 @@ export function sanitizeSingleLine(text: string): string {
     .trim();
 }
 
-/**
- * Return the one canonical representation accepted for an entity or ledger reference.
- * Spaces and case remain meaningful for compatibility with existing records; only the
- * surrounding whitespace is normalized. Markdown heading/control characters are rejected
- * so the value cannot change the line-oriented ledger structure after rendering.
- */
 export function normalizeEntitySlug(value: unknown): string | null {
   if (typeof value !== 'string') return null;
   const normalized = value.trim();

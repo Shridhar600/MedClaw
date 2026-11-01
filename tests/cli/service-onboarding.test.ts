@@ -300,7 +300,7 @@ describe('service onboarding', () => {
     },
   );
 
-  it.each([undefined, '', '   ', '--yes'])('refuses a malformed --medical-api-key value (%p) before any prompt or write', async (value) => {
+  it.each([undefined, '', '   ', '--yes'])('refuses a malformed --medical-api-key value before any prompt or write', async (value) => {
     const target = path.join(tmpDir, 'refused-option', 'config.json');
     const output: string[] = [];
     const inventory = fs.readdirSync(tmpDir);

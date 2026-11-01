@@ -93,16 +93,14 @@ export class ToolRegistry {
       return await tool.execute(params, context);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      // Tool error messages can echo PHI (tool args carry health content) — log
-      // the tool name + sanitized frame only. The full error text is returned
-      // to the agent (persisted into the 0600 session JSONL, not stdout/stderr).
+      // Tool errors can echo PHI; log the tool name and sanitized frame only.
       console.error(`[tool:${name}] Error:`, summarizeErrorForLog(e));
       return { content: [{ type: 'text', text: `Tool error: ${msg}` }], isError: true };
     }
   }
 
   private ownerOnlyRefused(tool: Tool, origin: ToolExecutionContext['origin']): boolean {
-    return tool.ownerTurnOnly === true && origin !== undefined && origin !== 'user';
+    return tool.ownerTurnOnly === true && origin !== 'user';
   }
 
   private isAllowed(tool: Tool): boolean {

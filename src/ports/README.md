@@ -6,7 +6,7 @@ concretes — so the memory core stays liftable and test-fakeable.
 
 **Public API (index.ts):**
 - Interfaces: `VectorIndex`, `KeywordIndex`, `FactMirror`, `EventSink`, `EmbeddingPort`,
-  `BlobStore`, `KVCache`, `Clock`, `IdGen` (+ their record/stat types).
+  `Clock`, `IdGen` (+ their record/stat types).
 - Owner/media seams: `OwnerStatePort` (its `replace` returns the typed `OwnerStateWriteResult`),
   `PairingCodePort`, `TransportIdentity`, `AdmissionDecision`, `AdmissionReason`, `PairingResult`,
   `MediaSourcePort`, `MediaReference`, `OpenedMedia`, `MediaStageResult`, `MediaStageReason`,

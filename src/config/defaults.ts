@@ -1,28 +1,8 @@
 import { BUILT_IN_EMERGENCY_KEYWORDS } from '../safety/emergency-detector';
 import { CONFIG_SCHEMA_VERSION, type StoredConfig } from './types';
 
-/**
- * The known local Ollama endpoint, as a single authority.
- *
- * The decoder compares a cloud role's `baseUrl` against exactly this string to refuse the
- * mistake of a cloud role inheriting the local endpoint, which only works if there is one value
- * to compare against.
- *
- * Declared before `DEFAULT_STORED_CONFIG`, which reads it at module evaluation time.
- */
 export const LOCAL_OLLAMA_BASE_URL = 'http://localhost:11434/v1';
 
-/**
- * Stored defaults for `schemaVersion: 2`.
- *
- * Two properties matter here:
- *  - No derived owner path appears. `memory.workspace`, `heartbeat.storePath` and
- *    `heartbeat.audit.path` are derived by `resolveOwnerPaths` and injected by
- *    `resolveEffectiveConfig`, so the persisted document has exactly one path authority.
- *  - `profiles.baseDir` is stored in `~/` form rather than frozen against `os.homedir()`
- *    at import time, so a test or a changed HOME cannot silently receive a stale root.
- *    The decoder expands it with an explicit home directory.
- */
 export const DEFAULT_STORED_CONFIG: StoredConfig = Object.freeze({
   schemaVersion: CONFIG_SCHEMA_VERSION,
   providers: {
@@ -44,9 +24,6 @@ export const DEFAULT_STORED_CONFIG: StoredConfig = Object.freeze({
   },
   channels: {
     telegram: {
-      // Disabled by default so the shipped defaults are themselves a decodable document.
-      // Setup enables it together with a bot token; a disabled channel is the truthful
-      // "configured, pairing-pending" state, not a working owner conversation.
       enabled: false,
       botToken: '',
     },
@@ -63,11 +40,8 @@ export const DEFAULT_STORED_CONFIG: StoredConfig = Object.freeze({
     budgetRatios: { health: 0.6, life: 0.2, agent: 0.2 },
   },
   sessions: {
-    softResetAfterMinutes: 240,
-    hardResetAfterMinutes: 1440,
     compaction: {
       enabled: true,
-      triggerAtTokenPercent: 80,
       memoryFlush: true,
       keepRecentTurns: 10,
     },
@@ -118,7 +92,6 @@ export const DEFAULT_STORED_CONFIG: StoredConfig = Object.freeze({
   },
   agent: {
     maxIterations: 15,
-    disclaimerEnabled: true,
   },
   emergency: {
     keywords: [...BUILT_IN_EMERGENCY_KEYWORDS],
@@ -136,10 +109,6 @@ export function cloneStoredDefaults(): StoredConfig {
   return structuredClone(DEFAULT_STORED_CONFIG);
 }
 
-/**
- * Single authority for the session-window triggers. `src/gateway/session.ts` reads these
- * instead of repeating the numbers inline, so they cannot disagree with the config module.
- */
 export const DEFAULT_SESSION_WINDOW = DEFAULT_STORED_CONFIG.sessions.window as NonNullable<
   StoredConfig['sessions']['window']
 >;

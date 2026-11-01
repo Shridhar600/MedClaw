@@ -1,14 +1,3 @@
-// src/memcore/transcript-sweep.ts
-//
-// Deterministic nightly transcript sweep (no LLM).
-// Diff yesterday's session JSONL against yesterday's ledger writes: any entity-ish mention in a
-// user chat turn that had no same-day ledger event and no existing curiosity item becomes a
-// `missing-data` curiosity question ("Did I miss logging X yesterday?"). Capture misses become
-// questions, not silent loss.
-//
-// Pure: no I/O, no clock, no randomness. The scheduler job supplies the day-file lines,
-// yesterday's ledger entities, and the current unresolved curiosity items, then persists the
-// bounded result.
 
 import type { AddCuriosityInput } from './curiosity-queue';
 import type { CuriosityItem } from './types';
@@ -55,8 +44,6 @@ export const DEFAULT_SWEEP_LEXICON: SweepLexicon = {
 
 const DEFAULT_MAX_ITEMS = 5;
 
-// A dose "number+unit" pattern. Longer units are listed first so alternation prefers them; the
-// dose entity strips inner whitespace ("500 mg" -> "500mg") so both spellings collapse to one.
 const DOSE_RE = /\b(\d+(?:\.\d+)?)\s?(mcg|mg|ml|iu|units?|tablets?|pills?|puffs?|g)\b/gi;
 
 /** Lowercase, trim and collapse internal whitespace. Applied to both mentions and ledger entities. */
@@ -78,8 +65,6 @@ interface Mention {
   pos: number;
 }
 
-// Only a medication-lexicon hit is critical. A bare dose ("500 mg") with no medication context is a
-// real capture miss but non-critical.
 function isCritical(category: Category): boolean {
   return category === 'med';
 }
@@ -93,8 +78,6 @@ function escapeRe(term: string): string {
   return term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// Extract keyword + dose mentions from one user-turn's content, in text order. A dose is only
-// mined when the turn has NO med keyword (otherwise it is reinforcement of that med, not a new miss).
 function extractTurnMentions(content: string, lexicon: SweepLexicon, turn: number): Mention[] {
   const found: Mention[] = [];
   const categories: Array<[Category, string[]]> = [
@@ -123,9 +106,6 @@ function extractTurnMentions(content: string, lexicon: SweepLexicon, turn: numbe
   return found;
 }
 
-// A user turn qualifies for mining only when it is a real chat turn: role 'user', origin 'chat'
-// (the default when the field is absent), and not a daemon heartbeat prompt (its first physical
-// line is the literal `[Heartbeat Trigger]` marker).
 function userChatContent(line: string): string | null {
   let entry: { role?: unknown; content?: unknown; origin?: unknown };
   try {
@@ -134,8 +114,6 @@ function userChatContent(line: string): string | null {
     return null; // malformed line — skip, never throw (resilience)
   }
   if (entry.role !== 'user') return null;
-  // Trust an explicit persisted origin. Only fall back to the `[Heartbeat Trigger]` marker for
-  // entries that carry no origin, so a genuine chat turn that starts with that text is still mined.
   const hasOrigin = typeof entry.origin === 'string';
   const origin = hasOrigin ? (entry.origin as string) : 'chat';
   if (origin !== 'chat') return null;

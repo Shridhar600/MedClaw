@@ -2,10 +2,6 @@ import { ProfileRuntimeManager } from '../../src/gateway/manager';
 import type { ProfileRuntime } from '../../src/gateway/runtime';
 import type { ProfileId } from '../../src/profiles/types';
 
-// RR-STRUCT R-S5a (mini-plan v3 §3.3, Finding-7): pure unit tests for the manager's orchestration
-// contract in isolation from Gateway/ProfileRuntime construction — single-flight, rejection-evict,
-// buildAll individual-guarding, and drainAndCloseAll's drain-in-flight + idempotency semantics.
-
 function fakeRuntime(profileId: string, overrides: Partial<ProfileRuntime> = {}): ProfileRuntime {
   return {
     profileId: profileId as ProfileId,
@@ -21,9 +17,9 @@ function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void; reject: 
   return { promise, resolve, reject };
 }
 
-describe('ProfileRuntimeManager (RR-STRUCT R-S5a, mini-plan v3 §3.3)', () => {
-  describe('single-flight get()', () => {
-    it('concurrent get(id) calls yield ONE build (buildRuntimeFor called exactly once)', async () => {
+describe('ProfileRuntimeManager', () => {
+  describe('single-flight get', () => {
+    it('concurrent get calls yield ONE build (buildRuntimeFor called exactly once)', async () => {
       const runtime = fakeRuntime('default');
       const buildRuntimeFor = jest.fn().mockImplementation(
         () => new Promise((resolve) => setTimeout(() => resolve(runtime), 5)),
@@ -58,8 +54,8 @@ describe('ProfileRuntimeManager (RR-STRUCT R-S5a, mini-plan v3 §3.3)', () => {
     });
   });
 
-  describe('rejection-evict (Finding-7a)', () => {
-    it('a build that rejects evicts its promise so the NEXT get() retries a fresh build', async () => {
+  describe('rejection-evict', () => {
+    it('a build that rejects evicts its promise so the NEXT get retries a fresh build', async () => {
       const runtime = fakeRuntime('default');
       const buildRuntimeFor = jest.fn()
         .mockRejectedValueOnce(new Error('transient boot failure'))
@@ -118,7 +114,7 @@ describe('ProfileRuntimeManager (RR-STRUCT R-S5a, mini-plan v3 §3.3)', () => {
     });
   });
 
-  describe('all() — currently-built snapshot', () => {
+  describe('all — currently-built snapshot', () => {
     it('excludes in-flight and failed builds; includes only resolved runtimes', async () => {
       const runtime = fakeRuntime('resolved');
       const pending = deferred<ProfileRuntime>();
@@ -137,7 +133,7 @@ describe('ProfileRuntimeManager (RR-STRUCT R-S5a, mini-plan v3 §3.3)', () => {
     });
   });
 
-  describe('drainAndCloseAll (Finding-7b, v3 §3.9)', () => {
+  describe('drainAndCloseAll', () => {
     it('closes every resolved runtime exactly once', async () => {
       const runtimeA = fakeRuntime('a');
       const runtimeB = fakeRuntime('b');
@@ -161,7 +157,6 @@ describe('ProfileRuntimeManager (RR-STRUCT R-S5a, mini-plan v3 §3.3)', () => {
       const getPromise = manager.get('slow' as ProfileId); // still in flight
       const drainPromise = manager.drainAndCloseAll(); // races the in-flight build
 
-      // The build finishes AFTER drainAndCloseAll has started.
       await new Promise((r) => setTimeout(r, 5));
       expect(runtime.drainAndClose).not.toHaveBeenCalled();
       gate.resolve(runtime);

@@ -1,20 +1,3 @@
-// src/indexstore/session-index.ts
-//
-// SessionIndex adapter over SQLite FTS5: verbatim `session_search` over the append-only day-file
-// archive. Pruning replaces in-window tool results with a marker, and the verbatim original is
-// always retrievable here.
-//
-// Like `SqliteKeywordIndex`, it opens its own better-sqlite3 connection to the per-profile
-// search.db (WAL + explicit busy_timeout) and imports better-sqlite3 directly, never a gateway
-// module. It owns its own `session_turns` (metadata) and `session_turns_fts` (content) tables.
-//
-// Per-chat isolation: every row carries a `chat_id` and the primary key is `<chatId>#<file>#<line>`,
-// so two chats sharing a day-file basename never collide and `search` filters by chat. In a per-chat
-// layout the directory component is authoritative; a flat archive falls back to the JSONL field.
-//
-// The FTS5 table is plain contentful (not external-content) because the content lives in JSONL on
-// disk. Anchors are the day-file `{file, line}` (physical non-empty line numbers), the same ones the
-// SessionManager append path assigns, so a rebuilt row resolves to the exact JSONL line.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -23,10 +6,6 @@ import { summarizeErrorForLog, tightenFile } from '../security';
 
 export interface SqliteSessionIndexConfig {
   dbPath: string;
-  /**
-   * The day-file archive root. Enables rebuild-from-disk on empty, corrupt or dirty-marked state.
-   * When omitted, incremental indexing still works but the index cannot self-heal.
-   */
   sessionsDir?: string;
 }
 
@@ -84,16 +63,9 @@ export class SqliteSessionIndex {
     this.db.pragma('busy_timeout = 5000');
     this.sessionsDir = config.sessionsDir;
     this.initSchema();
-    // better-sqlite3 creates search.db and its -wal/-shm siblings 0644 (world-readable PHI).
-    // Tighten all three to 0600 after the schema exists. Warn and continue; never crash.
     this.hardenDbFiles();
-    // Rebuild from disk when the archive is present and the index is untrustworthy: empty, a
-    // durable dirty marker from a swallowed incremental failure, or FTS/metadata parity broken.
-    // Never throws out of the constructor.
     try {
       if (this.sessionsDir && (this.isEmpty() || this.dirtyMarkerExists() || this.ftsParityBroken())) {
-        // Batches below intentionally bound transaction and allocation size. Set the durable marker
-        // before dropping derived rows so a crash at any point cannot look healthy on the next boot.
         this.markDirty();
         this.resetDerivedTables();
         if (this.rebuildFromDayFiles()) this.clearDirtyMarker();
@@ -108,11 +80,6 @@ export class SqliteSessionIndex {
     this.db.transaction(() => this.writeTurn(chatId, file, line, role, ts, content))();
   }
 
-  /**
-   * Durably record that an incremental index write was lost, so the next construction rebuilds from
-   * the archive even though the db is non-empty. Best effort: a marker-write failure only forgoes
-   * the durable reconcile and never crashes the turn.
-   */
   markDirty(): void {
     try {
       fs.writeFileSync(this.dirtyMarkerPath, new Date().toISOString());
@@ -122,12 +89,6 @@ export class SqliteSessionIndex {
     }
   }
 
-  /**
-   * Verbatim search over one chat's archive. Exact phrase first (all tokens, adjacent), then an
-   * OR-joined fallback for recall, ordered by recency. `chatId` scopes the result to that chat
-   * (omit only for maintenance/tests). Never throws: a corrupt or dropped derived table is reset,
-   * rebuilt from disk and retried once; any residual error degrades to an empty `failed` result.
-   */
   search(query: string, opts?: { chatId?: string; limit?: number }): SessionSearchResult {
     const limit = opts?.limit && opts.limit > 0 ? opts.limit : DEFAULT_LIMIT;
     try {
@@ -135,8 +96,6 @@ export class SqliteSessionIndex {
     } catch (e) {
       if (this.sessionsDir && SqliteSessionIndex.isCorruptionError(e)) {
         try {
-          // A dropped or damaged derived table is not repaired by an upsert: reset both tables,
-          // then rebuild the whole archive before retrying.
           this.resetDerivedTables();
           const complete = this.rebuildFromDayFiles();
           if (complete) this.clearDirtyMarker();
@@ -151,13 +110,6 @@ export class SqliteSessionIndex {
     }
   }
 
-  /**
-   * Re-index every day file under `sessionsDir` in bounded batches. A durable dirty marker covers
-   * crashes or unreadable files, so an incomplete rebuild cannot look healthy on the next boot. Line
-   * numbers remain physical non-empty positions and the archive stays the source of truth. In a
-   * per-chat layout the containing directory supplies the chat scope; a flat file falls back to the
-   * embedded chatId. Idempotent via the `<chatId>#<file>#<line>` upsert.
-   */
   rebuildFromDayFiles(sessionsDir?: string): boolean {
     const root = sessionsDir ?? this.sessionsDir;
     if (!root) return true;
@@ -190,8 +142,6 @@ export class SqliteSessionIndex {
         if (typeof content !== 'string' || content.length === 0) return; // nothing textual to index
         const role = typeof entry.role === 'string' ? entry.role : '';
         const ts = typeof entry.timestamp === 'string' ? entry.timestamp : '';
-        // A per-chat directory is the trust boundary: never let a JSONL field reassign a line to a
-        // different chat. Flat archives have no directory scope, so use their embedded field.
         const chatId = subdir || (typeof entry.chatId === 'string' && entry.chatId.length > 0
           ? entry.chatId
           : undefined);
@@ -229,8 +179,6 @@ export class SqliteSessionIndex {
       console.warn('[session-index] close failed:', summarizeErrorForLog(e));
     }
   }
-
-  // ---- internals ---------------------------------------------------------
 
   private runSearch(query: string, limit: number, chatId?: string): SessionHit[] {
     const tokens = query.match(/[\p{L}\p{N}]+/gu) ?? [];
@@ -292,8 +240,6 @@ export class SqliteSessionIndex {
     this.initSchema();
   }
 
-  // Metadata and derived FTS must have the same ids in both directions. Counts catch a lost row;
-  // the anti-joins catch an orphan FTS row with equal counts.
   private ftsParityBroken(): boolean {
     try {
       const meta = (this.db.prepare('SELECT COUNT(*) AS c FROM session_turns').get() as { c: number }).c;
@@ -340,8 +286,6 @@ export class SqliteSessionIndex {
     }
   }
 
-  // The immediate subdirectory of `root` a day file sits in (per-chat layout), or '' when the file
-  // is flat under root. Used only as a fallback when a JSONL entry lacks a chatId field.
   private static subdirChatId(root: string, fp: string): string {
     const rel = path.relative(root, fp);
     const parts = rel.split(path.sep);

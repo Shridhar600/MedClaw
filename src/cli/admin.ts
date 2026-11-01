@@ -26,10 +26,6 @@ export interface AdminPaths {
   configPath?: string;
   workspacePath?: string;
   storePath?: string;
-  /**
-   * Optional override for the owner-record store. Production leaves it undefined and gets the real file
-   * adapter; a caller that must observe an unconfirmed publication supplies its own store.
-   */
   ownerStore?: OwnerStateStoreFactory;
 }
 
@@ -100,17 +96,6 @@ export async function showConfig(paths: AdminPaths = {}): Promise<string> {
   return showRedactedConfigSummary(effectiveConfigFor(stored));
 }
 
-/**
- * Change one declared non-identity setting, offline.
- *
- * Refusals keep the original bytes byte-for-byte intact:
- *  - the path selects identity or is derived → refused before any read-modify-write;
- *  - the resulting document would not decode → refused before any write;
- *  - the replacement did not reach the filesystem → `failed`, original bytes preserved.
- *
- * When the rename committed but a durability step failed, the outcome is `uncertain`: the message says the
- * current content is not proven and must be inspected, and nothing is restored.
- */
 export async function setConfigValue(
   configPath: string,
   dottedPath: string,
@@ -127,8 +112,6 @@ export async function setConfigValue(
     );
   }
 
-  // Coordinate on the canonical CONFIG resource, not on any mutable profile identity. Two
-  // supported contenders cannot both report success: the loser is refused immediately.
   const leases = options.leases ?? new DirectoryLease();
   const { canonicalPath: canonicalForLease } = canonicalizeConfigPath(configPath);
   const configLease = await leases.tryAcquire({ kind: 'config', canonicalPath: canonicalForLease });
@@ -151,10 +134,6 @@ export async function setConfigValue(
   }
 }
 
-/**
- * Read-validate-replace while the caller holds the config lease. Split out so the lease is provably held for
- * the whole read-modify-write and released in exactly one place.
- */
 async function applyConfigValueUnderLease(
   configPath: string,
   configSetPath: ConfigSetPath,
@@ -166,8 +145,6 @@ async function applyConfigValueUnderLease(
   const next = structuredClone(stored) as unknown as Record<string, unknown>;
   setPathValue(next, configSetPath.segments, parseConfigValue(rawValue));
 
-  // Validate the whole document through the same decoder startup uses, so a `config set`
-  // can never persist a value that refuses to serve.
   const decoded = decodeConfigDocument(next, { homeDir: os.homedir() });
   if (decoded.kind === 'invalid') {
     const detail = decoded.issues.map((issue) => `${issue.code === 'unknown-field' ? '(unknown setting)' : issue.field}: ${issue.detail} [${issue.code}]`).join('; ');
@@ -190,14 +167,6 @@ async function applyConfigValueUnderLease(
   return `Updated ${dottedPath}. Restart the daemon to load the change.\n`;
 }
 
-/**
- * Issue a fresh pairing code for an unpaired owner.
- *
- * Offline by construction: this runs under the owner's own resource ownership, so a running
- * daemon refuses the command rather than two writers racing on the record. The plaintext is
- * printed only after the replacement has committed — a failed write can never show a code that
- * was never stored.
- */
 export async function issuePairingCode(options: AdminPaths = {}): Promise<string> {
   const selected = options.configPath ?? selectConfigPath();
   const services = new InstallationService(new DirectoryLease());
@@ -240,9 +209,6 @@ export async function issuePairingCode(options: AdminPaths = {}): Promise<string
       ].join('\n') + '\n';
     }
     if (issued.reason === 'uncertain') {
-      // `uncertain` covers both a post-rename flush that could not be confirmed and an acknowledgement lost before
-      // anything is known. Only the record knows which, so this text must not assert either "was replaced" or
-      // "unchanged".
       return [
         'Refused to issue a pairing code: the owner record could not be confirmed as written.',
         '',
@@ -276,10 +242,6 @@ function describePairingState(ownerRecordPath: string, ownerId: string): string 
     : 'pairing: pending — no code issued (run `pairing issue`)';
 }
 
-/**
- * Local inspection reads are bounded. A Markdown file or job store above the limit is reported as unavailable
- * rather than truncated into a healthy-looking summary, and an unreadable file is never reported as empty.
- */
 const MAX_INSPECTION_BYTES = 256 * 1024;
 
 type InspectionRead =
@@ -393,10 +355,6 @@ function heartbeatInspectionProblem(inspection: Extract<HeartbeatInspection, { k
   return `Heartbeat store unavailable: ${detail}.`;
 }
 
-/**
- * An endpoint safe to print. A configured base URL may carry `user:password@` userinfo, which is a credential;
- * `redactConfig` masks only the `apiKey`/`botToken` keys, so a URL printed verbatim could leak it.
- */
 export function printableEndpoint(baseUrl: string | undefined, fallback: string): string {
   if (baseUrl === undefined || baseUrl.trim() === '') return fallback;
   try {
@@ -404,16 +362,10 @@ export function printableEndpoint(baseUrl: string | undefined, fallback: string)
     if (parsed.username === '' && parsed.password === '') return baseUrl;
     return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
   } catch {
-    // Not parseable: it could not have come from the strict parser, so print it unchanged rather
-    // than invent a representation.
     return baseUrl;
   }
 }
 
-/**
- * The remote-embedding statement. Emitted from the one place every operator-facing summary is produced, so the
- * warning cannot be missing in one entry mode. "Configured" is not "verified-ready".
- */
 export function remoteEmbeddingWarning(): string {
   return 'WARNING: embeddings are remote — your text is sent to a cloud endpoint. The recall latency'
     + ' budget (p50<=300ms / p95<=800ms) assumes local embeddings. This is configured, not verified.';
@@ -434,8 +386,6 @@ export function showRedactedConfigSummary(config: EffectiveConfig): string {
     lines.push(`provider api key: ${providerApiKeyConfigured(config.providers.main) ? 'configured' : 'not set'}`);
   }
 
-  // The embedding role is an independent selection, so the summary names its provider and endpoint as well as
-  // its model; a cloud chat provider must not silently take embeddings with it.
   lines.push(`embedding provider: ${redacted.providers.embeddings.type}`);
   lines.push(`embedding model: ${redacted.providers.embeddings.model}`);
   lines.push(
@@ -460,10 +410,6 @@ export function showRedactedConfigSummary(config: EffectiveConfig): string {
   return formatLines(lines);
 }
 
-/**
- * Remove `user:password@` userinfo from any URL embedded in a readiness detail line. Sanitizes at the
- * presentation boundary, so the provider module keeps its transport behavior unchanged.
- */
 function stripUrlCredentials(text: string): string {
   return text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^@\s/]+@/gi, '$1');
 }
@@ -543,8 +489,6 @@ export async function showStatus(paths: AdminPaths = {}): Promise<string> {
     lines[0] = 'status: degraded';
     lines.push(`heartbeat jobs: unavailable — ${heartbeatInspectionProblem(inspection)}`);
   }
-  // Pairing-pending is reported separately from readiness: a healthy provider and a valid
-  // document still cannot serve a stranger until the owner is bound.
   lines.push(describePairingState(
     path.join(config.profiles.baseDir, 'profiles', config.profiles.defaultProfileId, '.state', 'owner-access.json'),
     config.profiles.defaultProfileId,

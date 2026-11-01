@@ -1,4 +1,3 @@
-// tests/memory/sqlite-store.test.ts
 import * as fs from 'fs';
 import * as path from 'path';
 import { SqliteStore } from '../../src/memory/sqlite-store';
@@ -61,8 +60,7 @@ describe('SqliteStore', () => {
   });
 });
 
-// ── RES-P0-3: corrupt DB quarantine + fresh rebuild ──────────────────────
-describe('SqliteStore corruption recovery (RES-P0-3)', () => {
+describe('SqliteStore corruption recovery', () => {
   let tmpDir: string;
 
   beforeEach(() => {
@@ -87,16 +85,12 @@ describe('SqliteStore corruption recovery (RES-P0-3)', () => {
       recovered = new SqliteStore(dbPath, 'default');
     }).not.toThrow();
 
-    // A quarantine file exists for the corrupt main DB.
     const entries = fs.readdirSync(tmpDir);
     const quarantinedMain = entries.filter((f) => f.startsWith('corrupt.db.corrupt-'));
     expect(quarantinedMain.length).toBe(1);
-    // Sibling WAL/SHM were also quarantined (rename path; unlink fallback is
-    // acceptable, but here rename succeeds on same tmpdir).
     const quarantinedWal = entries.filter((f) => f.startsWith('corrupt.db-wal.corrupt-'));
     expect(quarantinedWal.length).toBe(1);
 
-    // The fresh DB is functional: insert + keyword search return a hit.
     recovered!.upsertChunk({
       id: 'a.md:0',
       path: 'a.md',

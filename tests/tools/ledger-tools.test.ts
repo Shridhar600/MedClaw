@@ -12,10 +12,9 @@ import type { LLMProvider, LLMResponse, ToolSchema } from '../../src/providers/t
 
 const DAY = '2026-08-20T10:00:00.000Z';
 
-// W-C/D MED-15: the SAME adapter expression Gateway ships.
 const makeSafetyRenderer = makeSharedSafetyRenderer;
 
-describe('ledger tools (Task 12.1–12.3)', () => {
+describe('ledger tools', () => {
   let tmp: string;
   let ledger: LedgerStore;
   let view: SafetyView;
@@ -56,14 +55,14 @@ describe('ledger tools (Task 12.1–12.3)', () => {
     expect(r.content[0].text).toMatch(/[0-9a-f]{12}/); // token id surfaced
   });
 
-  it('DIAB-06: auto-populates known_side_effects for a medication via sideEffectLookup', async () => {
+  it('auto-populates known_side_effects for a medication via sideEffectLookup', async () => {
     build({ sideEffectLookup: async () => ['nausea', 'dizziness'] });
     await byName('ledger_record').execute({ entity: 'lisinopril', type: 'medication', fields: {} });
     const f = await ledger.getActive('lisinopril', 'medication');
     expect(f!.fields.known_side_effects).toEqual(['nausea', 'dizziness']);
   });
 
-  it('DIAB-06: falls back to [] when sideEffectLookup throws (never absent)', async () => {
+  it('falls back to [] when sideEffectLookup throws (never absent)', async () => {
     build({ sideEffectLookup: async () => { throw new Error('llm down'); } });
     await byName('ledger_record').execute({ entity: 'atorvastatin', type: 'medication', fields: {} });
     const f = await ledger.getActive('atorvastatin', 'medication');
@@ -148,18 +147,15 @@ describe('ledger tools (Task 12.1–12.3)', () => {
     await byName('ledger_record').execute({ entity: 'metformin', type: 'medication', fields: { dose: '500mg' }, note: 'v1' });
     await byName('ledger_record').execute({ entity: 'metformin', type: 'medication', fields: { notes: 'took with food' } });
     const r = await byName('ledger_query').execute({ entity: 'metformin', type: 'medication', status: 'all' });
-    // W-C/D MED-15 (T3): assert the CHAIN SHAPE, not a regex over rendered text.
     const chain = await ledger.getChain('metformin', 'medication');
     expect(chain).toHaveLength(2);
     expect(chain.map(f => f.version).sort()).toEqual([1, 2]);
-    // And the rendered text reflects both versions.
     expect(r.content[0].text).toContain('v1');
     expect(r.content[0].text).toContain('v2');
   });
 });
 
-// ── I2: malformed model args must return a clean tool error, never a raw throw ──
-describe('ledger tools arg validation (I2)', () => {
+describe('ledger tools arg validation', () => {
   let tmp: string;
   let tools: Tool[];
   const byName = (n: string): Tool => tools.find(t => t.name === n)!;
@@ -206,8 +202,7 @@ describe('ledger tools arg validation (I2)', () => {
   });
 });
 
-// I2 review follow-ups: close the remaining TypeError/corruption vectors.
-describe('ledger tools arg validation — review findings (I2)', () => {
+describe('ledger tools arg validation', () => {
   let tmp: string;
   let ledger: LedgerStore;
   let tools: Tool[];
@@ -265,8 +260,6 @@ describe('ledger tools arg validation — review findings (I2)', () => {
   });
 });
 
-// The owner's ledger over time: stop and restart things, leave disputes for later, restart the
-// daemon in between. Each "restart" builds fresh stores on the same workspace.
 describe('ledger tools — owner lifecycle across restarts', () => {
   let tmp: string;
   let ledger: LedgerStore;
@@ -374,7 +367,7 @@ describe('ledger tools — owner lifecycle across restarts', () => {
       },
       async embed(): Promise<number[]> { return []; },
     };
-    const loop = new AgentLoop(provider, registry, [], { maxIterations: 3, disclaimerEnabled: false });
+    const loop = new AgentLoop(provider, registry, [], { maxIterations: 3 });
 
     const result = await loop.run('[Heartbeat Trigger] check in', [], { chatId: 'chat-1', origin: 'heartbeat', mode: 'heartbeat' });
 
@@ -385,7 +378,6 @@ describe('ledger tools — owner lifecycle across restarts', () => {
     expect(result.trace.filter((m) => m.role === 'tool').every((m) => /owner/i.test(String(m.content)))).toBe(true);
     expect((await ledger.getActive('warfarin', 'medication'))!.fields.dose).toBe('10mg');
 
-    // The owner can still confirm the same proposal in their next turn.
     const owner = await byName('ledger_update').execute({ tokenId, confirm: true }, { chatId: 'chat-1', turnId: 'next-owner-turn' });
     expect(owner.isError).toBeFalsy();
     expect((await ledger.getActive('warfarin', 'medication'))!.fields.dose).toBe('0mg');

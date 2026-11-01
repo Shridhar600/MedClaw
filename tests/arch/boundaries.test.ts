@@ -9,8 +9,6 @@ describe('architecture boundaries', () => {
       cwd: repoRoot,
       encoding: 'utf-8',
     });
-    // If depcruise finds violations it exits with code != 0 and throws,
-    // so if we get here the check passed. Still verify output signals success.
     expect(result).toMatch(/✔|0 violations|no forbidden/i);
   });
 });

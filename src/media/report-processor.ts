@@ -7,11 +7,6 @@ import { MediaValidationError } from '../shared/errors';
 const workerGlobal = globalThis as unknown as { Worker?: typeof Worker };
 workerGlobal.Worker ??= Worker;
 
-/**
- * `pdf-parse` is loaded lazily, on first PDF extraction. A top-level import would pull pdfjs
- * (and its worker bookkeeping) into every process that imports this module, leaving an open
- * handle in runs that never parse a PDF.
- */
 let pdfParseModule: Promise<typeof import('pdf-parse')> | undefined;
 
 async function loadPdfParse(): Promise<typeof import('pdf-parse').PDFParse> {

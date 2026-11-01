@@ -5,12 +5,9 @@ import type { EffectiveConfig } from '../../src/config/types';
 import {} from '../helpers/test-config';
 import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
 import { makeTestTemp } from '../helpers/test-temp';
+import { ownerTools } from '../helpers/owner-tools';
 
 const CHAT_BINDING = 'chat-c';
-
-// Wave D-2 — session_search (PLAT-20) wired behind the live Gateway: the SqliteSessionIndex is built on
-// the profile search.db, injected into the SessionManager for incremental indexing, and exposed as the
-// `session_search` tool group. A turn recorded through the manager is retrievable verbatim via the tool.
 
 function makeConfig(tmpDir: string): EffectiveConfig {
   return {
@@ -22,7 +19,6 @@ function makeConfig(tmpDir: string): EffectiveConfig {
     },
     channels: { telegram: { enabled: false, botToken: '' } },
     tools: { allow: ['*'], deny: [] },
-    // Registry-scoped so sessions land under tmpDir (isolated) rather than the shared ~/.redacted/sessions.
     profiles: { baseDir: path.join(tmpDir, 'profiles-base'), defaultProfileId: 'default' },
     memory: {
       workspace: path.join(tmpDir, 'workspace'),
@@ -30,9 +26,7 @@ function makeConfig(tmpDir: string): EffectiveConfig {
       bootstrapMaxChars: 20000,
     },
     sessions: {
-      softResetAfterMinutes: 240,
-      hardResetAfterMinutes: 1440,
-      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+      compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
     },
     heartbeat: {
       enabled: false,
@@ -51,11 +45,11 @@ function makeConfig(tmpDir: string): EffectiveConfig {
         },
       },
     },
-    agent: { maxIterations: 15, disclaimerEnabled: true },
+    agent: { maxIterations: 15 },
   };
 }
 
-describe('Gateway session_search wiring (Wave D-2)', () => {
+describe('Gateway session_search wiring', () => {
   let tmpDir: string;
   let gateway: Gateway;
 
@@ -68,7 +62,7 @@ describe('Gateway session_search wiring (Wave D-2)', () => {
   });
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const registryOf = (): any => (gateway as any).agentLoop.registry;
+  const registryOf = (): any => ownerTools((gateway as any).agentLoop.registry);
 
   it('registers the session_search tool group', async () => {
     gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
@@ -91,14 +85,13 @@ describe('Gateway session_search wiring (Wave D-2)', () => {
       { role: 'user', content: 'metformin 500mg twice daily' },
     ]);
 
-    // The tool scopes by the calling chat (X-1) — search as chat-x (the chat the turn was recorded under).
     const res = await registryOf().execute('session_search', { query: 'metformin 500mg twice daily' }, { chatId: 'chat-x' });
     expect(res.isError).toBeFalsy();
     expect(res.content[0].text).toContain('metformin 500mg twice daily');
     expect(res.content[0].text).toContain('#L1');
   });
 
-  it('the /compact command forces a compaction and confirms (DD9)', async () => {
+  it('the /compact command forces a compaction and confirms', async () => {
     gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     await gateway.start();

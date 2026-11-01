@@ -1,17 +1,8 @@
-// VectorIndex adapter over the sqlite-vec (vec0) substrate. It opens its OWN better-sqlite3
-// connection (WAL permits multiple connections to one search.db) and imports better-sqlite3 and
-// sqlite-vec directly, never `src/memory/`. The DB path is injected by the composition layer.
-//
-// The memory store remains the primary writer. This adapter targets the same `chunks` +
-// `chunks_vec0` tables idempotently and adds the two columns the port carries beyond the store's
-// schema (lane, created_at).
-
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import { summarizeErrorForLog } from '../../security';
 import type { VectorIndex, Chunk, ChunkWithScore, VectorStats } from '../../ports';
 
-/** Thrown when an embedding's length does not match the index's fixed dimension. */
 export class VectorDimensionMismatchError extends Error {
   constructor(message: string) {
     super(message);
@@ -19,7 +10,7 @@ export class VectorDimensionMismatchError extends Error {
   }
 }
 
-/** A vector arm cannot answer queries and must be reported as degraded by RecallEngine. */
+/** Degrades the vector arm; RecallEngine must report it. */
 export class VectorIndexUnavailableError extends Error {
   constructor(message = 'vector index is unavailable') {
     super(message);
@@ -27,7 +18,6 @@ export class VectorIndexUnavailableError extends Error {
   }
 }
 
-/** The vector query failed after the arm was selected; callers must not treat completion as healthy. */
 export class VectorQueryFailedError extends Error {
   constructor() {
     super('vector index query failed');
@@ -69,7 +59,7 @@ export class SqliteVecIndex implements VectorIndex {
       sqliteVec.load(this.db);
       this.hasVec = true;
     } catch (e) {
-      // sqlite-vec is optional (keyword-only fallback). Sanitized log; never crash.
+      // Optional; keyword-only fallback, never crash.
       console.warn('[sqlite-vec-index] sqlite-vec unavailable, vector ops disabled:', summarizeErrorForLog(e));
     }
     this.initSchema();
@@ -89,8 +79,7 @@ export class SqliteVecIndex implements VectorIndex {
   async upsert(chunks: Chunk[]): Promise<void> {
     if (chunks.length === 0) return;
 
-    // Fix or validate the dimension BEFORE preparing vec statements (the vec0 table only exists
-    // once a dimension is known).
+    // Validate the dimension before preparing vec statements; the table needs a known dimension.
     for (const c of chunks) {
       if (c.embedding && c.embedding.length > 0) this.assertDimension(c.embedding.length);
     }
@@ -110,7 +99,7 @@ export class SqliteVecIndex implements VectorIndex {
     const deleteVec = this.hasVec ? this.db.prepare('DELETE FROM chunks_vec0 WHERE chunk_id = ?') : null;
     const insertVec = this.hasVec ? this.db.prepare('INSERT INTO chunks_vec0 (chunk_id, embedding) VALUES (?, ?)') : null;
 
-    // One transaction for the whole batch: atomic, and avoids per-row autocommit round-trips.
+    // One transaction for the whole batch.
     const runBatch = this.db.transaction((rows: Chunk[]) => {
       for (const c of rows) {
         const hasEmbedding = !!c.embedding && c.embedding.length > 0;
@@ -138,8 +127,7 @@ export class SqliteVecIndex implements VectorIndex {
   async *queryKnn(embedding: number[], k: number, filter?: Record<string, unknown>): AsyncIterable<ChunkWithScore> {
     if (k <= 0) return;
     if (!this.hasVec) throw new VectorIndexUnavailableError();
-    // The live read adapter has no configured dimension. Read it from the existing table/meta
-    // before validating the query; never adopt a mismatching query length as truth.
+    // The live adapter may have no configured dimension; never adopt the query's length as truth.
     if (this.dimension === null) {
       const existingDimension = this.readExistingDimension();
       if (existingDimension !== null) this.dimension = existingDimension;
@@ -200,7 +188,7 @@ export class SqliteVecIndex implements VectorIndex {
     return { totalChunks: row.n, dimension: this.dimension ?? 0 };
   }
 
-  /** Release the underlying connection. Not part of VectorIndex, but needed for lifecycle/tests. */
+  /** Not part of VectorIndex; used by lifecycle code. */
   close(): void {
     try {
       this.db.close();
@@ -209,33 +197,24 @@ export class SqliteVecIndex implements VectorIndex {
     }
   }
 
-  // ---- internals ---------------------------------------------------------
-
+  // The memory store is the primary writer; this adapter mirrors the same chunks/chunks_vec0 tables.
   private initSchema(): void {
     this.db.exec('PRAGMA journal_mode=WAL;');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS chunks (
         id TEXT PRIMARY KEY,
         path TEXT NOT NULL,
+        lane TEXT NOT NULL DEFAULT '',
         content TEXT NOT NULL,
         start_line INTEGER NOT NULL DEFAULT 0,
         end_line INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT '',
         embedding BLOB
       );
       CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
     `);
-    // The port's Chunk carries lane + createdAt, which the memory store's chunks table lacks.
-    // Add them so the adapter works over both a fresh temp DB and the live search.db.
-    this.ensureColumn('chunks', 'lane', "lane TEXT NOT NULL DEFAULT ''");
-    this.ensureColumn('chunks', 'created_at', "created_at TEXT NOT NULL DEFAULT ''");
   }
 
-  private ensureColumn(table: string, column: string, ddl: string): void {
-    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-    if (!cols.some(c => c.name === column)) {
-      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
-    }
-  }
 
   private ensureVecTable(dim: number): void {
     if (!this.hasVec) return;
@@ -275,7 +254,6 @@ export class SqliteVecIndex implements VectorIndex {
     return null;
   }
 
-  /** Fix the dimension on first embedded upsert, or reject a mismatch. */
   private assertDimension(dim: number): void {
     if (this.dimension === null) {
       this.ensureVecTable(dim);

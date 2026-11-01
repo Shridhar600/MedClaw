@@ -94,9 +94,6 @@ describe('LedgerStore', () => {
   });
 
   describe('higher-authority supersede', () => {
-    // W-C/D fix pass (AR / C2): a conflicting MED change needs user confirmation
-    // regardless of authority rank — the old assertion here enshrined the
-    // authority-rank bypass the hostile panel flagged as CRITICAL.
     it('doctor conflicting med change needs confirmation; confirm applies v2', async () => {
       await store.recordFact({
         entity: 'lisinopril', type: 'medication', fields: { dose: '10mg' }, provenance: userProv,
@@ -215,7 +212,7 @@ describe('LedgerStore', () => {
     });
   });
 
-  describe('confirm — token validation (A3)', () => {
+  describe('confirm — token validation', () => {
     it('rejects nonexistent token', async () => {
       await expect(store.confirm('nonexistent-token')).rejects.toThrow(/not found/);
     });
@@ -332,12 +329,11 @@ describe('LedgerStore', () => {
     });
   });
 
-  describe('A2 — paused entity supersession', () => {
+  describe('paused entity supersession', () => {
     it('paused entity superseded carries pre_pause_summary + paused status', async () => {
       await store.recordFact({
         entity: 'metformin', type: 'medication', fields: { dose: '500mg' }, provenance: docProv,
       });
-      // Build the paused state through the PUBLIC pause() API (no private-member hacking).
       await store.pause('metformin', 'medication', docProv, { prePauseSummary: 'Held for surgery' });
 
       const result = await store.recordFact({
@@ -352,10 +348,7 @@ describe('LedgerStore', () => {
       }
     });
 
-    it('resume=true on a paused MEDICATION requires confirmation, then produces active (H-1)', async () => {
-      // H-1 (medical-safety): resuming a paused med/allergy must NOT bypass the confirmation gate.
-      // This test previously asserted an INSTANT `applied` — that was the bypass bug the P1-gate
-      // audit flagged. The intent (resume yields an active fact) is preserved via the confirm path.
+    it('resume=true on a paused MEDICATION requires confirmation, then produces active', async () => {
       await store.recordFact({
         entity: 'metformin', type: 'medication', fields: { dose: '500mg' }, provenance: docProv,
       });
@@ -372,18 +365,16 @@ describe('LedgerStore', () => {
       expect(fact.status).toBe('active');
       const activeNow = await store.getActive('metformin', 'medication');
       expect(activeNow?.id).toBe(fact.id);
-      // no version remains paused after the resume is confirmed
       const chain = await store.getChain('metformin', 'medication');
       expect(chain.filter(f => f.status === 'paused')).toHaveLength(0);
     });
   });
 
-  describe('A6 — discontinued restart', () => {
+  describe('discontinued restart', () => {
     it('restart of a discontinued med creates a new active version carrying restartOf', async () => {
       await store.recordFact({
         entity: 'metformin', type: 'medication', fields: { dose: '500mg' }, provenance: docProv,
       });
-      // Actually discontinue (med-class → confirm), then actually restart() — the real contract.
       const disc = await store.discontinue('metformin', 'medication', docProv);
       expect(disc.kind).toBe('needs-confirmation');
       if (disc.kind === 'needs-confirmation') await store.confirm(disc.token.uuid);

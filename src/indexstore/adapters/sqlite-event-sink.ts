@@ -1,5 +1,3 @@
-// EventSink adapter over SQLite: the append-only `events` table feeding entity-correlation lag
-// queries. Uses its own better-sqlite3 connection to the per-profile search.db (WAL + busy_timeout).
 
 import Database from 'better-sqlite3';
 import { summarizeErrorForLog } from '../../security';

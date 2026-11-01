@@ -1,5 +1,3 @@
-// memcore barrel — the v2 memory system's public surface.
-// Stores are pure + injected (no module-level state); Markdown is the source of truth.
 
 // Ledger (versioned health facts)
 export { LedgerStore } from './ledger-store';

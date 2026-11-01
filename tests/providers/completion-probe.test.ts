@@ -1,10 +1,6 @@
 import type { LLMProvider } from '../../src/providers/types';
 import { probeChatCompletion } from '../../src/providers/healthcheck';
 
-// #3: /status must reflect whether the main model can actually COMPLETE a
-// tool-bearing request, not just whether a key/model is configured. probeChatCompletion
-// makes one real, tool-bearing call and maps the outcome to a ReadinessResult.
-
 function providerWith(chat: LLMProvider['chat']): Pick<LLMProvider, 'chat'> {
   return { chat };
 }

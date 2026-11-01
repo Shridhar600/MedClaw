@@ -20,7 +20,7 @@ async function withObservedCronExpansion(
   const convert = new Function('module', 'step',
     `${source.replace('numbers.push(i);', 'step(); numbers.push(i);')}\nreturn module.exports;`,
   )({ exports: {} }, () => {
-    if (++steps >= 2048) throw new Error('N02_FINITE_RANGE_BRAKE');
+    if (++steps >= 2048) throw new Error('FINITE_RANGE_BRAKE');
   }) as (expressions: string[]) => string[];
   jest.doMock('node-cron/src/convert-expression/range-conversion', (): ((expressions: string[]) => string[]) => (expressions: string[]): string[] => {
     calls += 1;
@@ -133,7 +133,7 @@ describe('cron_manage tool', () => {
     expect(jobs[0].chatId).toBe('chat-context-1');
   });
 
-  it('N02 refuses cron amplification before conversion or publication, preserving owner reminders across edits and restart', async () => {
+  it('refuses cron amplification before conversion or publication, preserving owner reminders across edits and restart', async () => {
     const fixture = writeConfigFixture(path.join(tmpDir, 'bounded-cron'));
     const owner = await bindOwnerFixture(fixture.ownerRecord, fixture.ownerId);
     const ownerBytes = fs.readFileSync(fixture.ownerRecord);
@@ -184,7 +184,6 @@ describe('cron_manage tool', () => {
             await current.pause(job.id);
             expect(stop).toHaveBeenCalledTimes(1); // same live task, actual pause is the positive control
           } finally { stop.mockRestore(); }
-          // Simulate a paused record edited on disk, not a scheduler-validator mock.
           await store.update(job.id, { cron: expression });
           const pausedBytes = fs.readFileSync(fixture.storePath);
           expansion.reset();
@@ -234,7 +233,7 @@ describe('cron_manage tool', () => {
     });
   });
 
-  it('N02 does not re-enter expanding recovery when disabling a malformed persisted cron fails', async () => {
+  it('does not re-enter expanding recovery when disabling a malformed persisted cron fails', async () => {
     await withObservedCronExpansion(async (expansion) => {
       const { HeartbeatScheduler: Scheduler, HeartbeatStore: Store } = await import('../../src/scheduler');
       const store = new Store(storePath);

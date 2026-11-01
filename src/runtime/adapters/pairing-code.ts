@@ -1,10 +1,3 @@
-// src/runtime/adapters/pairing-code.ts
-//
-// The only place a pairing code is generated and compared.
-//
-// The record stores a salted SHA-256 verifier, never the plaintext, so the file, the transcript,
-// the diagnostics and the model input can never contain a usable code. The plaintext exists only
-// in the return value of `issue()`, which the local CLI displays once after the record commits.
 
 import { createHash, randomBytes, timingSafeEqual } from 'crypto';
 import {
@@ -20,10 +13,6 @@ function sha256Hex(input: string): Buffer {
   return createHash('sha256').update(input, 'utf8').digest();
 }
 
-/**
- * Unbiased symbol draw by rejection sampling. `randomBytes(n) % 31` would bias the low
- * symbols, which is measurable across enough draws and is not acceptable for a secret.
- */
 function drawCode(): string {
   const alphabetLength = PAIRING_CODE_SYMBOLS.length;
   // Largest multiple of the alphabet that fits in a byte; reject the remainder.
@@ -41,10 +30,6 @@ function drawCode(): string {
 }
 
 export class CryptoPairingCodePort implements PairingCodePort {
-  /**
-   * `v1:<saltHex>:<sha256(salt + "\n" + plaintext)>`. Self-describing so the scheme can change
-   * without silently mis-verifying existing records.
-   */
   issue(): { plaintext: string; verifier: string } {
     const plaintext = drawCode();
     const salt = randomBytes(SALT_BYTES).toString('hex');
@@ -68,10 +53,6 @@ export class CryptoPairingCodePort implements PairingCodePort {
   }
 }
 
-/**
- * Comparison is case- and whitespace-insensitive so a code copied from a terminal or retyped in
- * lower case still works, while remaining an exact 8-symbol match otherwise.
- */
 function normalizeForComparison(value: string): string {
   return value.trim().toUpperCase();
 }

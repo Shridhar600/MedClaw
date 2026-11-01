@@ -55,22 +55,11 @@ export interface HeartbeatTurnRequest {
   input: string;
   egress: TurnEgress;
   afterDelivery: (result: AgentRunResult) => Promise<void>;
-  /**
-   * Stable per-occurrence identity (`heartbeatTurnId`), threaded into the `AgentLoop` run-context so a tool
-   * called inside a heartbeat builds a deterministic idempotency key: a scheduler retry of the same occurrence
-   * returns the cached original instead of double-writing. When absent, `AgentLoop` falls back to its
-   * in-memory sequence number.
-   */
+  /** Stable per-occurrence id; a scheduler retry then reuses the cached tool result instead of double-writing. */
   turnId?: string;
 }
 
-/**
- * The heartbeat occurrence key: `${job.id}:${job.lastRunAt}`.
- *
- * `lastRunAt` is set after the trigger completes and no retry/failure path touches it, so it is stable across
- * a retry of one occurrence but distinct across occurrences (tomorrow's recurring reminder is not dropped as
- * a duplicate). A missing `lastRunAt` yields `undefined`: no key, never an unstable one.
- */
+/** `${job.id}:${job.lastRunAt}`: stable across a retry of one occurrence, distinct across occurrences. */
 export function heartbeatTurnId(job: Pick<HeartbeatJob, 'id' | 'lastRunAt'>): string | undefined {
   if (!job.lastRunAt) return undefined;
   return `${job.id}:${job.lastRunAt}`;
@@ -80,11 +69,7 @@ export type HeartbeatTurnResult =
   | { status: 'sent'; result: AgentRunResult }
   | { status: 'noop'; result: AgentRunResult }
   | { status: 'preempted'; error: HeartbeatPreemptedError }
-  /**
-   * The runtime closed its stores mid-drain: this heartbeat turn was abandoned by the bounded hard-stop or lost
-   * the shutdown race. Distinct from 'preempted' (a live user turn evicted it) and from a failure. It is
-   * expected and benign, and must NOT be recorded via `scheduler.recordFailure`.
-   */
+  /** The runtime closed its stores mid-drain; expected and benign, never recorded as a failure. */
   | { status: 'abandoned'; error: DaemonShutdownError };
 
 interface QueueEntry {
@@ -130,8 +115,7 @@ export class TurnCoordinator {
         return { status: 'preempted', error };
       }
       if (error instanceof DaemonShutdownError) {
-        // Log-and-drop: the heartbeat's write was refused because the runtime already closed its stores.
-        // Do not attempt egress/afterDelivery against a runtime or channel that is mid-teardown.
+        // Log-and-drop: never touch a channel or runtime that is mid-teardown.
         console.warn('[gateway] Heartbeat turn abandoned by shutdown (log-and-drop):', summarizeErrorForLog(error));
         return { status: 'abandoned', error };
       }
@@ -141,7 +125,7 @@ export class TurnCoordinator {
 
   private enqueue<T>(chatId: string, priority: SemaphorePriority, operation: () => Promise<T>): Promise<T> {
     const queue = this.queues.get(chatId) ?? { user: [], heartbeat: [], draining: false };
-    // The owner always outranks waiting check-ins: evict them rather than refuse the owner.
+    // The owner outranks waiting check-ins: evict them rather than refuse the owner.
     if (priority === 'user') {
       for (const waiting of queue.heartbeat.splice(0)) waiting.reject(new HeartbeatPreemptedError());
     }
@@ -225,8 +209,7 @@ export class TurnCoordinator {
       return this.emit(egress, COMPACTION_RESPONSE);
     }
 
-    // Secrets are refused at the door, before media-error, onboarding and agent paths can record,
-    // capture or send them. Emergencies were already answered by the Router.
+    // Secrets are refused before any path can record, capture or send them.
     if (contentContainsCredentials(text).matched) return this.emit(egress, CREDENTIAL_REFUSAL_RESPONSE);
 
     const agentInput = this.buildAgentInput(incoming);
@@ -257,8 +240,7 @@ export class TurnCoordinator {
       return onboarding;
     }
 
-    // Keep the post-onboarding emergency check as a separate safety boundary. The Router normally
-    // handles the same emergency before this turn enters the coordinator.
+    // Separate safety boundary; the Router normally catches this emergency first.
     const postOnboardingEmergency = emergencyResponse(text);
     if (postOnboardingEmergency) {
       try {
@@ -283,10 +265,9 @@ export class TurnCoordinator {
     let result: AgentRunResult;
     try {
       const history = await sessions.prepareHistory(chatId);
-      // Derive `turnId` from the real Telegram messageId when available, so tool-call idempotency keys stay
-      // stable across a replayed delivery of the same message (an in-process counter is not).
+      // Message-derived turnId keeps tool idempotency keys stable across a replay.
       const turnId = incoming.messageId ? `chat:${chatId}:${incoming.messageId}` : undefined;
-      result = await this.requireAgentLoop().run(agentInput, history, { chatId, mode: 'chat', turnId });
+      result = await this.requireAgentLoop().run(agentInput, history, { chatId, origin: 'user', mode: 'chat', turnId });
     } catch (error) {
       console.error('[gateway] Agent error:', summarizeErrorForLog(error));
       await this.persistFailureTrace(chatId, agentInput, AGENT_FAILURE_RESPONSE);
@@ -325,8 +306,7 @@ export class TurnCoordinator {
       return result.text;
     }
 
-    // Keep the production contract: a failed transcript write must not schedule a policy
-    // reconciliation from a turn whose durable state is uncertain.
+    // A failed transcript write must not schedule reconciliation from uncertain state.
     if (!persistFailed && this.reconcile) {
       try {
         await this.reconcile(chatId);
@@ -340,8 +320,7 @@ export class TurnCoordinator {
   private async executeHeartbeat(request: HeartbeatTurnRequest): Promise<AgentRunResult> {
     const sessions = this.requireSessions();
     const history = await sessions.prepareHistory(request.chatId);
-    // Mirror `executeUser`'s message-derived `turnId`: the heartbeat's per-occurrence `turnId` (when supplied)
-    // feeds tool-call idempotency keys; `undefined` keeps `AgentLoop`'s sequence fallback.
+    // Mirrors executeUser: a per-occurrence turnId feeds idempotency keys.
     const result = await this.requireAgentLoop().run(
       request.input,
       history,
@@ -376,13 +355,16 @@ export class TurnCoordinator {
     );
   }
 
-  /** Onboarding answers go through the same capture pipeline as chat, so SAFETY.md and recall see them. */
+  /** Onboarding answers go through the capture pipeline like chat. */
   private async recordSeedFacts(facts: SeedFact[]): Promise<string[]> {
     const pipeline = this.runtime.capturePipeline;
     if (!pipeline) throw new Error('capture pipeline unavailable');
     const capturedAt = new Date().toISOString();
     const pending: string[] = [];
-    for (const fact of facts) {
+    for (const seed of facts) {
+      const fact = seed.type === 'medication'
+        ? { ...seed, fields: { ...seed.fields, known_side_effects: await this.runtime.sideEffectLookup(seed.entity).catch(() => []) } }
+        : seed;
       const result = await pipeline.ingest({
         kind: 'ledger-fact',
         idempotencyKey: `onboarding:${fact.type}:${fact.entity}:${JSON.stringify(fact.fields)}`,
@@ -438,9 +420,7 @@ export class TurnCoordinator {
     if (incoming.replyToMessageId) {
       parts.push('', `Reply to message id: ${incoming.replyToMessageId}`);
     }
-    // The transport sender id is deliberately NOT appended. It is a chat-shaped identifier needed only for
-    // authorization, which admission has already decided; appending it would ship it to the provider and into
-    // the persisted session window. Keep in sync with the twin in `router.ts`.
+    // The transport sender id is never appended: it would reach the provider and the session window; mirrors router.ts.
     return parts.join('\n');
   }
 

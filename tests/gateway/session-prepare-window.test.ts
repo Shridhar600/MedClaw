@@ -3,12 +3,7 @@ import type { LLMProvider, Message } from '../../src/providers/types';
 import { SessionManager } from '../../src/gateway/session';
 import { makeTestTemp } from '../helpers/test-temp';
 
-// P2b Wave D-1 / D1.4 — `prepareHistory` returns the WINDOW: `[summary system message?, ...verbatim
-// tail]`, sanitized with `stripOrphanToolMessages` (DD2). The idle soft/hard reset branches are gone
-// (DD10). At D1.4 the disk archive + the token-budget compaction auto-trigger are unchanged (D3
-// reworks the triggers to real-token thresholds).
-
-describe('prepareHistory window (D1.4)', () => {
+describe('prepareHistory window', () => {
   let dir: string;
   beforeEach(() => { dir = makeTestTemp('sm-win-'); });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
@@ -27,7 +22,7 @@ describe('prepareHistory window (D1.4)', () => {
     const m = new SessionManager({
       sessionsPath: dir,
       provider: makeProvider('SUMMARY: older turns'),
-      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: false, keepRecentTurns: 4 },
+      compaction: { enabled: true, memoryFlush: false, keepRecentTurns: 4 },
     });
     for (let i = 0; i < 5; i++) {
       await m.recordTurn('c1', [
@@ -41,7 +36,6 @@ describe('prepareHistory window (D1.4)', () => {
     expect(history[0].role).toBe('system');
     expect(history[0].content).toContain('[Previous conversation summary]');
     expect(history[0].content).toContain('SUMMARY: older turns');
-    // H4 turn-aware: keepRecentTurns=4 keeps the last 4 TURNS (8 messages, u1..a4); turn 0 is summarized.
     expect(history.slice(1).map((x: Message) => x.content)).toEqual(['u1', 'a1', 'u2', 'a2', 'u3', 'a3', 'u4', 'a4']);
   });
 

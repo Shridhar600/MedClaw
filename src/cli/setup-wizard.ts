@@ -50,9 +50,6 @@ function shouldRunLiveChecks(io: CliIO, options?: SetupReadinessDependencies): b
   if (io.input) {
     return false; // injected IO (unit tests / programmatic callers)
   }
-  // Live network checks only for a real interactive terminal. A piped stdin
-  // (scripted onboard, CI) cannot answer validation re-prompts, and the
-  // checks would make non-interactive runs depend on network reachability.
   return process.stdin.isTTY === true;
 }
 
@@ -93,8 +90,6 @@ function stateToArgs(state: SetupWizardState): ServiceOnboardingArgs {
     medicalModel: state.medicalModel,
     medicalProvider: state.medicalProvider,
     medicalApiKey: state.medicalApiKey,
-    // Provider, endpoint and key travel with the state, so an explicit embedding selection
-    // survives resolution, build, serialization and reload.
     embeddingProvider: state.embeddingProvider,
     embeddingModel: state.embeddingModel,
     embeddingUrl: state.embeddingUrl,
@@ -141,10 +136,6 @@ async function runEnvironmentStep(io: CliIO, state: SetupWizardState): Promise<v
   renderStatus(io, 'OK', 'Setup wizard is ready');
 }
 
-/**
- * The owner chooses the state root and the owner id. Everything else about their location is
- * derived, so there is no second path authority.
- */
 async function runStateStep(io: CliIO, state: SetupWizardState): Promise<void> {
   renderStepHeader(io, 2, TOTAL_STEPS, 'Owner state');
 
@@ -171,10 +162,6 @@ async function runStateStep(io: CliIO, state: SetupWizardState): Promise<void> {
   renderStatus(io, 'INFO', `Template files: ${listWorkspaceTemplateFiles().join(', ')}`);
 }
 
-/**
- * The main role step. Changing the main provider never touches the embedding role, so embeddings
- * cannot silently move to cloud.
- */
 async function runProviderStep(io: CliIO, state: SetupWizardState): Promise<void> {
   renderStepHeader(io, 3, TOTAL_STEPS, 'Provider Selection');
   const previousProvider = state.provider;
@@ -237,13 +224,6 @@ async function runProviderStep(io: CliIO, state: SetupWizardState): Promise<void
   }
 }
 
-/**
- * Prompt for an endpoint without ever rendering credentials in the visible default.
- *
- * `askValue` prints its default value, which would leak `user:password@` into the terminal. This
- * keeps "Enter keeps the current value" by restoring the pre-prompt value when the operator
- * accepts the sanitized default.
- */
 async function askEndpointValue(
   io: CliIO,
   prompt: string,
@@ -253,22 +233,12 @@ async function askEndpointValue(
   const source = current ?? fallback;
   const visibleDefault = printableEndpoint(source, fallback);
   const answer = await askValue(io, prompt, visibleDefault);
-  // Accepting the shown default keeps the source value. When `current` is undefined that source is
-  // the inherited fallback, so Enter must not replace a credentialed endpoint with its sanitized form.
   if (answer === visibleDefault) {
     return source;
   }
   return answer;
 }
 
-/**
- * The embedding role step, independent of the main role.
- *
- * A change here resets only what is role-incompatible: switching provider moves the model default
- * and drops the previous provider's key, so a stale credential never survives into another
- * provider's role. Switching between local and remote drops the incompatible endpoint. Configured
- * is not verified-ready, and the remote-embedding warning says so.
- */
 async function runEmbeddingStep(io: CliIO, state: SetupWizardState): Promise<void> {
   renderSectionHeader(io, 'Embedding role (independent of the chat provider)');
   const previous = state.embeddingProvider;
@@ -352,14 +322,6 @@ async function runEmbeddingStep(io: CliIO, state: SetupWizardState): Promise<voi
   }
 }
 
-/**
- * Live Ollama catalog check.
- *
- * Only checks models that will be served from this endpoint. A cloud embedding role, or a local
- * one with a different explicit endpoint, is skipped: reporting its model as missing would be a
- * false warning. Medical is included only when local, so a cloud medical selection never
- * produces an Ollama pull instruction.
- */
 async function runProviderChecks(
   io: CliIO,
   state: SetupWizardState,
@@ -667,8 +629,6 @@ export async function runSetupWizard(
       break;
     } catch (error) {
       renderStatus(io, 'WARN', `Could not write setup files: ${error instanceof Error ? error.message : String(error)}`);
-      // True for every refusal the writer can produce, including a half-published setup. Setup never
-      // overwrites existing owner evidence, so applying again into the same target is always refused.
       renderStatus(io, 'INFO', 'Apply again only with a fresh --state-root or --config target.');
     }
   }

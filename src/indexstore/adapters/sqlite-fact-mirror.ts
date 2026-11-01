@@ -1,13 +1,3 @@
-// src/indexstore/adapters/sqlite-fact-mirror.ts
-//
-// FactMirror adapter over SQLite — the rebuildable-from-Markdown mirror of the ledger that recall
-// Stage 1 reads. Opens its OWN better-sqlite3 connection to the per-profile search.db (WAL permits
-// multiple connections; explicit busy_timeout) and imports better-sqlite3 DIRECTLY, never
-// src/memory/. The DB path is injected by the composition layer (Gateway).
-//
-// Schema ownership: this layer owns `facts` (+ chunk_stats/events); the sqlite-store owns
-// chunks/chunks_fts/chunks_vec0/meta on the same file.
-
 import Database from 'better-sqlite3';
 import { summarizeErrorForLog } from '../../security';
 import type { FactMirror, FactRecord } from '../../ports';
@@ -16,11 +6,6 @@ export interface SqliteFactMirrorConfig {
   dbPath: string;
 }
 
-/**
- * Deterministic entity-head selection: an active lifecycle winner beats a terminal/non-active
- * record; within the same lifecycle state, higher version wins; on a version tie the later
- * createdAt wins; on a createdAt tie the higher id wins. `cur` undefined ⇒ candidate wins.
- */
 export function headWins(cand: FactRecord, cur: FactRecord | undefined): boolean {
   if (!cur) return true;
   const candActive = cand.status === 'active';
@@ -63,7 +48,6 @@ export class SqliteFactMirror implements FactMirror {
     replace(type, facts);
   }
 
-  /** Replace one type/entity scope while preserving every unrelated mirror row. */
   async replaceScope(type: string, entity: string, facts: FactRecord[]): Promise<void> {
     const replace = this.db.transaction((scopeType: string, scopeEntity: string, rows: FactRecord[]) => {
       this.db.prepare('DELETE FROM facts WHERE type = ? AND entity = ?').run(scopeType, scopeEntity);
@@ -74,7 +58,7 @@ export class SqliteFactMirror implements FactMirror {
   }
 
   async *queryActive(type?: string, entity?: string): AsyncIterable<FactRecord> {
-    // Active head only; v0 quarantine sentinels (version < 1) are never surfaced.
+    // v0 quarantine sentinels never surface.
     let sql = "SELECT json FROM facts WHERE status = 'active' AND version >= 1";
     const params: unknown[] = [];
     if (type !== undefined) {
@@ -93,7 +77,6 @@ export class SqliteFactMirror implements FactMirror {
   }
 
   async *queryPaused(type?: string): AsyncIterable<FactRecord> {
-    // Paused head only; v0 quarantine sentinels never surface.
     let sql = "SELECT json FROM facts WHERE status = 'paused' AND version >= 1";
     const params: unknown[] = [];
     if (type !== undefined) {
@@ -108,10 +91,7 @@ export class SqliteFactMirror implements FactMirror {
   }
 
   async *queryEntityHeads(): AsyncIterable<FactRecord> {
-    // One lifecycle head per (type, entity): active wins over terminal/non-active records, then
-    // version/createdAt/id give deterministic ordering. v0 quarantine sentinels are excluded.
-    // The window query selects one candidate JSON row per group, so the JS reducer (a defensive
-    // check) sees a bounded result set rather than every historical version on every recall turn.
+    // One head per (type, entity); the window bounds the rows the JS reducer sees.
     const rows = this.db.prepare(`
       SELECT json FROM (
         SELECT f.json AS json,
@@ -147,7 +127,7 @@ export class SqliteFactMirror implements FactMirror {
     clearAndFill(all);
   }
 
-  /** Release the underlying connection. Not part of FactMirror; needed for lifecycle/tests. */
+  /** Not part of FactMirror; used by lifecycle code. */
   close(): void {
     try {
       this.db.close();
@@ -156,8 +136,7 @@ export class SqliteFactMirror implements FactMirror {
     }
   }
 
-  // ---- internals ---------------------------------------------------------
-
+  // Owns `facts`; the sqlite-store owns chunks/chunks_fts/chunks_vec0/meta on the same file.
   private initSchema(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS facts (
@@ -178,7 +157,6 @@ export class SqliteFactMirror implements FactMirror {
         PRIMARY KEY (type, id)
       );
     `);
-    this.migrateLegacyPrimaryKey();
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_facts_entity ON facts(entity, status);
       CREATE INDEX IF NOT EXISTS idx_facts_type ON facts(type, status);
@@ -187,46 +165,6 @@ export class SqliteFactMirror implements FactMirror {
     `);
   }
 
-  /** Rebuild the legacy id-only table so same-name facts in different types can coexist. */
-  private migrateLegacyPrimaryKey(): void {
-    const columns = this.db.prepare('PRAGMA table_info(facts)').all() as Array<{ name: string; pk: number }>;
-    const primaryKey = columns.filter(c => c.pk > 0).sort((a, b) => a.pk - b.pk).map(c => c.name);
-    if (primaryKey.length !== 1 || primaryKey[0] !== 'id') return;
-
-    const migrate = this.db.transaction(() => {
-      this.db.exec('DROP TABLE IF EXISTS facts_rr5_new');
-      this.db.exec(`
-        CREATE TABLE facts_rr5_new (
-          id TEXT NOT NULL,
-          profile_id TEXT,
-          entity TEXT,
-          type TEXT,
-          version INTEGER NOT NULL DEFAULT 0,
-          status TEXT,
-          supersedes TEXT,
-          superseded_by TEXT,
-          safety_relevant INTEGER NOT NULL DEFAULT 0,
-          authority TEXT,
-          confidence REAL,
-          episode_id TEXT,
-          created_at TEXT,
-          json TEXT NOT NULL,
-          PRIMARY KEY (type, id)
-        )
-      `);
-      this.db.exec(`
-        INSERT OR REPLACE INTO facts_rr5_new
-          (id, profile_id, entity, type, version, status, supersedes, superseded_by,
-           safety_relevant, authority, confidence, episode_id, created_at, json)
-        SELECT id, profile_id, entity, type, version, status, supersedes, superseded_by,
-               safety_relevant, authority, confidence, episode_id, created_at, json
-        FROM facts
-      `);
-      this.db.exec('DROP TABLE facts');
-      this.db.exec('ALTER TABLE facts_rr5_new RENAME TO facts');
-    });
-    migrate();
-  }
 
   private upsertStmt(): Database.Statement {
     return this.db.prepare(`
@@ -273,8 +211,7 @@ export class SqliteFactMirror implements FactMirror {
   }
 
   private parseRow(r: FactRow): FactRecord | null {
-    // The full record round-trips via the json column; a corrupt row degrades to skip + warn
-    // (resilience — a mirror is always rebuildable from Markdown, never crash a read).
+    // A mirror is rebuildable; never crash a read on a corrupt row.
     try {
       return JSON.parse(r.json) as FactRecord;
     } catch (e) {

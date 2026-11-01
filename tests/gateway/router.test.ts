@@ -39,9 +39,7 @@ const owner = fixtureOwner(workspace);
     tools: { allow: ['*'], deny: [] },
     memory: { workspace, search: { hybridWeights: { vector: 0.7, keyword: 0.3 } }, bootstrapMaxChars: 20_000 },
     sessions: {
-      softResetAfterMinutes: 240,
-      hardResetAfterMinutes: 1440,
-      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+      compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
     },
     heartbeat: {
       enabled: false,
@@ -60,7 +58,7 @@ const owner = fixtureOwner(workspace);
         },
       },
     },
-    agent: { maxIterations: 5, disclaimerEnabled: false },
+    agent: { maxIterations: 5 },
   };
 }
 
@@ -86,9 +84,6 @@ function makeRuntime(workspace: string) {
 }
 
 function message(text: string, mediaPath?: string, chatId: string = TEST_OWNER_CHAT): AdmittedMessage {
-  // S1: admission judges the FULL transport identity and requires a non-empty channel, chatId, userId and
-  // eventId plus `chatType: 'private'`. This helper used to emit only chatId/userId, which is no longer a
-  // message anything can admit. `eventId` is derived so distinct messages are distinct events.
   return {
     channel: 'telegram',
     chatId,
@@ -100,15 +95,6 @@ function message(text: string, mediaPath?: string, chatId: string = TEST_OWNER_C
   };
 }
 
-/**
- * S1: the Router now REQUIRES admission and an owner id — there is no optional authority and no legacy
- * chat-to-identity lookup. Every Router in this suite therefore binds a real owner through the enrollment
- * state machine and routes `message(...)` from that owner.
- *
- * OLD -> NEW: these constructions passed `profileRegistry` and relied on `getProfileForChat`. Where a
- * test used the registry to make a chat UNRECOGNIZED, it now sends from a different chat entirely and
- * admission refuses it — the same outcome, decided by the authority that actually decides it.
- */
 async function ownerRouterDeps(
   workspace: string,
   chatId: string = TEST_OWNER_CHAT,
@@ -248,10 +234,6 @@ describe('GatewayMessageRouter media lifecycle', () => {
 
     const reply = await router.route({ ...message('hello', stagedPath), chatId: 'stranger-chat' }, egress);
 
-    // OLD -> NEW: was `expect(reply).toContain('not recognized')` — the Router's own UNRECOGNIZED_CHAT
-    // reply, reached because a registry had no profile for that chat. The Router has no such path now:
-    // admission refuses the chat first and owns every refusal message. Same outcome (no adoption, no
-    // coordinator call), decided by the authority that decides it.
     expect(reply).toMatch(/not connected to this assistant/i);
     expect(fs.existsSync(stagedPath)).toBe(false);
     expect(runtime.turnCoordinator.runUser).not.toHaveBeenCalled();
@@ -426,11 +408,7 @@ describe('GatewayMessageRouter routing decisions', () => {
       chatId: 'new-chat',
     }, egress);
 
-    // Plan15 §2.3: denied raw emergencies get canned guidance without health authority.
-    // The former M11 attribution had no canonical founder evidence. Preserve every no-effect check.
     expect(reply).toBe(EMERGENCY_RESPONSE);
-    // OLD -> NEW: was `registry.getProfileForChat('new-chat')` — "no pairing was created". The registry
-    // is gone; the owner RECORD is the only binding, so assert it never named that chat.
     expect(admission.ownsDestination('new-chat')).toBe(false);
     expect(fs.existsSync(stagedPath)).toBe(false);
     expect(fs.existsSync(path.join(workspace, 'reports'))).toBe(false);
@@ -534,13 +512,13 @@ describe('GatewayMessageRouter routing decisions', () => {
   });
 });
 
-describe('GatewayMessageRouter emergency raw-input boundary (RR2-A2)', () => {
+describe('GatewayMessageRouter emergency raw-input boundary', () => {
   let root: string;
   let workspace: string;
   let staging: string;
 
   beforeEach(() => {
-    root = makeTestTemp('redacted-router-rr2a2-');
+    root = makeTestTemp('redacted-router-');
     workspace = path.join(root, 'workspace');
     staging = path.join(root, 'staging', 'media');
     fs.mkdirSync(workspace, { recursive: true });
@@ -625,10 +603,7 @@ describe('GatewayMessageRouter emergency raw-input boundary (RR2-A2)', () => {
       egress,
     );
 
-    // User-authored metadata-looking lines remain raw text (spec13 D3); guidance grants no access.
     expect(reply).toBe(EMERGENCY_RESPONSE);
-    // OLD -> NEW: was `registry.getProfileForChat('new-chat')` — "no pairing was created". The registry
-    // is gone; the owner RECORD is the only binding, so assert it never named that chat.
     expect(admission.ownsDestination('new-chat')).toBe(false);
     expect(runtime.turnCoordinator.runUser).not.toHaveBeenCalled();
     expect(runtime.sessions.recordTurn).not.toHaveBeenCalled();

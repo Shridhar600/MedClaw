@@ -1,6 +1,3 @@
-// session_search: verbatim full-text search over the append-only day-file session archive. Read-only.
-// Results are anchored as `sessions/<file>#L<line>`. A failed index yields a plain "unavailable" note,
-// never a throw. PHI: snippets go to the agent (the feature) but are never logged.
 
 import type { Tool, ToolResult } from './types';
 import type { SessionSearchResult } from '../indexstore';
@@ -41,8 +38,6 @@ export function createSessionTools(deps: SessionToolsDeps): Tool[] {
         return ok('Provide a non-empty query to search past conversation turns.');
       }
       const limit = typeof params.limit === 'number' ? params.limit : undefined;
-      // Scope the search to the calling chat so it never surfaces another chat's health turns.
-      // Fail closed without chat context.
       const chatId = context?.chatId;
       if (chatId === undefined) {
         return ok('Session search is unavailable in this context.');

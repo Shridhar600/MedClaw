@@ -1,10 +1,3 @@
-// src/cli/setup-config.ts
-//
-// Setup's argument parsing and configuration/artifact building. It does no prompting and no
-// daemon launch; those stay in the wizard and the service entry.
-//
-// Identity is chosen here and nowhere else: the state root defaults to the selected config file's
-// directory, the owner ID defaults to `default`, and every owner path is derived from that pair.
 
 import * as os from 'os';
 import * as path from 'path';
@@ -20,23 +13,15 @@ import type { SetupWizardState } from './wizard-types';
 export interface ServiceOnboardingArgs {
   yes?: boolean;
   configPath?: string;
-  /**
-   * Owner state root. Every owner path is derived from it, so there is no second path authority.
-   * Defaults to the selected config file's directory.
-   */
   stateRoot?: string;
   /** Owner identity. Validated by the same grammar the config decoder uses. */
   ownerId?: string;
   provider?: ProviderConfig['type'];
   mainModel?: string;
   medicalModel?: string;
-  // The medical model resolves independently of the main provider and defaults to on-device
-  // Ollama medgemma. Set --medical-provider to opt into a cloud medical model.
   medicalProvider?: ProviderConfig['type'];
   /** Medical role only; never inherited from the main key. */
   medicalApiKey?: string;
-  // Embeddings are an independent selection. They default to local Ollama even when main is cloud;
-  // an explicit embedding option overrides only this role.
   embeddingModel?: string;
   embeddingProvider?: ProviderConfig['type'];
   embeddingUrl?: string;
@@ -75,11 +60,6 @@ export function isSupportedOnboardingProvider(
   return SUPPORTED_ONBOARDING_PROVIDERS.includes(providerType);
 }
 
-/**
- * A required option value. Refuses a missing, blank or option-shaped value (`--config --yes`).
- * Reports the field name, never the supplied text, because the value may be a secret.
- * Exported so the setup entry point applies the same rule to the config pair it forwards.
- */
 export function requireOptionValue(token: string, value: string | undefined): string {
   if (value === undefined || value.startsWith('-')) {
     throw new Error(`${token} requires a value. Usage: medclaw onboard ${token} <value>`);
@@ -90,11 +70,6 @@ export function requireOptionValue(token: string, value: string | undefined): st
   return value;
 }
 
-/**
- * An explicit provider selection must name a supported provider, at parse time.
- * The refusal names the role and the option and lists the choices. It never repeats the supplied
- * value: a pasted key is a realistic mistake and would reach the terminal and captured logs.
- */
 function parseProviderOption(
   token: '--provider' | '--medical-provider' | '--embedding-provider',
   value: string | undefined,
@@ -114,10 +89,6 @@ function parseProviderOption(
   return raw as ProviderConfig['type'];
 }
 
-/**
- * An explicit endpoint must be an absolute http(s) URL. Exported so the wizard applies the same
- * rule to its interactive prompt. Throws a message naming only the option.
- */
 export function requireHttpEndpoint(token: string, raw: string | undefined): string {
   const value = raw?.trim() ?? '';
   if (value === '') {
@@ -147,16 +118,6 @@ function parseBoolean(token: string, value: string | undefined): boolean {
   throw new Error(`${token} requires one of: true, false, yes, no, on, off, 1, 0.`);
 }
 
-/**
- * Strict setup argument parsing. Every rejection happens before the wizard and before any lease,
- * directory, template, record or config write:
- *  - an unknown option or an unexpected bare token is refused;
- *  - a missing, blank or option-shaped value is refused;
- *  - explicit provider, boolean and URL values are validated here, not at first use.
- *
- * Errors name the field or the reason only. A supplied value is never echoed, because
- * `--api-key`, `--medical-api-key`, `--embedding-api-key` and `--telegram-token` carry secrets.
- */
 export function parseArgs(argv: string[]): ServiceOnboardingArgs {
   const args: ServiceOnboardingArgs = {};
   for (let index = 0; index < argv.length; index += 1) {
@@ -165,8 +126,6 @@ export function parseArgs(argv: string[]): ServiceOnboardingArgs {
       continue;
     }
     if (!token.startsWith('--')) {
-      // Name the position, never the text: a key pasted as a positional argument must not reach
-      // stderr or captured logs.
       throw new Error(
         `Unexpected argument at position ${index + 1}: setup takes options only.`
         + ' Run `medclaw onboard --help`.',
@@ -306,15 +265,6 @@ function localOllamaUrl(): string {
   return getDefaultConfig().providers.main.baseUrl ?? LOCAL_OLLAMA_BASE_URL;
 }
 
-/**
- * Build one provider role from its own explicit inputs, so nothing leaks sideways between roles
- * (for example a cloud main moving embeddings to cloud, or `--api-key` reaching every role).
- *
- * Endpoint precedence, per role:
- *  - an explicit role endpoint wins;
- *  - otherwise a local role uses `--ollama-url` (or the local default) and a cloud role uses its
- *    own provider default, never the local fallback or another role's endpoint.
- */
 function buildProviderRole(options: {
   providerType: ProviderConfig['type'];
   model?: string;
@@ -369,10 +319,6 @@ export function resolveEmbeddingProvider(
   return args.embeddingProvider ?? getDefaultConfig().providers.embeddings.type;
 }
 
-/**
- * Apply all three roles independently. Main keeps its defaults. Embeddings default to local Ollama
- * even when main is cloud. Medical stays on-device medgemma by default, independent of main.
- */
 function applyProviders(
   config: EffectiveConfig,
   providerType: ProviderConfig['type'],
@@ -405,8 +351,6 @@ function applyProviders(
     pinsRouterEndpoint: embeddingType === 'openrouter',
   });
 
-  // Medical resolves independently of the main provider and defaults to on-device Ollama medgemma,
-  // kept local for privacy. Opt out with --medical-provider (+ --medical-model).
   const medicalType = args.medicalProvider ?? 'ollama';
   config.providers.medical = buildProviderRole({
     providerType: medicalType,
@@ -493,16 +437,9 @@ export function resolveSetupValues(args: ServiceOnboardingArgs): ResolvedSetupVa
   };
 }
 
-/**
- * Validate an owner ID with the same grammar the config decoder uses, so setup cannot write an
- * identity that would later be refused. The refusal names the option and the grammar, never the
- * supplied text, because a pasted credential must not be printed back or logged.
- */
 export function requireOwnerId(raw: string): ProfileId {
   const ownerId = asProfileId(raw.trim());
   if (ownerId === undefined) {
-    // The grammar is rendered from the one authority the decoder uses, wrapped in slashes so the
-    // operator recognizes it as the regular expression it is.
     throw new Error(
       `Invalid --owner-id: it must match /${OWNER_ID_PATTERN.source}/.`,
     );
@@ -530,8 +467,6 @@ export function resolveNonInteractiveArgs(args: ServiceOnboardingArgs): ServiceO
     medicalApiKey: args.medicalApiKey?.trim() ? args.medicalApiKey.trim() : undefined,
     embeddingProvider: embeddingType,
     embeddingModel: args.embeddingModel ?? embeddingDefaults.embeddings,
-    // An explicit embedding endpoint survives untouched. `--ollama-url` is the LOCAL control and is
-    // applied inside `buildProviderRole`, so a cloud embedding role never inherits it.
     embeddingUrl: args.embeddingUrl,
     embeddingApiKey: args.embeddingApiKey?.trim() ? args.embeddingApiKey.trim() : undefined,
     ollamaUrl:
@@ -544,11 +479,6 @@ export function resolveNonInteractiveArgs(args: ServiceOnboardingArgs): ServiceO
   };
 }
 
-/**
- * Select the owner identity and derive every owner path from it. Setup is the only place identity
- * is chosen. The owner workspace, scheduler store and audit log are derived from the state root,
- * so setup can never inherit the operator's real home directory.
- */
 export function buildConfigFromArgs(inputArgs: ServiceOnboardingArgs): EffectiveConfig {
   const args = resolveNonInteractiveArgs(inputArgs);
   const defaults = getDefaultConfig();
@@ -613,8 +543,6 @@ export function collectSetupErrors(args: ServiceOnboardingArgs, config: Effectiv
     errors.push('--medical-model is required for a cloud medical provider. Select a model supported by that provider.');
   }
 
-  // Per-role credential requirement. Each cloud role is satisfied by its own explicit key or its
-  // own provider's environment variable, never by another role's key.
   const embeddingType = resolveEmbeddingProvider(args);
   const requiredCloudRoles: Array<{ label: string; type: ProviderConfig['type']; explicitKey?: string; flag: string }> = [
     { label: 'provider', type: values.providerType, explicitKey: args.apiKey, flag: 'api-key' },
@@ -640,11 +568,6 @@ export function collectSetupErrors(args: ServiceOnboardingArgs, config: Effectiv
   return errors;
 }
 
-/**
- * Commit a new installation through the lease-owning writer, `InstallationService.setup()`. It
- * takes the config and owner-workspace leases, decides freshness under both, and releases only
- * what it acquired. This stays a thin adapter (CLI in, CLI error text out) with no writer logic.
- */
 export async function persistSetupArtifacts(configPath: string, config: EffectiveConfig): Promise<void> {
   const ownerId = asProfileId(config.profiles.defaultProfileId);
   if (ownerId === undefined) {
@@ -656,8 +579,6 @@ export async function persistSetupArtifacts(configPath: string, config: Effectiv
   const outcome = await new InstallationService(new DirectoryLease()).setup({ configPath, config, ownerId });
 
   if (outcome.kind === 'committed') return;
-  // Every non-commit result is a refusal with operator guidance attached; throw it so callers
-  // print it or let the wizard's retry loop report it.
   throw new Error(describeSetupRefusal(outcome));
 }
 
@@ -672,8 +593,6 @@ function describeSetupRefusal(outcome: SetupResult): string {
     case 'incomplete':
       return outcome.message;
     default:
-      // Unreachable: the caller returns on `committed` first. Stated so a future variant cannot
-      // silently report a success as a refusal.
       return 'Setup refused: the installation was not committed.';
   }
 }

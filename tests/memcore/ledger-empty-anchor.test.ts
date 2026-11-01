@@ -1,14 +1,9 @@
 import { renderLedgerFile, parseLedgerFile } from '../../src/memcore';
 import { fact } from '../helpers/memcore-fixtures';
 
-// Wave C regression: a fact may legitimately carry an empty provenance.anchor (e.g. a
-// caller records a fact before its narrative anchor is known). The renderer emits a
-// trailing `· ` that the reader trims to `·`, which the split-on-` · ` provenance parse
-// then rejected — silently quarantining the block and fabricating a v0 "active" fact on
-// each subsequent read. The round-trip must survive an empty anchor without quarantine.
 const PARSE_OPTS = { type: 'medication' as const, profileId: 'test-profile' };
 
-describe('ledger round-trip with empty provenance.anchor (Wave C data-integrity fix)', () => {
+describe('ledger round-trip with empty provenance.anchor (data-integrity fix)', () => {
   it('a fact with an empty anchor survives render -> parse without quarantine', () => {
     const f = fact('metformin', 'medication', { version: 1, status: 'active' });
     f.provenance.anchor = '';
@@ -46,10 +41,8 @@ describe('ledger round-trip with empty provenance.anchor (Wave C data-integrity 
   });
 
   it('still quarantines a genuinely malformed provenance line', () => {
-    // A provenance line with no source/confidence must still fail loud (no fabrication).
     const md = ['## bogus', '### v1 (active)', '- provenance: not a real provenance', '- captured_at: 2026-08-12T00:00:00.000Z'].join('\n');
     const parsed = parseLedgerFile(md, PARSE_OPTS);
-    // The block is quarantined rather than silently accepted as a real fact.
     expect(parsed.some(p => p.fields._quarantine !== undefined)).toBe(true);
   });
 });

@@ -1,11 +1,3 @@
-// Real first-run contender for the setup suite.
-//
-// Spawned as an actual OS process with its OWN `HOME`, it runs the production `runCli` entry point
-// for `onboard` with NO `--config` flag, so the configuration is selected by the real default
-// (`<home>/.redacted/config.json`). Nothing outside the synthetic home is read or written: the
-// machine and shell environment are untouched, and only this child's environment is overridden.
-//
-// Prints exactly one JSON result line on stdout.
 import { runCli } from '../../src/cli';
 import { defaultRuntimeConfigPath } from '../../src/runtime/startup';
 

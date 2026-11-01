@@ -3,9 +3,7 @@ import type { LLMProvider } from '../../src/providers/types';
 import { SessionManager } from '../../src/gateway/session';
 import { makeTestTemp } from '../helpers/test-temp';
 
-// F8 — compaction LLM calls must run through the injected background runner (semaphore 'background'
-// priority in production) so background compaction never starves or collides with user turns.
-describe('Compaction runs at background priority (F8)', () => {
+describe('Compaction runs at background priority', () => {
   let tmpDir: string;
 
   beforeEach(() => { tmpDir = makeTestTemp('redacted-bg-compaction-'); });
@@ -22,8 +20,8 @@ describe('Compaction runs at background priority (F8)', () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     let backgroundInvocations = 0;
     const manager = new SessionManager(
-      240, 1440, tmpDir, makeProvider('compaction summary'), undefined,
-      { enabled: true, triggerAtTokenPercent: 80, memoryFlush: false, keepRecentTurns: 2 },
+      tmpDir, makeProvider('compaction summary'), undefined,
+      { enabled: true, memoryFlush: false, keepRecentTurns: 2 },
     );
     manager.setBackgroundRunner(async (fn) => { backgroundInvocations += 1; return fn(); });
 
@@ -34,7 +32,6 @@ describe('Compaction runs at background priority (F8)', () => {
     await manager.runCompaction(chatId);
     warn.mockRestore();
 
-    // The summary generation went through the background runner (not a direct provider call).
     expect(backgroundInvocations).toBeGreaterThan(0);
   });
 });

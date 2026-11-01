@@ -23,16 +23,7 @@ describe('Gateway heartbeat integration', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  /**
-   * OLD -> NEW: these tests built `await boundGateway(config)` with no admission, which under S1 means the
-   * destination guard fails closed and every scheduled job is suppressed — the guard now authorizes against
-   * `OwnerState.binding.chatId` rather than the legacy profile registry. Binding a real owner here keeps the
-   * tests exercising the same authority production uses, instead of asserting against a dead default.
-   */
   async function boundGateway(config: EffectiveConfig): Promise<Gateway> {
-    // Bound to `chat-1`, the destination every scheduled job in this suite addresses. The guard
-    // authorizes exactly the bound chat and nothing else, so binding to any other id would suppress
-    // every job — which is the correct behaviour, and the reason these tests must declare their owner.
     const owner = await bindOwnerFixture(fixtureOwner(tmpDir).ownerRecord, fixtureOwner(tmpDir).ownerId, 'chat-1');
     return new Gateway(config, owner.gatewayDeps);
   }
@@ -54,9 +45,7 @@ describe('Gateway heartbeat integration', () => {
         bootstrapMaxChars: 20000,
       },
       sessions: {
-        softResetAfterMinutes: 240,
-        hardResetAfterMinutes: 1440,
-        compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+        compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
       },
       heartbeat: {
         enabled: true,
@@ -75,7 +64,7 @@ describe('Gateway heartbeat integration', () => {
           },
         },
       },
-      agent: { maxIterations: 15, disclaimerEnabled: true },
+      agent: { maxIterations: 15 },
       ...overrides,
     };
   }
@@ -109,7 +98,7 @@ describe('Gateway heartbeat integration', () => {
       usedTools: [],
       healthResponse: false,
     });
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send };
@@ -135,10 +124,6 @@ describe('Gateway heartbeat integration', () => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
-    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
-    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
-    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
-    // The call was therefore write-only and granted nothing.
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).handleScheduledJob(job, runtime);
@@ -204,13 +189,7 @@ describe('Gateway heartbeat integration', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).agentLoop = { run: jest.fn() };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
-    // RR2-B1 setup migration: the guarded policy reconcile refuses unpaired chats; pair
-    // the persisted job's chat so the HEARTBEAT.md sync assertions keep their meaning.
-    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
-    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
-    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
-    // The call was therefore write-only and granted nothing.
+    (gateway as any).sessions = new SessionManager(path.join(tmpDir, 'sessions'));
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).initializeScheduler();
@@ -249,10 +228,6 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
-    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
-    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
-    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
-    // The call was therefore write-only and granted nothing.
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send };
@@ -311,7 +286,7 @@ describe('Gateway heartbeat integration', () => {
       usedTools: [],
       healthResponse: false,
     });
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
       async () => undefined,
@@ -327,10 +302,6 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
-    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
-    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
-    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
-    // The call was therefore write-only and granted nothing.
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send };
@@ -369,16 +340,10 @@ describe('Gateway heartbeat integration', () => {
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).agentLoop = { run: jest.fn().mockResolvedValue({ text: 'ok', trace: [] }) };
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
     await sessions.recordTurn('chat-1', [{ role: 'user', content: 'Seed startup chat.' }]);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).sessions = sessions;
-    // RR2-B1 setup migration: the guarded policy reconcile refuses unpaired chats; pair
-    // the startup chat so the policy-job creation assertions keep their meaning.
-    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
-    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
-    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
-    // The call was therefore write-only and granted nothing.
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).initializeScheduler();
@@ -421,7 +386,7 @@ describe('Gateway heartbeat integration', () => {
     });
     const gateway = await boundGateway(config);
     const runtime = attachGatewayTestRuntime(gateway, config);
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
@@ -442,10 +407,6 @@ describe('Gateway heartbeat integration', () => {
     await sessions.recordTurn('chat-1', [{ role: 'user', content: 'Seed policy chat.' }]);
     const sessionState = sessions.getOrCreateSessionState('chat-1');
     sessionState.lastActiveAt = new Date(Date.now() - (2 * 60 * 60 * 1000));
-    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
-    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
-    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
-    // The call was therefore write-only and granted nothing.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).initializeScheduler();
 
@@ -496,7 +457,7 @@ describe('Gateway heartbeat integration', () => {
     });
     const gateway = await boundGateway(config);
     const runtime = attachGatewayTestRuntime(gateway, config);
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
       async () => undefined,
@@ -517,10 +478,6 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
-    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
-    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
-    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
-    // The call was therefore write-only and granted nothing.
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockRejectedValue(new Error('send failed')) };
@@ -571,7 +528,7 @@ describe('Gateway heartbeat integration', () => {
     });
     const gateway = await boundGateway(config);
     const runtime = attachGatewayTestRuntime(gateway, config);
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
       async () => undefined,
@@ -592,10 +549,6 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
-    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
-    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
-    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
-    // The call was therefore write-only and granted nothing.
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockRejectedValue(new Error('send failed')) };
@@ -649,7 +602,7 @@ describe('Gateway heartbeat integration', () => {
     });
     const gateway = await boundGateway(config);
     const runtime = attachGatewayTestRuntime(gateway, config);
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
       async (job) => {
@@ -672,10 +625,6 @@ describe('Gateway heartbeat integration', () => {
       source: 'system',
       kind: 'routine',
     });
-    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
-    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
-    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
-    // The call was therefore write-only and granted nothing.
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockRejectedValue(new Error('send failed')) };
@@ -726,7 +675,7 @@ describe('Gateway heartbeat integration', () => {
     });
     const gateway = await boundGateway(config);
     const runtime = attachGatewayTestRuntime(gateway, config);
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
       async () => undefined,
@@ -747,10 +696,6 @@ describe('Gateway heartbeat integration', () => {
       kind: 'routine',
       policyKey: 'defaults:morning-check-in',
     });
-    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
-    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
-    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
-    // The call was therefore write-only and granted nothing.
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = { send: jest.fn().mockRejectedValue(new Error('send failed')) };
@@ -778,8 +723,6 @@ describe('Gateway heartbeat integration', () => {
 
     const refreshed = await scheduler.getStore().get(job.id);
     expect(refreshed?.deliveryState).toBe('dead-letter');
-    // lastError/deadLetterReason are persisted to disk and must be PHI-safe:
-    // summarizeErrorForLog keeps the error name but strips the message body.
     expect(refreshed?.deadLetterReason).toContain('Error');
     expect(refreshed?.deadLetterReason).not.toContain('send failed');
 
@@ -835,7 +778,7 @@ describe('Gateway heartbeat integration', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).agentLoop = { run: jest.fn().mockResolvedValue({ text: 'ok', trace: [] }) };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (gateway as any).sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    (gateway as any).sessions = new SessionManager(path.join(tmpDir, 'sessions'));
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (gateway as any).initializeScheduler();
@@ -907,11 +850,7 @@ describe('Gateway heartbeat integration', () => {
         }),
       };
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (gateway as any).sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
-    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
-    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
-    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
-    // The call was therefore write-only and granted nothing.
+      (gateway as any).sessions = new SessionManager(path.join(tmpDir, 'sessions'));
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await (gateway as any).initializeScheduler();
@@ -949,7 +888,7 @@ describe('Gateway heartbeat integration', () => {
     const gateway = await boundGateway(config);
     const runtime = attachGatewayTestRuntime(gateway, config);
     const send = jest.fn().mockResolvedValue(undefined);
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
       async (job) => {
@@ -1002,10 +941,6 @@ describe('Gateway heartbeat integration', () => {
     (gateway as any).sessions = sessions;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).scheduler = scheduler;
-    // OLD: `pairChatToDefaultRuntime(gateway, 'chat-1')` paired this chat through `ProfileRegistry` and
-    // assigned it to `gateway.profileRegistry`. Both are gone — `boundGateway` binds the real owner record
-    // at 'chat-1' through the enrollment state machine, which is the authority the destination guard reads.
-    // The call was therefore write-only and granted nothing.
 
     await scheduler.runNow(firstJob.id);
     await scheduler.runNow(secondJob.id);

@@ -46,7 +46,6 @@ describe('setup wizard', () => {
     return { code, text: output.join(''), prompts: prompts.join('\n') };
   }
 
-  // State root, owner id, provider, main model, medical model, Ollama URL, then the embedding role.
   const ollamaStart = (root = stateRoot): string[] => [root, 'default', 'ollama', '', '', ''];
   const cloudStart = (key: string): string[] => [stateRoot, 'default', 'openai', key, '', ''];
   const freshState = (name: string): string => path.join(tmpDir, `${name}-state`);

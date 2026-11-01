@@ -47,11 +47,6 @@ describe('LLM semaphore wiring', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  /**
-   * OLD -> NEW: built `await boundGateway(config)` with no admission. Under S1 that makes the destination guard
-   * fail closed, so scheduled work is suppressed. Binding a real owner keeps these tests on the same
-   * authority production uses.
-   */
   async function boundGateway(config: EffectiveConfig): Promise<Gateway> {
     const owner = fixtureOwner(tmpDir);
     const bound = await bindOwnerFixture(owner.ownerRecord, owner.ownerId, 'chat-1');
@@ -75,9 +70,7 @@ describe('LLM semaphore wiring', () => {
         bootstrapMaxChars: 20000,
       },
       sessions: {
-        softResetAfterMinutes: 240,
-        hardResetAfterMinutes: 1440,
-        compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+        compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
       },
       heartbeat: {
         enabled: true,
@@ -96,7 +89,7 @@ describe('LLM semaphore wiring', () => {
           },
         },
       },
-      agent: { maxIterations: 15, disclaimerEnabled: true },
+      agent: { maxIterations: 15 },
       ...overrides,
     };
   }
@@ -121,18 +114,14 @@ describe('LLM semaphore wiring', () => {
 
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
     const semaphore = new LLMSemaphore();
-    const loop = new AgentLoop(recordingProvider, registry, [], { maxIterations: 15, disclaimerEnabled: false }, semaphore);
+    const loop = new AgentLoop(recordingProvider, registry, [], { maxIterations: 15 }, semaphore);
 
-    // Start a heartbeat blocker to occupy the running slot so subsequent
-    // calls must queue.
     const hbBlocker = loop.run('hb1-blocker', [], { chatId: 'c1', origin: 'heartbeat' });
     await firstChatStarted.promise;
 
-    // Queue a second heartbeat while drain is paused.
     const hb2 = loop.run('hb2', [], { chatId: 'c1', origin: 'heartbeat' });
     await Promise.resolve();
 
-    // Then queue a user job — should win by priority.
     const user = loop.run('user-input', [], { chatId: 'c1', origin: 'user' });
 
     firstChatDone.resolve();
@@ -140,7 +129,6 @@ describe('LLM semaphore wiring', () => {
     await user;
     await hb2;
 
-    // 3 chats called: hb1-blocker, then user-input (priority), then hb2
     expect(chatOrder).toEqual(['hb1-blocker', 'user-input', 'hb2']);
   });
 
@@ -163,7 +151,7 @@ describe('LLM semaphore wiring', () => {
 
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
     const semaphore = new LLMSemaphore();
-    const loop = new AgentLoop(blockingProvider, registry, [], { maxIterations: 15, disclaimerEnabled: false }, semaphore);
+    const loop = new AgentLoop(blockingProvider, registry, [], { maxIterations: 15 }, semaphore);
 
     const blocker = loop.run('blocker', [], { chatId: 'c1', origin: 'heartbeat' });
     await firstChatEntered.promise;
@@ -177,7 +165,7 @@ describe('LLM semaphore wiring', () => {
     const config = makeConfig();
     const gateway = await boundGateway(config);
     const send = jest.fn().mockResolvedValue(undefined);
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
 
     const runtime = attachGatewayTestRuntime(gateway, config, {
       semaphore,
@@ -185,12 +173,6 @@ describe('LLM semaphore wiring', () => {
       sessions,
     });
     (gateway as any).channel = { send };
-    // RR2-B1 setup migration: pair the job's chat to the attached runtime's profile so the
-    // queue-overflow assertions keep their original meaning under the destination guard.
-    // S1: this used to build a `ProfileRegistry`, pair 'chat-1' to the default profile and assign it to
-    // `gateway.profileRegistry`. That field no longer exists — admission replaced it — so the block was
-    // write-only scaffolding that granted nothing. The real authority is the bound owner record supplied
-    // through `bindGatewayOwner` at construction.
 
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
@@ -229,10 +211,6 @@ describe('LLM semaphore wiring', () => {
       const refreshed = await scheduler.getStore().get(job.id);
       expect(refreshed?.deliveryState).toBe('retry-wait');
 
-      // T1 strengthening: nextRetryAt must survive (markRun must not clobber
-      // retry state). handleScheduledJob (invoked-by-scheduler) calls
-      // scheduler.recordFailure, which schedules a wakeup — assert both the
-      // persisted retry state and the in-memory wakeup timer.
       expect(refreshed?.nextRetryAt).toBeTruthy();
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -259,7 +237,7 @@ describe('LLM semaphore wiring', () => {
   it('queue-full recordFailure storage failure does not escape handleScheduledJob', async () => {
     const config = makeConfig();
     const gateway = await boundGateway(config);
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
 
     const runtime = attachGatewayTestRuntime(gateway, config, {
       sessions,
@@ -269,13 +247,6 @@ describe('LLM semaphore wiring', () => {
       },
     });
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
-    // RR2-B1 setup migration: pair the job's chat to the attached runtime's profile.
-    {
-      // S1: this used to build a `ProfileRegistry`, pair 'chat-1' to the default profile and assign it to
-    // `gateway.profileRegistry`. That field no longer exists — admission replaced it — so the block was
-    // write-only scaffolding that granted nothing. The real authority is the bound owner record supplied
-    // through `bindGatewayOwner` at construction.
-    }
 
     const job = {
       id: 'job-rf',
@@ -311,7 +282,7 @@ describe('LLM semaphore wiring', () => {
   it('no semaphore passed: behavior unchanged (AgentLoop without 5th arg still works)', async () => {
     const provider = makeProvider([{ type: 'text', text: 'no-sem-ok' }]);
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
-    const loop = new AgentLoop(provider, registry, [], { maxIterations: 15, disclaimerEnabled: false });
+    const loop = new AgentLoop(provider, registry, [], { maxIterations: 15 });
 
     const result = await loop.run('hello', [], { chatId: 'c1', origin: 'user' });
     expect(result.text).toBe('no-sem-ok');

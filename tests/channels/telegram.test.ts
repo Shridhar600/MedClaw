@@ -34,9 +34,6 @@ describe('TelegramChannel', () => {
     jest.clearAllMocks();
     mockGetFile.mockReset();
     mockSendMessage.mockReset();
-    // Default: a cleanly-starting bot. Tests that exercise the reject path
-    // override this. Without a default, start() returns undefined and the new
-    // connect()'s .then() attachment throws synchronously.
     mockBotStart.mockResolvedValue(undefined);
     mockBotCatch.mockImplementation(() => undefined);
   });
@@ -69,17 +66,6 @@ describe('TelegramChannel', () => {
       expect(receivedMessages[0].messageId).toBe('77');
     });
 
-    // ── METADATA-FIRST (S1 T4) ────────────────────────────────────────────────────────
-    // S1 change (old -> new): the tests in this block used to assert that the document and photo
-    // handlers called `getFile`, fetched the bytes over HTTP and wrote a local staging file BEFORE
-    // any admission decision — and that a symlinked staging root was rejected at write time. That
-    // eager path is the defect: an unauthenticated stranger could make the process download and
-    // store arbitrary bytes. It has moved behind the core's admission boundary.
-    //
-    // What replaces it here: the transport emits an OPAQUE reference and does no I/O at all. The
-    // staging-path containment, the byte cap, the stream abort and the PHI-safe failure logging all
-    // now belong to `FsMediaStager` and are proved in `tests/runtime/media-stager.test.ts`.
-
     it('document handler emits an opaque media reference and performs no retrieval or write', async () => {
       let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
 
@@ -90,9 +76,7 @@ describe('TelegramChannel', () => {
       const mockFetch = jest.fn();
       global.fetch = mockFetch;
 
-      // A real directory to prove nothing was written into it. Workspace-local via `makeTestTemp`, never
-      // `os.tmpdir()`. The channel no longer takes a staging path, so this stands in for the owner's lane.
-      const stagingDir = makeTestTemp('socs-s1-tg-nothing-written');
+      const stagingDir = makeTestTemp('tg-nothing-written');
       const channel = new TelegramChannel('test-token');
       const received: IncomingMessage[] = [];
       await channel.onMessage(async (msg) => {
@@ -111,7 +95,6 @@ describe('TelegramChannel', () => {
 
       expect(received).toHaveLength(1);
       const message = received[0];
-      // The caption survives verbatim; the reference is an identity, not bytes or a path.
       expect(message.text).toBe('My report');
       expect(message.media).toEqual({
         channel: 'telegram',
@@ -122,11 +105,9 @@ describe('TelegramChannel', () => {
         advertisedBytes: 4096,
       });
 
-      // The load-bearing assertions: no Bot API call, no HTTP fetch, and nothing written.
       expect(mockGetFile).not.toHaveBeenCalled();
       expect(mockFetch).not.toHaveBeenCalled();
       expect(fs.readdirSync(stagingDir)).toEqual([]);
-      // And the wire type cannot carry a local path at all.
       expect((message as { mediaPath?: string }).mediaPath).toBeUndefined();
     });
 
@@ -146,7 +127,7 @@ describe('TelegramChannel', () => {
         received.push(msg);
       });
 
-      const stagingDir = makeTestTemp('socs-s1-tg-photo-nothing-written');
+      const stagingDir = makeTestTemp('tg-photo-nothing-written');
       await handler?.({
         message: {
           photo: [
@@ -169,8 +150,6 @@ describe('TelegramChannel', () => {
     });
 
     it('a caption-bearing document never reaches a fetch even when the sender is a stranger', async () => {
-      // The transport cannot know who the sender is — that is the core's job — so this asserts the
-      // property that matters here: the transport does no work regardless of who is talking.
       let handler: ((ctx: MockCtx) => Promise<void>) | undefined;
       mockBotOn.mockImplementation((event: string, cb: (ctx: MockCtx) => Promise<void>) => {
         if (event === 'message:document') handler = cb;
@@ -208,7 +187,6 @@ describe('TelegramChannel', () => {
         chat: { id: 123 },
         from: { id: 456 },
       };
-      // The handler re-throws so grammY's boundary catches it; suppress the throw here.
       await expect(handler?.(mockCtx)).rejects.toThrow();
       const logged = errorSpy.mock.calls.flat().map(String).join('\n');
       errorSpy.mockRestore();
@@ -287,8 +265,7 @@ describe('TelegramChannel', () => {
     });
   });
 
-  // ── RES-P0-1: grammY error boundary installed in constructor ────────────
-  describe('grammY error boundary (RES-P0-1)', () => {
+  describe('grammY error boundary', () => {
     it('installs bot.catch handler during construction', () => {
       mockBotCatch.mockClear();
       new TelegramChannel('test-token');
@@ -297,9 +274,8 @@ describe('TelegramChannel', () => {
     });
   });
 
-  // ── RES-P0-2: connect() never leaks an unhandled rejection ───────────────
-  describe('connect reconnect (RES-P0-2)', () => {
-    it('a bot whose start() rejects: no unhandledRejection, warn logged, reconnect scheduled', async () => {
+  describe('connect reconnect', () => {
+    it('a bot whose start rejects: no unhandledRejection, warn logged, reconnect scheduled', async () => {
       const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
       const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
       const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
@@ -316,11 +292,9 @@ describe('TelegramChannel', () => {
         const channel = new TelegramChannel('test-token');
         await channel.connect();
 
-        // Let the rejected promise's .then rejection handler run.
         await Promise.resolve();
         await Promise.resolve();
 
-        // Reconnect timer was scheduled (≈1s start, exponential backoff).
         const reconnectCall = setTimeoutSpy.mock.calls.find(
           ([fn, ms]) => typeof fn === 'function' && typeof ms === 'number' && ms >= 1000 && ms <= 1000,
         );
@@ -332,8 +306,6 @@ describe('TelegramChannel', () => {
         expect(warned).not.toContain('glucose');
         expect(warned).not.toContain('401 Unauthorized');
 
-        // No unhandledRejection reached the process.
-        // (drain any pending microtasks before checking)
         await new Promise((r) => setImmediate(r));
         expect(unhandled).toHaveLength(0);
 
@@ -363,6 +335,26 @@ describe('TelegramChannel', () => {
         logSpy.mockRestore();
         warnSpy.mockRestore();
       }
+    });
+  });
+
+  describe('send', () => {
+    it('delivers the same text as plain text when Telegram cannot parse the Markdown', async () => {
+      mockSendMessage
+        .mockRejectedValueOnce(Object.assign(new Error("Bad Request: can't parse entities: Can't find end of the entity"), { error_code: 400 }))
+        .mockResolvedValueOnce({});
+      const channel = new TelegramChannel('test-token');
+      await channel.send('42', { text: 'Your blood_pressure looks *fine' });
+      expect(mockSendMessage).toHaveBeenCalledTimes(2);
+      expect(mockSendMessage.mock.calls[1][1]).toBe('Your blood_pressure looks *fine');
+      expect(mockSendMessage.mock.calls[1][2].parse_mode).toBeUndefined();
+    });
+
+    it('still fails when Telegram rejects the message for another reason', async () => {
+      mockSendMessage.mockRejectedValue(Object.assign(new Error('Forbidden: bot was blocked by the user'), { error_code: 403 }));
+      const channel = new TelegramChannel('test-token');
+      await expect(channel.send('42', { text: 'hello' })).rejects.toThrow('Forbidden');
+      expect(mockSendMessage).toHaveBeenCalledTimes(1);
     });
   });
 });

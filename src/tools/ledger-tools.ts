@@ -1,6 +1,3 @@
-// Agent-facing ledger surface. Records route through the CapturePipeline (both lanes plus the SAFETY
-// re-render); confirmations and queries go straight to the store.
-
 import type { Tool, ToolExecutionContext, ToolResult } from './types';
 import type { CapturePipeline, QueuePort, SafetyRenderer } from '../capture';
 import { computeIdempotencyKey, refreshSafetyView } from '../capture';
@@ -22,25 +19,13 @@ export interface LedgerToolsDeps {
   safety: SafetyRenderer;
   queue: QueuePort;
   clock?: Clock;
-  /** Resolve a medication's side effects (LLM). Omit to always fall back to []. */
+  /** Resolve a medication's side effects; omitted falls back to []. */
   sideEffectLookup?: (entity: string, fields: Record<string, string | number | string[]>) => Promise<string[]>;
-  /**
-   * Narrative anchor port. When supplied, the confirm path writes the `## Ledger writes` back-link for the
-   * confirmed fact (the initial applied record's anchor comes from the pipeline).
-   */
+  /** Writes the `## Ledger writes` back-link for confirmed facts. */
   narrative?: { appendLedgerAnchor(date: string, entity: string, factId: string): Promise<string> };
-  /**
-   * Re-derive the recall substrate (chunk index bookkeeping and reindex; async, off the write lock) for a
-   * fact type after a state-changing confirm or remove. `ledger_record` re-derives via the capture pipeline,
-   * but `ledger_update` and `ledger_remove` bypass it; without this hook a confirmed retraction or
-   * discontinuation keeps injecting the stale fact into the next turn's context.
-   */
+  /** Off-lock re-derive; without it a confirmed change keeps injecting stale context. */
   afterLedgerMutation?: (type: FactType) => Promise<void>;
-  /**
-   * Synchronous FactMirror derivation, called inside the same write-lock op as the confirm/discontinue
-   * itself (never `afterLedgerMutation`, which runs outside the lock). It must not enqueue (no re-entrancy).
-   * A failure warns and continues; recall's fallback port covers reads.
-   */
+  /** In-lock FactMirror derivation; must not enqueue. */
   tier1Rederive?: (type: FactType) => Promise<void>;
 }
 
@@ -51,8 +36,7 @@ function err(text: string): ToolResult {
   return { content: [{ type: 'text', text }], isError: true };
 }
 
-// Shape-check model-supplied ledger_record args: a missing or mistyped field is a clean,
-// self-correctable tool error, never a deep TypeError.
+// Model-supplied args are untrusted: return a clean, self-correctable error, never a deep TypeError.
 function validateRecordArgs(params: Record<string, unknown>): string | null {
   const entity = params.entity;
   if (normalizeEntitySlug(entity) === null) {
@@ -106,8 +90,7 @@ function renderFacts(facts: LedgerFact[]): string {
 }
 
 export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
-  // Best-effort recall re-derive after a state-changing confirm/remove (mirror rebuilds at boot, so a
-  // failure degrades the next turn's recall, never the turn itself).
+  // Best-effort: a failure degrades the next turn's recall, never the turn itself.
   const afterMutation = async (type: FactType): Promise<void> => {
     if (!deps.afterLedgerMutation) return;
     try {
@@ -116,8 +99,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       console.warn('[ledger-tools] post-mutation recall re-derive failed (rebuilds at boot):', summarizeErrorForLog(e));
     }
   };
-  // Tier-1: called from WITHIN the write-lock `run()` closure (never after `queue.enqueue()`
-  // resolves) so the FactMirror update lands atomically with the confirm/discontinue itself.
+  // Called from within the write-lock closure so the mirror update lands atomically.
   const afterTier1 = async (type: FactType): Promise<void> => {
     if (!deps.tier1Rederive) return;
     try {
@@ -198,7 +180,6 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       required: ['entity', 'type'],
     },
     async execute(params, context): Promise<ToolResult> {
-      // Model-supplied args are untrusted: validate shapes here and return a clean, self-correctable error.
       const argErr = validateRecordArgs(params);
       if (argErr) return err(argErr);
       const entity = normalizeEntitySlug(params.entity);
@@ -209,16 +190,14 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       if (!FACT_TYPES.includes(type)) return err(`Unknown fact type "${type}".`);
       const fields = { ...((params.fields as Record<string, string | number | string[]>) ?? {}) };
 
-      // Field keys are model-invented names. A key that does not survive the Markdown round-trip
-      // would be silently dropped, renamed, or corrupt its block (or forge ledger structure).
+      // A model-invented key that fails the round-trip could drop, rename or forge ledger structure.
       for (const key of Object.keys(fields)) {
         if (!isStorableFieldKey(key)) {
           return err(`Write rejected: field key ${JSON.stringify(key.slice(0, 40))} is reserved or contains ":", "#", control characters, or edge spaces. Use a simple name such as "dose".`);
         }
       }
 
-      // The ledger lane carries the same credential-rejection bar as memory_write: scan every
-      // caller-controlled input before any write.
+      // Same credential bar as memory_write.
       const credScan = contentContainsCredentials(
         `${entity}\n${JSON.stringify(fields)}\n${(params.note as string) ?? ''}\n${(params.verbatim as string) ?? ''}`,
       );
@@ -226,8 +205,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
         return err(`Write rejected: content matches credential pattern (${credScan.pattern}). Credentials must never be stored in the health memory.`);
       }
 
-      // A medication must never be stored with an absent known_side_effects field. Resolve it once before
-      // enqueue; on failure (or no resolver) fall back to [].
+      // A stored medication must always carry known_side_effects; fall back to [].
       if (type === 'medication' && fields.known_side_effects === undefined) {
         if (deps.sideEffectLookup) {
           try {
@@ -244,10 +222,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
 
       const source = (params.source as Authority) ?? 'user';
       const confidence = (params.confidence as number) ?? 0.9;
-      // A deterministic idempotency key, so a replayed delivery of the same tool call returns the cached
-      // original result instead of double-writing. Built from the caller-scoped identity
-      // (chatId/turnId/toolCallId), NOT `provenance.capturedAt`, which is stamped fresh per call and would
-      // defeat replay detection. No key when the caller supplies no chatId/turnId.
+      // Key on caller identity, not capturedAt, which is stamped fresh per call and would defeat replay detection.
       const idempotencyKey = context?.chatId && context?.turnId
         ? computeIdempotencyKey({
           chatId: context.chatId,
@@ -316,7 +291,6 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       required: ['tokenId', 'confirm'],
     },
     async execute(params, context): Promise<ToolResult> {
-      // Same boundary rule as ledger_record: clean, self-correctable errors.
       if (typeof params.tokenId !== 'string' || params.tokenId.trim() === '') {
         return err('Missing or invalid required field "tokenId" (the confirmation token id string from ledger_record).');
       }
@@ -350,8 +324,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
             );
             // A confirmed safety-relevant change must re-render SAFETY.md in the same op.
             if (applied.safetyRelevant) await refreshSafetyView(deps.safety);
-            // Back-link for the confirmed fact: dispute resolutions and confirmed writes otherwise never
-            // appear in the daily log index.
+            // The narrative back-link: confirmed writes otherwise never reach the daily log index.
             if (deps.narrative) {
               try {
                 const day = new Date(applied.provenance.capturedAt);
@@ -363,18 +336,15 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
                 console.warn('[ledger_update] ledger-writes anchor failed (continuing):', summarizeErrorForLog(anchorError));
               }
             }
-            // In-lock: the FactMirror update lands atomically with this confirm.
             await afterTier1(applied.type);
             return applied;
           },
         });
-        // Off-lock: re-derive chunk index bookkeeping so the confirmed change (supersession, retraction,
-        // discontinuation, dispute resolution) reaches the next turn's context.
+        // Off-lock: re-derive chunk index bookkeeping so recall drops the stale change.
         await afterMutation(fact.type);
         return ok(`Confirmed: ${fact.entity} (${fact.type}) is now ${fact.status} as ${fact.id}.`);
       } catch (e) {
-        // Raw provider/store errors can echo entity names (health content). Token rejections carry a fixed
-        // PHI-free reason; everything else is logged sanitized and reported generically.
+        // Raw store errors can echo entity names; token rejections carry a fixed PHI-free reason.
         if (e instanceof TokenRejectedError) {
           return err(`Could not apply confirmation: ${e.message}`);
         }
@@ -389,7 +359,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
     name: 'ledger_remove',
     group: 'group:ledger',
     ownerTurnOnly: true,
-    description: 'Remove a health fact (e.g. discontinue a medication the user no longer takes). Meds and allergies ALWAYS ask the user for confirmation before applying; SAFETY.md updates on confirm (D8/DAD-11).',
+    description: 'Remove a health fact (e.g. discontinue a medication the user no longer takes). Meds and allergies ALWAYS ask the user for confirmation before applying; SAFETY.md updates on confirm.',
     parameters: {
       type: 'object',
       properties: {
@@ -400,7 +370,6 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       required: ['entity', 'type'],
     },
     async execute(params, context): Promise<ToolResult> {
-      // Boundary validation: a non-string entity/reason would otherwise TypeError deep in sanitize/parse.
       const entity = normalizeEntitySlug(params.entity);
       if (entity === null) {
         return err('Missing or invalid required field "entity" (a non-empty string naming the fact to remove).');
@@ -410,9 +379,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       if (params.reason !== undefined && typeof params.reason !== 'string') {
         return err('Invalid field "reason": expected a string.');
       }
-      // The reason persists into a ledger type file, so it passes the same credential bar and single-line
-      // discipline as every other caller-controlled input. A multi-line reason could forge version blocks
-      // (fake ACTIVE med facts) on re-parse.
+      // A multi-line reason could forge version blocks, so it takes the credential and single-line bar.
       let reason = (params.reason as string | undefined) ?? undefined;
       if (reason !== undefined) {
         const credScan = contentContainsCredentials(reason);
@@ -423,9 +390,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
         if (reason === '') reason = undefined;
       }
 
-      // The agent-facing removal surface. It routes through the ledger's discontinuation flow so medication
-      // removal is user-confirmed and every version stays preserved (soft delete). The SAFETY re-render and
-      // FactMirror derivation run inside the write lock, like `ledger_update`'s confirm path.
+      // Soft delete: medication removal needs confirmation and every version is kept.
       const result = await deps.queue.enqueue('turn', {
         label: 'ledger_remove:discontinue',
         run: async () => {
@@ -448,8 +413,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
           `current: ${summarizeFields(result.fact)}`,
         );
       }
-      // Off-lock: a direct-applied (non-medication) removal also bypasses the pipeline, so re-derive chunk
-      // index bookkeeping so recall drops it.
+      // Off-lock: a direct-applied removal also bypasses the pipeline, so recall must drop it.
       await afterMutation(result.fact.type);
       return ok(`Removed ${entity} (${type}) — now ${result.fact.status} as ${result.fact.id}.`);
     },
@@ -476,8 +440,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
       const status = (params.status as string) ?? 'active';
       if (type && !FACT_TYPES.includes(type)) return err(`Unknown fact type "${type}".`);
 
-      // Surface any dual-active conflict so the agent asks the user to clarify, instead of silently masking
-      // a head (getActive returns only the max version).
+      // Surface dual-active conflicts rather than silently masking a head.
       const conflicts = type ? await deps.ledger.listActiveConflicts(type) : [];
 
       if (entity && type) {

@@ -1,23 +1,3 @@
-// src/config/validation.ts
-//
-// Total decoder for the persisted `schemaVersion: 2` document, plus the semantic
-// validator shared by every consumer (startup, `config set`, wizard, readiness).
-//
-// Rules:
-//
-//  - Input is `unknown`. No cast, no deep-merge-as-validation. A document that is not
-//    an object, or whose nesting/types are wrong, is refused with an allowlisted
-//    field/reason. Input values are never included in a message.
-//  - Unknown keys are refused, not merged.
-//  - Prototype keys are refused at every level.
-//  - Identity is required: `profiles.baseDir` and `profiles.defaultProfileId`. A document
-//    without them cannot serve, because a default must never become an owner.
-//  - Defaults fill only omitted NON-IDENTITY settings, and only after the supplied shape
-//    has been validated.
-//  - Built-in emergency keywords are always retained; configured keywords are added only
-//    when they are valid non-empty strings.
-//
-// Pure: no filesystem access. `homeDir` is injected so `~/` expansion is testable.
 
 import * as path from 'path';
 import * as cron from 'node-cron';
@@ -145,10 +125,6 @@ function isPlainObject(value: unknown): value is Plain {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/**
- * Closed-schema read of one object level. Reports unknown and prototype keys, and returns
- * only the known keys so a nested reader can never walk an unvalidated branch.
- */
 function readObject(
   value: unknown,
   field: string,
@@ -343,12 +319,6 @@ function readProvider(r: Reader, raw: unknown, field: string, fallback: Provider
   return provider;
 }
 
-/**
- * Is this URL the known local Ollama endpoint, however it is spelled?
- *
- * Only that one default is recognised. It is not a general endpoint policy: a private or loopback
- * proxy at any other URL is a legal operator choice.
- */
 function isLocalOllamaBaseUrl(value: string): boolean {
   const trimmed = value.trim();
   if (trimmed === LOCAL_OLLAMA_BASE_URL) return true;
@@ -360,8 +330,6 @@ function isLocalOllamaBaseUrl(value: string): boolean {
   } catch {
     return false;
   }
-  // A trailing dot is the same DNS name, and userinfo does not make a different endpoint. Only these
-  // spelling differences are ignored; 127.0.0.1 is not treated as the same name as localhost.
   const host = (url: URL): string => url.hostname.toLowerCase().replace(/\.+$/, '');
   // Percent-escapes spell the same path (`/%76%31` is `/v1`). A malformed escape is left as-is.
   const decodePath = (value: string): string => {
@@ -379,13 +347,6 @@ function isLocalOllamaBaseUrl(value: string): boolean {
     && samePath;
 }
 
-/**
- * Per-role base URL policy.
- *
- * A local role must carry its local endpoint. A cloud role may carry an explicit endpoint (OpenRouter
- * has no SDK default) but must never carry the known local Ollama endpoint: a cloud provider never
- * inherits a local base URL. URL structure is checked earlier by `isValidHttpUrl`.
- */
 function checkProviderBaseUrl(r: Reader, provider: ProviderConfig, field: string): void {
   if (provider.type === 'ollama') {
     if (!provider.baseUrl) {
@@ -404,13 +365,12 @@ function checkProviderBaseUrl(r: Reader, provider: ProviderConfig, field: string
 
 function readSessions(r: Reader, raw: unknown): SessionsConfig {
   const d = r.defaults.sessions;
-  const obj = readObject(raw, 'sessions', ['softResetAfterMinutes', 'hardResetAfterMinutes', 'compaction', 'window'], r.issues);
+  const obj = readObject(raw, 'sessions', ['compaction', 'window'], r.issues);
   if (!obj) return structuredClone(d);
 
-  const compactionRaw = readObject(obj.compaction, 'sessions.compaction', ['enabled', 'triggerAtTokenPercent', 'memoryFlush', 'keepRecentTurns'], r.issues);
+  const compactionRaw = readObject(obj.compaction, 'sessions.compaction', ['enabled', 'memoryFlush', 'keepRecentTurns'], r.issues);
   const compaction = {
     enabled: reqBool(r, compactionRaw, 'enabled', 'sessions.compaction.enabled', d.compaction.enabled),
-    triggerAtTokenPercent: optFiniteNumber(r, compactionRaw, 'triggerAtTokenPercent', 'sessions.compaction.triggerAtTokenPercent', d.compaction.triggerAtTokenPercent, { min: 1, max: 100 }),
     memoryFlush: reqBool(r, compactionRaw, 'memoryFlush', 'sessions.compaction.memoryFlush', d.compaction.memoryFlush),
     keepRecentTurns: optFiniteNumber(r, compactionRaw, 'keepRecentTurns', 'sessions.compaction.keepRecentTurns', d.compaction.keepRecentTurns, { min: 1, integer: true }),
   };
@@ -428,8 +388,6 @@ function readSessions(r: Reader, raw: unknown): SessionsConfig {
   }
 
   return {
-    softResetAfterMinutes: optFiniteNumber(r, obj, 'softResetAfterMinutes', 'sessions.softResetAfterMinutes', d.softResetAfterMinutes, { min: 0, integer: true }),
-    hardResetAfterMinutes: optFiniteNumber(r, obj, 'hardResetAfterMinutes', 'sessions.hardResetAfterMinutes', d.hardResetAfterMinutes, { min: 0, integer: true }),
     compaction,
     window: win,
   };
@@ -513,8 +471,6 @@ function semanticIssues(stored: StoredConfig): ConfigIssue[] {
     }
   }
 
-  // A token is required exactly when telegram is enabled. A disabled channel is a valid
-  // "pairing-pending" state; `validateConfig` reports it as a warning.
   if (stored.channels.telegram.enabled && stored.channels.telegram.botToken.trim() === '') {
     r.issues.add('missing-secret', 'channels.telegram.botToken', 'telegram is enabled but no bot token is set');
   }
@@ -584,12 +540,6 @@ function readEmergencyKeywords(r: Reader, raw: unknown): string[] {
   return [...BUILT_IN_EMERGENCY_KEYWORDS, ...extra];
 }
 
-/**
- * Decode an unknown value into a validated `StoredConfig`.
- *
- * Never throws for bad input: returns typed issues so a caller can refuse honestly and
- * keep the original bytes on disk.
- */
 export function decodeStoredConfig(
   input: unknown,
   options: { homeDir: string },
@@ -693,10 +643,9 @@ export function decodeStoredConfig(
 
   const sessions = readSessions(r, root.sessions);
   const heartbeat = readHeartbeat(r, root.heartbeat);
-  const agentRaw = readObject(root.agent, 'agent', ['maxIterations', 'disclaimerEnabled'], issues);
+  const agentRaw = readObject(root.agent, 'agent', ['maxIterations'], issues);
   const agent = {
     maxIterations: optFiniteNumber(r, agentRaw, 'maxIterations', 'agent.maxIterations', defaults.agent.maxIterations, { min: 1, integer: true }),
-    disclaimerEnabled: reqBool(r, agentRaw, 'disclaimerEnabled', 'agent.disclaimerEnabled', defaults.agent.disclaimerEnabled),
   };
 
   const stored: StoredConfig = {
@@ -720,12 +669,6 @@ export function decodeStoredConfig(
   return { kind: 'valid', config: stored };
 }
 
-/**
- * Semantic validation of an already-constructed configuration.
- *
- * Gives the wizard, `config set` and the start preflight an errors/warnings view. It runs the
- * same rules as `decodeStoredConfig`, so there is no second validator to disagree with startup.
- */
 export function validateConfig(config: EffectiveConfig): ConfigValidationResult {
   const stored = toStoredView(config);
   const issues = semanticIssues(stored);

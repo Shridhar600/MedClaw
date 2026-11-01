@@ -8,10 +8,7 @@ import { makeTestTemp } from '../helpers/test-temp';
 const DAY = '2026-08-20T10:00:00.000Z';
 const userProv: Provenance = { source: 'user', confidence: 1, anchor: '', capturedAt: DAY, note: '' };
 
-// H-1 (Wave E panel) — a DISPUTED mint writes the ledger file (prior active → disputed + both heads
-// appended) but the pipeline only re-derived the recall mirror on `applied`. Result: Stage-1 recall
-// kept injecting the pre-dispute fact as ACTIVE until boot/next mutation (CONTRA-09 class, specs/13-A1).
-describe('CapturePipeline re-derives the recall mirror on a disputed mint (H-1)', () => {
+describe('CapturePipeline re-derives the recall mirror on a disputed mint', () => {
   let tmp: string;
   let pipeline: CapturePipeline;
   let rederiveCalls: string[][];

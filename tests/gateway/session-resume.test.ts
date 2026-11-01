@@ -4,14 +4,7 @@ import type { LLMProvider, Message } from '../../src/providers/types';
 import { SessionManager } from '../../src/gateway/session';
 import { makeTestTemp } from '../helpers/test-temp';
 
-// P2b Wave D-1 / D1.5+D1.6 — resume-after-restart reads the WINDOW (session-window.json, per-chat in
-// no-registry mode) + replays the day-file tail from `verbatimFrom` to EOF. It NO LONGER reads the
-// legacy `active-<chatId>.jsonl` file, and since D1.6 `recordTurn` no longer WRITES one — so resume can
-// only come from the day-file archive + window. The `rmActive` guard belt-and-braces that no stale
-// active file (should one exist) ever influences resume. The window is a derived snapshot: summaryBlock
-// + `verbatimFrom` = archive-EOF walked back by the verbatim tail length.
-
-describe('session resume from window + day files (D1.5)', () => {
+describe('session resume from window + day files', () => {
   let dir: string;
   beforeEach(() => {
     dir = makeTestTemp('sm-resume-');
@@ -49,7 +42,7 @@ describe('session resume from window + day files (D1.5)', () => {
     const a = new SessionManager({
       sessionsPath: dir,
       provider: makeProvider('SUMMARY of older turns'),
-      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: false, keepRecentTurns: 4 },
+      compaction: { enabled: true, memoryFlush: false, keepRecentTurns: 4 },
     });
     for (let i = 0; i < 6; i++) {
       await a.recordTurn('c1', [
@@ -60,7 +53,6 @@ describe('session resume from window + day files (D1.5)', () => {
     await a.runCompaction('c1');
     const before = await a.prepareHistory('c1');
     expect(before[0].role).toBe('system');
-    // H4 turn-aware: keepRecentTurns=4 keeps the last 4 TURNS (8 messages), u2..a5.
     expect(before.slice(1).map((m: Message) => m.content)).toEqual(['u2', 'a2', 'u3', 'a3', 'u4', 'a4', 'u5', 'a5']);
 
     rmActive('c1');
@@ -120,12 +112,12 @@ describe('session resume from window + day files (D1.5)', () => {
     }
   });
 
-  it('per-chat mode: one chat\'s compaction summary never leaks to another chat on resume (X-2)', async () => {
+  it('per-chat mode: one chat\'s compaction summary never leaks to another chat on resume', async () => {
     const a = new SessionManager({
       sessionsPath: dir,
       perChatArchive: true,
       provider: makeProvider('SUMMARY of chat A — glucose 300 recorded'),
-      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: false, keepRecentTurns: 2 },
+      compaction: { enabled: true, memoryFlush: false, keepRecentTurns: 2 },
     });
     for (let i = 0; i < 6; i++) {
       await a.recordTurn('chatA', [
@@ -149,7 +141,7 @@ describe('session resume from window + day files (D1.5)', () => {
     expect(chatB.map((m: Message) => m.content)).toEqual(['chatB hello', 'chatB hi']);
   });
 
-  it('a wiped window resumes empty at EOF, archive preserved (A-L6)', async () => {
+  it('a wiped window resumes empty at EOF, archive preserved', async () => {
     const a = new SessionManager({ sessionsPath: dir });
     await a.recordTurn('c1', [{ role: 'user', content: 'kept on disk' }]);
     fs.rmSync(path.join(dir, 'session-window.json')); // lose the window; day file stays

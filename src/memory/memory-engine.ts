@@ -3,16 +3,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { secureMkdir, secureWriteViaTmp, secureAppend } from '../security';
 
-// Methods are async by interface even though they use synchronous fs operations.
-// This keeps callers future-proof if we switch to fs.promises without API changes.
 export class MemoryEngine {
   constructor(
     private readonly workspace: string,
     private readonly profileId: string = 'default',
   ) {
     secureMkdir(workspace);
-    // Eagerly resolve the real workspace path to prevent a TOCTOU window
-    // between construction and the first resolve() call.
     void this.realWorkspace;
   }
 
@@ -27,8 +23,6 @@ export class MemoryEngine {
   }
 
   private resolve(relativePath: string): string {
-    // Absolute paths are explicitly rejected. path.join would otherwise normalize an absolute
-    // path inside the workspace (no escape, but surprising: callers expect them to be refused).
     if (path.isAbsolute(relativePath)) {
       throw new Error('Absolute paths are not allowed');
     }
@@ -37,8 +31,6 @@ export class MemoryEngine {
     if (!full.startsWith(this.workspace + path.sep) && full !== this.workspace) {
       throw new Error(`Path traversal detected: ${relativePath}`);
     }
-    // Symlink/TOCTOU guard — resolve the parent directory (or file itself) to
-    // detect symlinks that point outside the real workspace root.
     const checkTarget = fs.existsSync(full) ? full : this.nearestExistingParent(full);
     const realTarget = fs.realpathSync(checkTarget);
     const realRoot = this.realWorkspace;

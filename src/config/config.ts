@@ -1,12 +1,3 @@
-// src/config/config.ts
-//
-// Pure configuration policy. This module performs NO filesystem access: decoding,
-// defaulting, owner-path derivation and effective-config assembly all happen here, so
-// the same rules apply to startup, setup, `config set` and local inspection.
-//
-// Disk IO lives in `src/runtime/adapters/config-file.ts` (bounded read, canonical
-// resolution, commit-outcome reporting) and `src/runtime/installation.ts` (lease-owned
-// writers). That split is what makes the config policy liftable and testable.
 
 import * as os from 'os';
 import {
@@ -36,10 +27,6 @@ function defaultDerivedPaths(): DerivedOwnerPaths {
   };
 }
 
-/**
- * Assemble the runtime configuration: the validated stored document plus the owner paths
- * resolved once by the caller. Nothing downstream re-derives a path.
- */
 export function effectiveFromStored(stored: StoredConfig, paths: DerivedOwnerPaths): EffectiveConfig {
   return {
     ...structuredClone(stored),
@@ -52,10 +39,6 @@ export function effectiveFromStored(stored: StoredConfig, paths: DerivedOwnerPat
   };
 }
 
-/**
- * Derive the three owner paths a config needs. `OwnerPaths` from `src/profiles/paths.ts`
- * structurally satisfies this, so this module does not import the profiles module.
- */
 export function resolveEffectiveConfig(
   stored: StoredConfig,
   paths: DerivedOwnerPaths,
@@ -63,10 +46,6 @@ export function resolveEffectiveConfig(
   return effectiveFromStored(stored, paths);
 }
 
-/**
- * Decode a raw parsed document into a validated `StoredConfig`. Never throws for bad
- * input; the caller decides how to refuse.
- */
 export function decodeConfigDocument(input: unknown, options: DecodeOptions = {}): ConfigDecodeResult {
   return decodeStoredConfig(input, { homeDir: options.homeDir ?? os.homedir() });
 }

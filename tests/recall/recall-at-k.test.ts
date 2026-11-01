@@ -4,13 +4,6 @@ import { RecallEngine, DEFAULT_RECALL_CONFIG } from '../../src/recall';
 import type { FactRecord, ChunkWithScore } from '../../src/ports';
 import { FakeFactMirror, currentFactsOf, FakeVectorIndex, FakeKeywordIndex, FakeEmbedding, FakeChunkStats, fixedClock } from './fakes';
 
-// P2 Wave B / Task B3.2 — golden recall@k measurement (the R3 minimum). Deterministic: mocked/
-// frozen scores (no live Ollama) + injected clock (fixed ageDays). Expected ids are authored from
-// SCENARIO semantics (specs/09 style), NOT from whatever the engine returns today — so the suite
-// catches a systematic scoring/threshold/suppression bug, not snapshot drift. ≥50% of cases come
-// from OUTSIDE the knee/diabetes families (risk #9). The per-case floor (recall@3 = 1.0 for these
-// curated cases) is the regression baseline; retune consciously.
-
 interface FixtureChunk {
   id: string; content: string; lane: string; createdAt: string; cosine: number; bm25n: number;
 }

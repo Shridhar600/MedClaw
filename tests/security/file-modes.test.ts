@@ -1,8 +1,3 @@
-// tests/security/file-modes.test.ts
-//
-// Asserts the threat-model §5.1 compensating control: every PHI-bearing
-// directory is 0o700 and every PHI-bearing file is 0o600. Uses REAL tmpdir
-// writes — no fs mocks — because the threat is the on-disk mode the OS sees.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -74,8 +69,6 @@ describe('PHI file modes', () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  // ── secure-fs primitives ──────────────────────────────────────────
-
   describe('secure-fs helpers', () => {
     it('secureMkdir creates a directory at 0o700', () => {
       const d = path.join(root, 'sec');
@@ -134,7 +127,6 @@ describe('PHI file modes', () => {
       expect(modeOf(f)).toBe(0o644);
       secureAppend(f, 'more\n');
       expectFileMode(f);
-      // a second append must keep it 0o600 (and not fall back to loose)
       secureAppend(f, 'even more\n');
       expectFileMode(f);
     });
@@ -143,7 +135,6 @@ describe('PHI file modes', () => {
       const src = path.join(root, 'src.txt');
       secureWrite(src, 'payload');
       const dest = path.join(root, 'copy.txt');
-      // Warm a loose destination to prove copy then restricts it.
       fs.writeFileSync(dest, 'stale', { mode: 0o644 });
       fs.chmodSync(dest, 0o644);
       secureCopyFile(src, dest);
@@ -166,8 +157,6 @@ describe('PHI file modes', () => {
       expectFileMode(path.join(base, 'sub', 'y.md'));
     });
   });
-
-  // ── memory engine ────────────────────────────────────────────────
 
   describe('MemoryEngine', () => {
     it('workspace dir and memory files are 0o700 / 0o600', async () => {
@@ -193,28 +182,23 @@ describe('PHI file modes', () => {
     });
   });
 
-  // ── session manager ───────────────────────────────────────────────
-
   describe('SessionManager', () => {
     const mkMsg = (role: 'user' | 'assistant', content: string) => ({ role, content });
 
     it('sessions dir and day-file archive are 0o700 / 0o600', async () => {
       const sessionsPath = path.join(root, 'sessions');
-      const sm = new SessionManager(60, 1440, sessionsPath, undefined, undefined, undefined, 'default');
+      const sm = new SessionManager(sessionsPath, undefined, undefined, undefined, 'default');
       await sm.recordTurn('123', [mkMsg('user', 'my back hurts'), mkMsg('assistant', 'sorry to hear')]);
       expectDirMode(sessionsPath);
       expectFileMode(path.join(sessionsPath, new Date().toISOString().slice(0, 10) + '.jsonl'));
     });
 
-    // P2b/D3.6 (DD9): /new is a window-archive — the archive/ + summaries/ side-files are retired. The
-    // day-file archive is preserved 0600 and continues; the replacement window is durable and empty.
     it('reset preserves the day-file archive 0600 and writes an empty window (no archive/summaries side-files)', async () => {
       const sessionsPath = path.join(root, 'sessions2');
-      const sm = new SessionManager(60, 1440, sessionsPath, undefined, undefined, undefined, 'default');
+      const sm = new SessionManager(sessionsPath, undefined, undefined, undefined, 'default');
       await sm.recordTurn('456', [mkMsg('user', 'hi'), mkMsg('assistant', 'hello')]);
       await sm.resetSession('456');
 
-      // The retired side-files are never created.
       expect(fs.existsSync(path.join(sessionsPath, 'archive'))).toBe(false);
       expect(fs.existsSync(path.join(sessionsPath, 'summaries'))).toBe(false);
 
@@ -234,14 +218,12 @@ describe('PHI file modes', () => {
       fs.chmodSync(day, 0o644);
       expect(modeOf(day)).toBe(0o644);
 
-      const sm = new SessionManager(60, 1440, sessionsPath, undefined, undefined, undefined, 'default');
+      const sm = new SessionManager(sessionsPath, undefined, undefined, undefined, 'default');
       await sm.recordTurn('789', [mkMsg('assistant', 'ok')]);
       expectFileMode(day);
       expectDirMode(sessionsPath);
     });
   });
-
-  // ── heartbeat store ───────────────────────────────────────────────
 
   describe('HeartbeatStore', () => {
     it('store dir and heartbeat-jobs.json are 0o700 / 0o600', async () => {
@@ -258,14 +240,11 @@ describe('PHI file modes', () => {
       expectDirMode(path.dirname(storePath));
       expectFileMode(storePath);
 
-      // Re-saving (update path) must keep the file 0o600.
       const list = await store.list();
       await store.markRun(list[0].id, new Date().toISOString());
       expectFileMode(storePath);
     });
   });
-
-  // ── audit log ────────────────────────────────────────────────────
 
   describe('SchedulerAuditLog', () => {
     it('audit dir and audit.jsonl are 0o700 / 0o600', async () => {
@@ -299,8 +278,6 @@ describe('PHI file modes', () => {
     });
   });
 
-  // ── heartbeat markdown sync ──────────────────────────────────────
-
   describe('syncHeartbeatMarkdown', () => {
     it('workspace dir and HEARTBEAT.md are 0o700 / 0o600', async () => {
       const ws = path.join(root, 'hbsync');
@@ -316,8 +293,6 @@ describe('PHI file modes', () => {
     });
   });
 
-  // ── workspace bootstrap ──────────────────────────────────────────
-
   describe('ensureWorkspaceBootstrap', () => {
     it('workspace dir, required dirs (0o700) and copied templates (0o600)', () => {
       const ws = path.join(root, 'wsboot');
@@ -331,8 +306,6 @@ describe('PHI file modes', () => {
       }
     });
   });
-
-  // ── onboarding store ─────────────────────────────────────────────
 
   describe('OnboardingStore', () => {
     it('state dir and onboarding.json are 0o700 / 0o600', async () => {
@@ -348,8 +321,6 @@ describe('PHI file modes', () => {
       expectFileMode(stateFile);
     });
   });
-
-  // ── profile writer ───────────────────────────────────────────────
 
   describe('writeOnboardingProfile', () => {
     it('workspace dir and USER.md / HEALTH_PROFILE.md are 0o700 / 0o600', async () => {
@@ -370,20 +341,7 @@ describe('PHI file modes', () => {
     });
   });
 
-  // ── owner enrollment record ──────────────────────────────────────
-
-  /**
-   * OLD -> NEW. This block held three `ProfileRegistry` tests: the mode of `profiles.json`, the mode of
-   * files copied by the deleted workspace migration, and the mode of a `.trash` subtree produced by
-   * `deleteProfile`. All three exercised a class that no longer exists, so they protected nothing and were
-   * removed rather than kept.
-   *
-   * What replaces them is the invariant that actually mattered underneath: the durable owner record holds
-   * the owner's chat identifier, so it must be owner-only (0600) inside an owner-only state directory
-   * (0700). That was previously only ever asserted as a WRITE mode in passing fixtures — never as an
-   * expectation — so a writer that dropped the mode would have passed the whole suite. This asserts it
-   * through the REAL enrollment state machine and the REAL file port, not a hand-written record.
-   */
+  // The durable owner record holds the chat identifier, so it is owner-only (0600) in a 0700 dir.
   describe('owner enrollment record', () => {
     it('is written 0600 inside a 0700 owner workspace, and stays that way through a binding', async () => {
       const { composeOwnerAuthority } = await import('../../src/runtime/owner-authority');
@@ -397,14 +355,11 @@ describe('PHI file modes', () => {
       const authority = composeOwnerAuthority({ ownerId, ownerPaths: { ownerRecord: paths.ownerRecord } });
       await authority.admission.initialize();
 
-      // Written by the real store, on the real path.
       expect(fs.existsSync(paths.ownerRecord)).toBe(true);
       expectFileMode(paths.ownerRecord);
       expectDirMode(paths.workspace);
       expectDirMode(path.dirname(paths.ownerRecord));
 
-      // Issue and consume a code, so the record also holds a BINDING (the chat identifier) — the
-      // sensitive field whose exposure this mode exists to prevent. A pre-commit write must not weaken it.
       const issued = await authority.admission.issueChallenge();
       if (issued.kind === 'issued') {
         await authority.admission.handlePairing(
@@ -417,7 +372,6 @@ describe('PHI file modes', () => {
       }
       expectFileMode(paths.ownerRecord);
 
-      // And the plaintext code is never persisted: only a salted verifier is.
       const raw = fs.readFileSync(paths.ownerRecord, 'utf8');
       if (issued.kind === 'issued') {
         expect(raw).not.toContain(issued.plaintext);
@@ -439,8 +393,6 @@ describe('PHI file modes', () => {
       expectFileMode(configPath);
     });
   });
-
-  // ── memcore ledger store ─────────────────────────────────────────
 
   describe('LedgerStore', () => {
     it('ledger dir and fact file are 0o700 / 0o600', async () => {

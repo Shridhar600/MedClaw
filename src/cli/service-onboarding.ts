@@ -1,9 +1,3 @@
-// src/cli/service-onboarding.ts
-//
-// The setup entry point: validate the arguments, hand the owner off to the wizard when
-// interactive, apply the artifacts when not, and run the chosen completion action.
-//
-// Argument parsing and configuration/artifact building live in `./setup-config`.
 
 import * as fs from 'fs';
 import * as os from 'os';
@@ -106,8 +100,6 @@ export function startDaemon(
       child.unref?.();
 
       timer = setTimeout(() => {
-        // The daemon is detached (its own process group), so Ctrl-C in this wizard does not
-        // stop it. Write a pid file next to the config and tell the user how to stop it.
         let stopHint = '';
         if (child.pid) {
           const pidPath = path.join(path.dirname(configPath), 'redacted.pid');
@@ -187,16 +179,6 @@ export async function runServiceOnboarding(
   dependencies: OnboardingDependencies = {},
 ): Promise<number> {
   try {
-    // `onboard --help` must not be answered by the strict parser's "unknown option" refusal, so the
-    // help request is answered from the same module that owns the option list.
-    //
-    // Only a help token in the leading option position counts. A help token in another option's
-    // value position (`onboard --provider --help`) must still refuse the missing value.
-    //
-    // `runCli` forwards `['--config', <resolved path>, ...commandArgs]`, so that injected pair is
-    // skipped before the position check. The pair is validated first with `requireOptionValue`
-    // (the parser's own missing/blank/option-shaped rule): malformed option input must never
-    // produce a success exit.
     const hasLeadingConfigPair = argv[0] === '--config';
     if (hasLeadingConfigPair) {
       requireOptionValue('--config', argv[1]);
@@ -207,9 +189,6 @@ export async function runServiceOnboarding(
       return 0;
     }
 
-    // Strict parse first. Every malformed-input refusal happens here, before the wizard and before
-    // any lease, directory, template, record or config write. `parseArgs` throws a controlled
-    // `Error` naming the field or reason; this catch turns it into exit 1.
     const args = parseArgs(argv);
 
     if (!args.yes) {

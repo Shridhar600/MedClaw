@@ -1,5 +1,3 @@
-// Resource preflight for installed node-cron 3.x. This does not decide cron semantics.
-// Its converter expands ranges BEFORE validation, so bound that work before calling it.
 const MAX_INPUT_CHARACTERS = 1024;
 const MAX_RANGE_VALUES = 512;
 const FIELD_DOMAINS = [[0, 59], [0, 59], [0, 23], [1, 31], [1, 12], [0, 7]] as const;
@@ -35,16 +33,11 @@ export function isCronValidationWorkBounded(input: unknown): boolean {
       if (character === '-') reservedValues += max - min + 1;
       if (reservedValues > MAX_RANGE_VALUES) return false;
     }
-    // Look ahead so 1-2-1000000000 cannot hide its second range. Check after name/wildcard
-    // normalization: concatenated names can form a huge numeric endpoint too.
     for (const match of field.matchAll(/(\d+)-(?=(\d+))/g)) {
       for (const endpoint of [Number(match[1]), Number(match[2])]) {
         if (!Number.isSafeInteger(endpoint) || endpoint < min || endpoint > max) return false;
       }
     }
   }
-  // Each converter replacement consumes one hyphen and inserts only checked domain values.
-  // Reserving the whole domain per hyphen also covers reversed/chained ranges. Lists/steps
-  // then process bounded text; a large step divisor itself does not allocate a large range.
   return true;
 }

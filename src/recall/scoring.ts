@@ -1,10 +1,3 @@
-// Pure recall scoring. No I/O, no clock: ageDays is passed in (the engine derives it from an injected clock).
-//
-//   decay   = safetyRelevant ? 1 : exp(-ageDays / halfLifeDays)   (safety facts never time-decay)
-//   raw     = (0.7·cosine + 0.3·bm25n) · decay
-//   ranking = raw · (1 + 0.1·authorityRank)
-//
-// Thresholds apply to `raw`; the authority boost affects ranking/ordering only.
 
 export interface ScoreParams {
   cosine: number;

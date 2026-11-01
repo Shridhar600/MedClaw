@@ -19,16 +19,11 @@ function detectValue(raw: string): string | number | string[] {
     const n = Number(trimmed);
     if (Number.isFinite(n)) return n;
   }
-  if (trimmed === 'true') return 'true' as unknown as number;
-  if (trimmed === 'false') return 'false' as unknown as number;
+  if (trimmed === 'true') return 'true';
+  if (trimmed === 'false') return 'false';
   return trimmed;
 }
 
-/**
- * The form a value takes after one Markdown round-trip. The parser's `detectValue` coercion is the
- * single source of truth, so conflict detection and change hashes compare canonical forms: a stored
- * number and its re-typed string twin must never read as a contradiction.
- */
 export function canonicalFieldValue(value: string | number | string[]): string | number | string[] {
   if (Array.isArray(value)) return value.map(v => String(v).trim());
   const canonical = detectValue(String(value));
@@ -45,9 +40,6 @@ export function canonicalFields(
 }
 
 function parseProvenance(rawValue: string): { source: Authority; confidence: number; anchor: string; note?: string } | null {
-  // Split on the bare middot and trim each segment. An empty anchor is legitimate (a fact recorded before
-  // its narrative anchor is known) and the reader trims the renderer's trailing `· ` to `·`, so tolerate a
-  // missing/empty anchor rather than rejecting the line and quarantining the whole block.
   const parts = rawValue.split('·').map(s => s.trim());
 
   const sourceMatch = parts[0].match(/^([a-zA-Z]+)\s*\((\d+(?:\.\d+)?)\)$/);
@@ -145,8 +137,6 @@ function flattenFactForRender(fact: LedgerFact): string[] {
   if (fact.supersededBy) {
     lines.push(`- supersededBy: ${fact.supersededBy}`);
   }
-  // Cross-entity links + discontinue reason are top-level fields, so they need
-  // explicit render/parse (the generic `fields` fallback only covers `fields` keys).
   if (fact.replaces) {
     lines.push(`- replaces: ${fact.replaces}`);
   }
@@ -177,10 +167,6 @@ function flattenFactForRender(fact: LedgerFact): string[] {
       }
       continue;
     }
-    // Reserved names are rendered from their top-level `fact.*` field above; a
-    // `fields` entry with the same name must NOT also render (it would re-parse
-    // into the top-level slot and corrupt the round-trip). These names are
-    // therefore reserved and cannot be used as generic field keys.
     if (RESERVED_TOP_LEVEL_FIELD_KEYS.has(key)) {
       continue;
     }
@@ -202,10 +188,6 @@ const RESERVED_TOP_LEVEL_FIELD_KEYS = new Set<string>([
   'replaces', 'replacedBy', 'corrects', 'correctedBy', 'discontinuedReason', 'created_at',
 ]);
 
-/**
- * Whether a `fields` key survives render → parse unchanged. Reserved names would be dropped or read
- * back into top-level slots; `:`, `#`, control characters and edge whitespace change the line shape.
- */
 export function isStorableFieldKey(key: string): boolean {
   return key !== '' && key === key.trim() && !/[:#\p{Cc}]/u.test(key) && !RESERVED_TOP_LEVEL_FIELD_KEYS.has(key);
 }
@@ -285,8 +267,6 @@ function parseSingleVersionBlock(
   options: { type: FactType; profileId: string },
 ): LedgerFact | null {
   const bodyLines = body.split('\n');
-  // Free-form non-bullet text is tolerated, but a line that claims to be a structured field and is
-  // malformed is never silently discarded.
   for (const line of bodyLines) {
     if (line.startsWith('- ') && !/^- [^:]+: .*$/.test(line)) {
       throw new Error('malformed-field-line');
@@ -371,8 +351,6 @@ function parseSingleVersionBlock(
     }
   }
 
-  // A real version block always carries a valid `- provenance:` line. Its absence means the block is corrupt:
-  // throw so the caller quarantines it instead of fabricating an active fact from defaults.
   if (!sawProvenance) {
     throw new Error(`missing provenance in ${entity}@v${version}`);
   }

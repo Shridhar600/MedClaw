@@ -3,18 +3,11 @@ import * as path from 'path';
 import { listDayFiles, walkBackAnchor, readLinesAfter } from '../../src/gateway/session-window';
 import { makeTestTemp } from '../helpers/test-temp';
 
-// P2b Wave D-1 / D1.5 — the resume substrate: enumerate day files, compute the tail's start anchor by
-// walking back K lines from the archive EOF, and read every archive line strictly after a `verbatimFrom`
-// anchor. Anchors are EOF-EXCLUSIVE: `readLinesAfter(from)` skips the first `from.line` lines of
-// `from.file`, so `walkBackAnchor(dir, K)` returns the anchor for which `readLinesAfter` yields exactly
-// the last K lines (a fresh window at EOF ⇒ zero tail).
-
-describe('session-window replay helpers (D1.5)', () => {
+describe('session-window replay helpers', () => {
   let dir: string;
   beforeEach(() => { dir = makeTestTemp('swr-'); });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
-  // Write `n` JSONL entries `{i: <fileTag>-<k>}` to a day file, return the basename.
   const writeDay = (day: string, tag: string, n: number): string => {
     const lines = Array.from({ length: n }, (_v, k) => JSON.stringify({ i: `${tag}-${k + 1}` }));
     fs.writeFileSync(path.join(dir, `${day}.jsonl`), lines.join('\n') + '\n');
@@ -46,9 +39,7 @@ describe('session-window replay helpers (D1.5)', () => {
   it('walkBackAnchor crosses the day-file boundary', () => {
     writeDay('2026-08-25', 'A', 3);
     writeDay('2026-08-26', 'B', 2);
-    // total 5. Last 4 ⇒ skip 1 line of the earliest file.
     expect(walkBackAnchor(dir, 4)).toEqual({ file: '2026-08-25.jsonl', line: 1 });
-    // Last 2 ⇒ all of B, none of A.
     expect(walkBackAnchor(dir, 2)).toEqual({ file: '2026-08-26.jsonl', line: 0 });
   });
 
@@ -72,16 +63,12 @@ describe('session-window replay helpers (D1.5)', () => {
       const rows = readLinesAfter(dir, walkBackAnchor(dir, k));
       expect(rows).toHaveLength(k);
     }
-    // last-4 content check
     expect(tags(readLinesAfter(dir, walkBackAnchor(dir, 4)))).toEqual(['A-2', 'A-3', 'B-1', 'B-2']);
   });
 
   it('readLinesAfter at EOF returns [] and skips malformed lines', () => {
     fs.writeFileSync(path.join(dir, '2026-08-26.jsonl'), '{"i":"ok"}\nnot json\n{"i":"ok2"}\n');
-    // EOF anchor ⇒ nothing after it.
     expect(readLinesAfter(dir, { file: '2026-08-26.jsonl', line: 3 })).toEqual([]);
-    // From the start: the malformed physical line still occupies its slot (anchor line 2) but is
-    // dropped from the parsed output — callers parse r.raw and skip failures.
     const rows = readLinesAfter(dir, { file: '', line: 0 });
     expect(rows.map((r) => r.line)).toEqual([1, 2, 3]);
     expect(rows[1].raw).toBe('not json');

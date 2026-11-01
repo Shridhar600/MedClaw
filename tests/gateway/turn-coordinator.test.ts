@@ -37,9 +37,7 @@ const owner = fixtureOwner(workspace);
     tools: { allow: ['*'], deny: [] },
     memory: { workspace, search: { hybridWeights: { vector: 0.7, keyword: 0.3 } }, bootstrapMaxChars: 20_000 },
     sessions: {
-      softResetAfterMinutes: 240,
-      hardResetAfterMinutes: 1440,
-      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+      compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
     },
     heartbeat: {
       enabled: false,
@@ -58,7 +56,7 @@ const owner = fixtureOwner(workspace);
         },
       },
     },
-    agent: { maxIterations: 5, disclaimerEnabled: false },
+    agent: { maxIterations: 5 },
   };
 }
 
@@ -170,7 +168,6 @@ describe('TurnCoordinator whole-turn serialization', () => {
 
     expect(runtime.sessions.prepareHistory).toHaveBeenCalledTimes(2);
     expect(runtime.sessions.prepareHistory.mock.results[1].value).toBeDefined();
-    // M9: the transport sender id is not part of the prompt payload (see `buildAgentInput`).
     expect(runtime.agentLoop.run.mock.calls[1][1]).toEqual([{ role: 'user', content: 'first' }]);
   });
 
@@ -190,7 +187,6 @@ describe('TurnCoordinator whole-turn serialization', () => {
     const chatA = coordinator.runUser(message('A', 'chat-a'), egress, noEmergency);
     const chatB = coordinator.runUser(message('B', 'chat-b'), egress, noEmergency);
     await bothEntered.promise;
-    // M9: same — the prompt carries the turn text, not the sender identifier.
     expect(entered).toEqual(new Set(['A', 'B']));
 
     release.resolve();
@@ -254,7 +250,7 @@ describe('TurnCoordinator heartbeat preemption', () => {
       provider,
       new ToolRegistry({ allow: ['*'], deny: [] }),
       [],
-      { maxIterations: 5, disclaimerEnabled: false },
+      { maxIterations: 5 },
       semaphore,
     );
     (runtime as unknown as { agentLoop: AgentLoop }).agentLoop = loop;
@@ -330,7 +326,7 @@ describe('TurnCoordinator heartbeat preemption', () => {
       provider,
       new ToolRegistry({ allow: ['*'], deny: [] }),
       [],
-      { maxIterations: 5, disclaimerEnabled: false },
+      { maxIterations: 5 },
       semaphore,
     );
     (runtime as unknown as { agentLoop: AgentLoop }).agentLoop = loop;
@@ -404,17 +400,7 @@ describe('TurnCoordinator deterministic front-of-turn onboarding', () => {
   });
 });
 
-// RR-STRUCT R-S4 (mini-plan v3 §3.9, Part B): every caller of a gated write must turn a
-// DaemonShutdownError into a benign, sanitized-logged no-op — never crash, never rethrow to
-// process level. executeUser already had a catch around recordTurn/recordPromptUsage (the
-// existing `persistFailed` pattern) that handles ANY error the same way, DaemonShutdownError
-// included — this describe block proves that holds for the NEW error type without needing a code
-// change there. executeHeartbeat had NO local catch around recordTurn before R-S4 (a genuine gap:
-// it would have propagated to Gateway.handleScheduledJob's catch, which calls
-// scheduler.recordFailure — treating a benign shutdown-time abandonment as a real job failure) —
-// runHeartbeat now catches DaemonShutdownError the same way it already catches
-// HeartbeatPreemptedError, returning a new `{status: 'abandoned'}` outcome instead.
-describe('TurnCoordinator RR-STRUCT R-S4 — DaemonShutdownError graceful handling', () => {
+describe('TurnCoordinator — DaemonShutdownError graceful handling', () => {
   let runtime: RuntimeDouble;
 
   beforeEach(() => {

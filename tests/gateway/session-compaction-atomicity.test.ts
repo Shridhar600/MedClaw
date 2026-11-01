@@ -5,14 +5,9 @@ import { SessionManager } from '../../src/gateway/session';
 import { dateKey } from '../../src/gateway/session-window';
 import { makeTestTemp } from '../helpers/test-temp';
 
-// The raw CJS module object so writeFileSync can be spied reliably.
 const fsReal = jest.requireActual<typeof import('fs')>('fs');
 
-// P2b/D1.6 (DD1): compaction mutates ONLY the in-memory window — it NEVER rewrites the append-only
-// day-file archive. The window snapshot is saved best-effort, so even a failing window save cannot
-// corrupt the durable archive nor reject the turn. (Replaces the old persist-first active-file
-// atomicity contract; the active file no longer exists.)
-describe('Compaction disk-preservation (DD1)', () => {
+describe('Compaction disk-preservation', () => {
   let tmpDir: string;
 
   beforeEach(() => {
@@ -40,7 +35,7 @@ describe('Compaction disk-preservation (DD1)', () => {
     const manager = new SessionManager({
       sessionsPath: tmpDir,
       provider: makeProvider('Compaction summary for older turns — PHI marker glucose 300.'),
-      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: false, keepRecentTurns: 2 },
+      compaction: { enabled: true, memoryFlush: false, keepRecentTurns: 2 },
     });
 
     const chatId = 'chat-atom';
@@ -56,23 +51,16 @@ describe('Compaction disk-preservation (DD1)', () => {
     const seededRaw = fs.readFileSync(dayFile, 'utf-8');
     expect(seededRaw.trim().split('\n').length).toBe(12); // 6 user/assistant pairs, append-only
 
-    // Fail every atomic write (the window save) for the duration of compaction.
     const writeSpy = jest.spyOn(fsReal, 'writeFileSync').mockImplementation(() => {
       throw new Error('disk full mid-write');
     });
-    // Compaction must not throw out — the window save is best-effort (warn-and-continue).
     await expect(manager.runCompaction(chatId)).resolves.toBeUndefined();
     writeSpy.mockRestore();
 
-    // The append-only day-file archive is BYTE-IDENTICAL — compaction never touched it (DD1). The
-    // summary text never reached the durable archive.
     expect(fs.readFileSync(dayFile, 'utf-8')).toBe(seededRaw);
     expect(seededRaw).not.toContain('Compaction summary');
     expect(seededRaw).not.toContain('glucose');
 
-    // M5 candidate-then-swap: because the window save failed, the compaction is NOT applied in memory
-    // either — the OLD window is retained, so memory and disk never diverge (spec 14 §4). The day-file
-    // archive above is byte-identical regardless; that DD1 guarantee is the core of this test.
     const history = manager.getHistory(chatId);
     expect(history.every((m) => m.role !== 'system')).toBe(true);
     expect(history.length).toBe(12);

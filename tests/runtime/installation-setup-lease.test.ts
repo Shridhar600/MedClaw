@@ -1,5 +1,3 @@
-// Setup commits the owner record and the configuration document while holding both installation leases,
-// into a target whose private parents may not exist yet. Real service, leases, owner store and decoder.
 
 import { spawn, type ChildProcess } from 'child_process';
 import * as fs from 'fs';
@@ -17,18 +15,8 @@ import { makeTestTemp } from '../helpers/test-temp';
 
 const DEFAULT_HOME_CONTENDER = path.join(__dirname, '..', 'helpers', 'setup-default-home-contender.ts');
 
-/**
- * Every child this suite spawns, so a failing assertion can never leave one running and holding the
- * Jest process open.
- */
 const liveChildren = new Set<ChildProcess>();
 
-/**
- * A minimal valid STORED-shape document for a prospective install, plus the effective config the
- * setup writer is handed. `setup()` takes the prospective identity from the caller precisely
- * because no config document exists yet to read an owner from — that inversion is the whole reason
- * `acquireOwnership` cannot serve setup.
- */
 function prospectiveSetup(rootDir: string): {
   configPath: string;
   ownerId: ProfileId;
@@ -52,13 +40,7 @@ function prospectiveSetup(rootDir: string): {
   return { configPath, ownerId, config, ownerPaths };
 }
 
-/**
- * The ADVERTISED first-run shape: a synthetic home whose private config parent has never been created.
- *
- * `resolveSetupValues` derives the state root from the selected config file's directory, so with the
- * default target both the config parent and the workspace root are that one directory. Nothing about
- * this shape is a test convenience — it is byte-for-byte the layout a first run is told to use.
- */
+// `resolveSetupValues` derives the state root, so the config parent and workspace root are one directory.
 function absentParentSetup(
   syntheticHome: string,
   ownerId: ProfileId,
@@ -102,9 +84,6 @@ describe('installation setup holds both leases across its commit', () => {
   it('REFUSES when a running daemon already holds the owner workspace lease', async () => {
     const { configPath, ownerId, config, ownerPaths } = prospectiveSetup(root);
 
-    // Stand in for a live daemon: hold the OWNER lease for this exact workspace. A real daemon
-    // creates the lease's structural parent during boot (the workspace lease directory itself is
-    // inside it), so the stand-in must do the same or the lease is `unavailable`, not `acquired`.
     fs.mkdirSync(path.dirname(ownerPaths.workspaceLease), { recursive: true, mode: 0o700 });
     const daemon = new DirectoryLease();
     const held = await daemon.tryAcquire({
@@ -120,7 +99,6 @@ describe('installation setup holds both leases across its commit', () => {
 
       if (outcome.kind !== 'busy') throw new Error(`expected busy, got ${outcome.kind}`);
       expect(outcome.resource).toBe('owner');
-      // Nothing may have been written while another process owned the workspace.
       expect(fs.existsSync(ownerPaths.ownerRecord)).toBe(false);
       expect(fs.existsSync(configPath)).toBe(false);
     } finally {
@@ -222,7 +200,6 @@ describe('setup acquires its leases into a target whose structural parents are a
     const ownerId = asProfileId('default') as ProfileId;
     const { configPath, ownerPaths, config } = absentParentSetup(syntheticHome, ownerId);
 
-    // The precondition this protects: the private config parent really is absent.
     expect(fs.existsSync(path.dirname(configPath))).toBe(false);
     expect(fs.existsSync(ownerPaths.workspace)).toBe(false);
 
@@ -233,13 +210,11 @@ describe('setup acquires its leases into a target whose structural parents are a
     }
     expect(outcome.canonicalConfigPath).toBe(configPath);
 
-    // Everything setup publishes, actually on disk...
     expect(fs.existsSync(configPath)).toBe(true);
     expect(fs.existsSync(ownerPaths.ownerRecord)).toBe(true);
     expect(fs.existsSync(path.join(ownerPaths.workspace, 'SOUL.md'))).toBe(true);
     expect(fs.existsSync(path.join(ownerPaths.workspace, 'conditions'))).toBe(true);
 
-    // ...private, through the secure-fs contract, not inherited from the umask...
     expect(modeOf(path.dirname(configPath))).toBe(0o700);
     expect(modeOf(path.join(syntheticHome, '.redacted', 'profiles'))).toBe(0o700);
     expect(modeOf(ownerPaths.workspace)).toBe(0o700);
@@ -247,13 +222,11 @@ describe('setup acquires its leases into a target whose structural parents are a
     expect(modeOf(ownerPaths.ownerRecord)).toBe(0o600);
     expect(modeOf(path.join(ownerPaths.workspace, 'SOUL.md'))).toBe(0o600);
 
-    // ...and readable by the real decoder the daemon itself uses.
     const reloaded = await loadRuntimeConfig({ configPath, homeDir: syntheticHome });
     expect(reloaded.profiles.defaultProfileId).toBe(ownerId);
     expect(reloaded.profiles.baseDir).toBe(path.dirname(configPath));
     expect(reloaded.memory.workspace).toBe(ownerPaths.workspace);
 
-    // The installation it left behind is a real installation: it can be owned and released again.
     const owned = await new InstallationService(new DirectoryLease()).acquireOwnership(configPath, syntheticHome);
     expect(owned.kind).toBe('owned');
     if (owned.kind !== 'owned') return;
@@ -288,12 +261,9 @@ describe('setup acquires its leases into a target whose structural parents are a
       ownerId,
     });
 
-    // Refusal, not success and not an unhandled rejection escaping the service.
     expect(outcome.kind).toBe('unavailable');
     if (outcome.kind !== 'unavailable') return;
     expect(outcome.reason).toBe('unsafe-parent');
-    // The refusal must be ACTIONABLE. "Create the installation directory" is impossible when the
-    // name is already taken by a file, so the guidance has to name the real obstacle instead.
     expect(outcome.guidance).toContain('not a directory');
     expect(outcome.guidance).toContain('Choose a different');
     expect(outcome.guidance).not.toContain('Create the installation directory');
@@ -307,7 +277,6 @@ describe('setup acquires its leases into a target whose structural parents are a
     const ownerId = asProfileId('default') as ProfileId;
     const { configPath, config, ownerPaths } = absentParentSetup(syntheticHome, ownerId);
 
-    // Prior owner evidence in a workspace whose whole parent chain is missing.
     fs.mkdirSync(ownerPaths.workspace, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(ownerPaths.workspace, 'MEMORY.md'), 'synthetic prior owner content', { mode: 0o600 });
 
@@ -319,7 +288,6 @@ describe('setup acquires its leases into a target whose structural parents are a
     );
     expect(fs.existsSync(configPath)).toBe(false);
     expect(fs.existsSync(ownerPaths.ownerRecord)).toBe(false);
-    // Scaffolding is structural only: it never bootstraps templates into a refused target.
     expect(fs.existsSync(path.join(ownerPaths.workspace, 'SOUL.md'))).toBe(false);
   });
 
@@ -336,8 +304,6 @@ describe('setup acquires its leases into a target whose structural parents are a
       stdout: string;
       stderr: string;
     }>((resolve, reject) => {
-      // A per-child HOME and REDACTED_CONFIG_PATH. The machine, the shell environment and the real
-      // home directory are untouched; only this child's environment is overridden.
       const child = spawn(process.execPath, ['--import', 'tsx', DEFAULT_HOME_CONTENDER], {
         cwd: path.join(__dirname, '..', '..'),
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -356,14 +322,11 @@ describe('setup acquires its leases into a target whose structural parents are a
       });
     });
 
-    // The default selection really is `<home>/.redacted/config.json`, and setup reported success
-    // rather than exiting zero after a refusal.
     expect(result.selectedPath).toBe(expectedConfigPath);
     expect(result.exit).toBe(0);
     expect(result.stdoutClaimsSetupComplete).toBe(true);
     expect(result.stderr).toBe('');
 
-    // The committed installation is real, private and reloadable — not a created empty folder.
     const ownerPaths = resolveOwnerPaths(path.dirname(expectedConfigPath), 'default' as ProfileId);
     expect(fs.existsSync(expectedConfigPath)).toBe(true);
     expect(fs.existsSync(ownerPaths.ownerRecord)).toBe(true);

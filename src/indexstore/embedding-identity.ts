@@ -1,13 +1,4 @@
-// src/indexstore/embedding-identity.ts
-//
-// Embedding provider locality check. The recall latency budget (p50≤300ms / p95≤800ms) assumes local
-// embeddings; a remote embeddings endpoint blows past it, so the gateway logs a boot config warning. Pure — no I/O.
 
-/**
- * True when the embeddings base URL points at a non-loopback host (public or LAN). A missing,
- * empty, or unparseable URL is treated as LOCAL (the default Ollama assumption) — never warn on
- * ambiguity, only on a clearly-remote host.
- */
 export function isRemoteEmbeddingBaseUrl(baseUrl?: string): boolean {
   if (!baseUrl) return false;
   let host: string;

@@ -1,17 +1,3 @@
-// src/profiles/owner-admission.ts
-//
-// The enrollment state machine. One owner record, explicit phases, an in-memory per-chat daily
-// pairing allowance, and no silent path to a clinical turn.
-//
-// Two rules shape everything here:
-//
-//  1. Configuration never grants a transport address. Identity and paths come from config;
-//     who may talk to this owner comes from the record's binding.
-//  2. A record that cannot be understood refuses. Missing, unreadable, corrupt, wrong-owner
-//     and bound-to-someone-else all refuse. None of them is "a fresh installation".
-//
-// No file access, clock, crypto or config import lives here: those arrive as the `OwnerStatePort`,
-// `PairingCodePort`, `Clock` and a plain `expectedOwnerId` string (see the `v2-core-boundary` rule).
 
 import type { Clock } from '../ports/clock';
 import {
@@ -69,8 +55,6 @@ export const PAIRING_EXPIRED_TEXT =
   'That pairing code has expired. Generate a new one on the owner\'s own computer with ' +
   '`pairing issue`.';
 
-export const PAIRING_LIMITED_TEXT = 'No further pairing attempts are available right now.';
-
 export const PAIRING_COMPLETE_TEXT =
   'Pairing complete. This chat is now connected to the owner.';
 
@@ -80,7 +64,6 @@ export const PAIRING_REFUSED_TEXT =
 export const PAIRING_UNAVAILABLE_TEXT =
   'The owner record could not be read, so no request is being served. On the owner\'s computer, ' +
   're-run setup.';
-
 
 const REFUSAL_TEXT: Record<AdmissionReason, string> = {
   unavailable: PAIRING_UNAVAILABLE_TEXT,
@@ -124,25 +107,12 @@ export type InstallationAdmission =
 
 export type IssueChallengeResult =
   | { kind: 'issued'; plaintext: string; expiresAt: string }
-  /**
-   * `writeReason` is present only when the record could be read and the replacement was refused
-   * before publication. `unavailable` means the record could not be read: a different fault.
-   */
   | {
       kind: 'refused';
       reason: 'already-bound' | 'unavailable' | 'uncertain';
       writeReason?: OwnerWriteReason;
     };
 
-/**
- * What `initialize()` achieved.
- *
- * - `created`: published and confirmed.
- * - `exists`: a readable record was already there, so nothing was written.
- * - `unavailable`: an existing record could not be read. Setup must refuse rather than repair it.
- * - `refused`: nothing was published and nothing pre-existed.
- * - `uncertain`: it may be published, with confirmation incomplete.
- */
 export type InitializeResult = 'created' | 'exists' | 'unavailable' | 'refused' | 'uncertain';
 
 /** A code submission is only considered when it is exactly the trimmed, upcased alphabet form. */
@@ -184,11 +154,6 @@ function bindingMatches(identity: TransportIdentity, binding: OwnerBinding): boo
 }
 
 export class OwnerAdmissionService {
-  /**
-   * Serializes every mutation of the record. The owner workspace lease already excludes other
-   * processes, so this only orders this process's attempts. It must cover the read that computes
-   * the allowance, or two concurrent attempts could each see allowance remaining.
-   */
   private tail: Promise<unknown> = Promise.resolve();
 
   /** Today's pairing allowance per candidate chat. In memory on purpose: a restart resets it. */
@@ -202,10 +167,6 @@ export class OwnerAdmissionService {
     this.sink = guardedDiagnosticSink(deps.diagnostics ?? SILENT_DIAGNOSTIC_SINK);
   }
 
-  /**
-   * Boot check. A missing, unreadable, corrupt or wrong-owner record refuses: the daemon must not
-   * come up in a state where it would serve on a default identity.
-   */
   inspectInstallation(): InstallationAdmission {
     const startedAt = this.deps.clock.now().getTime();
     const decision = this.readInstallation();
@@ -229,10 +190,6 @@ export class OwnerAdmissionService {
       : { kind: 'unpaired' };
   }
 
-  /**
-   * Fresh read, no mutation. Called for every inbound event and before every scheduled dispatch,
-   * so a binding change takes effect without a restart.
-   */
   inspect(identity: TransportIdentity): AdmissionDecision {
     const startedAt = this.deps.clock.now().getTime();
     const decision = this.decide(identity);
@@ -240,10 +197,6 @@ export class OwnerAdmissionService {
     return decision;
   }
 
-  /**
-   * The admission decision itself, with no diagnostic side effect. Reporting happens in one place
-   * (`inspect`), so a new early return cannot skip its diagnostic.
-   */
   private decide(identity: TransportIdentity): AdmissionDecision {
     const read = this.deps.store.read();
     if (read.kind === 'missing') {
@@ -265,8 +218,6 @@ export class OwnerAdmissionService {
       if (identity.chatType !== 'private') return { kind: 'refused', reason: 'non-private-chat' };
       return bindingMatches(identity, state.binding)
         ? { kind: 'owner', ownerId: state.ownerId }
-        // A stranger arriving after binding gets only a generic refusal: never enrollment,
-        // never reassignment.
         : { kind: 'refused', reason: 'already-bound' };
     }
 
@@ -275,13 +226,6 @@ export class OwnerAdmissionService {
     return { kind: 'pairing-only' };
   }
 
-  /**
-   * Whether this chat is the bound owner's addressable destination for scheduled work.
-   *
-   * Fail-closed: only the current binding authorizes a destination, re-read at the moment of the
-   * check (never cached). An unreadable, missing, wrong-owner or not-yet-bound record authorizes
-   * nothing. `channel` is deliberately not compared: a job addresses a chat id.
-   */
   ownsDestination(chatId: string): boolean {
     if (typeof chatId !== 'string' || chatId.length === 0) return false;
     const read = this.deps.store.read();
@@ -291,14 +235,6 @@ export class OwnerAdmissionService {
     return read.state.binding.chatId === chatId;
   }
 
-  /**
-   * True only when this exact inbound event is the one that established the current binding, i.e. a
-   * genuine redelivery of the owner's pairing message.
-   *
-   * Matching the event id, not the code alphabet, matters: ordinary eight-letter health words
-   * (`headache`, `diabetes`) fit the alphabet and must reach the model as narrative.
-   * Fails closed: an unreadable record is not a pairing event.
-   */
   isRedeliveredPairingEvent(identity: TransportIdentity): boolean {
     const read = this.deps.store.read();
     if (read.kind !== 'available') return false;
@@ -412,9 +348,6 @@ export class OwnerAdmissionService {
       return this.finish('paired', identity, bound.ownerId);
     }
     if (bindCommit.kind === 'uncertain') {
-      // The acknowledgement failed, but the replacement may have landed. Reload before
-      // answering: never claim an outcome the record does not support, and never undo a
-      // binding that did land.
       const reread = this.deps.store.read();
       if (
         reread.kind === 'available'
@@ -428,11 +361,6 @@ export class OwnerAdmissionService {
     return this.finish('unavailable', identity, undefined, 'record-unavailable');
   }
 
-  /**
-   * Issue (or reissue) a pairing challenge. Local writer only, unpaired only. The plaintext is
-   * returned only after the record is committed, so a failed commit can never print a code that
-   * was never stored.
-   */
   async issueChallenge(): Promise<IssueChallengeResult> {
     const read = this.deps.store.read();
     if (read.kind === 'missing' || read.kind === 'unavailable') {
@@ -461,18 +389,12 @@ export class OwnerAdmissionService {
       return { kind: 'issued', plaintext: issued.plaintext, expiresAt };
     }
     if (committed.kind === 'failed') {
-      // Nothing was published, so the record still holds the previous code. This is `unavailable`,
-      // not `uncertain`. The specific cause travels as `writeReason`.
       return { kind: 'refused', reason: 'unavailable', writeReason: committed.reason };
     }
     // The stored challenge may exist but its plaintext is unrecoverable by design. Reissue for a usable code.
     return { kind: 'refused', reason: 'uncertain' };
   }
 
-  /**
-   * Create the initial unpaired record when none exists. Used by setup only.
-   * `created` is reported only for a confirmed publication; every other outcome is propagated.
-   */
   async initialize(): Promise<InitializeResult> {
     const read = this.deps.store.read();
     if (read.kind === 'available') return 'exists';
@@ -483,10 +405,6 @@ export class OwnerAdmissionService {
     return 'refused';
   }
 
-  /**
-   * Publish a whole record and reduce the port's typed result to what policy needs.
-   * The port states which side of the rename failed. A throw is mapped to `uncertain`.
-   */
   private async replace(
     next: OwnerState,
   ): Promise<
@@ -509,10 +427,6 @@ export class OwnerAdmissionService {
     }
   }
 
-  /**
-   * Build a pairing result. `reason` says why a non-progress outcome failed; every refusal branch
-   * passes it explicitly. The default exists only for progress branches.
-   */
   private finish(
     kind: PairingResult['kind'],
     identity: TransportIdentity,
@@ -540,10 +454,6 @@ export class OwnerAdmissionService {
       : { stage: 'pairing', outcome: kind, reason, durationMs };
   }
 
-  /**
-   * Emit through the guarded sink. It runs inside the admission decision, so a throwing adapter
-   * must not be reachable from a stranger's message.
-   */
   private emit(event: DiagnosticEvent): void {
     this.sink.emit(event);
   }

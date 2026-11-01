@@ -42,13 +42,13 @@ function throwingProvider(): LLMProvider {
   };
 }
 
-const compaction = { enabled: true, triggerAtTokenPercent: 80, memoryFlush: false, keepRecentTurns: 2 };
+const compaction = { enabled: true, memoryFlush: false, keepRecentTurns: 2 };
 
 afterAll(() => {
   for (const d of tmpDirs) fs.rmSync(d, { recursive: true, force: true });
 });
 
-describe('Compaction pipeline (spec 14 §4)', () => {
+describe('Compaction pipeline', () => {
   it('produces an anchored summary + recent tail; every bullet anchor resolves; the day file is untouched', async () => {
     const sessionsPath = tmpSessions();
     const summary = '- Patient reported knee pain\n- Started metformin 500mg\n- Follow up next week';
@@ -69,13 +69,10 @@ describe('Compaction pipeline (spec 14 §4)', () => {
     const after = fs.readFileSync(dayFile, 'utf8');
     const history = mgr.getHistory('chat1');
 
-    // Window = [summary system message, ...the kept recent tail]. H4 turn-aware: keepRecentTurns=2 keeps
-    // the last 2 TURNS = 4 messages (u5,a5,u6,a6), so the window is 1 summary + 4.
     expect(history[0].role).toBe('system');
     expect(history[0].content).toContain('[Previous conversation summary]');
     expect(history.length).toBe(1 + 4);
 
-    // Every bullet anchor resolves to a real day-file line (spec 14 §4.2 anchor validity).
     const anchors = [...(history[0].content as string).matchAll(/sessions\/(\S+?)#L(\d+)/g)];
     expect(anchors.length).toBeGreaterThan(0);
     for (const m of anchors) {
@@ -85,11 +82,10 @@ describe('Compaction pipeline (spec 14 §4)', () => {
       expect(line).toBeLessThanOrEqual(count);
     }
 
-    // Disk day-file archive is byte-identical — compaction never rewrites it (DD1).
     expect(after).toBe(before);
   });
 
-  it('a summary LLM failure keeps the OLD window unchanged (spec 14 §4: never lose the thread)', async () => {
+  it('a summary LLM failure keeps the OLD window unchanged (never lose the thread)', async () => {
     const sessionsPath = tmpSessions();
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const mgr = new SessionManager({ sessionsPath, provider: throwingProvider(), compaction });
@@ -106,12 +102,11 @@ describe('Compaction pipeline (spec 14 §4)', () => {
 
     const history = mgr.getHistory('chat1');
     warn.mockRestore();
-    // Old window retained in full: no summary added, no older turns dropped.
     expect(history.length).toBe(beforeHistory);
     expect(history.every((m) => m.role !== 'system')).toBe(true);
   });
 
-  it('copies the summary bullets to a wired summary sink (spec 14 §4 step 4)', async () => {
+  it('copies the summary bullets to a wired summary sink', async () => {
     const sessionsPath = tmpSessions();
     const summary = '- Reported chest tightness\n- Advised to monitor';
     const mgr = new SessionManager({ sessionsPath, provider: textProvider(summary), compaction });

@@ -9,9 +9,7 @@ import { makeTestTemp } from '../helpers/test-temp';
 
 const DAY = '2026-08-20T10:00:00.000Z';
 
-// E1.2 — `ledger_record` exposes `replaces`/`corrects` so the capture path can set them; they thread
-// schema → payload → pipeline → recordFact, and the store stamps the reverse link (M-6).
-describe('ledger_record cross-link params (E1.2)', () => {
+describe('ledger_record cross-link params', () => {
   let tmp: string;
   let ledger: LedgerStore;
   let tools: Tool[];

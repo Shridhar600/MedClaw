@@ -1,6 +1,3 @@
-// Shared KeywordIndex contract (P2 Task A2). Any KeywordIndex adapter must pass this suite —
-// the FTS keyword arm of hybrid recall (Stage 2). NOT a test file itself; invoked from an
-// adapter's own *.test.ts with a factory that builds a fresh, isolated adapter per call.
 
 import type { KeywordIndex, Chunk, ChunkWithScore } from '../../src/ports';
 
@@ -27,7 +24,7 @@ function chunk(id: string, content: string, over: Partial<Chunk> = {}): Chunk {
 }
 
 export function runKeywordIndexContract(makeIndex: MakeKeywordIndex): void {
-  describe('KeywordIndex contract (P2 A2)', () => {
+  describe('KeywordIndex contract', () => {
     let idx: ContractKeywordIndex;
 
     beforeEach(() => {

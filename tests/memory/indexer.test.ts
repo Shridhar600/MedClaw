@@ -1,4 +1,3 @@
-// tests/memory/indexer.test.ts
 import * as fs from 'fs';
 import * as path from 'path';
 import { MemoryIndexer } from '../../src/memory/indexer';
@@ -28,7 +27,7 @@ describe('MemoryIndexer', () => {
     fs.rmSync(tmpDir, { recursive: true });
   });
 
-  it('indexAll() stores chunks in SQLite', async () => {
+  it('indexAll stores chunks in SQLite', async () => {
     fs.writeFileSync(path.join(workspaceDir, 'test.md'), '# Test\n\nSome content here.');
     const indexer = new MemoryIndexer(store, mockProvider, workspaceDir);
     await indexer.indexAll();

@@ -17,16 +17,11 @@ afterEach(() => {
 const userProv: Provenance = { source: 'user', confidence: 1, anchor: 'memory/u.md#L1', capturedAt: '2026-08-12T00:00:00.000Z' };
 const docProv: Provenance = { source: 'doctor', confidence: 0.95, anchor: 'memory/v.md#L1', capturedAt: '2026-08-12T00:00:00.000Z' };
 
-// listAllOfType is the FactMirror re-derivation source: it must return EVERY fact of a type
-// (all entities, all versions incl. non-active) so the mirror can flip a superseded head off
-// `active`. listByType (active-only) cannot do that.
-describe('LedgerStore.listAllOfType (mirror re-derivation source, P2 A1.4)', () => {
+describe('LedgerStore.listAllOfType (mirror re-derivation source)', () => {
   it('returns all versions across entities, including superseded heads', async () => {
-    // knee: user v1 (mild) then doctor supersedes with a conflicting severity (higher authority applies).
     await store.recordFact({ entity: 'knee', type: 'condition', fields: { severity: 'mild' }, provenance: userProv });
     const sup = await store.recordFact({ entity: 'knee', type: 'condition', fields: { severity: 'severe' }, provenance: docProv });
     expect(sup.kind).toBe('applied'); // higher authority auto-applies for a non-med conflict
-    // diabetes: a separate active entity in the same type file.
     await store.recordFact({ entity: 'diabetes', type: 'condition', fields: { status: 'managed' }, provenance: docProv });
 
     const all = await store.listAllOfType('condition');

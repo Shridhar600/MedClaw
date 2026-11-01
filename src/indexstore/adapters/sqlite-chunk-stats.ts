@@ -1,7 +1,3 @@
-// src/indexstore/adapters/sqlite-chunk-stats.ts
-//
-// ChunkStatsWriter adapter over SQLite: recall usage telemetry. Uses its own better-sqlite3
-// connection to the per-profile search.db (WAL + busy_timeout).
 
 import Database from 'better-sqlite3';
 import { summarizeErrorForLog } from '../../security';

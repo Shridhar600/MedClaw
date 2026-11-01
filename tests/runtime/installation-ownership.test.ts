@@ -1,11 +1,3 @@
-// tests/runtime/installation-ownership.test.ts
-//
-// The protected invariant: exactly one local process at a time owns a MedClaw installation.
-//
-// Real collaborators throughout — the real `InstallationService`, the real directory lease, the
-// real `config set` writer, the real `Gateway` shutdown disposition — and real OS processes for
-// the contention cases, released together by an IPC barrier. Nothing here mocks the ownership
-// model.
 import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -26,19 +18,13 @@ interface ContenderResult {
   reason?: string;
 }
 
-/**
- * Every child spawned by this suite, so a failing assertion can never leave a contender spinning
- * on its barrier and holding the Jest process open.
- */
 const liveChildren = new Set<import('child_process').ChildProcess>();
 
 function killAllChildren(): void {
   for (const child of liveChildren) {
     try {
       child.kill('SIGKILL');
-    } catch {
-      // already gone
-    }
+    } catch { /* ignore */ }
   }
   liveChildren.clear();
 }
@@ -57,7 +43,7 @@ function spawnContender(
       {
         cwd: path.join(__dirname, '..', '..'),
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env, ...env, SOCS_RELEASE_MARKER: releaseMarker },
+        env: { ...process.env, ...env, TEST_RELEASE_MARKER: releaseMarker },
       },
     );
     liveChildren.add(child);
@@ -85,8 +71,6 @@ function raceContenders(
   const started = Array.from({ length: count }, (_, i) =>
     spawnContender(`c${i}`, configPath, barrierFile, releaseMarker),
   );
-  // Let every contender reach its barrier wait, then release them together. The winner holds its
-  // lease briefly so the losers observe a genuinely held resource, then releases.
   return new Promise((resolve) => {
     setTimeout(() => {
       fs.writeFileSync(barrierFile, 'go');
@@ -102,7 +86,7 @@ describe('installation resource ownership', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = makeTestTemp('socs-s1-ownership-');
+    tmpDir = makeTestTemp('ownership-');
   });
 
   afterEach(() => {
@@ -136,7 +120,6 @@ describe('installation resource ownership', () => {
     expect(held.kind).toBe('owned');
     if (held.kind !== 'owned') return;
 
-    // A second supported writer, in this same process, is refused rather than conflicting.
     const contender = await services.acquireOwnership(fixture.configPath, tmpDir);
     expect(contender.kind).toBe('busy');
     if (contender.kind !== 'busy') return;
@@ -147,8 +130,6 @@ describe('installation resource ownership', () => {
   });
 
   it('refuses a second owner of the same workspace reached through a different config document', async () => {
-    // Two configuration files, one owner workspace: the workspace lease is the real arbiter, so
-    // an alias cannot smuggle a second daemon into the owner's state.
     const baseDir = path.join(tmpDir, 'shared-state');
     const first = writeConfigFixture(tmpDir, { baseDir, ownerId: 'owner' });
     const secondDir = path.join(tmpDir, 'alias');
@@ -163,8 +144,6 @@ describe('installation resource ownership', () => {
 
     const other = await services.acquireOwnership(secondConfig, tmpDir);
 
-    // The second document is a different config resource, so it gets past the config lease and is
-    // refused at the workspace lease — the resource that actually protects owner state.
     expect(other.kind).toBe('busy');
     if (other.kind !== 'busy') return;
     expect(other.resource).toBe('owner');
@@ -183,7 +162,6 @@ describe('installation resource ownership', () => {
     expect(held.kind).toBe('owned');
     if (held.kind !== 'owned') return;
 
-    // The alias resolved to the target, so the original path contends on the same lease.
     const direct = await services.acquireOwnership(fixture.configPath, tmpDir);
     expect(direct.kind).toBe('busy');
     if (direct.kind !== 'busy') return;
@@ -221,7 +199,6 @@ describe('installation resource ownership', () => {
     expect(result.lease.reason).toBe('malformed-holder');
     expect(result.lease.holderState).toBe('malformed');
     expect(result.lease.guidance).toContain('never taken automatically');
-    // Untouched: no automatic recovery.
     expect(fs.existsSync(leasePath)).toBe(true);
   });
 
@@ -236,13 +213,11 @@ describe('installation resource ownership', () => {
     const holder = readHolder(leasePath);
     expect(holder).toBeDefined();
 
-    // A foreign release attempt leaves the real holder intact.
     const { releaseLeaseIfOwned } = await import('../../src/runtime/adapters/directory-lease');
     expect(releaseLeaseIfOwned(leasePath, 'a-token-that-is-not-ours')).toBe(false);
     expect(fs.existsSync(leasePath)).toBe(true);
     expect(readHolder(leasePath)?.token).toBe(holder?.token);
 
-    // Release is idempotent for the real owner.
     await held.ownership.release();
     expect(fs.existsSync(leasePath)).toBe(false);
     await held.ownership.release();
@@ -266,7 +241,6 @@ describe('installation resource ownership', () => {
     expect(result.kind).toBe('busy');
     if (result.kind !== 'busy') return;
     expect(result.resource).toBe('owner');
-    // The failed second acquisition must NOT leave the first lease held.
     expect(fs.existsSync(leasePathFor(fixture.configPath))).toBe(false);
     expect(fs.existsSync(workspaceLease)).toBe(true);
   });
@@ -294,12 +268,8 @@ describe('installation resource ownership', () => {
     expect(owned).toHaveLength(1);
     expect(busy).toHaveLength(3);
 
-    // A loser may observe the claim before the holder record lands; both reasons are an immediate `busy`.
     expect(busy.every((r) => r.reason === 'held' || r.reason === 'malformed-holder')).toBe(true);
 
-    // The stronger contract that replaces the removed artifact. Nothing a losing process did left
-    // anything behind: no staged lease directory, no second claim, no rewritten document. Every
-    // contender released, so the config directory holds exactly the one document it started with.
     expect(fs.readdirSync(tmpDir).sort()).toEqual(['config.json', 'go', 'release', 'state']);
     const stored = JSON.parse(fs.readFileSync(fixture.configPath, 'utf8')) as {
       profiles: { defaultProfileId: string };
@@ -313,7 +283,6 @@ describe('installation resource ownership', () => {
     const release = path.join(tmpDir, 'release');
 
     const contender = spawnContender('holder', fixture.configPath, barrier, release);
-    // Give the contender time to pass its barrier and take both leases.
     await new Promise((r) => setTimeout(r, 1200));
     fs.writeFileSync(barrier, 'go');
     await new Promise((r) => setTimeout(r, 1200));
@@ -327,7 +296,6 @@ describe('installation resource ownership', () => {
     fs.writeFileSync(release, 'go');
     await contender;
 
-    // Once the holder is gone the same command commits normally.
     const message = await setConfigValue(fixture.configPath, 'agent.maxIterations', '9');
     expect(message).toContain('Updated agent.maxIterations');
     expect(JSON.parse(fs.readFileSync(fixture.configPath, 'utf8')).agent.maxIterations).toBe(9);
@@ -363,10 +331,6 @@ describe('installation resource ownership', () => {
       readable: false,
     });
 
-    // Inspection must agree with acquisition about an occupied claim path. A dangling symlink is one:
-    // `existsSync` follows it and reports the claim absent, which would tell an operator the
-    // installation is free while the daemon refuses it as busy. Present-but-unreadable is the honest
-    // answer, and the guidance that goes with it is the manual-inspection one.
     const { DirectoryLease: RealLease } = await import('../../src/runtime/adapters/directory-lease');
     fs.symlinkSync(path.join(tmpDir, 'no-such-target'), leasePathFor(fixture.configPath));
     expect(describeLeaseForLocalInspection(fixture.configPath)).toEqual({
@@ -401,7 +365,7 @@ describe('ownership release requires quiescence', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = makeTestTemp('socs-s1-quiescence-');
+    tmpDir = makeTestTemp('quiescence-');
   });
 
   afterEach(() => {
@@ -414,10 +378,6 @@ describe('ownership release requires quiescence', () => {
     return writeConfigFixture(tmpDir, {});
   }
 
-  /**
-   * Real collaborators: a real Gateway over a real owner workspace. Only the external channel is
-   * absent (telegram is disabled), which is the supported local configuration.
-   */
   async function buildRealGateway(
     fixture: ReturnType<typeof writeConfigFixture>,
     diagnostics?: import('../../src/ports').DiagnosticSink,
@@ -429,8 +389,6 @@ describe('ownership release requires quiescence', () => {
     const config = effectiveConfigFor(readConfigDocument(fixture.configPath, tmpDir).stored);
     const { bindGatewayOwner } = await import('../helpers/gateway-owner-deps');
     const deps = await bindGatewayOwner(config, 'owner-chat');
-    // A counting wrapper, not a stub: provider CONSTRUCTION is what "a refusal builds nothing" is
-    // measured against, and the real factory keeps every other behaviour of the suite unchanged.
     const withCount = onBuildProvider
       ? { createProvider: (cfg: Parameters<typeof createProvider>[0]): ReturnType<typeof createProvider> => {
           onBuildProvider();
@@ -446,14 +404,6 @@ describe('ownership release requires quiescence', () => {
     return gateway;
   }
 
-  /**
-   * Hold ONE real transcript sweep past the runtime's drain budget, through real collaborators only.
-   *
-   * Real prior-day day-file on disk with an unlogged medication (so a sweep that completes genuinely
-   * persists a curiosity item), and a real `LedgerStore.listAllOfType` read parked on an explicit
-   * barrier and then delegated to the original implementation — so the sweep that eventually finishes
-   * is the real sweep over real data. The single substitution is where that one read blocks.
-   */
   function holdRealTranscriptSweep(
     fixture: ReturnType<typeof writeConfigFixture>,
     runtime: import('../../src/gateway/runtime').ProfileRuntime,
@@ -495,7 +445,6 @@ describe('ownership release requires quiescence', () => {
     const curiosityPath = path.join(fixture.workspace, 'curiosity.md');
     const curiosityBefore = fs.existsSync(curiosityPath) ? fs.readFileSync(curiosityPath, 'utf8') : '';
 
-    // Launch through the SAME entry the installed cron callback uses.
     runtime.launchBackgroundSweep();
     const sweep = runtime.sweepInFlight!;
     expect(sweep).toBeDefined();
@@ -510,11 +459,6 @@ describe('ownership release requires quiescence', () => {
     };
   }
 
-  /**
-   * Drive `daemon.shutdown()` across the runtime's shared 10,000ms drain budget deterministically:
-   * fake timers pinned with `jest.setSystemTime()` so the sweep's own `new Date()` cannot drift while
-   * the clock is advanced, then advanced in bulk. Never a wall-clock sleep, never a forced exit.
-   */
   async function shutdownAcrossDrainBudget(shutdown: () => Promise<void>): Promise<void> {
     jest.useFakeTimers();
     jest.setSystemTime(new Date());
@@ -548,7 +492,6 @@ describe('ownership release requires quiescence', () => {
     const fixture = makeOwnerFixture();
     const gateway = await bootRealGateway(fixture);
 
-    // Sampled synchronously: `stop()` is genuinely in flight, so ownership must not be released yet.
     const stopping = gateway.stop();
     expect(gateway.getShutdownDisposition()).toBe('pending');
 
@@ -592,7 +535,6 @@ describe('ownership release requires quiescence', () => {
       createGateway: () => gateway,
     });
 
-    // A refused boot throws with honest guidance rather than starting a second daemon.
     await expect(startDaemon({
       services,
       configPath: fixture.configPath,
@@ -603,25 +545,12 @@ describe('ownership release requires quiescence', () => {
     await daemon.shutdown();
   }, 60_000);
 
-  /**
-   * The nightly transcript sweep is real production work that keeps touching owner
-   * files AFTER `drainAndClose()` has closed the stores and set the runtime to `closed`.
-   *
-   * Everything here is real: the real `startDaemon`, the real `Gateway`, the real `ProfileRuntime`,
-   * the real session day-file on disk, the real `LedgerStore` and the real `CuriosityQueue`. The
-   * only substitutions are (a) one real ledger read held behind an explicit barrier and then
-   * delegated to the original implementation, and (b) real child OS processes for the contenders.
-   * The clock is controlled with fake timers so the 10s shared drain budget is exceeded
-   * deterministically instead of by a 10s wall-clock sleep.
-   */
   it('retains both installation leases while a real transcript sweep outlives the drain budget', async () => {
     const fixture = makeOwnerFixture();
     const gateway = await buildRealGateway(fixture);
     const services = new InstallationService(new DirectoryLease());
     const { startDaemon } = await import('../../src/index');
 
-    // A second configuration document pointing at the SAME owner workspace: the workspace lease,
-    // not the config lease, must be what protects this installation.
     const aliasDir = path.join(tmpDir, 'alias');
     fs.mkdirSync(aliasDir, { recursive: true });
     const aliasConfigPath = path.join(aliasDir, 'other-config.json');
@@ -640,13 +569,10 @@ describe('ownership release requires quiescence', () => {
     expect(runtime.ledgerStore).toBeDefined();
     expect(runtime.curiosity).toBeDefined();
 
-    // Real prior-day transcript plus a held real ledger read — see `holdRealTranscriptSweep`.
     const held = holdRealTranscriptSweep(fixture, runtime);
     const { sweep, curiosityPath, curiosityBefore, release: releaseLedgerRead, restoreLedger } = held;
     await held.whenHeld;
 
-    // Controlled clock: cross the runtime's shared drain budget deterministically, with no
-    // wall-clock wait — see `shutdownAcrossDrainBudget`.
     const budgetWarnings: string[] = [];
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
       budgetWarnings.push(args.map((a) => String(a)).join(' '));
@@ -654,8 +580,6 @@ describe('ownership release requires quiescence', () => {
     await shutdownAcrossDrainBudget(() => daemon.shutdown());
     warnSpy.mockRestore();
 
-    // The drain really did abandon a phase at the shared budget — the sanitized warning names the
-    // budget and the phase label, and pins the 10,000ms constant outcome 6 requires preserved.
     const budgetWarning = budgetWarnings.find((line) => /drain budget/i.test(line));
     expect(budgetWarning).toMatch(/Shutdown drain budget \(10000ms\) exceeded/);
     expect(budgetWarning).toContain('transcript-sweep');
@@ -664,22 +588,16 @@ describe('ownership release requires quiescence', () => {
     expect(budgetWarning).not.toContain(tmpDir);
     expect(budgetWarning).not.toContain('naproxen');
 
-    // Stop returned: it did NOT wait for the stuck sweep. The bound is the real one — the sweep is
-    // demonstrably still running at the moment shutdown resolves.
     expect(runtime.isClosed()).toBe(true);
     let sweepSettled = false;
     void sweep.then(() => { sweepSettled = true; }, () => { sweepSettled = true; });
     await new Promise((resolve) => setImmediate(resolve));
     expect(sweepSettled).toBe(false);
 
-    // `closed` is not quiescence. Asserted in the order the harm would happen: the leases must still
-    // be held, and only then does the disposition explain why.
     expect(fs.existsSync(leasePathFor(fixture.configPath))).toBe(true);
     expect(fs.existsSync(fixture.workspaceLease)).toBe(true);
     expect(daemon.gateway.getShutdownDisposition()).toBe('pending');
 
-    // Real contender OS processes must be refused: the same config, and a different config that
-    // resolves to the same owner workspace.
     const barrierFile = path.join(tmpDir, 'go');
     const releaseMarker = path.join(tmpDir, 'release');
     fs.writeFileSync(barrierFile, 'go');
@@ -688,11 +606,8 @@ describe('ownership release requires quiescence', () => {
     expect(same.outcome).toBe('busy');
     expect(alias.outcome).toBe('busy');
     expect(alias.resource).toBe('owner');
-    // The lease directory on disk is still ours, not a contender's.
     expect(readHolder(fixture.workspaceLease)?.pid).toBe(process.pid);
 
-    // Release the barrier and observe the ACTUAL late outcome: the still-running sweep finishes and
-    // persists its item — while ownership is still held, which is exactly why it must be.
     releaseLedgerRead();
     restoreLedger();
     const sweepResult = await sweep;
@@ -700,17 +615,13 @@ describe('ownership release requires quiescence', () => {
     const curiosityAfter = fs.readFileSync(curiosityPath, 'utf8');
     expect(curiosityAfter).not.toBe(curiosityBefore);
     expect(curiosityAfter).toContain('naproxen');
-    // The late write happened under retained ownership, not under a second installation.
     expect(fs.existsSync(fixture.workspaceLease)).toBe(true);
     expect(readHolder(fixture.workspaceLease)?.pid).toBe(process.pid);
 
-    // Only once the continuation has really settled may a repeated root shutdown release. This is
-    // the real release path — no lease is deleted by hand anywhere in this test.
     await daemon.shutdown();
     expect(fs.existsSync(leasePathFor(fixture.configPath))).toBe(false);
     expect(fs.existsSync(fixture.workspaceLease)).toBe(false);
 
-    // …and a contender now genuinely succeeds.
     fs.writeFileSync(barrierFile, 'go');
     fs.writeFileSync(releaseMarker, 'go');
     const next = await spawnContender('after-release', fixture.configPath, barrierFile, releaseMarker);
@@ -730,7 +641,6 @@ describe('ownership release requires quiescence', () => {
       createGateway: () => gateway,
     });
 
-    // A real owner turn runs to completion while the daemon holds ownership.
     await gateway.handleTestMessage('chat-1', 'a short note about today');
     expect(fs.existsSync(leasePathFor(fixture.configPath))).toBe(true);
     expect(fs.existsSync(fixture.workspaceLease)).toBe(true);
@@ -744,7 +654,7 @@ describe('acquisition refuses every pre-existing lease entry without replacing i
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = makeTestTemp('socs-s1-unknown-lease-');
+    tmpDir = makeTestTemp('unknown-lease-');
   });
 
   afterEach(() => {
@@ -766,7 +676,6 @@ describe('acquisition refuses every pre-existing lease entry without replacing i
     expect(result.resource).toBe('config');
     expect(result.lease.reason).toBe('malformed-holder');
     expect(result.lease.holderState).toBe('malformed');
-    // Nothing was claimed, nothing was published, nothing was repaired.
     expect(result.lease.guidance).toContain('never taken automatically');
 
     const after = fs.lstatSync(leasePath);
@@ -775,7 +684,6 @@ describe('acquisition refuses every pre-existing lease entry without replacing i
     expect(after.mode & 0o777).toBe(before.mode & 0o777);
     expect(fs.readdirSync(leasePath)).toEqual([]);
     expect(fs.existsSync(path.join(leasePath, 'holder.json'))).toBe(false);
-    // The owner workspace lease was never reached, so nothing else was created either.
     expect(fs.existsSync(fixture.workspaceLease)).toBe(false);
   });
 
@@ -787,7 +695,6 @@ describe('acquisition refuses every pre-existing lease entry without replacing i
     const previousUmask = process.umask(0o700);
     let held;
     try {
-      // Real adapter, real filesystem, no injected fault — only the process umask.
       held = await new DirectoryLease().tryAcquire({ kind: 'config', canonicalPath: leaseDir });
     } finally {
       process.umask(previousUmask);
@@ -797,15 +704,11 @@ describe('acquisition refuses every pre-existing lease entry without replacing i
     if (held.kind !== 'acquired') return;
 
     const claim = leasePathFor(leaseDir);
-    // Both modes are umask-affected at creation and must be established explicitly. The HOLDER RECORD
-    // is the load-bearing one: release is token-checked by reading it, so an unreadable record makes
-    // the caller's own lease impossible to release even after a successful acquisition.
     expect(fs.statSync(claim).mode & 0o777).toBe(0o700);
     expect(fs.statSync(path.join(claim, 'holder.json')).mode & 0o777).toBe(0o600);
     expect(fs.readdirSync(claim)).toEqual(['holder.json']);
     expect(readHolder(claim)?.pid).toBe(process.pid);
 
-    // Release really works under this umask: it must read the record and remove the claim.
     await held.release();
     expect(fs.existsSync(claim)).toBe(false);
   });

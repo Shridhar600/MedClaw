@@ -73,8 +73,6 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     mockCheckProviderBindAddresses.mockReturnValue({ localhostOnly: true, warnings: [] });
     mockVerifyWorkspacePermissions.mockReturnValue({ secure: true, warnings: [] });
     mockProbeChatCompletion.mockReset();
-    // Default: the live completion probe passes (isolates the config-check tests
-    // from the probe). Individual tests override it.
     mockProbeChatCompletion.mockResolvedValue({
       ready: true, checked: true, label: 'main provider', status: 'ok',
       details: ['live completion verified'], warnings: [],
@@ -103,9 +101,7 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
         bootstrapMaxChars: 20000,
       },
       sessions: {
-        softResetAfterMinutes: 240,
-        hardResetAfterMinutes: 1440,
-        compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+        compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
       },
       heartbeat: {
         enabled: false,
@@ -124,7 +120,7 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
           },
         },
       },
-      agent: { maxIterations: 15, disclaimerEnabled: true },
+      agent: { maxIterations: 15 },
     };
   }
 
@@ -227,7 +223,7 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
       chatType: 'private',
       eventId: 'local:chat-1:1', chatId: 'chat-1', text: 'hi there' });
 
-    expect(run).toHaveBeenCalledWith('hi there', expect.any(Array), { chatId: 'chat-1', mode: 'chat' });
+    expect(run).toHaveBeenCalledWith('hi there', expect.any(Array), { chatId: 'chat-1', origin: 'user', mode: 'chat', turnId: undefined });
     expect(send).toHaveBeenCalledWith('chat-1', { text: 'hello from agent' });
 
     await gateway.stop();
@@ -285,7 +281,6 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
     expect(statusText).toContain('not yet');
 
     mockCheckSystemReadiness.mockResolvedValue(allReadyResult());
-    // let start complete
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway as any).channel = undefined;
     await startPromise.catch(() => {});
@@ -331,8 +326,6 @@ describe('Gateway boot healthchecks + /status + security wiring', () => {
 
     const statusText = send.mock.calls[0][1].text;
     expect(statusText).toContain('Security warnings: 1');
-    // Provider baseUrls and warning bodies are config internals — they must
-    // never reach a network channel.
     expect(statusText).not.toContain('api.example.com');
     expect(statusText).not.toContain('not localhost');
 
