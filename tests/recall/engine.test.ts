@@ -2,7 +2,7 @@ import { RecallEngine, DEFAULT_RECALL_CONFIG } from '../../src/recall';
 import type { RecallDeps } from '../../src/recall';
 import type { FactRecord, FactMirror } from '../../src/ports';
 import {
-  FakeFactMirror, FakeVectorIndex, FakeKeywordIndex, FakeEmbedding, FakeChunkStats, ThrowingChunkStats, fixedClock, chunkHit,
+  FakeFactMirror, currentFactsOf, FakeVectorIndex, FakeKeywordIndex, FakeEmbedding, FakeChunkStats, ThrowingChunkStats, fixedClock, chunkHit,
 } from './fakes';
 
 function frec(over: Partial<FactRecord> & { id: string; entity: string }): FactRecord {
@@ -14,14 +14,16 @@ function frec(over: Partial<FactRecord> & { id: string; entity: string }): FactR
 }
 
 function makeEngine(over: Partial<RecallDeps> = {}): RecallEngine {
+  const factMirror = over.factMirror ?? new FakeFactMirror();
   return new RecallEngine({
     embedding: over.embedding ?? new FakeEmbedding(),
     vectorIndex: over.vectorIndex ?? new FakeVectorIndex(),
     keywordIndex: over.keywordIndex ?? new FakeKeywordIndex(),
-    factMirror: over.factMirror ?? new FakeFactMirror(),
+    factMirror,
     chunkStats: over.chunkStats ?? new FakeChunkStats(),
     clock: over.clock ?? fixedClock('2026-10-01T00:00:00.000Z'),
     config: over.config ?? DEFAULT_RECALL_CONFIG,
+    currentFacts: over.currentFacts ?? currentFactsOf(factMirror),
   });
 }
 
@@ -334,7 +336,7 @@ describe('RecallEngine — Stage 4 (feedback + auto-mute)', () => {
 });
 
 describe('RecallEngine — resilience (never crashes the turn)', () => {
-  it('a throwing factMirror fails closed for narrative suppression while preserving turn safety', async () => {
+  it('an unreadable fact source fails closed: a visible warning, no stale narrative', async () => {
     // An async-iterable that rejects on iteration (avoids a yield-less generator, require-yield).
     const boom = (): AsyncIterable<FactRecord> => ({
       [Symbol.asyncIterator]: () => ({ next: () => Promise.reject(new Error('boom')) }),
@@ -346,7 +348,7 @@ describe('RecallEngine — resilience (never crashes the turn)', () => {
     const chunk = chunkHit({ id: 'c', content: 'a note that scores well enough here', createdAt: '2026-10-01T00:00:00.000Z', score: 0.9 });
     const r = await makeEngine({ factMirror: throwingMirror, vectorIndex: new FakeVectorIndex([chunk]) })
       .run({ profileId: 'default', userMessage: 'note' });
-    expect(r.ledger).toBe('');  // stage 1 degraded
+    expect(r.ledger).toMatch(/could not be read/);  // stage 1 says so instead of going silently empty
     expect(r.checkNotes).toBe('');  // stage 3 degraded
     // A failed head read must never disable stale suppression and look healthy.
     expect(r.narrative).toBe('');

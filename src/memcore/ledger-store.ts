@@ -9,7 +9,7 @@ import {
 import { parseLedgerFile, renderLedgerFile, canonicalFields } from './ledger-parser';
 import { normalizeEntitySlug, sanitizeSingleLine } from './sanitize';
 import { TokenRejectedError } from './token-errors';
-import { ParseQuarantineError } from '../shared/errors';
+import { LedgerUnreadableError, ParseQuarantineError } from '../shared/errors';
 import { secureWrite, secureWriteViaTmp, secureMkdir, secureChmodFile, summarizeErrorForLog, resolveContainedPath } from '../security';
 import type { Clock } from '../ports';
 import { systemClock } from '../ports';
@@ -96,6 +96,8 @@ export class LedgerStore {
   private tokens = new Map<string, StoredToken>();
   private readonly factsCache = new Map<FactType, LedgerFactsCache>();
   private readonly pendingIndexDeltas = new Map<FactType, LedgerIndexDelta[]>();
+  /** Damaged files, keyed by type, with the fingerprint already preserved as a `.corrupt-` copy. */
+  private readonly damaged = new Map<FactType, LedgerFileFingerprint>();
 
   constructor(private rootDir: string, private clock: Clock = systemClock) {
     secureMkdir(rootDir);
@@ -114,7 +116,10 @@ export class LedgerStore {
     } catch (err: unknown) {
       this.invalidateFactsCache(type);
       const nodeErr = err as NodeJS.ErrnoException;
-      if (nodeErr.code === 'ENOENT') return [];
+      if (nodeErr.code === 'ENOENT') {
+        this.damaged.delete(type);
+        return [];
+      }
       throw err;
     }
     if (!stat.isFile()) {
@@ -145,25 +150,44 @@ export class LedgerStore {
     }
     if (!isUtf8(rawBytes)) {
       console.warn('[ledger-store] invalid UTF-8 content; preserving bytes in quarantine');
-      if (!this.quarantineCorruptFile(fp, rawBytes)) {
-        throw new ParseQuarantineError('ledger source could not be quarantined safely');
-      }
+      this.markDamaged(type, fp, rawBytes, fingerprint);
       return [];
     }
     const content = rawBytes.toString('utf8');
     const facts = parseLedgerFile(content, { type, profileId: path.basename(this.rootDir) });
     const hasQuarantineFact = facts.some((fact) => fact.version === 0 && fact.fields._quarantine !== undefined);
-    // A file with no usable facts, or one containing a malformed block, is corrupt.
-    // Preserve the exact source bytes before a later write is allowed to replace the
-    // live file. Valid blocks remain usable; quarantine sentinels never enter callers.
+    // A file with no usable facts, or one containing a malformed block, is damaged. Its readable
+    // facts stay visible; the file is read-only (writeFacts refuses) until the owner repairs it,
+    // so no later write can silently drop the damaged block.
     if ((facts.length === 0 && content.trim() !== '') || hasQuarantineFact) {
-      if (!this.quarantineCorruptFile(fp, rawBytes)) {
-        throw new ParseQuarantineError('ledger source could not be quarantined safely');
-      }
+      this.markDamaged(type, fp, rawBytes, fingerprint);
       return facts.filter((fact) => fact.version >= 1 && fact.fields._quarantine === undefined);
     }
+    this.damaged.delete(type);
     this.factsCache.set(type, { fingerprint, facts: this.cloneFacts(facts) });
     return this.cloneFacts(facts);
+  }
+
+  /** Record a damaged file, preserving its exact bytes once per distinct content. */
+  private markDamaged(type: FactType, fp: string, rawBytes: Buffer, fingerprint: LedgerFileFingerprint): void {
+    const known = this.damaged.get(type);
+    if (known && this.sameFingerprint(known, fingerprint)) return;
+    if (!this.quarantineCorruptFile(fp, rawBytes)) {
+      throw new ParseQuarantineError('ledger source could not be quarantined safely');
+    }
+    this.damaged.set(type, fingerprint);
+  }
+
+  /** Every change path reads through here: a damaged file is read-only until the owner repairs it. */
+  private async readForChange(type: FactType): Promise<LedgerFact[]> {
+    const facts = await this.readFacts(type);
+    if (this.damaged.has(type)) throw new LedgerUnreadableError();
+    return facts;
+  }
+
+  /** Ledger file names found damaged by the most recent read of each type. */
+  damagedFiles(): string[] {
+    return [...this.damaged.keys()].map((type) => TYPE_TO_FILE[type]);
   }
 
   /** Copy corrupt source bytes to a secure sidecar so read-only callers retain usable facts. */
@@ -443,7 +467,7 @@ export class LedgerStore {
       corrects: normalizeOptionalReference(params.corrects),
       correctedBy: normalizeOptionalReference(params.correctedBy),
     };
-    const allFacts = await this.readFacts(p.type);
+    const allFacts = await this.readForChange(p.type);
     const active = this.activeVersion(allFacts, p.entity);
     const cur = active || this.pausedVersion(allFacts, p.entity);
     const now = this.clock.now().toISOString();
@@ -589,7 +613,7 @@ export class LedgerStore {
     provenance: Provenance;
   }): Promise<RetractResult> {
     const entity = requireEntitySlug(params.entity);
-    const allFacts = await this.readFacts(params.type);
+    const allFacts = await this.readForChange(params.type);
     const cur = this.activeVersion(allFacts, entity);
     if (!cur) {
       return { kind: 'noop', reason: 'no-active-version' };
@@ -680,7 +704,7 @@ export class LedgerStore {
     opts?: { reason?: string; replacedBy?: string },
   ): Promise<LedgerMutationResult> {
     entity = requireEntitySlug(entity);
-    const allFacts = await this.readFacts(type);
+    const allFacts = await this.readForChange(type);
     const cur = this.activeVersion(allFacts, entity);
     if (!cur) return { kind: 'noop', reason: 'no-active-version' };
 
@@ -736,7 +760,7 @@ export class LedgerStore {
     fields: Record<string, string | number | string[]>,
   ): Promise<LedgerMutationResult> {
     entity = requireEntitySlug(entity);
-    const allFacts = await this.readFacts(type);
+    const allFacts = await this.readForChange(type);
     if (this.activeVersion(allFacts, entity)) return { kind: 'noop', reason: 'already-active' };
     const discontinued = this.latestDiscontinued(allFacts, entity);
     if (!discontinued) return { kind: 'noop', reason: 'no-discontinued-version' };
@@ -767,7 +791,7 @@ export class LedgerStore {
     opts: { prePauseSummary: string },
   ): Promise<LedgerMutationResult> {
     entity = requireEntitySlug(entity);
-    const allFacts = await this.readFacts(type);
+    const allFacts = await this.readForChange(type);
     const active = this.activeVersion(allFacts, entity);
     if (!active) return { kind: 'noop', reason: 'no-active-version' };
 
@@ -892,7 +916,7 @@ export class LedgerStore {
   /** Apply a confirmed op. Throws TokenRejectedError with PHI-free reasons on state mismatches. */
   private async applyConfirmOp(op: PendingOp, options?: { winningVersion?: number }): Promise<LedgerFact> {
     if (op.kind === 'write') {
-      const allFacts = await this.readFacts(op.type);
+      const allFacts = await this.readForChange(op.type);
       // Resolve the current version as active OR paused (a paused-entity update
       // has no active version — mirrors recordFact). Without this the paused-carry
       // branch below is unreachable and confirm() rejects (A2).
@@ -945,7 +969,7 @@ export class LedgerStore {
     }
 
     if (op.kind === 'retract') {
-      const allFacts = await this.readFacts(op.type);
+      const allFacts = await this.readForChange(op.type);
       const cur = this.activeVersion(allFacts, op.entity);
       if (!cur) throw new TokenRejectedError('no-active-version');
       if (factSnapshotHash(cur) !== op.baselineCurHash) {
@@ -982,7 +1006,7 @@ export class LedgerStore {
       if (winningVersion !== op.versionA && winningVersion !== op.versionB) {
         throw new TokenRejectedError('dispute-version-not-offered');
       }
-      const allFacts = await this.readFacts(op.type);
+      const allFacts = await this.readForChange(op.type);
       // Self-review IMPORTANT-3: at mint time the pre-dispute fact was flipped to
       // `disputed`, so ANY current active version means a third write landed in
       // the window — resolving now would create a double-active entity.
@@ -1006,7 +1030,7 @@ export class LedgerStore {
 
     if (op.kind === 'discontinue') {
       // Re-read current state (the 15-min token window may have seen other writes).
-      const allFacts = await this.readFacts(op.type);
+      const allFacts = await this.readForChange(op.type);
       const cur = this.activeVersion(allFacts, op.entity);
       if (!cur) throw new TokenRejectedError('no-active-version');
       if (factSnapshotHash(cur) !== op.baselineCurHash) {
@@ -1016,7 +1040,7 @@ export class LedgerStore {
     }
 
     if (op.kind === 'restart') {
-      const allFacts = await this.readFacts(op.type);
+      const allFacts = await this.readForChange(op.type);
       // Guard against a second restart token confirming into a SECOND active version
       // (two coexisting restart tokens → double-active → the entity can never be retired).
       if (this.activeVersion(allFacts, op.entity)) {
@@ -1082,6 +1106,17 @@ export class LedgerStore {
       if (f.status === 'active' && f.version >= 1) counts.set(f.entity, (counts.get(f.entity) ?? 0) + 1);
     }
     return [...counts.entries()].filter(([, n]) => n > 1).map(([entity]) => entity);
+  }
+
+  /** Every current fact (active or paused) across all types — what the agent treats as true now. */
+  async listCurrent(): Promise<LedgerFact[]> {
+    const out: LedgerFact[] = [];
+    for (const type of Object.keys(TYPE_TO_FILE) as FactType[]) {
+      for (const f of await this.readFacts(type)) {
+        if (f.version >= 1 && (f.status === 'active' || f.status === 'paused')) out.push(f);
+      }
+    }
+    return out;
   }
 
   /**

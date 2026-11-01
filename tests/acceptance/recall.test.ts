@@ -71,6 +71,7 @@ describe('P2 recall acceptance (real adapters, disk-backed → assembled prompt)
     chunkStats: stats,
     clock,
     config: DEFAULT_RECALL_CONFIG,
+    currentFacts: async () => ({ facts: (await ledger.listCurrent()).map(ledgerFactToRecord), damagedFiles: ledger.damagedFiles() }),
   });
 
   async function syncMirror(): Promise<void> {

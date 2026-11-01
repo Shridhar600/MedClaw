@@ -257,6 +257,64 @@ describe('Gateway C3 — per-turn recall + v2 assembly cutover (D9)', () => {
   });
 });
 
+// The ledger Markdown is the source of truth for what the agent believes is current. The owner can
+// hand-edit it, a derived index can lag, a file can be damaged — the next reply must follow the ledger.
+describe('Gateway — current facts follow the ledger', () => {
+  let tmpDir: string;
+  let gateway: Gateway;
+  let workspace: string;
+
+  beforeEach(() => {
+    tmpDir = makeTestTemp('redacted-ledger-truth-');
+    workspace = fixtureOwner(tmpDir).workspace;
+  });
+  afterEach(async () => {
+    try { await gateway?.stop(); } catch { /* ignore */ }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const registryOf = (): any => (gateway as any).agentLoop.registry;
+  const lastSystem = (seen: Message[][]): string => String(seen[seen.length - 1][0].content);
+  const ledgerFile = (name: string): string => path.join(workspace, 'ledger', name);
+
+  it('a hand edit of the ledger reaches the next reply', async () => {
+    gateway = await startGateway(tmpDir);
+    const seen = captureProvider(gateway);
+    await registryOf().execute('ledger_record', { entity: 'daily-walk', type: 'goal', fields: { target: '5000 steps' } });
+    await gateway.handleTestMessage('chat-1', 'hello', 'm1');
+    expect(lastSystem(seen)).toContain('5000 steps');
+
+    const file = ledgerFile('goals.md');
+    fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace('5000 steps', '9000 steps'));
+    await gateway.handleTestMessage('chat-1', 'hello again', 'm2');
+
+    expect(lastSystem(seen)).toContain('9000 steps');
+    expect(lastSystem(seen)).not.toContain('5000 steps');
+  });
+
+  it('a damaged ledger file is flagged in the reply context and refuses changes until repaired', async () => {
+    gateway = await startGateway(tmpDir);
+    const seen = captureProvider(gateway);
+    await registryOf().execute('ledger_record', { entity: 'metformin', type: 'medication', fields: { dose: '500mg' } });
+    const file = ledgerFile('medications.md');
+    fs.appendFileSync(file, '## warfarin\n### v1 (active)\n- dose 5mg\n');
+    const damaged = fs.readFileSync(file, 'utf8');
+
+    await gateway.handleTestMessage('chat-1', 'what am I taking?', 'm1');
+    expect(lastSystem(seen)).toMatch(/medications\.md[^\n]*damaged/);
+    expect(lastSystem(seen)).toContain('metformin');
+
+    const change = await registryOf().execute('ledger_record', { entity: 'metformin', type: 'medication', fields: { dose: '1000mg' } });
+    expect(change.isError).toBe(true);
+    expect(change.content[0].text).toMatch(/damaged/);
+    await gateway.handleTestMessage('chat-1', 'and now?', 'm2');
+
+    expect(fs.readFileSync(file, 'utf8')).toBe(damaged);
+    expect(fs.readdirSync(path.dirname(file)).filter((f) => f.startsWith('medications.md.corrupt-'))).toHaveLength(1);
+  });
+});
+
 // A secret pasted into chat (a caption, an onboarding answer, a plain message) is refused at the
 // door: it never reaches the provider and never lands in any file under the owner's state.
 describe('Gateway — secrets in inbound messages', () => {

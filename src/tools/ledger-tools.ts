@@ -14,6 +14,7 @@ import { normalizeEntitySlug } from '../memcore/sanitize';
 import type { Clock } from '../ports';
 import { systemClock } from '../ports';
 import { summarizeErrorForLog, contentContainsCredentials } from '../security';
+import { LedgerUnreadableError } from '../shared/errors';
 
 const FACT_TYPES: FactType[] = ['medication', 'condition', 'symptom', 'appointment', 'metric', 'goal', 'allergy'];
 const AUTHORITIES: Authority[] = ['doctor', 'lab', 'report', 'sensor', 'user', 'inference'];
@@ -128,7 +129,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
     try {
       await deps.tier1Rederive(type);
     } catch (e) {
-      console.warn('[ledger-tools] Tier-1 fact-mirror derivation failed (recall fallback covers reads):', summarizeErrorForLog(e));
+      console.warn('[ledger-tools] Tier-1 fact-mirror derivation failed (recall reads the ledger):', summarizeErrorForLog(e));
     }
   };
   const clock = deps.clock ?? systemClock;
@@ -303,6 +304,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
         if (message === 'invalid-cross-link' || message === 'unresolved-cross-link') {
           return err('Write rejected: cross-link target could not be resolved.');
         }
+        if (e instanceof LedgerUnreadableError) return err(e.message);
         console.warn('[ledger_record] write failed:', summarizeErrorForLog(e));
         return err('Could not record this ledger fact. Please try again.');
       }
@@ -392,6 +394,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): Tool[] {
         if (e instanceof TokenRejectedError) {
           return err(`Could not apply confirmation: ${e.message}`);
         }
+        if (e instanceof LedgerUnreadableError) return err(e.message);
         console.warn('[ledger_update] confirm failed:', summarizeErrorForLog(e));
         return err('Could not apply confirmation. Please re-state the change to get a fresh proposal.');
       }

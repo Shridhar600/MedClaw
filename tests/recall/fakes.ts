@@ -7,6 +7,16 @@ import type {
   EmbeddingPort, ChunkStat, ChunkStatsWriter, Clock,
 } from '../../src/ports';
 
+/** Serve the ledger-backed current-facts port from the same records a fake mirror holds. */
+export function currentFactsOf(mirror: FactMirror): () => Promise<{ facts: FactRecord[]; damagedFiles: string[] }> {
+  return async () => {
+    const facts: FactRecord[] = [];
+    for await (const f of mirror.queryActive()) facts.push(f);
+    for await (const f of mirror.queryPaused()) facts.push(f);
+    return { facts, damagedFiles: [] };
+  };
+}
+
 export class FakeFactMirror implements FactMirror {
   constructor(private records: FactRecord[] = []) {}
 

@@ -86,8 +86,8 @@ export interface CuriosityWriter {
  *   - `tier1Rederive` — SYNCHRONOUS, INSIDE the write lock (local-only, <5ms budget: SQLite
  *     FactMirror writes, no network/LLM). Runs BEFORE the op returns, so a read that starts the
  *     instant after this write commits sees a mirror that is already consistent with it. A
- *     failure here warns and continues (fail-SOFT for availability — recall's injected
- *     `fallbackActiveFacts` port covers reads regardless; the next mutation's Tier-1 step retries).
+ *     failure here warns and continues (fail-SOFT for availability — recall reads current facts
+ *     from the ledger itself; the next mutation's Tier-1 step retries).
  *   - `rederive` (Tier-2) — ASYNC, OUTSIDE the write lock (may embed — RR-7 C-09: embeddings never
  *     run inside the single-writer lock). Reindexes narrative/ledger chunks for search. NEVER
  *     fails closed; a lag degrades to keyword-only recall (RR-8 C-61), never wedges the turn.
@@ -172,7 +172,7 @@ export class CapturePipeline {
           try {
             await this.deps.tier1Rederive.rederive(routed.changed);
           } catch (e) {
-            console.warn(`[capture] Tier-1 fact-mirror derivation failed (recall fallback covers reads; next write repairs): ${summarizeErrorForLog(e)}`);
+            console.warn(`[capture] Tier-1 fact-mirror derivation failed (recall reads the ledger; next write repairs): ${summarizeErrorForLog(e)}`);
           }
         }
         this.markCommitted(idempotencyKey, routed.result);

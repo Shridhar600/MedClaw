@@ -38,6 +38,13 @@ export class ParseQuarantineError extends AppError {
   }
 }
 
+/** A ledger file is damaged: its readable facts stay visible, but it is read-only until repaired. */
+export class LedgerUnreadableError extends AppError {
+  constructor() {
+    super('This part of the health record is damaged and is read-only until it is repaired. The damaged copy is kept next to the file.');
+  }
+}
+
 /**
  * A write to curated memory exceeded the section's character budget.
  * The caller should relay entries for the model to merge/reduce.

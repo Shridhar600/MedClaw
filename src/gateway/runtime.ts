@@ -33,7 +33,7 @@ import {
   ledgerFactToRecord,
   isRemoteEmbeddingBaseUrl,
 } from '../indexstore';
-import type { EmbeddingPort, FactRecord } from '../ports';
+import type { EmbeddingPort } from '../ports';
 import { systemClock } from '../ports';
 import { CapturePipeline, FileCaptureIdempotency, makeSafetyRenderer, MutationCoordinator } from '../capture';
 import { SqliteStore } from '../memory/sqlite-store';
@@ -55,7 +55,7 @@ import type { PrepareSystem } from '../agent/agent-loop';
 import { ContextAssembler } from '../agent/context';
 import { ContextAssembler as ContextAssemblerV2 } from '../context2';
 import type { SafetyReader } from '../context2';
-import { RecallEngine, DEFAULT_RECALL_CONFIG } from '../recall';
+import { RecallEngine, DEFAULT_RECALL_CONFIG, type CurrentFacts } from '../recall';
 import { createProvider, type ProviderFactory } from '../providers/factory';
 import type { LLMProvider } from '../providers/types';
 import type { LLMSemaphore } from '../tools/semaphore';
@@ -524,7 +524,7 @@ export class ProfileRuntime {
       // the OUTER single-writer lock (only one can ever run at a time, period), the `mirrorTails`
       // per-type promise chain that used to guard the — previously UNLOCKED, async — mirror write
       // against ITSELF is redundant and was removed. A FactMirror-write failure warns and
-      // continues (fail-SOFT: recall's `fallbackActiveFacts` port covers reads regardless; the
+      // continues (fail-SOFT: recall reads current facts from the ledger itself, not the mirror; the
       // next mutation's Tier-1 step retries; boot's full rebuild is the ultimate backstop) — it
       // must NEVER abort the write itself.
       const tier1Rederive = {
@@ -557,7 +557,7 @@ export class ProfileRuntime {
                   await factMirror.replaceType(type, facts.map(ledgerFactToRecord));
                 }
               } catch (e) {
-                console.warn('[gateway] Tier-1 fact-mirror derivation failed (recall fallback covers reads; next write repairs):', summarizeErrorForLog(e));
+                console.warn('[gateway] Tier-1 fact-mirror derivation failed (recall reads the ledger; next write repairs):', summarizeErrorForLog(e));
               }
             }
           }
@@ -644,21 +644,12 @@ export class ProfileRuntime {
           chunkStats,
           clock: systemClock,
           config: DEFAULT_RECALL_CONFIG,
-          // RR-STRUCT R-S3 Finding-3: `stage1Ledger` calls this when `factMirror.queryActive()`
-          // throws, instead of failing OPEN to an empty ledger context (a clinical hazard — a
-          // discontinued/active medication would silently vanish from the prompt). Composed from
-          // LedgerStore directly (no `listAllActive()` method exists verbatim) — `listByType(t)`
-          // already filters to `status==='active' && version>=1` for one type, exactly what
-          // `factMirror.queryActive()` (no type arg) returns across ALL types. This composition
-          // lives HERE, not in `src/recall/`, because recall is ports-only and cannot import
-          // `LedgerStore` (arch:check `v2-core-boundary`) — only the composition root may.
-          fallbackActiveFacts: async (): Promise<FactRecord[]> => {
-            const out: FactRecord[] = [];
-            for (const t of Object.keys(TYPE_TO_FILE) as FactType[]) {
-              out.push(...(await ledgerStore.listByType(t)).map(ledgerFactToRecord));
-            }
-            return out;
-          },
+          // Current facts come straight from the ledger (the source of truth, cached by file
+          // fingerprint). Recall is ports-only, so the composition root supplies the read.
+          currentFacts: async (): Promise<CurrentFacts> => ({
+            facts: (await ledgerStore.listCurrent()).map(ledgerFactToRecord),
+            damagedFiles: ledgerStore.damagedFiles(),
+          }),
         });
         runtime.recallEngine = recallEngine;
         const v2Assembler = new ContextAssemblerV2({

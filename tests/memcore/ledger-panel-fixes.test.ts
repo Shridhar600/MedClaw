@@ -85,24 +85,8 @@ describe('F6 — retracting a medication always requires confirmation', () => {
   });
 });
 
-describe('F3 — corrupt ledger file is quarantined, not silently truncated', () => {
-  it('preserves prior bytes in a sidecar before the next write overwrites', async () => {
-    fs.mkdirSync(path.join(tmpDir, 'ledger'), { recursive: true });
-    const fp = path.join(tmpDir, 'ledger', 'medications.md');
-    fs.writeFileSync(fp, '## metformin\n### v1 (activ'); // truncated mid-version-header → parses to []
-    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
-    try {
-      await store.recordFact({ entity: 'aspirin', type: 'medication', fields: { dose: '75mg' }, provenance: doc });
-      const sidecars = fs.readdirSync(path.join(tmpDir, 'ledger')).filter(n => n.includes('corrupt'));
-      expect(sidecars.length).toBe(1);
-      expect(fs.readFileSync(path.join(tmpDir, 'ledger', sidecars[0]), 'utf-8')).toContain('metformin');
-      expect(warnSpy).toHaveBeenCalled();
-    } finally {
-      warnSpy.mockRestore();
-    }
-  });
-
-  it('sidecar-quarantines a partially corrupt block before the next write', async () => {
+describe('a damaged ledger file is preserved and read-only until repaired', () => {
+  it('keeps the damaged bytes, refuses changes, and accepts them again once the file is fixed', async () => {
     fs.mkdirSync(path.join(tmpDir, 'ledger'), { recursive: true });
     const fp = path.join(tmpDir, 'ledger', 'medications.md');
     const corrupt = Buffer.from([
@@ -113,17 +97,24 @@ describe('F3 — corrupt ledger file is quarantined, not silently truncated', ()
     ].join(''));
     fs.writeFileSync(fp, corrupt);
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
-
     try {
-      await store.recordFact({ entity: 'aspirin', type: 'medication', fields: { dose: '75mg' }, provenance: doc });
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await expect(store.recordFact({ entity: 'aspirin', type: 'medication', fields: { dose: '75mg' }, provenance: doc }))
+          .rejects.toThrow(/damaged/);
+      }
+      expect(fs.readFileSync(fp)).toEqual(corrupt);
+      const sidecars = fs.readdirSync(path.join(tmpDir, 'ledger')).filter(n => n.includes('corrupt'));
+      expect(sidecars).toHaveLength(1);
+      expect(fs.readFileSync(path.join(tmpDir, 'ledger', sidecars[0]))).toEqual(corrupt);
+      expect(store.damagedFiles()).toEqual(['medications.md']);
+
+      fs.writeFileSync(fp, '');
+      const repaired = await store.recordFact({ entity: 'aspirin', type: 'medication', fields: { dose: '75mg' }, provenance: doc });
+      expect(repaired.kind).toBe('applied');
+      expect(store.damagedFiles()).toEqual([]);
     } finally {
       warnSpy.mockRestore();
     }
-
-    const sidecars = fs.readdirSync(path.join(tmpDir, 'ledger')).filter(n => n.includes('corrupt'));
-    expect(sidecars).toHaveLength(1);
-    expect(fs.readFileSync(path.join(tmpDir, 'ledger', sidecars[0]))).toEqual(corrupt);
-    expect(await store.getActive('metformin', 'medication')).toBeNull();
   });
 });
 

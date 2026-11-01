@@ -24,8 +24,7 @@
 //   3. A `selfHeal()` entry point: a distinctly-labeled NEW top-level op (self-heal must never be
 //      invoked from inside a running op — the same re-entrancy guard applies to it).
 //
-// Tier-1 vs Tier-2 classification, idempotency-with-cached-result, and the `fallbackActiveFacts`
-// read-side port live in the domain callers (CapturePipeline, ledger-tools, episode-tools,
+// Tier-1 vs Tier-2 classification and idempotency-with-cached-result live in the domain callers (CapturePipeline, ledger-tools, episode-tools,
 // safety-tools, recall/engine.ts) — this module only guarantees the ONE lock + no-reentrancy +
 // semantic entry points every one of them is built on.
 

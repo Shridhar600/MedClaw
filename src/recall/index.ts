@@ -1,6 +1,6 @@
 export { RecallEngine, DEFAULT_RECALL_CONFIG, chunkHasStaleEntity } from './engine';
 export type {
-  RecallConfig, RecallDeps, RecallInput, RecallReport, RecallHit, IndexStatus,
+  RecallConfig, RecallDeps, RecallInput, RecallReport, RecallHit, IndexStatus, CurrentFacts,
 } from './engine';
 export { scoreChunk } from './scoring';
 export type { ScoreParams, ScoreResult } from './scoring';
