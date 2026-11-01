@@ -1,5 +1,3 @@
-// src/runtime/startup.ts
-//
 // One configuration selection and one strict load, shared by the daemon and every retained
 // CLI command. Selection precedence is `--config` > `REDACTED_CONFIG_PATH` >
 // `home/.redacted/config.json`, and a missing flag value or unknown option is a usage
@@ -76,16 +74,9 @@ export interface GlobalOptionParse {
 }
 
 /**
- * Parse the retained global options. A `--config` without a value is a usage error, and an
- * unrecognised `--` option is a usage error. Both used to fall through silently.
- */
-/**
- * Global options are recognised only BEFORE the command.
- *
- * Once a bare token (the command name) is seen, everything after it belongs to that command's own
- * parser — `medclaw onboard --yes --owner-id kiran` must reach `parseArgs`, not die here as an
- * "unknown option". An unrecognised flag BEFORE the command is still refused, so a typo in the
- * global position is not silently forwarded to a command that will ignore it.
+ * Global options are recognised only BEFORE the command. Once a bare token (the command name) is seen,
+ * everything after it belongs to that command's own parser. An unrecognised flag before the command is
+ * refused, so a typo in the global position is not silently forwarded.
  */
 export function parseGlobalOptions(argv: ReadonlyArray<string>): GlobalOptionParse {
   let configPath: string | undefined;

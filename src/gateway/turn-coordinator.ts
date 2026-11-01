@@ -56,27 +56,20 @@ export interface HeartbeatTurnRequest {
   egress: TurnEgress;
   afterDelivery: (result: AgentRunResult) => Promise<void>;
   /**
-   * RR-STRUCT R-S3b (C-39 for heartbeats): stable per-OCCURRENCE identity
-   * (`heartbeatTurnId`), threaded into the `AgentLoop` run-context so a tool called
-   * inside a heartbeat (e.g. `ledger_record`) builds a deterministic idempotency key —
-   * a scheduler RETRY of the same occurrence returns the cached original instead of
-   * double-writing. Absent ⇒ `AgentLoop` falls back to its in-memory sequence number
-   * (today's behavior).
+   * Stable per-occurrence identity (`heartbeatTurnId`), threaded into the `AgentLoop` run-context so a tool
+   * called inside a heartbeat builds a deterministic idempotency key: a scheduler retry of the same occurrence
+   * returns the cached original instead of double-writing. When absent, `AgentLoop` falls back to its
+   * in-memory sequence number.
    */
   turnId?: string;
 }
 
 /**
- * RR-STRUCT R-S3b: the heartbeat occurrence key — `${job.id}:${job.lastRunAt}`.
+ * The heartbeat occurrence key: `${job.id}:${job.lastRunAt}`.
  *
- * `lastRunAt` is set by `HeartbeatStore.markRun` AFTER the trigger completes
- * (`scheduler/runtime.ts` `executeJobBody`), and NO retry/failure/outcome path touches
- * it (`retry-policy` patches, `markError`, `recordOutcome` all leave it alone) — so it
- * is STABLE across a RETRY of one occurrence (the retry dedupes the write it already
- * made) but DISTINCT across occurrences (tomorrow's recurring reminder is NOT dropped
- * as a duplicate of tonight's — a static `job.id` alone WOULD drop it). A missing
- * `lastRunAt` (e.g. a never-yet-run job) yields `undefined`: no key, today's
- * per-call behavior — never a random/unstable one.
+ * `lastRunAt` is set after the trigger completes and no retry/failure path touches it, so it is stable across
+ * a retry of one occurrence but distinct across occurrences (tomorrow's recurring reminder is not dropped as
+ * a duplicate). A missing `lastRunAt` yields `undefined`: no key, never an unstable one.
  */
 export function heartbeatTurnId(job: Pick<HeartbeatJob, 'id' | 'lastRunAt'>): string | undefined {
   if (!job.lastRunAt) return undefined;
@@ -88,12 +81,9 @@ export type HeartbeatTurnResult =
   | { status: 'noop'; result: AgentRunResult }
   | { status: 'preempted'; error: HeartbeatPreemptedError }
   /**
-   * RR-STRUCT R-S4 (mini-plan v3 §3.9, Part B): the runtime closed its stores mid-drain — this
-   * heartbeat turn was abandoned by the bounded hard-stop (Part C) or lost the shutdown race.
-   * Distinct from 'preempted' (a live user turn evicted it) and from an actual failure — a
-   * shutdown-time abandonment is expected/benign and must NOT be recorded via
-   * `scheduler.recordFailure` (Gateway.handleScheduledJob only branches on 'preempted'; an
-   * 'abandoned' result falls through harmlessly, exactly like 'sent'/'noop').
+   * The runtime closed its stores mid-drain: this heartbeat turn was abandoned by the bounded hard-stop or lost
+   * the shutdown race. Distinct from 'preempted' (a live user turn evicted it) and from a failure. It is
+   * expected and benign, and must NOT be recorded via `scheduler.recordFailure`.
    */
   | { status: 'abandoned'; error: DaemonShutdownError };
 
@@ -140,9 +130,8 @@ export class TurnCoordinator {
         return { status: 'preempted', error };
       }
       if (error instanceof DaemonShutdownError) {
-        // Log-and-drop (never crash, never error-scare, never rethrown to process level): the
-        // heartbeat's write was refused because the runtime already closed its stores. Do not
-        // attempt egress/afterDelivery against a runtime/channel that is mid-teardown.
+        // Log-and-drop: the heartbeat's write was refused because the runtime already closed its stores.
+        // Do not attempt egress/afterDelivery against a runtime or channel that is mid-teardown.
         console.warn('[gateway] Heartbeat turn abandoned by shutdown (log-and-drop):', summarizeErrorForLog(error));
         return { status: 'abandoned', error };
       }
@@ -294,11 +283,8 @@ export class TurnCoordinator {
     let result: AgentRunResult;
     try {
       const history = await sessions.prepareHistory(chatId);
-      // RR-STRUCT R-S3: derive `turnId` from the real Telegram messageId when available (the same
-      // identity `captureUserTurn` already keys its idempotencyKey on above) rather than letting
-      // AgentLoop fall back to an in-memory, restart-resetting sequence number — tool-call
-      // idempotency keys built from `context.turnId` need a value that is STABLE across a replayed
-      // delivery of the SAME message, which an in-process counter is not.
+      // Derive `turnId` from the real Telegram messageId when available, so tool-call idempotency keys stay
+      // stable across a replayed delivery of the same message (an in-process counter is not).
       const turnId = incoming.messageId ? `chat:${chatId}:${incoming.messageId}` : undefined;
       result = await this.requireAgentLoop().run(agentInput, history, { chatId, mode: 'chat', turnId });
     } catch (error) {
@@ -354,9 +340,8 @@ export class TurnCoordinator {
   private async executeHeartbeat(request: HeartbeatTurnRequest): Promise<AgentRunResult> {
     const sessions = this.requireSessions();
     const history = await sessions.prepareHistory(request.chatId);
-    // RR-STRUCT R-S3b: mirror `executeUser`'s message-derived `turnId` — the heartbeat's
-    // per-occurrence `turnId` (when supplied) is what tool-call idempotency keys are
-    // built from; `undefined` keeps `AgentLoop`'s sequence fallback (today's behavior).
+    // Mirror `executeUser`'s message-derived `turnId`: the heartbeat's per-occurrence `turnId` (when supplied)
+    // feeds tool-call idempotency keys; `undefined` keeps `AgentLoop`'s sequence fallback.
     const result = await this.requireAgentLoop().run(
       request.input,
       history,
@@ -453,10 +438,9 @@ export class TurnCoordinator {
     if (incoming.replyToMessageId) {
       parts.push('', `Reply to message id: ${incoming.replyToMessageId}`);
     }
-    // M9: the transport sender id is deliberately NOT appended. It is a chat-shaped identifier needed
-    // only for authorization, which admission has already decided, and appending it shipped it to the
-    // provider on every turn and into the persisted session window. This is the second of the two
-    // `buildAgentInput` twins; see the same note in `router.ts`.
+    // The transport sender id is deliberately NOT appended. It is a chat-shaped identifier needed only for
+    // authorization, which admission has already decided; appending it would ship it to the provider and into
+    // the persisted session window. Keep in sync with the twin in `router.ts`.
     return parts.join('\n');
   }
 

@@ -1,23 +1,21 @@
 // src/memcore/scratch-store.ts
 //
-// The agent's ephemeral notebook: freeform notes at `scratch/<id>.md` that
-// self-destruct after a TTL (spec 03 §2.5 / §6 — default 30d). Notes are
-// search-only and never auto-injected; before anything is promoted to durable
-// memory it MUST pass `scanForPromotion` (PLAT-06):
+// The agent's ephemeral notebook: freeform notes at `scratch/<id>.md` that self-destruct after a TTL (default
+// 30d). Notes are search-only and never auto-injected; before anything is promoted to durable memory it must
+// pass `scanForPromotion`:
 //   - credential branch reuses `contentContainsCredentials` from src/security;
-//   - injection branch uses the local `INJECTION_PATTERNS` const below,
-//     documented as DEFENSE-IN-DEPTH (a second net, not a substitute).
+//   - injection branch uses the local `INJECTION_PATTERNS` const below, as defense-in-depth (a second net, not a
+//     substitute).
 //
-// The TTL sweep is driven ENTIRELY by the injected clock — never wall time —
-// so tests advance a `mutableClock` fixture instead of waiting. A corrupt
-// scratch file is skipped with a sanitized warning and never deleted (D2).
+// The TTL sweep is driven entirely by the injected clock, never wall time, so tests advance a `mutableClock`
+// fixture instead of waiting. A corrupt scratch file is skipped with a sanitized warning and never deleted.
 
 import * as fs from 'fs';
 import type { Clock, IdGen } from '../ports';
 import { systemClock, uuidIdGen } from '../ports';
 import { contentContainsCredentials, secureWriteViaTmp, secureMkdir, summarizeErrorForLog, resolveContainedPath } from '../security';
 
-/** Default note lifetime: 30 days (spec 03: `scratch/` TTL 30d). */
+/** Default note lifetime: 30 days. */
 export const DEFAULT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface ScratchNote {
@@ -45,7 +43,7 @@ export interface PromotionScanResult {
  * false positive surfaces the note for the user instead of risking a prompt.
  */
 export const INJECTION_PATTERNS: RegExp[] = [
-  // Direct instruction-override ("Ignore previous instructions…" — PLAT-06 sample).
+  // Direct instruction-override ("Ignore previous instructions…").
   /ignore\s+(?:all\s+|any\s+|your\s+)*(?:previous|prior|above|earlier)\s+(?:instructions|messages|prompts?|context|commands|rules)/i,
   /disregard\s+(?:all\s+|any\s+)*(?:previous|prior|above|earlier)\s+(?:instructions|messages|prompts?|context|commands|rules)/i,
   // Wipe-memory attempts ("forget everything you learned").
@@ -155,9 +153,8 @@ export class ScratchStore {
   }
 
   /**
-   * Safety scan run before any scratch content is promoted to durable memory
-   * (PLAT-06). Blocks on a credential pattern OR a prompt-injection pattern;
-   * returns `{ ok: true }` for clean content. Pure — never mutates the note.
+   * Safety scan run before any scratch content is promoted to durable memory. Blocks on a credential pattern or a
+   * prompt-injection pattern; returns `{ ok: true }` for clean content. Pure — never mutates the note.
    */
   scanForPromotion(content: string): PromotionScanResult {
     const cred = contentContainsCredentials(content);

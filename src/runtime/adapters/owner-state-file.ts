@@ -2,25 +2,22 @@
 //
 // The one place the owner record touches the filesystem.
 //
-// Policy (what the record may contain) is decided by `src/profiles/owner-state.ts`; this module
-// only does bounded reads and one explicit flush-and-replace write, using the existing security
-// permission helpers. It validates raw storage through the profiles public decoder, never by
-// importing an internal file.
+// Policy (what the record may contain) lives in `src/profiles/owner-state.ts`; this module only does
+// bounded reads and one explicit flush-and-replace write, and validates raw storage through the
+// profiles public decoder.
 //
-// Three properties this adapter exists to guarantee:
-//
-//  1. ONE byte budget, enforced on both sides. The same `OWNER_RECORD_MAX_BYTES` bounds the encoded
-//     write BEFORE anything is published and the bytes actually read from the opened descriptor
-//     AFTER, so a record this writer could produce is a record the reader will accept. A `stat`-only
-//     precheck is not enough: the file can grow between the check and the read.
-//  2. Publication truth is decided HERE, because this is where the rename boundary is. A failure
-//     before the rename is `failed` (previous bytes unchanged); a failure after it is `uncertain`
-//     (the new bytes are live and readable) and is never swallowed and never rolled back.
+// Guarantees:
+//  1. ONE byte budget on both sides. `OWNER_RECORD_MAX_BYTES` bounds the encoded write before
+//     anything is published and the bytes read from the opened descriptor, so a record this writer
+//     can produce is one the reader accepts. A `stat`-only precheck is not enough: the file can
+//     grow between the check and the read.
+//  2. Publication truth is decided here, at the rename boundary. A failure before the rename is
+//     `failed` (previous bytes unchanged); a failure after it is `uncertain` (the new bytes are live
+//     and readable) and is never swallowed or rolled back.
 //  3. A record that cannot be read is reported unavailable, so the caller refuses rather than
 //     renaming it aside and silently re-opening first-contact pairing.
 //
-// The filesystem sync step is injected so the uncertainty boundary is provable in a real flow
-// without a real power loss.
+// The filesystem sync step is injected so the uncertainty boundary can be driven in a real flow.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -29,15 +26,15 @@ import { decodeOwnerState, encodeOwnerState } from '../../profiles';
 import { OWNER_RECORD_MAX_BYTES } from '../../ports/owner-state';
 import type { OwnerState, OwnerStateRead, OwnerStateWriteResult } from '../../ports/owner-state';
 
-/** Re-exported so existing importers keep one name for the budget; the declaration lives in ports. */
+/** Re-exported so importers keep one name for the budget; the declaration lives in ports. */
 export { OWNER_RECORD_MAX_BYTES };
 
 /** Owner-only file mode, matching the rest of the owner's `.state` contents. */
 const OWNER_RECORD_MODE = 0o600;
 
 /**
- * The durability steps of one replacement, injectable so a real publication can be driven through a
- * controlled post-rename failure in tests. Same shape as `ConfigFileSync`, and for the same reason.
+ * The durability steps of one replacement, injectable so a test can drive a real publication
+ * through a controlled post-rename failure. Same shape as `ConfigFileSync`.
  */
 export interface OwnerRecordFileSync {
   syncFile(fd: number): void;
@@ -73,10 +70,9 @@ export class FileOwnerStatePort {
   ) {}
 
   /**
-   * Fresh read on every call, bounded on the OPENED descriptor rather than on a prior `stat`. No mtime
-   * cache and no quarantine-to-empty: a record that cannot be understood is reported as unavailable
-   * so the caller refuses, rather than being renamed aside and silently replaced by a fresh,
-   * re-openable installation.
+   * Fresh read on every call, bounded on the OPENED descriptor rather than a prior `stat`. No
+   * quarantine-to-empty: a record that cannot be understood is reported unavailable so the caller
+   * refuses, instead of it being renamed aside and replaced by a re-openable installation.
    */
   read(): OwnerStateRead {
     let fd: number | undefined;
@@ -117,24 +113,19 @@ export class FileOwnerStatePort {
 
   /**
    * One atomic whole-record replacement: same-directory temp file, file fsync, rename, parent
-   * directory fsync. Binding and challenge consumption are therefore never observable
-   * half-applied.
+   * directory fsync. Binding and challenge consumption are never observable half-applied.
    *
-   * Order is the whole contract. Everything before the rename is `failed` — nothing was published,
-   * existing bytes are unchanged and a missing record is still missing, and cleanup removes only this
-   * attempt's temp file. Everything after it is `uncertain`: the new bytes ARE the file's content and
-   * stay readable, so this never restores, deletes or denies them; it reports the incomplete
-   * confirmation to the caller instead.
+   * Order is the contract. Before the rename everything is `failed`: existing bytes are unchanged
+   * and cleanup removes only this attempt's temp file. After it everything is `uncertain`: the new
+   * bytes ARE the file's content and stay readable, so this never restores or deletes them.
    *
-   * This is a process-crash guarantee on a POSIX filesystem that supports directory fsync. It is NOT
-   * a claim about power loss or a device that does not support directory fsync; those are reported
-   * separately rather than implied here.
+   * This is a process-crash guarantee on a POSIX filesystem that supports directory fsync, not a
+   * claim about power loss.
    */
   async replace(next: OwnerState): Promise<OwnerStateWriteResult> {
     const content = encodeOwnerState(next);
-    // Refuse BEFORE the filesystem is touched at all. The previous readable record is left exactly
-    // as it was, no temp file is created, and the caller reports a size refusal rather than a write
-    // fault it cannot explain.
+    // Refuse BEFORE the filesystem is touched: the previous record is left as it was and no temp
+    // file is created.
     if (Buffer.byteLength(content, 'utf8') > this.maxBytes) {
       return { status: 'failed', reason: 'too-large' };
     }
@@ -149,11 +140,9 @@ export class FileOwnerStatePort {
     const tmpPath = path.join(directory, `.owner-access.json.tmp-${process.pid}-${Date.now()}`);
 
     let fd: number | undefined;
-    // Ownership is tracked SEPARATELY from the descriptor, because the descriptor cannot answer this
-    // question. A refused exclusive open means the file already on disk was NOT created by this
-    // attempt — unlinking it would destroy pre-existing bytes that have nothing to do with this write.
-    // Ownership must also survive `closeQuietly` below: the rename-failure path closes the descriptor
-    // first and still owns the temp file it created.
+    // Ownership is tracked separately from the descriptor. A refused exclusive open means the file on
+    // disk was NOT created by this attempt, and unlinking it would destroy unrelated bytes. It must
+    // also survive `closeQuietly`: the rename-failure path closes the descriptor but still owns the temp.
     let ownsTmp = false;
     try {
       fd = fs.openSync(tmpPath, 'wx', OWNER_RECORD_MODE);
@@ -181,8 +170,7 @@ export class FileOwnerStatePort {
     }
 
     // Past the rename the new record is live. Nothing below may claim the old bytes survived.
-    // `tightenFile` keeps its existing graceful warn-and-continue behaviour (plan 15 §7 mode
-    // hardening must never fail a write), and the temp file already carried 0600 into the rename.
+    // Mode hardening must never fail a write, and the temp file already carried 0600 into the rename.
     tightenFile(this.recordPath);
     try {
       this.sync.syncDir(directory);
@@ -203,11 +191,9 @@ function closeQuietly(fd: number | undefined): void {
 }
 
 /**
- * Remove ONLY the temp file this attempt actually created. Never the record, never a peer's temp.
- *
- * `owned` is the guard, deliberately not `fd`. No descriptor does not mean no ownership — the
- * rename-failure path closes the descriptor and still owns its temp — and a descriptor-less refusal
- * means the opposite, that the colliding destination pre-existed and must be left exactly as it is.
+ * Remove ONLY the temp file this attempt actually created, never the record or a peer's temp.
+ * `owned` is the guard, not `fd`: the rename-failure path has no descriptor but still owns its temp,
+ * while a descriptor-less refusal means the colliding destination pre-existed and must stay.
  */
 function cleanupTmp(tmpPath: string, fd: number | undefined, owned: boolean): void {
   closeQuietly(fd);

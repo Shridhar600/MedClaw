@@ -9,11 +9,10 @@ import type { OwnerPaths } from '../profiles';
 /**
  * The one place owner authority is composed for a running local process.
  *
- * Plan 15 §5 requires that a daemon's root gate its own direct build APIs, and forbids an optional
- * admission fallback in a new core API. That is only enforceable if there is a single composition
- * point: every entry path (the daemon in `src/index.ts`, local admin in `src/cli/admin.ts`) builds
+ * Every entry path (the daemon in `src/index.ts`, local admin in `src/cli/admin.ts`) builds
  * admission here, from the identity and record path that ownership acquisition already resolved.
- * Nothing infers an owner, and nothing defaults to `'default'`.
+ * A daemon root must gate its own direct build APIs, so there is a single composition point and no
+ * optional admission fallback. Nothing infers an owner, and nothing defaults to `'default'`.
  */
 export interface OwnerAuthority {
   /** The configured owner identity. Never inferred, never defaulted. */
@@ -52,9 +51,8 @@ export function composeOwnerAuthority(
 /*
  * Diagnostics default to silence, deliberately.
  *
- * The closed `DiagnosticEvent` union carries no identifier, no path and no exception text — a chat id
- * or pairing code in a log line would be a disclosure and a rate-limit oracle (plan 15 §50, rollout
- * §456). So there is no longer a reason to keep pairing outcomes out of a local log on privacy grounds:
- * a caller that wants outcomes supplies a sink over the closed contract, and a caller that does not
- * gets silence rather than an accidental stdout print.
+ * The closed `DiagnosticEvent` union carries no identifier, no path and no exception text, since a
+ * chat id or pairing code in a log line would be a disclosure and a rate-limit oracle. A caller
+ * that wants outcomes supplies a sink over the closed contract; a caller that does not gets
+ * silence rather than an accidental stdout print.
  */

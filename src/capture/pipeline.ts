@@ -1,14 +1,11 @@
 // src/capture/pipeline.ts
 //
-// CapturePipeline — the turn-level CaptureEvent router. Given a normalized event, it
-// writes BOTH memory lanes (structured ledger + lossless narrative) with cross-anchors
-// and re-renders SAFETY.md on safety-relevant facts, all serialized through the write
-// queue (a single turn-priority op per event, IO-only — amendment B2).
+// CapturePipeline — the turn-level CaptureEvent router. Given a normalized event, it writes BOTH
+// memory lanes (structured ledger + lossless narrative) with cross-anchors and re-renders SAFETY.md
+// on safety-relevant facts, all inside one IO-only op on the write queue.
 //
-// Boundary (F5/G7): every dependency is a typed IN-MODULE interface — no concrete-class
-// import from memcore, only type-only. Gateway (Task 13) injects the concrete
-// LedgerStore / NarrativeStore / SafetyView-adapter / WriteQueue / CuriosityQueue, which
-// structurally satisfy these ports.
+// Every dependency is a typed in-module interface (no concrete memcore imports beyond types); the
+// gateway injects the concrete stores, which satisfy these ports structurally.
 
 import type { Clock, EventSink } from '../ports';
 import { systemClock } from '../ports';
@@ -31,7 +28,7 @@ import { summarizeErrorForLog, contentContainsCredentials } from '../security';
 import { sanitizeSingleLine, TYPE_TO_FILE } from '../memcore';
 import type { CaptureIdempotency } from './idempotency';
 
-/** The single-writer queue seam (WriteQueue). Ops MUST be IO-only (B2). */
+/** The single-writer queue seam. Ops MUST be IO-only. */
 export interface QueuePort {
   enqueue<T>(priority: 'turn' | 'background', op: {
     label: string;
@@ -66,7 +63,7 @@ export interface NarrativeWriter {
   appendLedgerAnchor(date: string, entity: string, factId: string): Promise<string>;
 }
 
-/** The SAFETY.md view. `listSafetyRelevant` sources the full current set to re-render from (D8). */
+/** The SAFETY.md view. `listSafetyRelevant` sources the full current set to re-render from. */
 export interface SafetyRenderer {
   render(safetyRelevantFacts: LedgerFact[]): Promise<string>;
   listSafetyRelevant(): Promise<LedgerFact[]>;
@@ -74,24 +71,20 @@ export interface SafetyRenderer {
   markDirty?(): void;
 }
 
-/** The durable follow-up queue (consumed P4). Mirrors CuriosityQueue.add. */
+/** The durable follow-up queue. Mirrors CuriosityQueue.add. */
 export interface CuriosityWriter {
   add(item: Omit<CuriosityItem, 'id' | 'profileId' | 'createdAt'>): Promise<CuriosityItem>;
 }
 
 /**
- * Post-write re-derivation seam (P2 A1.4/A2.4; RR-STRUCT R-S3 two-tier split, mini-plan v3 §3.7).
- * Given the workspace-relative paths a capture op just wrote, re-derive a projection. Two
- * INSTANCES of this same shape are injected, at different tiers:
- *   - `tier1Rederive` — SYNCHRONOUS, INSIDE the write lock (local-only, <5ms budget: SQLite
- *     FactMirror writes, no network/LLM). Runs BEFORE the op returns, so a read that starts the
- *     instant after this write commits sees a mirror that is already consistent with it. A
- *     failure here warns and continues (fail-SOFT for availability — recall reads current facts
- *     from the ledger itself; the next mutation's Tier-1 step retries).
- *   - `rederive` (Tier-2) — ASYNC, OUTSIDE the write lock (may embed — RR-7 C-09: embeddings never
- *     run inside the single-writer lock). Reindexes narrative/ledger chunks for search. NEVER
- *     fails closed; a lag degrades to keyword-only recall (RR-8 C-61), never wedges the turn.
- * Concrete injected by Gateway. Both are best-effort: a failure never fails the capture itself.
+ * Post-write re-derivation seam. Given the workspace-relative paths a capture op just wrote, it
+ * re-derives a projection. Two instances are injected at different tiers:
+ *   - `tier1Rederive`: SYNCHRONOUS, INSIDE the write lock (local-only: SQLite FactMirror writes, no
+ *     network or LLM). It runs before the op returns, so a read right after the write sees a
+ *     consistent mirror. A failure warns and continues; recall reads current facts from the ledger.
+ *   - `rederive` (tier 2): ASYNC, OUTSIDE the write lock, because embeddings must never run inside
+ *     the single-writer lock. It reindexes chunks for search. A lag degrades to keyword-only recall.
+ * Both are best-effort: a failure never fails the capture itself.
  */
 export interface Rederiver {
   rederive(relPaths: string[]): Promise<void>;
@@ -123,8 +116,8 @@ export interface CapturePipelineDeps {
   curiosity?: CuriosityWriter;
   events?: EventSink;
   clock?: Clock;
-  /** Tier-1 (sync, IN the write lock). See {@link Rederiver}. Must never itself enqueue — the
-   *  coordinator's re-entrancy guard rejects that (Finding-4) rather than deadlocking. */
+  /** Tier-1 (sync, IN the write lock). See {@link Rederiver}. Must never itself enqueue; the
+   *  coordinator's re-entrancy guard rejects that rather than deadlocking. */
   tier1Rederive?: Rederiver;
   /** Tier-2 (async, OFF the write lock). See {@link Rederiver}. */
   rederive?: Rederiver;
@@ -158,16 +151,15 @@ export class CapturePipeline {
       scope: `capture:${event.kind}`,
       idempotencyKey,
       run: async () => {
-        // RR-STRUCT R-S3 (Finding-5/C-39): a matched-committed key returns the CACHED ORIGINAL
-        // result, not `undefined` — a caller like `ledger_record` needs its `RecordFactResult`
-        // (e.g. to relay a needs-confirmation token) even on a replayed/duplicate delivery.
+        // A matched-committed key returns the cached original result, so a replayed delivery still
+        // gives callers like `ledger_record` their `RecordFactResult` (e.g. a confirmation token).
         const cached = this.cachedResult(idempotencyKey);
         if (cached.found) {
           return { result: cached.result as RecordFactResult | void, changed: [] };
         }
         const routed = await this.route(event);
-        // Tier-1 (in-lock, sync, local-only): derive the FactMirror BEFORE this op returns, so
-        // the write and its safety-critical projection land atomically relative to any read.
+        // Tier-1 (in-lock, sync, local-only): derive the FactMirror before this op returns, so the
+        // write and its projection land atomically relative to any read.
         if (this.deps.tier1Rederive && routed.changed.length > 0) {
           try {
             await this.deps.tier1Rederive.rederive(routed.changed);
@@ -179,10 +171,8 @@ export class CapturePipeline {
         return routed;
       },
     });
-    // Out-of-op (B2): Tier-2 — re-derive index bookkeeping + reindex chunks for the changed
-    // files. This runs OUTSIDE the single-writer queue op so embedding latency never wedges the
-    // queue. Best-effort — a re-derive failure never fails the capture (chunks are rebuildable +
-    // A4-healed). Skipped on an idempotent replay (`changed` is empty — nothing new to index).
+    // Tier-2 runs OUTSIDE the single-writer queue op so embedding latency never wedges the queue.
+    // Best-effort (chunks are rebuildable). Skipped on an idempotent replay, where `changed` is empty.
     if (this.deps.rederive && outcome.changed.length > 0) {
       try {
         await this.deps.rederive.rederive(outcome.changed);
@@ -226,10 +216,9 @@ export class CapturePipeline {
   }
 
   private async route(event: CaptureEvent): Promise<RouteOutcome> {
-    // CRED (SB-6) defense-in-depth: every capture payload passes the credential
-    // bar before ANY lane is touched. Tool paths surface a clean rejection at
-    // the tool boundary; non-tool sources (per-turn chat capture) degrade to a
-    // sanitized warn + skip — never a crash, never a persisted credential.
+    // Defense in depth: every capture payload passes the credential check before ANY lane is
+    // touched. Tool paths surface a clean rejection at the tool boundary; non-tool sources (per-turn
+    // chat capture) warn with a sanitized message and skip, never persisting a credential.
     const cred = contentContainsCredentials(JSON.stringify(event.payload));
     if (cred.matched) {
       console.warn(`[capture] event skipped: content matches credential pattern (${cred.pattern})`);
@@ -268,7 +257,7 @@ export class CapturePipeline {
 
   private async ingestLedgerFact(p: LedgerFactInput): Promise<RouteOutcome> {
     const day = this.dayOf(p.provenance.capturedAt);
-    // Lossless narrative first, so the structured fact can anchor back to it (KNEE-01).
+    // Lossless narrative first, so the structured fact can anchor back to it.
     const { anchor } = await this.deps.narrative.append({
       text: p.text ?? p.entity,
       language: p.language,
@@ -287,10 +276,10 @@ export class CapturePipeline {
       replaces: p.replaces,
       corrects: p.corrects,
     });
-    // The narrative note always lands → its day file changed. `applied` AND `disputed` both WRITE the
-    // ledger file (a dispute mint flips the prior active to disputed + appends both heads), so both must
-    // re-derive the recall mirror — otherwise Stage-1 keeps injecting the pre-dispute fact as ACTIVE
-    // (H-1 / CONTRA-09 class). `needs-confirmation` writes nothing (only mints a token).
+    // The narrative note always lands, so its day file changed. `applied` and `disputed` both write
+    // the ledger file (a dispute flips the prior active fact to disputed), so both must re-derive the
+    // recall mirror or recall keeps injecting the pre-dispute fact as active. `needs-confirmation`
+    // writes nothing (it only mints a token).
     const changed: string[] = [this.narrativePath(day)];
     if (result.kind === 'applied') {
       await this.deps.narrative.appendLedgerAnchor(day, p.entity, result.fact.id);
@@ -305,9 +294,9 @@ export class CapturePipeline {
   }
 
   /**
-   * A1: a minted dispute creates a durable follow-up item (re-ask ~7d) so the
-   * conflict resurfaces until resolved. Critical iff the disputed fact is a
-   * med/allergy. Best-effort — a curiosity failure never fails the capture.
+   * A minted dispute creates a durable follow-up item (re-ask in ~7 days) so the conflict
+   * resurfaces until resolved. Critical iff the disputed fact is a medication or allergy.
+   * Best-effort: a curiosity failure never fails the capture.
    */
   private async enqueueDisputeCuriosity(
     result: Extract<RecordFactResult, { kind: 'disputed' }>,
@@ -347,7 +336,7 @@ export class CapturePipeline {
     const result = await this.deps.ledger.recordFact({
       entity: p.entity,
       type: 'metric',
-      // F19 / DIAB-02: a metric fact always carries its day-granularity date as a field.
+      // A metric fact always carries its day-granularity date as a field.
       fields: { ...p.fields, date: p.date },
       provenance: { ...p.provenance, anchor },
       safetyRelevant: p.safetyRelevant,
@@ -360,7 +349,7 @@ export class CapturePipeline {
       if (result.fact.safetyRelevant) await this.reRenderSafety();
       await this.emitEvent(result.fact);
     } else if (result.kind === 'disputed') {
-      // H-1: a disputed metric mint also wrote the ledger file → re-derive the mirror.
+      // A disputed metric mint also wrote the ledger file, so re-derive the mirror.
       changed.push(this.ledgerPath('metric'));
     }
     return { result, changed };
@@ -405,7 +394,7 @@ export class CapturePipeline {
       safetyTouched = corrected.fact.safetyRelevant;
       await this.emitEvent(corrected.fact);
     } else if (corrected.kind === 'disputed') {
-      // H-1: a disputed corrected-fact mint also wrote the ledger file → re-derive the mirror.
+      // A disputed corrected-fact mint also wrote the ledger file, so re-derive the mirror.
       changed.push(this.ledgerPath(p.corrected.type));
     }
 
@@ -418,18 +407,16 @@ export class CapturePipeline {
       safetyTouched = safetyTouched || retract.fact.safetyRelevant;
       changed.push(this.ledgerPath(p.wrong.type));
     } else if (retract.kind === 'needs-confirmation') {
-      // CT (SB-2): the mistaken fact is safety-relevant; it stays active pending
-      // user confirmation while the corrected fact is already recorded. Surface
-      // the token on the result so the tool layer can ask the user (DAD-10).
+      // The mistaken fact is safety-relevant, so it stays active pending user confirmation while the
+      // corrected fact is already recorded. The token goes on the result so the tool layer can ask.
       // PHI: never interpolate the entity name into logs.
       console.warn('[capture] correction retract needs confirmation; corrected fact recorded, mistaken fact retained pending confirmation');
       pendingRetract = retract.token;
     }
 
     if (safetyTouched) await this.reRenderSafety();
-    // CT: the retract token rides the result on EVERY corrected-arm outcome —
-    // dropping it whenever the corrected fact itself went pending lost the only
-    // confirmation path for the mistaken safety-relevant fact.
+    // The retract token rides the result on EVERY corrected-arm outcome; dropping it when the
+    // corrected fact itself went pending would lose the only confirmation path for the mistaken fact.
     const result = pendingRetract
       ? ({ ...corrected, pendingRetract } as RecordFactResult)
       : corrected;
@@ -437,12 +424,12 @@ export class CapturePipeline {
   }
   // ---- helpers -----------------------------------------------------------
 
-  /** Re-render SAFETY.md from the current safety-relevant set (D8). */
+  /** Re-render SAFETY.md from the current safety-relevant set. */
   private async reRenderSafety(): Promise<void> {
     await refreshSafetyView(this.deps.safety);
   }
 
-  /** Best-effort event mirror (P2 no-op when no sink is injected). Never throws. */
+  /** Best-effort event mirror (no-op when no sink is injected). Never throws. */
   private async emitEvent(fact: LedgerFact): Promise<void> {
     const sink = this.deps.events;
     if (!sink) return;
@@ -460,9 +447,8 @@ export class CapturePipeline {
   }
 
   /**
-   * Both lanes agree on the same day, derived from the event's capturedAt — NOT a
-   * divergent store clock (F20). The injected clock is only a defensive fallback for a
-   * missing/invalid capturedAt.
+   * Both lanes agree on the same day, derived from the event's capturedAt rather than a divergent
+   * store clock. The injected clock is only a fallback for a missing or invalid capturedAt.
    */
   private dayOf(iso?: string): string {
     const parsed = iso ? new Date(iso) : this.clock.now();

@@ -1,12 +1,10 @@
-// src/indexstore/adapters/sqlite-keyword-index.ts
+// KeywordIndex adapter over SQLite FTS5: the keyword arm of hybrid recall. It opens its OWN
+// better-sqlite3 connection to the per-profile search.db (WAL plus an explicit busy_timeout) and
+// imports better-sqlite3 directly, never `src/memory/`.
 //
-// KeywordIndex adapter over SQLite FTS5 — the keyword arm of hybrid recall (P2 Task A2,
-// specs/07 §6 Stage 2). Opens its OWN better-sqlite3 connection to the per-profile search.db
-// (WAL + explicit busy_timeout, D6) and imports better-sqlite3 DIRECTLY — never src/memory/.
-//
-// Wraps the same P0-owned `chunks` + `chunks_fts` tables (M-3): in the live system the P0
-// sqlite-store inits them first; standalone (contract tests) this adapter creates a compatible
-// subset. bm25 `rank` is normalized to (0,1]; queries are OR-joined for recall breadth.
+// It wraps the same `chunks` + `chunks_fts` tables the memory store owns: in the live system the
+// store creates them first; standalone this adapter creates a compatible subset. bm25 `rank` is
+// normalized to (0,1]; queries are OR-joined for recall breadth.
 
 import Database from 'better-sqlite3';
 import { summarizeErrorForLog } from '../../security';
@@ -69,7 +67,7 @@ export class SqliteKeywordIndex implements KeywordIndex {
   async *match(query: string, k: number, filter?: Record<string, unknown>): AsyncIterable<ChunkWithScore> {
     if (k <= 0) return;
     const matchQuery = SqliteKeywordIndex.toFtsMatchQuery(query);
-    if (!matchQuery) return; // empty / punctuation-only → no results, never an error
+    if (!matchQuery) return; // empty or punctuation-only: no results, never an error
 
     // Over-fetch when a post-query metadata filter is present so it can still return up to k.
     const fetch = filter ? k * 5 : k;
@@ -105,7 +103,7 @@ export class SqliteKeywordIndex implements KeywordIndex {
         endLine: r.end_line,
         createdAt: r.created_at,
         // fts5 bm25 `rank` is more-negative for better matches; |rank| grows with relevance.
-        // Squash to (0,1] so it combines with cosine in scoreChunk (Stage 2).
+        // Squash to (0,1] so it combines with cosine in scoreChunk.
         score: SqliteKeywordIndex.normalize(Math.abs(r.rank)),
       };
     }
@@ -131,9 +129,9 @@ export class SqliteKeywordIndex implements KeywordIndex {
   // ---- internals ---------------------------------------------------------
 
   private initSchema(): void {
-    // CREATE IF NOT EXISTS so this no-ops when the P0 store already owns these tables on a
-    // shared search.db (M-3: store inits first). Standalone (contract), this creates the subset
-    // the keyword arm needs (no `embedding` column — that is the vec adapter's / P0's concern).
+    // CREATE IF NOT EXISTS so this no-ops when the memory store already owns these tables on a
+    // shared search.db. Standalone, it creates the subset the keyword arm needs (no `embedding`
+    // column; that belongs to the store and the vec adapter).
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS chunks (
         id TEXT PRIMARY KEY,
@@ -145,7 +143,7 @@ export class SqliteKeywordIndex implements KeywordIndex {
       CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
       CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(id UNINDEXED, path, content);
     `);
-    // The port's Chunk carries lane + createdAt, which P0's chunks table predates.
+    // The port's Chunk carries lane + createdAt, which the memory store's chunks table lacks.
     this.ensureColumn('chunks', 'lane', "lane TEXT NOT NULL DEFAULT ''");
     this.ensureColumn('chunks', 'created_at', "created_at TEXT NOT NULL DEFAULT ''");
   }
@@ -157,7 +155,7 @@ export class SqliteKeywordIndex implements KeywordIndex {
     }
   }
 
-  /** Tokenize like the P0 store (Unicode letters/numbers), quote each term, OR-join for recall. */
+  /** Tokenize like the memory store (Unicode letters/numbers), quote each term, OR-join for recall. */
   private static toFtsMatchQuery(query: string): string | null {
     const tokens = query.match(/[\p{L}\p{N}]+/gu) ?? [];
     if (tokens.length === 0) return null;

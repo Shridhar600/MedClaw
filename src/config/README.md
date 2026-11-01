@@ -55,7 +55,7 @@ occurrence; this is not a calendar or recurrence engine.
 **Provider endpoints:** a LOCAL role must carry its local base URL. A CLOUD role may carry an
 explicit endpoint — OpenRouter has no SDK default, so setup writes its router URL and the document
 must be able to keep it — but it must not carry `LOCAL_OLLAMA_BASE_URL`, which is the concrete
-inheritance mistake (plan 15 §2.1: "cloud provider selection never inherits a local base URL").
+inheritance mistake: cloud provider selection never inherits a local base URL.
 Structural URL validity is decided separately and earlier: a non-http(s) scheme, an unparseable
 string or a wrongly typed value is still refused. The rule is deliberately not an SSRF policy and
 does not ban private or loopback endpoints at other URLs.

@@ -1,32 +1,26 @@
 // src/capture/mutation-coordinator.ts
 //
-// MutationCoordinator — RR-STRUCT R-S3 (mini-plan v3 §3.6). The complete single-writer every
-// model-facing mutation routes through. It is a thin wrapper over the RR-6b crash-safe
-// `WriteQueue` (src/profiles/write-queue.ts): the queue already gives crash-safe begin/commit
-// journaling and turn-priority serialization; this module adds the THREE properties the mini-
-// plan requires on top of it:
+// MutationCoordinator: the single writer every model-facing mutation routes through. It is a thin
+// wrapper over the crash-safe `WriteQueue` (src/profiles/write-queue.ts), which already gives
+// begin/commit journaling and turn-priority serialization. This module adds three properties:
 //
-//   1. No re-entrancy (Finding-4): the pump is single-threaded — a queue op whose `run()` calls
-//      `enqueue()`/`mutate()` again would push a new item onto the SAME queue the pump's `while`
-//      loop is currently blocked inside `await`-ing, and the loop never gets back around to serve
-//      it (reproduced deadlock). Guarded here with `AsyncLocalStorage`, which correctly threads
-//      through the ASYNC CONTINUATION of a running op (so a call nested many `await`s deep inside
-//      `op.run()` is still caught) while NOT flagging a wholly separate, legitimately-concurrent
-//      caller who happens to call `enqueue()` while another op is mid-flight (that caller has its
-//      own call stack, not descended from the running op's `AsyncLocalStorage.run()`) — a naive
-//      module-level boolean flag would have false-positived on ordinary concurrent callers.
+//   1. No re-entrancy. The pump is single-threaded: a queue op whose `run()` calls
+//      `enqueue()`/`mutate()` again would push an item onto the same queue the pump is blocked
+//      awaiting, and the loop would never serve it (deadlock). Guarded with `AsyncLocalStorage`,
+//      which follows the async continuation of a running op (a call nested many `await`s deep is
+//      still caught) but does not flag a separate, legitimately concurrent caller. A module-level
+//      boolean flag would false-positive on ordinary concurrent callers.
 //   2. A semantic `mutate()` entry point for keyed read-modify-write ops, alongside `run()`
-//      (`enqueue()`) for append-only lanes. NOTE (disclosed design call, see report §1): the
-//      underlying `WriteQueue` is a single GLOBAL pump, not sharded per key — so `mutate()` and
-//      `enqueue()` share identical serialization semantics today; `mutate()` exists as the KEYED
-//      semantic call site (its `id` flows into the journal `scope` for diagnostics) and as the
-//      forward-compat seam if the queue is ever sharded per id for throughput.
-//   3. A `selfHeal()` entry point: a distinctly-labeled NEW top-level op (self-heal must never be
-//      invoked from inside a running op — the same re-entrancy guard applies to it).
+//      (`enqueue()`) for append-only lanes. The underlying `WriteQueue` is a single global pump,
+//      not sharded per key, so the two share identical serialization today. `mutate()` is the keyed
+//      call site (its `id` flows into the journal `scope` for diagnostics) and the seam for
+//      sharding per id later.
+//   3. A `selfHeal()` entry point: a distinctly labeled new top-level op. It must never be invoked
+//      from inside a running op; the same re-entrancy guard applies.
 //
-// Tier-1 vs Tier-2 classification and idempotency-with-cached-result live in the domain callers (CapturePipeline, ledger-tools, episode-tools,
-// safety-tools, recall/engine.ts) — this module only guarantees the ONE lock + no-reentrancy +
-// semantic entry points every one of them is built on.
+// Tier-1 vs Tier-2 classification and idempotency-with-cached-result live in the domain callers
+// (CapturePipeline, ledger-tools, episode-tools, safety-tools, recall/engine.ts). This module only
+// guarantees the one lock, no re-entrancy and the semantic entry points they are built on.
 
 import { AsyncLocalStorage } from 'async_hooks';
 import { createHash } from 'crypto';
@@ -43,14 +37,14 @@ function canonicalize(value: unknown): unknown {
 }
 
 /**
- * RR-STRUCT R-S3 (mini-plan v3 §3.6 Finding-5): the idempotency key scheme —
+ * The idempotency key scheme:
  * `sha256(chatId : turnMessageId : toolCallId : canonicalParams)`. `turnMessageId` is the caller's
  * per-turn identity (the Telegram messageId for a chat turn; `${job.id}:${lastRunAt}` for a
- * heartbeat — a static `job.id` alone would drop tomorrow's recurring reminder as a duplicate of
- * today's; `test:${chatId}:${turnIndex}` for CLI/test). `toolCallId` (the provider's per-call id)
- * disambiguates two parallel calls to the SAME tool with identical arguments in one turn — WITHOUT
- * it, such calls collide and dedupe to one (a known, disclosed gap when a caller cannot supply
- * one). `canonicalParams` is deep-key-sorted before hashing so field order never changes the key.
+ * heartbeat, since a static `job.id` alone would drop tomorrow's recurring reminder as a duplicate
+ * of today's; `test:${chatId}:${turnIndex}` for CLI/test). `toolCallId` (the provider's per-call id)
+ * disambiguates two parallel calls to the same tool with identical arguments in one turn; without
+ * it such calls collide and dedupe to one (a known gap when a caller cannot supply one).
+ * `canonicalParams` is deep-key-sorted before hashing so field order never changes the key.
  */
 export function computeIdempotencyKey(parts: {
   chatId: string;
@@ -65,9 +59,9 @@ export function computeIdempotencyKey(parts: {
 }
 
 /** Thrown synchronously (before the op is ever enqueued) when `enqueue`/`mutate`/`selfHeal` is
- *  called from within the async continuation of an already-running coordinator op. The single-
- *  threaded pump would otherwise deadlock silently (Finding-4) — failing fast here turns a hang
- *  into a diagnosable programming error. */
+ *  called from within the async continuation of an already-running coordinator op. The
+ *  single-threaded pump would otherwise deadlock silently; failing fast turns a hang into a
+ *  diagnosable programming error. */
 export class ReentrantMutationError extends AppError {
   constructor(attemptedLabel: string, runningLabel: string) {
     super(`MutationCoordinator: "${attemptedLabel}" was called re-entrantly from within the already-running op "${runningLabel}" — this would deadlock the single-threaded write pump. Internal Tier-1 projection steps must run inline, never via enqueue()/mutate()/selfHeal() again.`);
@@ -87,16 +81,13 @@ export class MutationCoordinator {
   private readonly reentrancyGuard = new AsyncLocalStorage<string>();
 
   /**
-   * RR-STRUCT R-S4 (mini-plan v3 §3.9, closes C-27 core): `isShutdown` is a PORT injected by the
-   * composition root (`ProfileRuntime`, wired to `runtime.isClosed()`) — never a direct import of
-   * `src/gateway`, which would violate the v2-core module boundary. It keys on CLOSED (post-
-   * `closeStore()`), not merely "stopping": an in-flight mutation that started before `stop()`
-   * began must still be allowed to enqueue and drain (that is the entire point of
-   * `drainInFlightOperations`/`writeQueue.drain()` in `runtime.ts`'s `drainAndClose`) — gating on
-   * "stopping" here would strand such an in-flight op mid-drain (e.g. a `ledger_record` tool call
-   * invoked partway through an already-approved turn) instead of letting it finish. Defaults to
-   * "never shut down" so every existing call site (`new MutationCoordinator(queue)`, tests
-   * included) is unaffected.
+   * `isShutdown` is a port injected by the composition root (`ProfileRuntime`, wired to
+   * `runtime.isClosed()`), never a direct import of `src/gateway`, which would violate the
+   * v2-core module boundary. It keys on closed (post-`closeStore()`), not merely "stopping": an
+   * in-flight mutation that started before `stop()` began must still be allowed to enqueue and
+   * drain (that is the point of `drainInFlightOperations`/`writeQueue.drain()` in `runtime.ts`'s
+   * `drainAndClose`). Gating on "stopping" would strand such an op mid-drain. Defaults to "never
+   * shut down" so existing call sites are unaffected.
    */
   constructor(
     private readonly queue: WriteQueue,
@@ -150,9 +141,9 @@ export class MutationCoordinator {
     return this.queue.drain();
   }
 
-  /** RR-STRUCT R-S4: reject a late write BEFORE it ever touches the WriteQueue/stores. Checked
-   *  before the reentrancy guard (the common, expected-during-shutdown case takes priority over
-   *  the rarer programming-error case). */
+  /** Reject a late write before it ever touches the WriteQueue/stores. Checked before the
+   *  reentrancy guard (the expected-during-shutdown case takes priority over the rarer
+   *  programming-error case). */
   private assertNotShutdown(label: string): void {
     if (this.isShutdown()) {
       throw new DaemonShutdownError(label);

@@ -3,13 +3,12 @@
 // Total decoder for the persisted `schemaVersion: 2` document, plus the semantic
 // validator shared by every consumer (startup, `config set`, wizard, readiness).
 //
-// Rules that are deliberate, because each replaces a live defect:
+// Rules:
 //
 //  - Input is `unknown`. No cast, no deep-merge-as-validation. A document that is not
 //    an object, or whose nesting/types are wrong, is refused with an allowlisted
-//    field/reason. Input VALUES are never included in a message.
-//  - Unknown keys are refused, not merged. `heartbeat.storepath` used to load and then be
-//    re-persisted forever.
+//    field/reason. Input values are never included in a message.
+//  - Unknown keys are refused, not merged.
 //  - Prototype keys are refused at every level.
 //  - Identity is required: `profiles.baseDir` and `profiles.defaultProfileId`. A document
 //    without them cannot serve, because a default must never become an owner.
@@ -347,11 +346,8 @@ function readProvider(r: Reader, raw: unknown, field: string, fallback: Provider
 /**
  * Is this URL the known local Ollama endpoint, however it is spelled?
  *
- * An exact string comparison is too shallow a guard: `http://localhost:11434/v1/`,
- * `HTTP://LOCALHOST:11434/v1` and `http://localhost:11434/v1` are the SAME endpoint, and a guard
- * that refuses only one spelling is not a guard. This normalisation exists only to recognise that
- * one known default. It is not a general endpoint policy: a private or loopback proxy at any other
- * URL is still a legal operator choice (PD-8 — self-hosted paths are first-class).
+ * Only that one default is recognised. It is not a general endpoint policy: a private or loopback
+ * proxy at any other URL is a legal operator choice.
  */
 function isLocalOllamaBaseUrl(value: string): boolean {
   const trimmed = value.trim();
@@ -364,16 +360,10 @@ function isLocalOllamaBaseUrl(value: string): boolean {
   } catch {
     return false;
   }
-  // A trailing dot is the same DNS name (`localhost.` === `localhost`). Userinfo does NOT make it a
-  // different endpoint — `http://user:pass@localhost:11434/v1` still points at the local Ollama
-  // endpoint, so it must be caught too. (Cold re-review: userinfo and trailing-dot spellings
-  // bypassed the guard.) The comparison intentionally ignores only these spelling differences; it
-  // does not treat 127.0.0.1 as the same name, so a proxy bound there stays a legal cloud endpoint
-  // under PD-8's self-hosted allowance.
+  // A trailing dot is the same DNS name, and userinfo does not make a different endpoint. Only these
+  // spelling differences are ignored; 127.0.0.1 is not treated as the same name as localhost.
   const host = (url: URL): string => url.hostname.toLowerCase().replace(/\.+$/, '');
-  // Percent-escapes are an alternative spelling of the same path: `/%76%31` decodes to `/v1`, so a
-  // comparison on the raw pathname would let a disguised local endpoint through. A malformed escape
-  // is left as-is; the value still had to parse as a URL above.
+  // Percent-escapes spell the same path (`/%76%31` is `/v1`). A malformed escape is left as-is.
   const decodePath = (value: string): string => {
     try {
       return decodeURIComponent(value);
@@ -392,16 +382,9 @@ function isLocalOllamaBaseUrl(value: string): boolean {
 /**
  * Per-role base URL policy.
  *
- * A LOCAL role must carry its local endpoint. A CLOUD role may carry an explicit endpoint —
- * OpenRouter has no SDK default of its own, so setup writes its router URL and the document has
- * to be able to keep it — but it must never carry the known local Ollama endpoint, which is the
- * concrete inheritance mistake plan 15 §2.1 forbids ("cloud provider selection never inherits a
- * local base URL").
- *
- * The rule is deliberately narrow. It is NOT a blanket ban on cloud base URLs (that blanket ban
- * was finding R04: supported OpenRouter setup could not be saved or reloaded), and it is NOT an
- * SSRF/endpoint policy platform. Structural validity of the URL is decided separately and earlier
- * by `isValidHttpUrl`, which still refuses a non-http(s) scheme or an unparseable string.
+ * A local role must carry its local endpoint. A cloud role may carry an explicit endpoint (OpenRouter
+ * has no SDK default) but must never carry the known local Ollama endpoint: a cloud provider never
+ * inherits a local base URL. URL structure is checked earlier by `isValidHttpUrl`.
  */
 function checkProviderBaseUrl(r: Reader, provider: ProviderConfig, field: string): void {
   if (provider.type === 'ollama') {
@@ -530,9 +513,8 @@ function semanticIssues(stored: StoredConfig): ConfigIssue[] {
     }
   }
 
-  // A token is required exactly when telegram is enabled. A disabled channel is a truthful
-  // "configured, pairing-pending" state, not an error; `validateConfig` reports it as a
-  // warning so no one mistakes it for a working owner conversation.
+  // A token is required exactly when telegram is enabled. A disabled channel is a valid
+  // "pairing-pending" state; `validateConfig` reports it as a warning.
   if (stored.channels.telegram.enabled && stored.channels.telegram.botToken.trim() === '') {
     r.issues.add('missing-secret', 'channels.telegram.botToken', 'telegram is enabled but no bot token is set');
   }
@@ -566,8 +548,7 @@ function semanticIssues(stored: StoredConfig): ConfigIssue[] {
     r.issues.add('invalid-timezone', 'heartbeat.timezone', 'expected an IANA time zone such as Asia/Kolkata');
   }
 
-  // Bound conversion before the scheduler's expanding validator. Both defaults are checked,
-  // including disabled ones and already-constructed configs passed to validateConfig.
+  // Bound the work before the scheduler's expanding validator. Disabled defaults are checked too.
   for (const key of ['morningCheckIn', 'eveningSummary'] as const) {
     const expression = stored.heartbeat.policy.defaults[key].cron;
     if (!isCronValidationWorkBounded(expression)) {
@@ -599,7 +580,7 @@ function readEmergencyKeywords(r: Reader, raw: unknown): string[] {
     if (extra.includes(keyword)) continue;
     extra.push(keyword);
   }
-  // Built-ins are always retained (specs: emergency keywords cannot be removed by config).
+  // Built-ins are always retained: config cannot remove emergency keywords.
   return [...BUILT_IN_EMERGENCY_KEYWORDS, ...extra];
 }
 
@@ -643,7 +624,7 @@ export function decodeStoredConfig(
   ], issues);
   if (!root) return { kind: 'invalid', issues: issues.issues };
 
-  // --- identity: mandatory, never defaulted -------------------------------------------
+  // Identity: mandatory, never defaulted.
   const profilesRaw = readObject(root.profiles, 'profiles', ['baseDir', 'defaultProfileId'], issues);
   const baseDirRaw = reqNonEmptyString(r, profilesRaw, 'baseDir', 'profiles.baseDir');
   const ownerIdRaw = reqNonEmptyString(r, profilesRaw, 'defaultProfileId', 'profiles.defaultProfileId');
@@ -665,7 +646,6 @@ export function decodeStoredConfig(
     }
   }
 
-  // --- providers ------------------------------------------------------------------------
   const providersRaw = readObject(root.providers, 'providers', ['main', 'medical', 'embeddings'], issues);
   const providers = {
     main: readProvider(r, providersRaw?.main, 'providers.main', defaults.providers.main),
@@ -673,7 +653,6 @@ export function decodeStoredConfig(
     embeddings: readProvider(r, providersRaw?.embeddings, 'providers.embeddings', defaults.providers.embeddings),
   };
 
-  // --- channels -------------------------------------------------------------------------
   const channelsRaw = readObject(root.channels, 'channels', ['telegram'], issues);
   const telegramRaw = readObject(channelsRaw?.telegram, 'channels.telegram', ['enabled', 'botToken'], issues);
   const channels = {
@@ -683,14 +662,12 @@ export function decodeStoredConfig(
     },
   };
 
-  // --- tools ----------------------------------------------------------------------------
   const toolsRaw = readObject(root.tools, 'tools', ['allow', 'deny'], issues);
   const tools = {
     allow: optStringArray(r, toolsRaw, 'allow', 'tools.allow', defaults.tools.allow),
     deny: optStringArray(r, toolsRaw, 'deny', 'tools.deny', defaults.tools.deny),
   };
 
-  // --- memory ----------------------------------------------------------------------------
   const memoryRaw = readObject(root.memory, 'memory', ['search', 'bootstrapMaxChars', 'budgetRatios'], issues);
   const searchRaw = readObject(memoryRaw?.search, 'memory.search', ['hybridWeights'], issues);
   const weightsRaw = readObject(searchRaw?.hybridWeights, 'memory.search.hybridWeights', ['vector', 'keyword'], issues);
@@ -714,7 +691,6 @@ export function decodeStoredConfig(
     memory.budgetRatios = structuredClone(defaults.memory.budgetRatios);
   }
 
-  // --- sessions / heartbeat / agent -------------------------------------------------------
   const sessions = readSessions(r, root.sessions);
   const heartbeat = readHeartbeat(r, root.heartbeat);
   const agentRaw = readObject(root.agent, 'agent', ['maxIterations', 'disclaimerEnabled'], issues);
@@ -747,9 +723,8 @@ export function decodeStoredConfig(
 /**
  * Semantic validation of an already-constructed configuration.
  *
- * Retained because the wizard, `config set` and the start preflight all need an
- * errors/warnings view. It runs the SAME rules as `decodeStoredConfig` — there is no
- * second validator that can disagree with the one startup uses.
+ * Gives the wizard, `config set` and the start preflight an errors/warnings view. It runs the
+ * same rules as `decodeStoredConfig`, so there is no second validator to disagree with startup.
  */
 export function validateConfig(config: EffectiveConfig): ConfigValidationResult {
   const stored = toStoredView(config);

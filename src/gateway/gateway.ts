@@ -34,12 +34,6 @@ import type { Clock } from '../ports/clock';
 import { systemClock } from '../ports/defaults';
 import { TurnQueueFullError, heartbeatTurnId } from './turn-coordinator';
 
-/**
- * Required collaborators for a production Gateway. S1 makes admission non-optional in
- * composition; it stays optional on the constructor only so the pre-S1 direct-construction tests
- * can still describe a single-runtime world. A Gateway booted WITHOUT admission has no enrollment
- * authority at all and must not be used to serve a real owner.
- */
 /** Canned, non-clinical explanations for a refused attachment. Never leaks a reason detail. */
 const MEDIA_REFUSAL_TEXT: Record<string, string> = {
   unsupported: 'That attachment type cannot be accepted.',
@@ -52,38 +46,18 @@ const MEDIA_REFUSAL_TEXT: Record<string, string> = {
 };
 
 export interface GatewayAdmissionDeps {
-  /**
-   * The owner's enrollment authority. REQUIRED.
-   *
-   * It used to be optional so pre-S1 tests could construct a Gateway with no identity at all. That
-   * optionality was load-bearing in the worst way: `if (this.admission)` in `start()` skipped the
-   * entire refusal policy, and `admitAndStage` passed media and text straight through, so a Gateway
-   * built without it served as though every chat were the owner. Plan 15 §5 requires that "New core APIs
-   * must not have an optional admission fallback". It is now non-optional, and `ownerPaths()` refuses a
-   * config that names no valid owner.
-   */
+  /** The owner's enrollment authority. Required: a Gateway without it would serve every chat as the owner. */
   admission: OwnerAdmissionService;
   /** The owner identity `admission` is configured for. REQUIRED; never inferred, never defaulted. */
   ownerId: ProfileId;
-  /**
-   * How providers are constructed for this daemon (plan 15 §3 `GatewayBindings`).
-   *
-   * Production composition supplies the real factory explicitly rather than letting the Gateway and
-   * `ProfileRuntime.create` each reach for one internally — that hidden creation is what made a
-   * real owner spine untestable without live providers. Defaults to the real factory, so a caller
-   * that omits it gets exactly the previous production behaviour.
-   */
+  /** How providers are built for this daemon. Defaults to the real factory. */
   createProvider?: ProviderFactory;
   /**
-   * How attached media bytes are retrieved (plan 15 §2.5). Supplied by production composition.
-   * Absent it, media is refused rather than silently dropped — a transport that cannot retrieve
-   * bytes must not appear to succeed.
+   * How attached media bytes are retrieved. When absent, media is refused rather than silently
+   * dropped: a transport that cannot retrieve bytes must not appear to succeed.
    */
   mediaSource?: MediaSourcePort;
-  /**
-   * The closed diagnostic contract, covering admission, pairing, media intake and start/stop.
-   * Silent for reusable direct construction. The daemon root explicitly selects its output adapter.
-   */
+  /** The closed diagnostic contract for admission, pairing, media intake and start/stop. Silent by default. */
   diagnostics?: DiagnosticSink;
   /** Optional: defaults to the system clock. Injected in tests so durations are real measurements. */
   clock?: Clock;
@@ -93,12 +67,9 @@ const SHUTDOWN_RESPONSE = 'The health assistant is shutting down. Please try aga
 const BOOT_HEALTHCHECK_BUDGET_MS = 3_000;
 
 /**
- * RR2-B1 (R2-10/11): a narrow, gateway-local boundary representing an AUTHORIZATION
- * suppression of a scheduled delivery — the destination chat stopped belonging to the owning
- * profile between dispatch and egress. Deliberately NOT an operational/provider error: it must
- * never enter `recordFailure`'s retry/dead-letter state machine, and it must never let
- * `afterDelivery` record an honest-looking sent/noop. Module-local by design — no other
- * consumer may throw or catch it.
+ * Thrown when a scheduled delivery is suppressed because the destination chat no longer belongs to
+ * the owning profile. Not an operational error: it must never enter the retry/dead-letter path or be
+ * recorded as sent.
  */
 class HeartbeatDestinationSuppressedError extends Error {
   constructor() {
@@ -133,13 +104,8 @@ function readinessLabel(result: ReadinessResult): 'OK' | 'FAIL' | 'PENDING' {
 }
 
 /**
- * C01 follow-up (R01): `serveOwner()` refused to replace a runtime generation that still has unsettled
- * resource-touching work.
- *
- * A dedicated type rather than a string match, because the refusal needs one honest diagnostic
- * (`start-stop`/`refused`) instead of two contradictory ones: `start()`'s generic catch would otherwise
- * also report `failed`/`build-failed` for a start that built nothing at all. Carries no owner, chat or
- * path data — the message is fixed operator guidance.
+ * Thrown when `serveOwner()` refuses to replace a runtime generation that still has unsettled work.
+ * Carries no owner, chat or path data.
  */
 class PreviousWorkUnsettledError extends Error {}
 class AdmissionRefusedError extends Error {}
@@ -150,9 +116,7 @@ export class Gateway {
   private resolvedMemoryWorkspace?: string;
   private bootHealth?: { providers: ReadinessResult[]; telegram: ReadinessResult };
   private mainProvider?: LLMProvider;
-  /** RR-STRUCT R-S5a: the medical-provider fallback used for medication side-effect lookups,
-   *  shared across every profile's runtime (daemon-singleton per mini-plan v3 §3.1) — hoisted to
-   *  a field (was a `start()`-local var) so `buildRuntimeFor` can close over it for any profile. */
+  /** Medical-provider fallback for medication side-effect lookups, shared by every profile's runtime. */
   private sideEffectProvider?: LLMProvider;
   private securityWarnings: string[] = [];
   private reconcileTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
@@ -163,19 +127,10 @@ export class Gateway {
   private inboundTurnsInFlight = 0;
   private stopPromise?: Promise<void>;
   private runtime?: ProfileRuntime;
-  /** RR-STRUCT R-S5a (mini-plan v3 §3.3): owns one ProfileRuntime per paired profile. `this.runtime`
-   *  above stays the DEFAULT profile's runtime (`manager.get(defaultProfileId)`) — every existing
-   *  accessor/handler/Router keeps reading `this.runtime` unchanged; dispatch stays default-only
-   *  (the RR-4 refusal is untouched — R-S5b routes by profile and retires it). */
+  /** Owns one ProfileRuntime per paired profile. `this.runtime` is the default profile's runtime. */
   private manager?: ProfileRuntimeManager;
   private router?: GatewayMessageRouter;
-  /** Overrides the legacy paired-profile enumeration while serving pairing only. */
-
-  /**
-   * S1 admission. When supplied, it is the sole authority for who may reach a clinical runtime,
-   * and its boot answer decides whether one may be built at all. Absent only for pre-S1 tests that
-   * construct a Gateway directly with a hand-built runtime.
-   */
+  /** Sole authority for who may reach a clinical runtime; its boot answer decides whether one is built. */
   private admission: OwnerAdmissionService;
   /**
    * Set when the owner record is not yet bound. While true the daemon serves pairing and canned
@@ -185,15 +140,7 @@ export class Gateway {
   private unpairedOnly = false;
   /** The owner identity admission is configured for, used as the dispatch target when admitted. */
   private admissionOwnerId: ProfileId;
-  /**
-   * The ONE derivation of this owner's resources, memoised from the validated config.
-   *
-   * S1 change: every durable path used to be resolved through the legacy `ProfileRegistry`
-   * migration branch (`migrateAndResolveWorkspace` / `hasBeenMigrated` / `resolveSchedulerPaths`),
-   * which could silently place the search database and session transcripts BESIDE — outside — the
-   * leased owner workspace. `config.profiles.baseDir` + `defaultProfileId` are mandatory in schema v2,
-   * so the Gateway derives the identical bundle with the identical pure function composition uses.
-   */
+  /** The one derivation of this owner's resources, memoised from the validated config. */
   private ownerPathsCache?: OwnerPaths;
   private readonly buildProvider: ProviderFactory;
   private readonly mediaSource?: MediaSourcePort;
@@ -201,18 +148,8 @@ export class Gateway {
   /** Injected so a start/stop duration is measured, not guessed. */
   private readonly clock: Clock;
   /**
-   * Abort signal for in-flight media intake.
-   *
-   * Created in the constructor rather than lazily inside `serveOwner`, because it has to outlive any
-   * single promotion: a controller created per promotion would only ever abort that promotion's
-   * downloads. `stop()` aborts it, which is what finally makes the comment on the intake path true.
-   *
-   * NOT `readonly`, and re-armed by `start()`. `stop()` aborting this controller is permanent for the
-   * object, so a `readonly` field meant a restarted Gateway refused every subsequent attachment with
-   * "That upload was cancelled" — forever, with no recovery short of constructing a new Gateway.
-   * `start()` -> `stop()` -> `start()` is an existing, exercised contract (see
-   * `tests/gateway/gateway-transcript-sweep.test.ts`), so this was a real latent break, not a
-   * theoretical one.
+   * Abort signal for in-flight media intake. `stop()` aborts it permanently, so `start()` re-arms it
+   * with a fresh controller.
    */
   private mediaIntake = new AbortController();
   /** In-flight unpaired -> bound promotion, so concurrent messages cannot both build a runtime. */
@@ -250,9 +187,7 @@ export class Gateway {
     return this.bootSweepResult ? { ...this.bootSweepResult } : undefined;
   }
 
-  /** Test/diagnostic seam (mirrors `runtimeInstance`): the manager owning every built profile's
-   *  runtime. `undefined` until `start()` has run (or in the `attachGatewayTestRuntime` test-double
-   *  seam, which never constructs one). */
+  /** Test/diagnostic seam: the manager owning every built profile's runtime. */
   get runtimeManager(): ProfileRuntimeManager | undefined {
     return this.manager;
   }
@@ -323,11 +258,7 @@ export class Gateway {
     try {
       await this.startServing();
     } catch (error) {
-      // C01 follow-up (R01): the replacement refusal gets its OWN truthful outcome. Reporting
-      // `failed`/`build-failed` for it would be a lie twice over — nothing was built, and the refusal
-      // has to be distinguishable from a real build failure by an operator reading the sink.
-      // `durationMs` is the real elapsed start span, measured here rather than fabricated at the
-      // refusal site, which has no start timestamp.
+      // Report a replacement refusal as its own outcome, not as a build failure: nothing was built.
       if (error instanceof PreviousWorkUnsettledError) {
         this.sink.emit({
           stage: 'start-stop',
@@ -369,13 +300,10 @@ export class Gateway {
 
     console.log('[gateway] Starting Redacted...');
 
-    // ── S1 admission comes first ──────────────────────────────────────────────────────────
-    // A missing, unreadable, corrupt or wrong-owner record must NOT boot into a serving state,
-    // and an unpaired record must NOT build anything clinical. Both decisions are taken before a
-    // provider is created, before the workspace is touched, and before any index or scheduler
-    // exists, so "unpaired" cannot degrade into "serving on a default identity".
-    // Re-arm intake for this run of the daemon. `stop()` aborted the previous controller, and an
-    // aborted signal cannot be un-aborted, so a restart needs a fresh one.
+    // Admission comes first. A missing, corrupt or wrong-owner record must not boot into a serving
+    // state, and an unpaired record must not build anything clinical: both are decided before any
+    // provider, workspace, index or scheduler exists.
+    // Re-arm intake for this run: an aborted signal cannot be reused.
     this.mediaIntake = new AbortController();
 
     const admissionState = this.admission.inspectInstallation();
@@ -386,24 +314,9 @@ export class Gateway {
         + 'Re-run setup on this computer, then start the daemon again.',
       );
     }
-    // ── The staging sweep. BOOT ONLY, and this is its only call site. ──
-    //
-    // It used to live inside `serveOwner`, which is shared by boot AND the mid-session unpaired ->
-    // bound promotion. That placement is what made it dangerous, and this module's README already
-    // stated the intended rule: "sweepStagedMedia is exported because boot must call it, and boot is
-    // the only safe moment". Two failures came from the old placement:
-    //
-    //   1. `unpairedOnly` is cleared only at the END of `serveOwner`, so a promotion that failed
-    //      anywhere earlier left it set and the NEXT owner message re-entered and swept again — this
-    //      time over a lane holding live staged media.
-    //   2. The sweep was never mutually exclusive with `stager.stage(...)`. Two messages interleave,
-    //      so one could be mid-download while the other's promotion swept the lane underneath it,
-    //      deleting a file the owner was actively uploading.
-    //
-    // Here it runs once, after admission has confirmed the record belongs to this owner and while
-    // `startDaemon` still holds the workspace lease, and before any intake is accepted. An unpaired
-    // boot sweeps too: nothing can be in flight yet, so there is nothing to destroy, and it keeps
-    // S1-R-01 true for a daemon that pairs later.
+    // Staging sweep: boot only. It must not run during an unpaired -> bound promotion or while intake
+    // is live, or it could delete a file the owner is mid-upload. It runs once, after admission has
+    // confirmed the owner and before any intake is accepted.
     this.sweepOwnerStagingLane();
 
     if (admissionState.kind === 'unpaired') {
@@ -417,21 +330,6 @@ export class Gateway {
     console.log('[gateway] Redacted is running.');
   }
 
-  /**
-   * Build everything that only the BOUND owner may have: workspace, providers, the runtime, the
-   * router and the scheduler.
-   *
-   * This is the single implementation of "serve the owner", shared by two callers:
-   *
-   * - `start()` on a boot whose record is already bound, and
-   * - the unpaired -> bound transition in `ensureOwnerServing`, which fires on the first admitted
-   *   owner message after the owner sends their pairing code.
-   *
-   * It used to be inline in `start()`, which meant a daemon that booted unpaired could never serve
-   * the owner: pairing bound the record, but nothing rebuilt a runtime, so every later message was
-   * answered with the canned "profile temporarily unavailable" until the operator restarted. The
-   * restart was never documented anywhere.
-   */
   /** Attempt once before intake. Failure preserves authority and never triggers a promotion retry. */
   private sweepOwnerStagingLane(): void {
     if (this.bootSweepAttempted) return;
@@ -447,29 +345,15 @@ export class Gateway {
   }
 
   /**
-   * C01 follow-up (R01): whether replacing the runtime generation currently installed on this Gateway
-   * would hide work that can still touch owner resources.
-   *
-   * Read from exactly the sources `stopResources()` drains and `getShutdownDisposition()` reports — an
-   * unfinished stop, a construction still in flight, and the manager's resolved runtimes (or the
-   * directly attached fallback) — so this can never disagree with the disposition root releases on.
-   *
-   * Two conditions are deliberately NOT here. An in-flight inbound turn needs no guard: the counter
-   * lives on the Gateway, so replacement does not hide it, and the drain already awaits turns under
-   * the same bounded budget (the post-drain re-check below catches the case where that budget expires).
-   * And a "replacement already refused" flag is not here, because a flag would be a permanent
-   * closed-flag refusal that no amount of real settlement could clear.
-   *
-   * Deliberately NOT a retained list of retired generations: pruning such a list requires observing
-   * each old runtime's settlement, which is not available synchronously, so it would grow without
-   * bound or need polling (spec16 §1/§3, and brief §8.2).
+   * Whether replacing the installed runtime generation would hide work that can still touch owner
+   * resources. Reads the same sources `stopResources()` drains and `getShutdownDisposition()`
+   * reports, so it cannot disagree with the disposition root releases on.
    */
   private replacementWouldHideLiveWork(): boolean {
     // An unfinished stop means this Gateway is mid-teardown. Replacing the generation now would
     // redirect `stopResources()`'s drain at the NEW manager and strand the old one entirely.
     if (this.stopPromise) return true;
-    // An un-settled construction is awaited by `ProfileRuntimeManager.performDrain()` with NO budget
-    // of its own (`manager.ts:154`), so replacing nothing here would let `start()` block forever.
+    // Draining awaits an unsettled construction with no budget of its own, so replacing now could block start() forever.
     if ((this.manager?.pendingBuildCount() ?? 0) > 0) return true;
     const runtimes = this.manager ? this.manager.all() : (this.runtime ? [this.runtime] : []);
     for (const runtime of runtimes) {
@@ -479,8 +363,8 @@ export class Gateway {
   }
 
   /**
-   * Throw the R01 replacement refusal. One message, no owner/chat/path data, and no mutation: the old
-   * generation stays installed, visible to the disposition, and drainable by `stopResources()`.
+   * Refuse replacement without mutating anything: the old generation stays installed and drainable.
+   * The message carries no owner, chat or path data.
    */
   private refuseRuntimeReplacement(): never {
     throw new PreviousWorkUnsettledError(
@@ -490,26 +374,20 @@ export class Gateway {
     );
   }
 
+  /**
+   * Build everything only the bound owner may have: workspace, providers, runtime, router and
+   * scheduler. Shared by boot and the unpaired -> bound promotion.
+   */
   private async serveOwner(options: { connectChannel: boolean; runHealthchecks: boolean }): Promise<void> {
     const { config } = this;
 
-    // C01 follow-up (R01), FIRST of two checks: refuse to REPLACE a generation that already owns
-    // resource-touching work.
-    //
-    // `drainAndCloseAll()` further down is bounded and memoized — it resolves at the shared drain
-    // budget whether or not the old runtime actually settled. Overwriting `this.manager` therefore
-    // proves nothing finished; it only makes the old continuation unreachable from
-    // `getShutdownDisposition()`, which is how a timed-out sweep became invisible to root and let a
-    // second installation acquire a workspace the old runtime was still writing to.
-    //
-    // Placed at the TOP of the method, before any provider, runtime, router or scheduler is built, so
-    // a refusal cannot leave a half-built serving generation behind. It is here rather than in
-    // `start()` because `serveOwner` is the single replacement site shared by BOTH callers — the boot
-    // and the unpaired->bound promotion re-entry — and patching one caller would leave the other open.
+    // Refuse to replace a generation that still has unsettled work. The drain below is bounded, so
+    // overwriting `this.manager` proves nothing finished and would hide that work from
+    // `getShutdownDisposition()`. Checked before anything is built so a refusal leaves no half-built
+    // generation, and here because both boot and promotion pass through this method.
     if (this.replacementWouldHideLiveWork()) this.refuseRuntimeReplacement();
 
-    // The owner's derived paths. Resolved once, here, so a config that cannot name a valid owner
-    // refuses the boot BEFORE a provider, a runtime or a scheduler exists.
+    // Resolved once so a config that names no valid owner refuses the boot before anything is built.
     const ownerPaths = this.ownerPaths();
     const profileId = ownerPaths.profileId;
 
@@ -538,28 +416,17 @@ export class Gateway {
       if (!token) {
         throw new Error('TELEGRAM_BOT_TOKEN not set. Set it in config or environment.');
       }
-      // The channel emits media references only — it never downloads, writes or names a file, so it
-      // takes no staging path. Containment is `FsMediaStager`'s, bound to the owner's lane at
-      // composition. `deliverMessage` -> `admitAndStage` is what decides whether bytes are fetched.
+      // The channel emits media references only; it never downloads or writes files. Whether bytes are
+      // fetched is decided by `admitAndStage`, and containment belongs to `FsMediaStager`.
       this.channel = new TelegramChannel(token);
       this.channel.onMessage((msg) => this.handleMessage(msg));
     }
 
-    // RR-STRUCT R-S5a (mini-plan v3 §3.3): ProfileRuntimeManager owns one ProfileRuntime per
-    // paired profile. The DEFAULT profile is built first and DIRECTLY (not via buildAll) so its
-    // failure semantics stay byte-identical to pre-R-S5a: exactly one build attempt, and a
-    // genuine failure propagates straight out of start() (see tests/gateway/memcore-wiring.test.ts
-    // "aborts boot when the SAFETY.md injection invariant is violated"). Every OTHER paired
-    // profile is then eager-built via buildAll — individually guarded, so a secondary profile's
-    // broken storage degrades only that profile and never touches the default or aborts boot.
-    // Drain any runtime from an EARLIER entry into this method before replacing it.
-    //
-    // A promotion that fails after this point leaves `unpairedOnly` set, so the next owner message
-    // re-enters `serveOwner` and reaches this line again. It no longer simply overwrites: the two R01
-    // checks decide whether replacement is allowed at all, and when it is allowed the previous manager
-    // is drained here first — `stopResources` only ever drains the CURRENT manager, so skipping this
-    // would leave the previous one holding open handles against owner state for the rest of the
-    // process. Draining first makes re-entry safe rather than merely survivable.
+    // The default profile is built first and directly, so a genuine failure propagates out of start()
+    // after exactly one attempt. Other paired profiles are then built individually guarded, so a
+    // broken secondary profile never aborts boot.
+    // A promotion that fails after this point is re-entered by the next owner message, so any earlier
+    // manager is drained first; `stopResources` only drains the current one.
     if (this.manager !== undefined) {
       try {
         await this.manager.drainAndCloseAll();
@@ -568,17 +435,8 @@ export class Gateway {
         // could never make progress. It is reported, not swallowed.
         console.warn('[gateway] Failed to drain the previous runtime before rebuilding:', summarizeErrorForLog(error));
       }
-      // C01 follow-up (R01), SECOND of two checks, and the load-bearing one: this drain can CREATE
-      // pendingness on the very generation it is draining. `drainAndClose()` registers each phase in
-      // the runtime's `unsettledDrainWork`, and a phase abandoned at the shared 10,000ms budget stays
-      // there — so a generation that was quiescent a moment ago can be `pending` by the time control
-      // reaches here. A `session-compactions` phase awaiting a compaction, or a `scheduler-stop`
-      // awaiting a stalled heartbeat, are both real shapes: neither is a source of
-      // `ProfileRuntime.getShutdownDisposition()`, so only this re-check sees them.
-      //
-      // The drain is memoized, so re-checking is free and non-destructive, and it is placed
-      // immediately before the overwrite with nothing in between — the check and the thing it guards
-      // are now adjacent rather than separated by the operation that invalidates the check.
+      // Second replacement check: the drain itself can leave a phase unsettled (for example a stalled
+      // compaction or scheduler stop). Placed immediately before the overwrite it guards.
       if (this.replacementWouldHideLiveWork()) this.refuseRuntimeReplacement();
     }
 
@@ -591,9 +449,7 @@ export class Gateway {
       await this.channel.connect();
     }
 
-    // `stop()` may have begun while this build was in flight. Everything above is drainable through
-    // `this.manager`, but a scheduler started now would have no owner left to stop it and would never be
-    // drained. Bail out instead: the daemon is shutting down, so leaving `unpairedOnly` set is correct.
+    // If stop() began during the build, do not start a scheduler that nothing would drain.
     if (this.stopping) {
       console.log('[gateway] Shutdown began while building the owner runtime; not starting the scheduler.');
       return;
@@ -610,14 +466,9 @@ export class Gateway {
   }
 
   /**
-   * RR-STRUCT R-S5a Part C (mini-plan v3 §3.8 A-F07): a nightly-sweep COORDINATOR across every
-   * built profile — each profile's own cron (`ProfileRuntime`'s internal `sweepTask`, R-S1)
-   * already sweeps itself independently in production; this is the manual/test-triggered surface
-   * (`gateway.runTranscriptSweep()`). Preserves the EXISTING external contract exactly: it still
-   * returns the DEFAULT profile's `NightlySweepResult` (the shape every existing sweep test
-   * asserts on), while additionally sweeping every OTHER built profile against its OWN sessions/
-   * ledger/curiosity, individually guarded — one profile's sweep failure never aborts another's
-   * (including the default's).
+   * Nightly transcript sweep across every built profile. Returns the default profile's result; other
+   * profiles are swept against their own data and individually guarded, so one failure never aborts
+   * another.
    */
   async runTranscriptSweep(): Promise<NightlySweepResult> {
     if (this.stopping) return { scanned: false, added: 0 };
@@ -672,27 +523,10 @@ export class Gateway {
   }
 
   /**
-   * Local-transport test seam. NOT a serving path.
-   *
-   * It presents an explicit `local` transport identity rather than none, because admission refuses a
-   * message with no transport identity — and silently omitting it would make this path untestable and
-   * its refusals meaningless. Because the identity is `local`, this seam only reaches the owner when the
-   * owner was bound over `local`; against a Telegram binding it is correctly refused as a stranger.
-   *
-   * It used to call `requireRouter().route(...)` directly. To be precise about what that did and did
-   * not mean: it was NOT an admission bypass, because `route()` runs `admission.inspect()` before
-   * anything else. What it DID skip is the front half of `deliverMessage`:
-   *
-   *   - `ensureOwnerServing`, so a daemon that booted unpaired and then paired could NOT be driven to
-   *     build its runtime through this seam, even though a real Telegram message would build it; and
-   *   - `admitAndStage`, so the admitted-message normalisation and its `mediaError` handling never ran.
-   *
-   * So this seam could not serve a stranger, but it was not the same path production takes, and a test
-   * using it was asserting against a subtly different machine. It now delegates to `deliverMessage`, so
-   * a test exercises the same admission and promotion path a real message takes.
-   *
-   * Note this seam takes no media: its signature has no place to put a `MediaReference`. Tests that need
-   * admitted media must drive `deliverMessage` directly, which is what the media suites do.
+   * Local-transport test seam, not a serving path. It presents a `local` transport identity (admission
+   * refuses a message with none) and goes through `deliverMessage`, so it exercises the same admission
+   * and promotion path as a real message. It takes no media; tests that need admitted media drive
+   * `deliverMessage` directly.
    */
   async handleTestMessage(chatId: string, text: string, sourceMessageId?: string): Promise<string> {
     if (this.stopping) return SHUTDOWN_RESPONSE;
@@ -715,15 +549,7 @@ export class Gateway {
     return reply;
   }
 
-  /**
-   * The Telegram channel's inbound callback. A thin edge adapter over `deliverMessage` — it supplies
-   * the channel's egress and nothing else.
-   *
-   * It used to call `route()` directly, which meant the channel's messages never passed through
-   * admission-staged media: an attachment arrived as a `MediaReference` that nothing ever retrieved,
-   * and the placeholder text the channel substitutes ("Sent a photo") reached the model as if it were
-   * the whole message. There is now exactly one inbound path.
-   */
+  /** The Telegram channel's inbound callback: a thin adapter over `deliverMessage` that supplies the channel's egress. */
   private async handleMessage(incoming: IncomingMessage): Promise<void> {
     try {
       await this.deliverMessage(incoming, (text) => this.channel!.send(incoming.chatId, { text }));
@@ -733,27 +559,15 @@ export class Gateway {
   }
 
   /**
-   * The one inbound path every transport shares.
-   *
-   * `handleMessage` delegates here with the Telegram channel's egress. A non-Telegram edge adapter
-   * calls the same method with its OWN egress (plan 15 §3: "Future CLI normalizes identity/media
-   * through its own edge adapter and calls the same admission/turn/action seams; it does not
-   * pretend a CLI conversation has Telegram identity").
-   *
-   * This is the seam that lets the acceptance spine exercise the REAL admission, router and runtime
-   * with a genuine `telegram` transport identity without standing up a polling bot. It is not a
-   * bypass: admission sees exactly the identity the transport supplied, so a caller cannot use it
-   * to claim an identity it does not have.
+   * The one inbound path every transport shares; a non-Telegram adapter calls it with its own egress.
+   * Not an admission bypass: admission sees exactly the identity the transport supplied.
    */
   async deliverMessage(incoming: IncomingMessage, egress: (text: string) => Promise<void>): Promise<void> {
     if (this.stopping) return;
-    // A daemon that booted unpaired has no runtime. If the owner has since paired, THIS is the moment
-    // to build one — see `ensureOwnerServing`. Checked before staging so the transition never races a
-    // retrieval it would then have to discard.
-    // TRACKED. The promotion builds a provider, a runtime and a scheduler — real work touching owner
-    // resources. Untracked, `getShutdownDisposition()` reported `quiescent` while it was still running
-    // (this.manager is not assigned until the build finishes), so `startDaemon`'s shutdown released the
-    // installation lease and a second daemon could enter the workspace we were still writing to.
+    // A daemon that booted unpaired has no runtime; if the owner has since paired, build one now,
+    // before staging so the transition never races a retrieval it would then discard. The promotion
+    // is tracked because it touches owner resources: untracked, shutdown could report `quiescent`
+    // and release the installation lease while it is still writing.
     await this.trackInboundTurn(() => this.ensureOwnerServing(incoming));
     if (this.stopping) return;
     const admitted = await this.admitAndStage(incoming);
@@ -762,25 +576,9 @@ export class Gateway {
   }
 
   /**
-   * Run the SAME admission policy used by text and scheduling, then stage any media, then re-check
-   * authority before the turn begins.
-   *
-   * Order is the whole point (plan 15 §2.5): a denied identity never causes a fetch, a fetch never
-   * happens for an unadmitted sender, and authority is re-read after the (slow) retrieval so a
-   * binding that changed mid-download cannot be raced into a clinical turn.
-   */
-  /**
-   * Promote a pairing-only daemon to a serving one, on the first admitted owner message.
-   *
-   * Boot decides admission ONCE, and an unpaired boot deliberately builds no provider, workspace,
-   * runtime or scheduler. That is correct — but it left no path back. Pairing bound the record, and
-   * every subsequent message resolved to a runtime that did not exist, so the owner was answered
-   * "this chat's profile is temporarily unavailable" until they restarted a daemon nobody had told
-   * them to restart. Requiring a restart is also wrong on its own terms: `pairing issue` refuses
-   * while the daemon holds the installation lease, so the documented sequence already had the owner
-   * stop and start the process by hand.
-   *
-   * Single-flight: two messages arriving together must not both build a runtime.
+   * Promote a pairing-only daemon to a serving one on the first admitted owner message, so the owner
+   * does not have to restart the daemon after pairing. Single-flight: two messages arriving together
+   * must not both build a runtime.
    */
   private async ensureOwnerServing(incoming: IncomingMessage): Promise<void> {
     if (!this.unpairedOnly || this.stopping) return;
@@ -814,25 +612,19 @@ export class Gateway {
     }
   }
 
+  /**
+   * Apply the admission policy, then stage any media, then re-check authority before the turn begins.
+   * A denied identity never causes a fetch, and authority is re-read after the slow retrieval so a
+   * binding that changed mid-download cannot be raced into a clinical turn.
+   */
   private async admitAndStage(incoming: IncomingMessage): Promise<AdmittedMessage | undefined> {
-    // Admission is REQUIRED, so there is no "no authority" branch left to fail closed in: the policy
-    // always exists. This used to read `if (!admission) { if (incoming.media) return undefined; return
-    // incoming as AdmittedMessage; }` — which handed an unadmitted sender a clinical turn whenever a
-    // Gateway was composed without admission, and silently dropped the owner's media.
+    // Admission always exists, so there is no "no authority" branch to fail closed in.
     const decision = this.admission.inspect(transportIdentityOf(incoming));
     const admitted: AdmittedMessage = { ...incoming };
 
     if (decision.kind !== 'owner') {
-      // Not the owner, so NO media is fetched, staged or buffered — that is the whole security value of
-      // this seam, and it holds equally for an unpaired owner, a stranger and a group.
-      //
-      // The message itself is still handed to the Router, which owns every refusal and pairing reply.
-      // Dropping it here was wrong twice over:
-      //   - it made pairing over a real transport unreachable, because the only caller of
-      //     `handlePairing` lives inside `route()`, so the owner's code was discarded before it could
-      //     bind and the promotion transition could never fire; and
-      //   - it made a stranger's DM SILENT instead of answered with the canned refusal, because the
-      //     Router is what sends that reply.
+      // Not the owner: no media is fetched, staged or buffered. The message still goes to the Router,
+      // which owns every refusal and pairing reply (including the owner's pairing code).
       if (incoming.media) admitted.mediaError = MEDIA_REFUSAL_TEXT.unsupported;
       return admitted;
     }
@@ -874,12 +666,8 @@ export class Gateway {
   }
 
   /**
-   * Run one inbound turn while it is visible to the shutdown disposition.
-   *
-   * A turn that has started and not yet settled may still read or write owner resources, so it is
-   * counted. Admission-state replacement, media staging and their cleanup ride inside this same
-   * window; S5 owns cancelling them, not deciding whether ownership may be released. Both entry
-   * points go through here so the count cannot be bypassed by the test/dev path.
+   * Run one inbound turn while it is visible to the shutdown disposition. A turn that has started and
+   * not settled may still read or write owner resources, so it is counted.
    */
   private async trackInboundTurn<T>(operation: () => Promise<T>): Promise<T> {
     this.inboundTurnsInFlight += 1;
@@ -891,23 +679,17 @@ export class Gateway {
   }
 
   /**
-   * Whether anything that can still touch owner resources has settled.
-   *
-   * `pending` covers in-flight runtime construction, in-flight inbound turns (which include
-   * admission-state replacement, media staging and their cleanup), an unfinished drain, and — since
-   * C01 (R01) — any runtime continuation that started and has not really settled, including a drain
-   * phase abandoned at the shared 10s budget. Only `quiescent` authorises releasing the
-   * installation's resource ownership. A stop that returns after a timeout is NOT quiescence; S5
-   * owns bounded cancellation and the shared stop deadline.
+   * Whether anything that can still touch owner resources has settled. `pending` covers in-flight
+   * construction, inbound turns, an unfinished drain, and any runtime continuation that has not really
+   * settled (including a drain phase abandoned at the shared budget). Only `quiescent` authorises
+   * releasing the installation's resource ownership; a stop that returns after a timeout is not quiescence.
    */
   getShutdownDisposition(): 'quiescent' | 'pending' {
     if (this.stopPromise) return 'pending';
     if (this.inboundTurnsInFlight > 0) return 'pending';
     if (this.manager?.pendingBuildCount() ?? 0 > 0) return 'pending';
-    // C01 (R01): a runtime that closed its stores while a drain phase was abandoned at the shared
-    // budget still has a continuation that can write owner files. `closed` is not quiescence.
-    // Read exactly the runtime sources `stopResources()` drains — the manager's resolved runtimes
-    // and the directly attached fallback — so the test-double path is protected too.
+    // A runtime that closed its stores while a drain phase was abandoned still has a continuation that
+    // can write owner files. Reads the same sources `stopResources()` drains.
     for (const runtime of this.manager ? this.manager.all() : (this.runtime ? [this.runtime] : [])) {
       if (runtime.getShutdownDisposition() === 'pending') return 'pending';
     }
@@ -915,12 +697,8 @@ export class Gateway {
   }
 
   /**
-   * Counters behind the disposition, for honest local reporting and tests.
-   *
-   * `runtimes` counts the runtimes currently reporting `pending`. Without it the R01 production case
-   * (a stuck nightly sweep, no inbound turn, no pending build) reports `turns=0, builds=0` on the one
-   * path that tells the operator ownership was retained and the lease may need removing by hand — a
-   * self-contradicting report. Counts and a boolean only; never an identifier, path or payload.
+   * Counters behind the disposition, for local reporting and tests. `runtimes` counts runtimes
+   * reporting `pending`. Counts and a boolean only; never an identifier, path or payload.
    */
   shutdownWorkInFlight(): { turns: number; builds: number; runtimes: number; stopping: boolean } {
     let runtimes = 0;
@@ -942,10 +720,7 @@ export class Gateway {
     if (this.stopPromise) return this.stopPromise;
     const startedAt = this.clock.now().getTime();
     this.stopping = true;
-    // Abort in-flight media intake FIRST, before draining. Without this the comment on the intake
-    // path was fiction: a `stage()` in progress kept streaming and writing after `stop()` returned,
-    // burning the drain budget and leaving a partial behind. Plan 15 T4 requires abort on stop, and
-    // review round 2 found (twice, independently) that nothing ever called this.
+    // Abort in-flight media intake first so a `stage()` in progress stops writing before the drain.
     this.mediaIntake.abort();
     this.runtime?.beginStopping();
     const shared = this.stopResources()
@@ -990,11 +765,10 @@ export class Gateway {
 
     try {
       if (this.manager) {
-        // RR-STRUCT R-S5a: drains + closes EVERY built profile's runtime (not just the default).
+        // Drains and closes every built profile's runtime.
         await this.manager.drainAndCloseAll();
       } else {
-        // Test-double seam (attachGatewayTestRuntime): start() never ran, so no manager exists —
-        // fall back to closing the directly-attached runtime, exactly as pre-R-S5a.
+        // Test-double seam: start() never ran, so close the directly attached runtime.
         await this.runtime?.drainAndClose();
       }
     } catch (error) {
@@ -1008,12 +782,9 @@ export class Gateway {
   }
 
   /**
-   * RR-STRUCT R-S5b (mini-plan v3 §3.1 Finding-6, §3.8 A-F03; the R-S5a deferral): starts EACH
-   * built profile's OWN heartbeat scheduler (R-S5a built every runtime with `canSchedule:false`
-   * and started only the default's). Boot order is unchanged — the Router is created before
-   * this runs, so the R-S5a scheduler-recovery race guard (recovery invoking
-   * `runScheduledJob → handleScheduledJob → requireRouter()` before the router exists) still
-   * holds for every profile. No-manager (test-double) mode starts just the attached runtime.
+   * Start each built profile's own heartbeat scheduler. The Router already exists by now, so
+   * scheduler recovery cannot reach `requireRouter()` before it is created. Without a manager
+   * (test double) only the attached runtime is started.
    */
   private async initializeScheduler(): Promise<void> {
     if (!this.config.heartbeat.enabled || !this.channel) return;
@@ -1023,9 +794,8 @@ export class Gateway {
       if (!runtime.scheduler) {
         await runtime.initializeScheduler({
           schedulerPaths: this.schedulerPathsFor(),
-          // RR2-B1: the trigger closure captures THIS profile's concrete runtime — the job's
-          // `chatId` never re-selects a runtime — and the destination guard is threaded into
-          // the scheduler so create/update/resume/registration refuse foreign addresses.
+          // The trigger captures this profile's runtime (the job's chatId never re-selects one), and the
+          // destination guard makes the scheduler refuse addresses the profile does not own.
           runScheduledJob: (job) => this.handleScheduledJob(job, runtime, true),
           canAddressChat: (chatId) => this.canChatIdAddressProfile(chatId, runtime.profileId),
         });
@@ -1038,33 +808,20 @@ export class Gateway {
     }
   }
 
-  /**
-   * Scheduler paths for the owner. Derived from the same bundle as every other owner resource, so the
-   * job store and audit log can no longer land on a legacy fallback path.
-   */
+  /** Scheduler paths for the owner, derived from the same bundle as every other owner resource. */
   private schedulerPathsFor(): { storePath: string; auditLogPath: string } {
     const ownerPaths = this.ownerPaths();
     return { storePath: ownerPaths.schedulerStore, auditLogPath: ownerPaths.auditLog };
   }
 
   /**
-   * RR2-B1 (R2-10/11) destination-ownership predicate: `chatId` may be addressed by work running as
-   * `profileId` ONLY when the CURRENT owner record binds that chat to that owner identity.
-   *
-   * Side-effect-free and fail-closed. It reads exactly one thing — the owner record — and never
-   * Router.resolveProfileForChat / getOrCreateDefaultProfile / pairChatToProfile, never the legacy
-   * registry, and never builds or initializes a runtime. No admission authority means FALSE: there is no
-   * implicit default authorization. Lookup failures are logged sanitized and refused.
-   * `job.chatId` is a destination, never authority.
-   *
-   * It previously read `ProfileRegistry.getProfileForChat`. S1 made pairing the only route to a profile,
-   * so nothing ever paired the registry and this returned `false` for the owner's own chat — with
-   * `heartbeat.enabled` defaulting to true, the owner's reminders were inert in the shipped daemon while
-   * still being armed at boot. See `OwnerAdmissionService.ownsDestination`.
+   * Destination-ownership predicate: `chatId` may be addressed by work running as `profileId` only when
+   * the current owner record binds that chat to that owner identity. Side-effect-free and fail-closed:
+   * no admission authority, or a lookup failure (logged sanitized), means false. `job.chatId` is a
+   * destination, never authority.
    */
   private canChatIdAddressProfile(chatId: string, profileId: ProfileId): boolean {
-    // Work dispatched as some OTHER identity may not address this daemon's single owner destination.
-    // Multi-profile activation is parked, so there is exactly one dispatching identity that can pass.
+    // Work dispatched as another identity may not address this daemon's single owner destination.
     if (this.admissionOwnerId !== profileId) return false;
     try {
       return this.admission.ownsDestination(chatId);
@@ -1085,11 +842,9 @@ export class Gateway {
   }
 
   /**
-   * RR2-B1: scheduled dispatch requires an explicit trusted runtime. `owner` is the
-   * ProfileRuntime whose scheduler created/fired this job — every trigger closure captures
-   * its concrete runtime at construction, so `job.chatId` never re-selects a runtime. All
-   * session/turn/scheduler/outcome state stays on the owner; a foreign or unpaired
-   * destination is refused BEFORE any session, tool, model, delivery-policy or channel work.
+   * Scheduled dispatch requires an explicit trusted runtime: `owner` is the runtime whose scheduler
+   * fired this job, and `job.chatId` never re-selects one. A foreign or unpaired destination is
+   * refused before any session, tool, model, delivery-policy or channel work.
    */
   private async handleScheduledJob(
     job: HeartbeatJob,
@@ -1127,15 +882,12 @@ export class Gateway {
       `Prompt: ${job.prompt}`,
     ].join('\n');
 
-    // RR2-B1: the destination can be REASSIGNED while the model runs. Re-check ownership
-    // immediately before channel.send (the delivery gate) and again before recording a
-    // sent/noop outcome, so a mid-turn reassignment is refused and suppressed — never
-    // delivered, never recorded as an honest success, never pushed into retry logic.
+    // The destination can be reassigned while the model runs, so ownership is re-checked before send
+    // and before recording an outcome: a mid-turn reassignment is suppressed, never delivered or
+    // recorded as success.
     let delivered = false;
     try {
-      // RR-STRUCT R-S3b (C-39 for heartbeats): thread the per-occurrence turnId so a
-      // `ledger_record` inside this turn gets a deterministic idempotency key — a
-      // scheduler RETRY of this occurrence dedupes instead of double-writing.
+      // A per-occurrence turnId gives ledger writes a deterministic idempotency key, so a scheduler retry dedupes.
       const turnId = heartbeatTurnId(job);
       const result = await coordinator.runHeartbeat({
         chatId: job.chatId,
@@ -1202,8 +954,7 @@ export class Gateway {
 
   private async reconcileAfterScheduledDelivery(chatId: string, owner: ProfileRuntime): Promise<void> {
     try {
-      // RR2-B1: reconciliation after a scheduled job stays owner-bound. If ownership no
-      // longer holds, skip — never re-resolve a now-foreign chat into another runtime.
+      // Reconciliation stays owner-bound: if ownership no longer holds, skip rather than re-resolve another runtime.
       if (!this.canChatIdAddressProfile(chatId, owner.profileId)) {
         console.warn(
           '[gateway] Skipping post-delivery heartbeat reconciliation: destination is no longer owned by this profile.',
@@ -1217,28 +968,22 @@ export class Gateway {
   }
 
   /**
-   * RR-STRUCT R-S5b: reconcile runs against the runtime OWNING `chatId` — its scheduler +
-   * workspace — never the ambient default. A non-default chat's reconcile writes ONLY that
-   * profile's `HEARTBEATS.md` + scheduler store (the pre-R-S5b early-return for non-default
-   * chats is retired along with the refusal).
+   * Reconcile against the runtime owning `chatId` (its scheduler and workspace), never the ambient
+   * default, so a chat's reconcile only writes that profile's `HEARTBEATS.md` and scheduler store.
    */
   private async reconcileHeartbeatPolicies(chatId: string): Promise<void> {
     if (this.stopping) {
       return;
     }
-    // Sync-first: every already-built profile (boot eager-build, the overwhelming common case)
-    // resolves with ZERO async hops, preserving the exact pre-R-S5b microtask timing the
-    // debounce path is pinned to. The async fallback on-demand builds a profile paired after
-    // boot that was never built (lazy serving). NON-JOB callers only (user-turn reconcile +
-    // debounce + startup): scheduled delivery uses the owner-bound path below.
+    // Sync-first: already-built profiles resolve with no async hop (the debounce path relies on that
+    // timing); the async fallback builds a profile paired after boot. For non-job callers only;
+    // scheduled delivery uses the owner-bound path below.
     const runtime = this.runtimeForChatSync(chatId) ?? await this.runtimeForChat(chatId);
     if (!runtime?.scheduler) {
       return;
     }
-    // RR2-B1: fail-closed, matching the scheduler's createJob guard. An unpaired chat
-    // (or a lookup failure) must not arm policy jobs on the resolved runtime — and the
-    // refusal must degrade here (sanitized warn, no reconcile) instead of propagating a
-    // createJob ownership error through reconcilePolicyJobs' rethrow path.
+    // Fail closed: an unpaired chat (or a lookup failure) must not arm policy jobs. Degrade here with
+    // a sanitized warning instead of propagating a createJob ownership error.
     if (!this.canChatIdAddressProfile(chatId, runtime.profileId)) {
       console.warn('[gateway] Skipping heartbeat policy reconciliation: chat is not owned by the resolving profile.');
       return;
@@ -1247,10 +992,8 @@ export class Gateway {
   }
 
   /**
-   * RR2-B1: the reconcile body, bound to an explicit runtime. Called by
-   * `reconcileAfterScheduledDelivery` with the OWNING runtime (never a chat-derived
-   * re-resolution), and by `reconcileHeartbeatPolicies` for non-job callers (existing
-   * chat-resolution behavior retained there).
+   * The reconcile body, bound to an explicit runtime: the owning runtime after a scheduled delivery,
+   * or the chat-resolved runtime for non-job callers.
    */
   private async reconcileHeartbeatPoliciesOnRuntime(runtime: ProfileRuntime, chatId: string): Promise<void> {
     const scheduler = runtime.scheduler;
@@ -1271,8 +1014,7 @@ export class Gateway {
     if (this.stopping) {
       return;
     }
-    // Synchronous resolve (no async hop): the debounce timer must be scheduled synchronously
-    // so the window's timer semantics hold exactly as pre-R-S5b (fake-timer-pinned).
+    // Resolve synchronously so the debounce timer is scheduled synchronously.
     const runtime = this.runtimeForChatSync(chatId);
     if (!runtime?.scheduler) {
       return;
@@ -1290,19 +1032,14 @@ export class Gateway {
     this.reconcileTimers.set(chatId, timer);
   }
 
-  /**
-   * Kept for the single-runtime/test-double surface (F11 test calls this directly): resolves
-   * the startup-policy chat for the DEFAULT (attached) runtime, exactly as before.
-   */
+  /** Startup-policy chat for the default (attached) runtime; kept for the single-runtime surface. */
   private async resolveStartupPolicyChatId(): Promise<string | undefined> {
     return this.resolveStartupPolicyChatIdFor(this.runtime);
   }
 
   /**
-   * RR-STRUCT R-S5b: startup-policy resolution SCOPED to one profile's runtime — its most
-   * recent session chat or scheduler job belonging to THAT profile (an unpaired/stale chat
-   * belongs to the default only, preserving the F11 no-auto-pair-at-boot invariant for every
-   * profile: this method only READS the registry, never pairs).
+   * Startup-policy chat scoped to one profile's runtime: its most recent session chat or scheduler job.
+   * Only reads; it never pairs a chat at boot.
    */
   private async resolveStartupPolicyChatIdFor(runtime: ProfileRuntime | undefined): Promise<string | undefined> {
     if (!runtime) return undefined;
@@ -1318,10 +1055,8 @@ export class Gateway {
 
   private launchBackgroundReconcile(chatId: string): void {
     if (this.stopping) return;
-    // Track the background op on the OWNING runtime so each profile's shutdown drain accounts
-    // for its own reconciles (falls back to the default-tracked op if unresolvable). The
-    // reconcile itself (`reconcileHeartbeatPolicies`) re-resolves async — this stays sync so
-    // the timer callback's fire-and-track semantics hold under fake timers.
+    // Track on the owning runtime so each profile's shutdown drain accounts for its own reconciles.
+    // Stays synchronous so the timer callback's fire-and-track semantics hold under fake timers.
     const runtime = this.runtimeForChatSync(chatId) ?? this.runtime;
     if (!runtime) return;
     runtime.trackBackgroundOperation('heartbeat reconciliation', () => this.reconcileHeartbeatPolicies(chatId));
@@ -1356,26 +1091,14 @@ export class Gateway {
   }
 
   /**
-   * Build the ONE runtime this daemon serves, from this owner's derived paths and nothing else.
-   *
-   * S1 change (the retirement of the legacy migration branch): this used to branch on
-   * `profileId === defaultProfileId`, call `migrateAndResolveWorkspace` — which copied the workspace
-   * into a registry profile directory and sealed a sentinel — and fall back to `search.db` and
-   * `sessions` paths one level ABOVE the workspace when that sentinel did not match. Since T1,
-   * `config.memory.workspace` already IS `<baseDir>/profiles/<ownerId>`, so the "migration" copied a
-   * directory onto itself, and because the sentinel was keyed on a hash of the SOURCE path while it was
-   * sealed under the DEFAULT profile, the read and the write could never agree: the owner's whole PHI
-   * tree was re-copied on every boot, forever, and the derived database could land outside the lease.
-   *
-   * Every path now comes from one pure derivation over already-validated config. There is no second
-   * authority, no sentinel, no copy, and no path that can exist outside the leased owner workspace.
+   * Build the one runtime this daemon serves. Every path comes from the owner's derived path bundle,
+   * so nothing can exist outside the leased owner workspace.
    */
   private async buildRuntimeFor(profileId: ProfileId): Promise<ProfileRuntime> {
     const { config } = this;
     const ownerPaths = this.ownerPaths();
 
-    // Multi-profile activation is parked for S1. A request for any OTHER identity is refused rather
-    // than silently served from the selected owner's resources.
+    // A request for any other identity is refused rather than served from the owner's resources.
     if (profileId !== ownerPaths.profileId) {
       throw new Error(`Refusing to build a runtime for "${profileId}": this daemon serves owner "${ownerPaths.profileId}".`);
     }
@@ -1406,13 +1129,9 @@ export class Gateway {
       mainProvider: this.mainProvider!,
       createProvider: this.buildProvider,
       semaphore: this.semaphore!,
-      // RR-STRUCT R-S5a: scheduler recovery must not invoke a callback before ProfileRuntime.create
-      // returns. Gateway explicitly initializes the runtime's scheduler AFTER boot
-      // (initializeScheduler), where the concrete runtime exists to capture in the trigger closure and
-      // the destination guard is threaded (RR2-B1).
-      // RR2-B1: no owner-less `runScheduledJob` is passed here — a closure captured at build time
-      // could not bind this runtime, and canSchedule stays false so the direct-factory activation path
-      // (which requires canAddressChat) is not used.
+      // The scheduler is initialized after boot (initializeScheduler), once the concrete runtime exists
+      // to capture in the trigger closure, so recovery cannot invoke a callback before create returns.
+      // canSchedule stays false for the same reason.
       canSchedule: false,
       reconcile: (chatId) => this.debouncedReconcile(chatId),
       sideEffectLookup: (entity) => this.lookupSideEffects(this.sideEffectProvider ?? this.mainProvider!, entity),
@@ -1420,11 +1139,8 @@ export class Gateway {
   }
 
   /**
-   * The single derived-path bundle for the selected owner, computed once.
-   *
-   * `profiles.baseDir` and `defaultProfileId` are required by the schema-v2 decoder, so this cannot
-   * fall back to a default identity or a home-relative path. A hand-built config that omits them is a
-   * caller programming error and throws here rather than inventing a location.
+   * The derived-path bundle for the selected owner, computed once. It never falls back to a default
+   * identity or home-relative path; a config without a valid owner throws.
    */
   private ownerPaths(): OwnerPaths {
     if (this.ownerPathsCache) return this.ownerPathsCache;
@@ -1437,7 +1153,7 @@ export class Gateway {
     return this.ownerPathsCache;
   }
 
-  /** The owner, and only the owner. Multi-profile eager activation is retired in S1. */
+  /** The owner, and only the owner. */
   private pairedProfileIds(): ProfileId[] {
     return [this.ownerPaths().profileId];
   }
@@ -1590,29 +1306,15 @@ export class Gateway {
     return this.runtime?.workspace || this.resolvedMemoryWorkspace || this.config.memory?.workspace || '';
   }
 
-  /**
-   * Owner-scoped incoming media staging.
-   *
-   * S1 change (old -> new): this used to be `~/.redacted/.staging/media` — a HOME-wide location, so
-   * two daemons sharing a home account swept and wrote into the same directory, and the boot sweep
-   * deleted whatever it found there. It is now derived from the selected owner's paths, so staging
-   * cannot exist without the owner whose lease this process holds.
-   */
+  /** Owner-scoped incoming media staging directory, inside the owner's workspace. */
   private mediaStagingDir(): string | undefined {
     const base = this.getEffectiveWorkspace();
     return base ? path.join(base, '.state', 'media-staging') : undefined;
   }
 
   /**
-   * The stager, or `undefined` when no media source was injected. Media is only ever staged through
-   * this, and only after admission.
-   */
-  /**
-   * The trusted ancestor for the staging sweep and adoption: the owner's own workspace.
-   *
-   * Uses the same effective-workspace resolution as the rest of the Gateway, so a configuration
-   * that names no owner workspace yields `undefined` and staging is simply unavailable — rather than
-   * throwing while routing a message.
+   * The trusted ancestor for the staging sweep and adoption: the owner's own workspace. A config that
+   * names no owner workspace yields `undefined`, so staging is unavailable rather than throwing.
    */
   private ownerStagingBase(): string | undefined {
     const base = this.getEffectiveWorkspace();
@@ -1620,18 +1322,9 @@ export class Gateway {
   }
 
   /**
-   * ONE stager for this Gateway, memoised.
-   *
-   * This used to construct `new FsMediaStager(...)` per inbound message. `FsMediaStager` keeps its
-   * `active` / `waiting` / `slotWaiters` counters as INSTANCE fields, and those counters are what gate
-   * the `MEDIA_MAX_ACTIVE = 1` / `MEDIA_MAX_WAITING = 4` module constants. A fresh instance per message
-   * therefore always saw `0 >= 1`, so the concurrency queue never engaged, `wakeSlot()` was a no-op and
-   * the `'queue-full'` refusal was unreachable in production: N simultaneous attachments meant N
-   * simultaneous 10 MB streams against a disk and a network. `media-stager.ts` documented a bound it did
-   * not enforce.
-   *
-   * The bound only bites when concurrent attachments actually happen, so this stayed invisible for as
-   * long as no media source was wired — and would have detonated the moment one was.
+   * The Gateway's one media stager, memoised. Its active/waiting counters implement the intake
+   * concurrency bound, so it must not be rebuilt per message. `undefined` when no media source was
+   * injected; media is only staged through it, and only after admission.
    */
   private mediaStager(): FsMediaStager | undefined {
     const stagingDir = this.mediaStagingDir();
@@ -1679,22 +1372,16 @@ export class Gateway {
       // installation adopt or delete another installation's staged file.
       stagingBaseDir: this.ownerStagingBase(),
       buildBootStatusText: () => this.buildBootStatusText(),
-      // RR-STRUCT R-S5b (mini-plan v3 §3.2): the Router dispatches every turn to the runtime
-      // OWNING the resolved profile. Manager-backed in production; when no manager exists
-      // (the `attachGatewayTestRuntime` test-double seam, which never builds one) every
-      // profileId resolves to the single attached runtime — one resolver-based code path,
-      // both worlds working. Never rejects: a degraded profile yields `undefined` and the
-      // Router emits the canned degraded reply instead of crashing.
+      // Dispatch every turn to the runtime owning the resolved profile. Without a manager (test
+      // double) every profile resolves to the single attached runtime. Never rejects: a degraded
+      // profile yields `undefined` and the Router sends the canned degraded reply.
       resolveRuntime: (profileId) => this.resolveRuntimeForProfile(profileId),
     });
   }
 
   /**
-   * RR-STRUCT R-S5b: the single per-profile runtime accessor every dispatch path funnels
-   * through (message routing via the Router's resolver, scheduled jobs, reconciles).
-   * `manager.get` is a memoized map read (single-flight); a persistently-broken profile
-   * rejects per call (rejection-evict + retry, Finding-7a) and degrades to `undefined`
-   * with a sanitized log — never a throw to the daemon.
+   * The per-profile runtime accessor every dispatch path uses. A persistently broken profile
+   * degrades to `undefined` with a sanitized log, never a throw to the daemon.
    */
   private async resolveRuntimeForProfile(profileId: ProfileId): Promise<ProfileRuntime | undefined> {
     try {
@@ -1710,12 +1397,8 @@ export class Gateway {
   }
 
   /**
-   * The runtime that owns `chatId`, or `undefined`.
-   *
-   * S1 change: this resolved a chat through `ProfileRegistry.getProfileForChat` and, when the chat was
-   * not in the registry, fell back to the DEFAULT profile — "unpaired == default". That fallback is the
-   * silent grant that let any chat select a runtime. Ownership is now the owner RECORD, read through
-   * `canChatIdAddressProfile`, so an unbound chat resolves to nothing.
+   * The runtime that owns `chatId`, or `undefined`. Ownership is the owner record (via
+   * `canChatIdAddressProfile`), so an unbound chat resolves to nothing, never a default profile.
    */
   private async runtimeForChat(chatId: string): Promise<ProfileRuntime | undefined> {
     const ownerPaths = this.ownerPaths();
@@ -1723,11 +1406,7 @@ export class Gateway {
     return this.resolveRuntimeForProfile(ownerPaths.profileId);
   }
 
-  /**
-   * Synchronous twin of `runtimeForChat` for the timer-driven reconcile path (see
-   * `ProfileRuntimeManager.getIfBuilt`): never builds, never awaits — `undefined` means
-   * "nothing to reconcile right now".
-   */
+  /** Synchronous twin of `runtimeForChat` for the timer-driven reconcile path: never builds or awaits. */
   private runtimeForChatSync(chatId: string): ProfileRuntime | undefined {
     const ownerPaths = this.ownerPaths();
     if (!this.canChatIdAddressProfile(chatId, ownerPaths.profileId)) return undefined;
@@ -1735,8 +1414,7 @@ export class Gateway {
     return this.runtime;
   }
 
-  /** Whether `chatId` is a destination this daemon's owner may address. Same authority as
-   *  `canChatIdAddressProfile`: the owner record, fail-closed, never a registry. */
+  /** Whether `chatId` is a destination this daemon's owner may address (the owner record, fail-closed). */
   private chatBelongsToProfile(chatId: string, profileId: ProfileId): boolean {
     return this.canChatIdAddressProfile(chatId, profileId);
   }

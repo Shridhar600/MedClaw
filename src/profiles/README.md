@@ -20,10 +20,8 @@ and a serialized mutation queue that all writers funnel through.
   Every mutation (agent turn, dream, heartbeat, TTL sweep, ledger or memory write) goes
   through this queue to guarantee ordering.
 
-**Retired in S1 (T5):** `ProfileRegistry`. It owned chat→identity resolution, profile CRUD, a
-workspace-migration copy with a sentinel, and a default-profile grant. Each of those duplicated or
-contradicted owner admission, and two of them granted authority. Deleting it is the fix; it is not
-replaced by a shim. See report §11e/§11g.
+**No profile registry:** chat→identity resolution and every grant of authority belong to owner
+admission alone. Nothing else may map a chat to an identity.
 
 **Dependencies:** ports (clock, id-gen), memcore (types only)
 

@@ -12,11 +12,9 @@ import { runServiceOnboarding } from './service-onboarding';
 import type { CliIO } from './prompts';
 
 /**
- * Name a token for an error message WITHOUT echoing a possible value.
- *
- * A single authority for the router: `--name=value` reports `--name`, a long option reports itself,
- * and anything else is not a supported name and is replaced by a placeholder. This is why a pasted
- * secret cannot reach stderr through any refusal in this file. (Cold reviews D1/E3.)
+ * Name a token for an error message WITHOUT echoing a possible value: `--name=value` reports
+ * `--name`, a long option reports itself, and anything else becomes a placeholder. This keeps a
+ * pasted secret off stderr in every refusal in this file.
  */
 function reportToken(token: string | undefined, placeholder: string): string {
   if (token === undefined) return placeholder;
@@ -58,14 +56,9 @@ function helpText(): string {
 }
 
 /**
- * Load the ALREADY-RESOLVED selected configuration. Refuses when the document is unavailable, so no
- * inspection command can fall back to a default identity or report a healthy-empty result.
- *
- * This deliberately takes an absolute, already-selected path rather than an optional flag value.
- * It used to do the selection itself with `flagConfigPath ?? defaultRuntimeConfigPath()`, which is
- * how the environment step got skipped: eight hand-written copies of that expression across this
- * file and `admin.ts` meant any one of them could reintroduce the bug. Selection now happens exactly
- * once, in `runCli`, through the single locked implementation.
+ * Load the already-resolved selected configuration. Refuses when the document is unavailable, so no
+ * inspection command can fall back to a default identity or report a healthy-empty result. Takes an
+ * absolute, already-selected path; selection happens once, in `runCli`.
  */
 async function selectedConfig(resolvedConfigPath: string) {
   return loadRuntimeConfig({ configPath: resolvedConfigPath });
@@ -74,11 +67,8 @@ async function selectedConfig(resolvedConfigPath: string) {
 export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
   const mergedIO = { ...defaultIO(), ...io };
 
-  // Global parsing THROWS on an unknown option or a missing `--config` value. It used to be called
-  // above the try/catch below, so `medclaw --bogus status` rejected the promise instead of
-  // returning a usage exit code — an unhandled rejection for an operator typo (brief §8C).
-  // Both parsing and selection are now inside the guarded region, and both refusals are reported
-  // as exit code 1 with a message, never as a thrown error.
+  // Global parsing THROWS on an unknown option or a missing `--config` value, so parsing and
+  // selection stay inside the guarded region: both refusals return exit code 1 with a message.
   let selectedConfigPath: string;
   let command: string | undefined;
   let commandArgs: string[];
@@ -90,19 +80,11 @@ export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
       return 0;
     }
 
-    // ── THE single point where configuration selection happens ──
-    //
-    // Brief T1 requires `--config > REDACTED_CONFIG_PATH > ~/.redacted/config.json` to apply
-    // "everywhere". It used to be re-derived by hand at eight call sites as
-    // `configPath ?? defaultRuntimeConfigPath()`, which silently skips the environment step: the flag
-    // arrived here, but `REDACTED_CONFIG_PATH` never did. `onboard` compounded it by manufacturing a
-    // `--config` flag containing the default, so a correct selection anywhere downstream could not
-    // recover. The result was a daemon serving one installation while `status`, `config set` and
-    // `pairing issue` read or mutated another.
-    //
-    // Resolved once, here, and passed down explicitly. Every downstream helper now takes a required
-    // resolved path, so there is no second place to get this wrong. `selectConfigPath` also validates
-    // a present-but-empty `--config` and resolves relative values against the cwd.
+    // The single point where configuration selection happens:
+    // `--config > REDACTED_CONFIG_PATH > ~/.redacted/config.json`. It is resolved once here and
+    // passed down explicitly as a required path, so every command reads the same installation the
+    // daemon serves. `selectConfigPath` also validates a present-but-empty `--config` and resolves
+    // relative values against the cwd.
     selectedConfigPath = selectConfigPath({ flagValue: configPath });
 
     [command, ...commandArgs] = rest;
@@ -221,9 +203,8 @@ export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
       return 0;
     }
 
-    // A command name is normally echoed so the operator sees the typo. An OPTION-shaped first token
-    // (reached via `medclaw -- --api-key=...`) is not a command name and may be a pasted secret, so
-    // only its name is reported. (Cold re-review residual echo.)
+    // A command name is normally echoed so the operator sees the typo. An option-shaped first token
+    // (reached via `medclaw -- --api-key=...`) may be a pasted secret, so only its name is reported.
     const reportedCommand = command.startsWith('-')
       ? (command.includes('=') ? command.slice(0, command.indexOf('=')) : '(option-shaped token)')
       : command;

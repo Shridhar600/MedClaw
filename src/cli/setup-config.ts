@@ -1,15 +1,10 @@
 // src/cli/setup-config.ts
 //
-// Setup's argument parsing and configuration/artifact building, extracted so the wizard and the
-// service entry point stop importing each other (plan 15 §2.4). `service-onboarding.ts` no longer
-// needs a dynamic import of the wizard, and `setup-wizard.ts` no longer imports the service —
-// the grandfathered cycle in `.dependency-cruiser.cjs` can go away.
+// Setup's argument parsing and configuration/artifact building. It does no prompting and no
+// daemon launch; those stay in the wizard and the service entry.
 //
-// Identity is chosen HERE and nowhere else. The state root defaults to the selected config file's
-// directory, the owner ID defaults to `default`, and every owner path is DERIVED from that pair.
-//
-// This module does no prompting and no daemon launch. Those stay in the wizard and the service
-// entry.
+// Identity is chosen here and nowhere else: the state root defaults to the selected config file's
+// directory, the owner ID defaults to `default`, and every owner path is derived from that pair.
 
 import * as os from 'os';
 import * as path from 'path';
@@ -35,14 +30,13 @@ export interface ServiceOnboardingArgs {
   provider?: ProviderConfig['type'];
   mainModel?: string;
   medicalModel?: string;
-  // forka #11: the medical model resolves INDEPENDENTLY of the main provider and
-  // defaults to on-device Ollama medgemma (privacy + health-specialized). Set
-  // --medical-provider to opt into a cloud medical model.
+  // The medical model resolves independently of the main provider and defaults to on-device
+  // Ollama medgemma. Set --medical-provider to opt into a cloud medical model.
   medicalProvider?: ProviderConfig['type'];
   /** Medical role only; never inherited from the main key. */
   medicalApiKey?: string;
-  // R05 (plan 15 §2.4): embeddings are an INDEPENDENT selection. Defaults stay local Ollama even
-  // when main is cloud; an explicit embedding provider/model/url/key overrides only this role.
+  // Embeddings are an independent selection. They default to local Ollama even when main is cloud;
+  // an explicit embedding option overrides only this role.
   embeddingModel?: string;
   embeddingProvider?: ProviderConfig['type'];
   embeddingUrl?: string;
@@ -82,14 +76,9 @@ export function isSupportedOnboardingProvider(
 }
 
 /**
- * A required option value.
- *
- * Refuses a missing value, an empty/blank value, and a value that is itself an option — the three
- * ways `--config --yes` or a trailing `--config` used to be accepted as a value. The FIELD NAME is
- * reported, never the supplied text, because the value may be a secret (brief §8C).
- *
- * Exported so the setup ENTRY point applies the same rule to the config pair it forwards, instead of
- * growing its own weaker check (C04-P02). One policy, one implementation.
+ * A required option value. Refuses a missing, blank or option-shaped value (`--config --yes`).
+ * Reports the field name, never the supplied text, because the value may be a secret.
+ * Exported so the setup entry point applies the same rule to the config pair it forwards.
  */
 export function requireOptionValue(token: string, value: string | undefined): string {
   if (value === undefined || value.startsWith('-')) {
@@ -103,14 +92,8 @@ export function requireOptionValue(token: string, value: string | undefined): st
 
 /**
  * An explicit provider selection must name a supported provider, at parse time.
- *
- * The refusal names the ROLE and the option that must change, and lists the supported choices. It
- * never repeats the supplied value: a pasted key is a realistic `--provider` value, and printing it
- * back writes a secret into the terminal and into any captured log (C04-P01).
- *
- * The message PREFIX for each role is unchanged from the pre-existing refusal, so the assertions
- * already pinned to `Unsupported onboard provider` / `… medical provider` / `… embedding provider`
- * keep holding; only the value interpolation is gone.
+ * The refusal names the role and the option and lists the choices. It never repeats the supplied
+ * value: a pasted key is a realistic mistake and would reach the terminal and captured logs.
  */
 function parseProviderOption(
   token: '--provider' | '--medical-provider' | '--embedding-provider',
@@ -132,11 +115,8 @@ function parseProviderOption(
 }
 
 /**
- * An explicit endpoint must be an absolute http(s) URL.
- *
- * Exported because the wizard asks for the same endpoint interactively and must apply the SAME
- * rule — a second copy of this check in the wizard would be a second policy for the same contract.
- * Returns the accepted value, or throws a message naming only the option.
+ * An explicit endpoint must be an absolute http(s) URL. Exported so the wizard applies the same
+ * rule to its interactive prompt. Throws a message naming only the option.
  */
 export function requireHttpEndpoint(token: string, raw: string | undefined): string {
   const value = raw?.trim() ?? '';
@@ -163,25 +143,19 @@ function parseBoolean(token: string, value: string | undefined): boolean {
   const normalized = (value ?? '').trim().toLowerCase();
   if (['true', '1', 'yes', 'y', 'on'].includes(normalized)) return true;
   if (['false', '0', 'no', 'n', 'off'].includes(normalized)) return false;
-  // Reports the option name only. The old message interpolated the supplied text, which is a
-  // secret-bearing path for `--telegram-enabled`-adjacent usage and violates the no-values rule.
+  // Report the option name only; the supplied text may be a secret.
   throw new Error(`${token} requires one of: true, false, yes, no, on, off, 1, 0.`);
 }
 
 /**
- * STRICT setup argument parsing.
- *
- * Every rejection here happens before the wizard, before any lease, directory, template, record or
- * config write (brief §8C):
- *  - an unknown option is refused instead of silently ignored (R06 / SOL-05);
- *  - an unexpected bare token is refused;
- *  - a missing, blank, or option-shaped value is refused, so a trailing `--config` can no longer
- *    erase the globally selected target and silently fall back to the home default;
- *  - a required value that is itself an option (`--config --yes`) is refused;
+ * Strict setup argument parsing. Every rejection happens before the wizard and before any lease,
+ * directory, template, record or config write:
+ *  - an unknown option or an unexpected bare token is refused;
+ *  - a missing, blank or option-shaped value is refused;
  *  - explicit provider, boolean and URL values are validated here, not at first use.
  *
- * Errors name the FIELD or the reason only. A supplied value is never echoed, because
- * `--api-key`, `--medical-api-key`, `--embedding-api-key` and `--telegram-token` are secret-bearing options.
+ * Errors name the field or the reason only. A supplied value is never echoed, because
+ * `--api-key`, `--medical-api-key`, `--embedding-api-key` and `--telegram-token` carry secrets.
  */
 export function parseArgs(argv: string[]): ServiceOnboardingArgs {
   const args: ServiceOnboardingArgs = {};
@@ -191,9 +165,8 @@ export function parseArgs(argv: string[]): ServiceOnboardingArgs {
       continue;
     }
     if (!token.startsWith('--')) {
-      // Names the POSITION, never the text. An operator who forgets `--api-key` and pastes the key
-      // as a positional argument would otherwise have the secret written to stderr and into any
-      // captured log. (Cold-review finding 2 — this branch previously echoed the token verbatim.)
+      // Name the position, never the text: a key pasted as a positional argument must not reach
+      // stderr or captured logs.
       throw new Error(
         `Unexpected argument at position ${index + 1}: setup takes options only.`
         + ' Run `medclaw onboard --help`.',
@@ -278,8 +251,7 @@ export function parseArgs(argv: string[]): ServiceOnboardingArgs {
         index += 1;
         break;
       default: {
-        // Report only the option NAME. An operator who wrote `--api-key=sk-...` must not have the
-        // secret echoed back: everything after the first '=' is a value. (Cold re-review D1.)
+        // Report only the option name. Everything after the first '=' is a value and may be a secret.
         const name = token.includes('=') ? token.slice(0, token.indexOf('=')) : token;
         throw new Error(
           `Unknown option: ${name}. Run \`medclaw onboard --help\` for the supported options.`,
@@ -324,9 +296,7 @@ export const ONBOARD_HELP_TEXT = [
   '  --heartbeats-enabled <true|false>',
 ].join('\n') + '\n';
 
-// forka #11: the default on-device medical model + Ollama URL, used whenever the
-// medical provider resolves to Ollama (which is the default, independent of the
-// main provider).
+// Default on-device medical model, used whenever the medical provider resolves to Ollama.
 function defaultMedgemmaModel(): string {
   return getDefaultConfig().providers.medical.model;
 }
@@ -337,16 +307,13 @@ function localOllamaUrl(): string {
 }
 
 /**
- * Build ONE provider role from its own explicit inputs.
- *
- * R05 replaced a single `applyProvider` that wrote main and embeddings together, which is what made
- * cloud main silently move embeddings to cloud and copied `--api-key` into every role. Each role is
- * now resolved from its own provider/model/endpoint/key, so nothing can leak sideways between them.
+ * Build one provider role from its own explicit inputs, so nothing leaks sideways between roles
+ * (for example a cloud main moving embeddings to cloud, or `--api-key` reaching every role).
  *
  * Endpoint precedence, per role:
  *  - an explicit role endpoint wins;
  *  - otherwise a local role uses `--ollama-url` (or the local default) and a cloud role uses its
- *    own provider default — never the local fallback, never another role's endpoint.
+ *    own provider default, never the local fallback or another role's endpoint.
  */
 function buildProviderRole(options: {
   providerType: ProviderConfig['type'];
@@ -374,9 +341,7 @@ function buildProviderRole(options: {
     model: model ?? defaultModel,
   };
 
-  // A blank endpoint means "not supplied", never "persist an empty string". The interactive wizard
-  // can produce one (an operator pressing Enter at the endpoint prompt), and persisting `""` wrote a
-  // meaningless field the decoder then dropped on reload.
+  // A blank endpoint means "not supplied", never "persist an empty string".
   const explicit = explicitBaseUrl?.trim() === '' ? undefined : explicitBaseUrl;
 
   if (providerType === 'ollama') {
@@ -405,12 +370,8 @@ export function resolveEmbeddingProvider(
 }
 
 /**
- * Apply all three roles independently (plan 15 §2.4: "Main provider and embeddings are independent
- * choices").
- *
- * Main keeps its existing defaults. Embeddings default to the local Ollama default even when main
- * is cloud — that default is the R05 fix, not an omission. Medical stays on-device medgemma by
- * default, independently of main (forka #11).
+ * Apply all three roles independently. Main keeps its defaults. Embeddings default to local Ollama
+ * even when main is cloud. Medical stays on-device medgemma by default, independent of main.
  */
 function applyProviders(
   config: EffectiveConfig,
@@ -444,9 +405,8 @@ function applyProviders(
     pinsRouterEndpoint: embeddingType === 'openrouter',
   });
 
-  // forka #11: medical resolves INDEPENDENTLY of the main provider and defaults
-  // to on-device Ollama medgemma — the health-specialized model, kept local for
-  // the core privacy promise. Opt out with --medical-provider (+ --medical-model).
+  // Medical resolves independently of the main provider and defaults to on-device Ollama medgemma,
+  // kept local for privacy. Opt out with --medical-provider (+ --medical-model).
   const medicalType = args.medicalProvider ?? 'ollama';
   config.providers.medical = buildProviderRole({
     providerType: medicalType,
@@ -467,8 +427,7 @@ export function modelDefaultsForProvider(providerType: ProviderConfig['type']): 
   medical: string;
   embeddings: string;
 } {
-  // forka #11: medical defaults to on-device medgemma independent of the main
-  // provider, so it is the same for cloud and Ollama here.
+  // Medical defaults to on-device medgemma regardless of the main provider.
   const medical = getDefaultConfig().providers.medical.model;
   if (providerType === 'openrouter') {
     return {
@@ -536,11 +495,8 @@ export function resolveSetupValues(args: ServiceOnboardingArgs): ResolvedSetupVa
 
 /**
  * Validate an owner ID with the same grammar the config decoder uses, so setup cannot write an
- * identity that would later be refused.
- *
- * The refusal names the option and the grammar it must satisfy, never the supplied text. An
- * operator who pastes a credential instead of an id would otherwise have it printed back to the
- * terminal and into any captured log (C04-P01).
+ * identity that would later be refused. The refusal names the option and the grammar, never the
+ * supplied text, because a pasted credential must not be printed back or logged.
  */
 export function requireOwnerId(raw: string): ProfileId {
   const ownerId = asProfileId(raw.trim());
@@ -558,9 +514,7 @@ export function resolveNonInteractiveArgs(args: ServiceOnboardingArgs): ServiceO
   const defaults = getDefaultConfig();
   const values = resolveSetupValues(args);
   const providerDefaults = modelDefaultsForProvider(values.providerType);
-  // R05: the embedding role resolves from its OWN selection and its OWN provider defaults. It used
-  // to take `providerDefaults.embeddings` — the MAIN provider's cloud defaults — which is what made
-  // cloud main silently move embeddings to cloud.
+  // The embedding role resolves from its own selection and its own provider defaults.
   const embeddingType = resolveEmbeddingProvider(args);
   const embeddingDefaults = modelDefaultsForProvider(embeddingType);
 
@@ -576,9 +530,8 @@ export function resolveNonInteractiveArgs(args: ServiceOnboardingArgs): ServiceO
     medicalApiKey: args.medicalApiKey?.trim() ? args.medicalApiKey.trim() : undefined,
     embeddingProvider: embeddingType,
     embeddingModel: args.embeddingModel ?? embeddingDefaults.embeddings,
-    // An explicit embedding endpoint survives resolution untouched. `--ollama-url` stays the LOCAL
-    // control and is applied inside `buildProviderRole`, never here, so a cloud embedding role can
-    // never inherit it.
+    // An explicit embedding endpoint survives untouched. `--ollama-url` is the LOCAL control and is
+    // applied inside `buildProviderRole`, so a cloud embedding role never inherits it.
     embeddingUrl: args.embeddingUrl,
     embeddingApiKey: args.embeddingApiKey?.trim() ? args.embeddingApiKey.trim() : undefined,
     ollamaUrl:
@@ -592,13 +545,9 @@ export function resolveNonInteractiveArgs(args: ServiceOnboardingArgs): ServiceO
 }
 
 /**
- * Select the owner identity and derive every owner path from it.
- *
- * Setup is the only place identity is chosen. The state root is the selected config file's
- * directory, and the owner workspace, scheduler store and audit log are derived from it, so
- * the document has one path authority and setup can never inherit the operator's real home
- * directory. T3 replaces this with the lease-owned `InstallationService.setup()` and adds the
- * explicit `--state-root` / `--owner-id` selection; the derivation itself does not change.
+ * Select the owner identity and derive every owner path from it. Setup is the only place identity
+ * is chosen. The owner workspace, scheduler store and audit log are derived from the state root,
+ * so setup can never inherit the operator's real home directory.
  */
 export function buildConfigFromArgs(inputArgs: ServiceOnboardingArgs): EffectiveConfig {
   const args = resolveNonInteractiveArgs(inputArgs);
@@ -639,7 +588,7 @@ export function createInitialWizardState(args: ServiceOnboardingArgs): SetupWiza
     medicalModel: resolved.medicalModel ?? defaults.providers.medical.model,
     medicalProvider: resolved.medicalProvider ?? 'ollama',
     medicalApiKey: resolved.medicalApiKey,
-    // R05: seeded from the EMBEDDING role's own selection, defaulting to the local Ollama role.
+    // Seeded from the embedding role's own selection, defaulting to the local Ollama role.
     embeddingProvider:
       resolved.embeddingProvider && isSupportedOnboardingProvider(resolved.embeddingProvider)
         ? resolved.embeddingProvider
@@ -664,8 +613,8 @@ export function collectSetupErrors(args: ServiceOnboardingArgs, config: Effectiv
     errors.push('--medical-model is required for a cloud medical provider. Select a model supported by that provider.');
   }
 
-  // Per-role credential requirement. Each CLOUD role is satisfied by ITS OWN explicit key or ITS
-  // OWN provider's environment variable — never by the other role's explicit key.
+  // Per-role credential requirement. Each cloud role is satisfied by its own explicit key or its
+  // own provider's environment variable, never by another role's key.
   const embeddingType = resolveEmbeddingProvider(args);
   const requiredCloudRoles: Array<{ label: string; type: ProviderConfig['type']; explicitKey?: string; flag: string }> = [
     { label: 'provider', type: values.providerType, explicitKey: args.apiKey, flag: 'api-key' },
@@ -692,18 +641,9 @@ export function collectSetupErrors(args: ServiceOnboardingArgs, config: Effectiv
 }
 
 /**
- * Commit a new installation by calling the lease-owning writer.
- *
- * This function used to do the work itself: an `assertFreshInstallation` CHECK, then templates, then
- * the owner record, then the config document — all holding **no lease at all**. Nothing stopped that
- * from committing a second installation beside a running daemon (which holds both leases), or from
- * letting two concurrent setups both pass the check. The locked rule in plan 15 §2.2 is that
- * "short-lived setup/config/pairing writers hold both until their commit/refusal completes", so the
- * sequence now lives in `InstallationService.setup()`, which acquires the config lease, then the
- * owner workspace lease, decides freshness UNDER BOTH, and releases only what it acquired.
- *
- * Kept as a function because both callers need it: the service entry and the wizard's retry loop.
- * It stays a thin adapter — CLI in, CLI error text out — so no writer logic is reintroduced here.
+ * Commit a new installation through the lease-owning writer, `InstallationService.setup()`. It
+ * takes the config and owner-workspace leases, decides freshness under both, and releases only
+ * what it acquired. This stays a thin adapter (CLI in, CLI error text out) with no writer logic.
  */
 export async function persistSetupArtifacts(configPath: string, config: EffectiveConfig): Promise<void> {
   const ownerId = asProfileId(config.profiles.defaultProfileId);
@@ -716,9 +656,8 @@ export async function persistSetupArtifacts(configPath: string, config: Effectiv
   const outcome = await new InstallationService(new DirectoryLease()).setup({ configPath, config, ownerId });
 
   if (outcome.kind === 'committed') return;
-  // Every non-commit result is a refusal with operator-facing guidance already attached. Throwing
-  // keeps both existing callers unchanged: the service entry prints it, and the wizard's retry loop
-  // catches it, reports it and lets the operator adjust the target.
+  // Every non-commit result is a refusal with operator guidance attached; throw it so callers
+  // print it or let the wizard's retry loop report it.
   throw new Error(describeSetupRefusal(outcome));
 }
 
@@ -733,8 +672,8 @@ function describeSetupRefusal(outcome: SetupResult): string {
     case 'incomplete':
       return outcome.message;
     default:
-      // Unreachable: the caller returns on `committed` before reaching here. Stated rather than
-      // left implicit so a future variant cannot silently report a success as a refusal.
+      // Unreachable: the caller returns on `committed` first. Stated so a future variant cannot
+      // silently report a success as a refusal.
       return 'Setup refused: the installation was not committed.';
   }
 }

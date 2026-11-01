@@ -40,8 +40,8 @@ export const EMERGENCY_RESPONSE =
   'This may be an emergency. Please contact local emergency services now or go to the nearest emergency department. If you can, ask someone nearby to stay with you while you get help.'
   + MEDICAL_DISCLAIMER;
 
-// RR2-A2: code-owned complete-statement denials. An explicit denial suppresses the
-// matching built-in trigger only when the ENTIRE normalized message equals one of
+// Code-owned complete-statement denials. An explicit denial suppresses the
+// matching built-in trigger only when the entire normalized message equals one of
 // these forms. This is intentionally conservative: suffixes, second sentences,
 // uncertainty, mixed intent, quotations, historical accounts and third-party
 // quotations never qualify, so those inputs still escalate. Never treat `not`,

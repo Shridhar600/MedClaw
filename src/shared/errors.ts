@@ -18,9 +18,9 @@ export class NotImplementedError extends AppError {
 /**
  * A MedClaw-generated media/report validation error (unsupported file, extension/MIME mismatch,
  * no renderable pages, provider not vision-capable, raw-media policy). Its message describes the
- * FILE or CONFIG — never health content — so it is safe to echo to the user. This TYPE is how the
- * medical tools tell a self-generated validation error (echo it) apart from a raw provider error
- * (never echo — it can carry PHI from the prompt). See medical-tools `buildReportErrorMessage` (F-2).
+ * file or config, never health content, so it is safe to echo to the user. The medical tools use
+ * this type to tell it apart from a raw provider error, which must never be echoed because it can
+ * carry PHI from the prompt.
  */
 export class MediaValidationError extends AppError {
   constructor(message: string) {
@@ -110,18 +110,13 @@ export class InvariantViolationError extends AppError {
 }
 
 /**
- * RR-STRUCT R-S4 (mini-plan v3 §3.9): a write was refused because the owning `ProfileRuntime`
- * has progressed past the safe point of its `running -> stopping -> closed` shutdown sequence
- * (its SQLite handles are closed). This is the EXPECTED, HANDLED outcome of a straggler/abandoned
- * write racing shutdown — never an unhandled crash against a closed native handle. Thrown by
- * `MutationCoordinator.enqueue/mutate/selfHeal` (src/capture) and `SessionManager.recordTurn/
- * recordPromptUsage/runCompaction` (src/gateway), both gated on `ProfileRuntime.isClosed()`.
- * Lives here (not in mutation-coordinator.ts, where `ReentrantMutationError` lives) because BOTH
- * `src/capture` (v2-core) and `src/gateway` (legacy) must be able to import it without a
- * module-law violation (`v2-core-boundary` in .dependency-cruiser.cjs permits v2-core modules to
- * import only from `src/ports/`, `src/shared/`, their own directory, and external packages).
- * `label` is a PHI-free operation/lane name (a tool/method label, never health content) — safe to
- * log and safe to surface in a tool-result error string.
+ * A write was refused because the owning `ProfileRuntime` is past the safe point of its shutdown
+ * sequence (its SQLite handles are closed). This is the expected, handled outcome of a straggler
+ * write racing shutdown, never a crash against a closed native handle. Thrown by the capture
+ * mutation coordinator and the session manager, both gated on `ProfileRuntime.isClosed()`.
+ * Lives in `src/shared` so both `src/capture` and `src/gateway` can import it within the module
+ * boundary rules. `label` is a PHI-free operation or lane name, safe to log and to show in a
+ * tool-result error string.
  */
 export class DaemonShutdownError extends AppError {
   constructor(public readonly label: string) {

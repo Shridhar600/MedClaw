@@ -1,19 +1,16 @@
 // src/memcore/curated-memory.ts
 //
-// MEMORY.md — the curated narrative memory with a hard character budget (specs/07 §7;
-// plan Task 6). Category budgets are independent: Health 60% / Life 20% / Agent notes 20%
-// of the injected `budgetChars`. Writes are FAIL-LOUD: an over-budget append throws
-// `BudgetExceededError{section, gauge, currentEntries}` and writes nothing — the engine
-// NEVER auto-evicts across categories and NEVER evicts a health entry to fit a non-health
-// one (CHAT-02/CHAT-05). The model merges in-turn via `replace()` after the tool relays
-// `currentEntries` (D6). "Clinical merged last" ordering is a P3 L1-manual instruction —
-// P1 asserts only engine properties (D6/F11).
+// MEMORY.md — the curated narrative memory with a hard character budget. Category budgets are independent:
+// Health 60% / Life 20% / Agent notes 20% of the injected `budgetChars`. Writes fail loudly: an over-budget
+// append throws `BudgetExceededError{section, gauge, currentEntries}` and writes nothing. The engine never
+// auto-evicts across categories and never evicts a health entry to fit a non-health one. The model merges
+// in-turn via `replace()` after the tool relays `currentEntries`.
 //
 // The gauge line is auto-maintained in each section heading:
 //   ## Health <!-- 1320/1320 chars used (100%) -->
 //
-// Corrupt-file reads degrade to empty sections + sanitized warn, preserving any salvageable
-// raw bytes in a <!-- PARSE-ERROR --> quarantine note (D2/F24). Never crashes.
+// Corrupt-file reads degrade to empty sections plus a sanitized warning, preserving any salvageable raw bytes
+// in a <!-- PARSE-ERROR --> quarantine note. Never crashes.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -32,10 +29,9 @@ export interface CuratedMemoryOptions {
   /** Total MEMORY.md budget in characters; split across the three sections by {@link budgetRatios}. */
   budgetChars: number;
   /**
-   * Per-section share of `budgetChars` (E1.4 — sourced from `config.memory.budgetRatios`). Any
-   * missing or non-positive entry falls back to the 60/20/20 default. Changing the shares only
-   * resizes the per-section budgets — the no-cross-category + health-never-evicted invariants stay
-   * code-enforced (CHAT-02/05).
+   * Per-section share of `budgetChars`, sourced from `config.memory.budgetRatios`. A missing or non-positive
+   * entry falls back to the 60/20/20 default. Changing the shares only resizes the per-section budgets; the
+   * no-cross-category and health-never-evicted invariants stay code-enforced.
    */
   budgetRatios?: Partial<Record<MemorySection, number>>;
 }
@@ -92,9 +88,9 @@ export class CuratedMemory {
     return Math.floor(this.opts.budgetChars * this.sectionShare(section));
   }
 
-  /** The H1 budget-line ratio summary, rendered from the effective shares (e.g. "health 60% / …"). */
+  /** The budget-line ratio summary for the title heading, rendered from the effective shares (e.g. "health 60% / …"). */
   private ratioSummary(): string {
-    // Short section keys (health/life/agent) — matches the historic H1 label, not SECTION_DISPLAY.
+    // Short section keys (health/life/agent), not SECTION_DISPLAY.
     return SECTION_ORDER.map(s => `${s} ${Math.round(this.sectionShare(s) * 100)}%`).join(' / ');
   }
 
@@ -115,8 +111,8 @@ export class CuratedMemory {
   }
 
   /**
-   * Replace a section's entries wholesale with the given set (the D6 in-turn merge path).
-   * Also fail-loud when the merged set still exceeds the budget.
+   * Replace a section's entries wholesale with the given set (the in-turn merge path).
+   * Also fails loudly when the merged set still exceeds the budget.
    */
   async replace(section: MemorySection, entries: string[]): Promise<string[]> {
     const { items } = this.load();
@@ -340,9 +336,8 @@ export class CuratedMemory {
   }
 
   /**
-   * Load the current file, degrading on corrupt read (D2/F24): sanitized warn + fresh
-   * skeleton, preserving any salvageable raw bytes in a PARSE-ERROR quarantine note.
-   * Never crashes.
+   * Load the current file, degrading on a corrupt read: sanitized warning + fresh skeleton, preserving any
+   * salvageable raw bytes in a PARSE-ERROR quarantine note. Never crashes.
    */
   private load(): { items: ParsedItem[] } {
     const fp = this.filePath();

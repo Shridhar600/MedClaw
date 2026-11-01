@@ -1,9 +1,8 @@
 // src/profiles/write-queue.ts
 //
-// Per-profile single-writer queue. Every memory mutation funnels through one
-// serialized promise-chain so two writes never interleave on the same profile
-// (PLAT-03, amendment B2). Inbound-turn ops outrank background ops (a user is
-// waiting; heartbeats/dreaming are not). Journal failures are advisory: they
+// Per-profile single-writer queue. Every memory mutation funnels through one serialized promise
+// chain so two writes never interleave on the same profile. Inbound-turn ops outrank background
+// ops (a user is waiting; heartbeats and dreaming are not). Journal failures are advisory: they
 // degrade recovery visibility but never block the source operation.
 
 import * as fs from 'fs';
@@ -14,7 +13,7 @@ import { secureAppend, secureWriteViaTmp, summarizeErrorForLog } from '../securi
 
 export type WritePriority = 'turn' | 'background';
 
-/** A unit of work. `run()` MUST be IO-only — never an LLM call (amendment B2). */
+/** A unit of work. `run()` must be IO-only, never an LLM call. */
 export interface WriteOp<T> {
   label: string;
   /** PHI-free affected-lane name, for recovery diagnostics. */
@@ -54,7 +53,7 @@ export interface JournalCommitRecord {
 export type JournalRecord = JournalBeginRecord | JournalCommitRecord;
 
 type ParsedJournalRecord = JournalRecord & {
-  /** True when this record came from the pre-RR-6b tab-separated format. */
+  /** True when this record came from the tab-separated line format. */
   legacy?: boolean;
 };
 
@@ -93,7 +92,7 @@ function parseJournalLine(line: string): ParsedJournalRecord {
     }
     if (phase === 'commit' && typeof parsed.id === 'string') return { phase: 'commit', id: parsed.id };
   } catch {
-    // Fall through to the legacy line parser. A malformed line remains visible to reconciliation.
+    // Fall through to the line parser. A malformed line remains visible to reconciliation.
   }
 
   const sep = line.indexOf('\t');
@@ -169,9 +168,9 @@ export async function reconcileJournal(
 }
 
 /**
- * Compatibility recovery entry point. Legacy tab-separated journals retain their old clear-on-success
- * behavior. RR-6b JSON journals are append-only: this function surfaces unresolved begins but leaves the
- * records in place, because a callback that only rebuilds projections cannot prove the source committed.
+ * Recovery entry point. Tab-separated journals are cleared on success. JSON journals are
+ * append-only: this function surfaces unresolved begins but leaves the records in place, because a
+ * callback that only rebuilds projections cannot prove the source committed.
  */
 export async function replayJournal(
   journalPath: string,

@@ -1,8 +1,8 @@
 // src/ports/media-source.ts
 //
-// The media boundary (plan 15 §2.5). Interface-only: no app module imports.
+// The media boundary. Interface-only: no app module imports.
 //
-// The split matters and is the whole point of this file:
+// The split is the whole point of this file:
 //
 //   the TRANSPORT emits an opaque `MediaReference` — an identity, never bytes;
 //   the CORE decides admission first, and only then asks a `MediaSourcePort` to open a stream.
@@ -69,7 +69,7 @@ export type MediaStageResult =
   | { kind: 'refused'; reason: MediaStageReason };
 
 /**
- * Typed owning-module limits (plan 15 §2.5). Deliberately constants, not setup knobs: they are
+ * Typed owning-module limits. Deliberately constants, not setup knobs: they are
  * safety bounds, and an operator tuning them by hand is how they stop being safety bounds.
  */
 export const MEDIA_MAX_FILE_BYTES = 10 * 1024 * 1024;

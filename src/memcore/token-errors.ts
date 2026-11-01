@@ -1,10 +1,5 @@
-// src/memcore/token-errors.ts
-//
-// Typed rejection for confirmation-token failures (W-C/D PPHI fix). The raw
-// Error messages interpolated entity names (health content) which previously
-// leaked into persisted session JSONL via the ledger_update catch. Carries a
-// FIXED-VOCABULARY reason only — never entity names, field values, or raw
-// provider/error text.
+// Typed rejection for confirmation-token failures. Carries a fixed-vocabulary reason only: never
+// entity names, field values, or raw provider/error text (PHI must not reach session logs).
 
 /** Safe rejection reasons — fixed vocabulary, PHI-free by construction. */
 export type TokenRejectionReason =

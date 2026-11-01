@@ -8,13 +8,9 @@ const workerGlobal = globalThis as unknown as { Worker?: typeof Worker };
 workerGlobal.Worker ??= Worker;
 
 /**
- * `pdf-parse` is loaded LAZILY, on first actual PDF extraction.
- *
- * A top-level `import` pulled pdfjs (and its worker/CustomGC bookkeeping) into every process that
- * merely imported this module — which is every test that touches report processing, whether or not
- * it ever parses a PDF. That left Jest holding an open handle after green and made the whole suite
- * appear to hang. Loading it on demand means a run that never parses a PDF never creates the handle,
- * and a run that does still gets the real parser.
+ * `pdf-parse` is loaded lazily, on first PDF extraction. A top-level import would pull pdfjs
+ * (and its worker bookkeeping) into every process that imports this module, leaving an open
+ * handle in runs that never parse a PDF.
  */
 let pdfParseModule: Promise<typeof import('pdf-parse')> | undefined;
 

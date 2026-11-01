@@ -1,15 +1,14 @@
 import { InvariantViolationError } from '../shared/errors';
 
 /**
- * Boot-time safety invariant (D9 / PLAT-04 / PLAT-05).
+ * Boot-time safety invariant.
  *
- * The assembled system prompt MUST contain a non-empty SAFETY.md verbatim and in full —
- * never truncated, never partially injected. This is a pure guard: no I/O, no clock.
+ * The assembled system prompt must contain a non-empty SAFETY.md verbatim and in full: never
+ * truncated, never partially injected. This is a pure guard: no I/O, no clock.
  *
- * - Empty / whitespace-only / null / undefined safety content -> no-op (PLAT-04: empty SAFETY.md
- *   is allowed and skipped).
- * - Non-empty content that is not a substring of the prompt -> throw (PLAT-05: partial or missing
- *   injection is a hard failure; the caller aborts the turn/boot). medical-safety > resilience.
+ * - Empty, whitespace-only, null or undefined safety content is a no-op (an empty SAFETY.md is allowed).
+ * - Non-empty content that is not a substring of the prompt throws. Partial or missing injection is
+ *   a hard failure and the caller aborts the turn/boot; medical safety outranks resilience.
  */
 export function assertSafetyInjected(
   assembledPrompt: string,

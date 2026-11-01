@@ -494,12 +494,11 @@ type AbortableChatProvider = Pick<LLMProvider, 'chat'> & {
   chatWithSignal?: (messages: Message[], tools: ToolSchema[] | undefined, signal: AbortSignal) => Promise<LLMResponse>;
 };
 
-// #3: config/reachability checks over-report OK — a key-present but
-// subscription-blocked, invalid, or tool-incapable model still looks "ready".
-// This makes ONE real, tool-bearing completion call and maps the outcome to a
-// ReadinessResult. It NEVER throws (a failed probe is a health signal, not a
-// crash) and NEVER surfaces the raw provider error (PHI posture — the reason is
-// a fixed string + reasonCode, the prompt carries no user content).
+// Readiness probe: config and reachability checks can over-report OK (a key-present but
+// subscription-blocked, invalid, or tool-incapable model still looks ready), so this makes one
+// real tool-bearing completion call and maps the outcome to a ReadinessResult. It never throws (a
+// failed probe is a health signal) and never surfaces the raw provider error (PHI posture: the
+// reason is a fixed string plus reasonCode, and the prompt carries no user content).
 export async function probeChatCompletion(
   provider: Pick<LLMProvider, 'chat'>,
   options: { timeoutMs?: number; label?: string; signal?: AbortSignal } = {},

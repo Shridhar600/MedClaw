@@ -23,9 +23,8 @@ export type CompletionAction = 'start' | 'review-config' | 'exit';
 export interface SetupWizardState {
   configPath: string;
   /**
-   * Owner state root — the ONLY path the owner chooses. The workspace, scheduler store, audit log,
-   * transcript directory, media staging and owner record are all derived from it plus `ownerId`,
-   * so there is no second path authority to disagree with.
+   * Owner state root, the only path the owner chooses. The workspace, scheduler store, audit log,
+   * transcript directory, media staging and owner record are all derived from it plus `ownerId`.
    */
   stateRoot: string;
   /** Owner identity, validated with the config decoder's grammar. */
@@ -37,8 +36,8 @@ export interface SetupWizardState {
   medicalProvider?: ProviderConfig['type'];
   medicalApiKey?: string;
   /**
-   * The EMBEDDING role's own selection (plan 15 §2.4). Independent of `provider`: a cloud main
-   * provider must not silently move embeddings to cloud. Defaults to the local Ollama role.
+   * The embedding role's own selection. Independent of `provider`: a cloud main provider must not
+   * silently move embeddings to cloud. Defaults to the local Ollama role.
    */
   embeddingProvider: ProviderConfig['type'];
   embeddingModel: string;

@@ -3,16 +3,15 @@
 // The enrollment state machine. One owner record, explicit phases, an in-memory per-chat daily
 // pairing allowance, and no silent path to a clinical turn.
 //
-// Two hard rules shape everything here:
+// Two rules shape everything here:
 //
-//  1. **Configuration never grants a transport address.** Identity and paths come from config;
-//     who may talk to this owner comes from the record's binding. They are separate authorities.
-//  2. **A record that cannot be understood refuses.** Missing, unreadable, corrupt, wrong-owner
+//  1. Configuration never grants a transport address. Identity and paths come from config;
+//     who may talk to this owner comes from the record's binding.
+//  2. A record that cannot be understood refuses. Missing, unreadable, corrupt, wrong-owner
 //     and bound-to-someone-else all refuse. None of them is "a fresh installation".
 //
-// No file access, no clock, no crypto and no config import lives here: those arrive as the
-// `OwnerStatePort`, `PairingCodePort`, `Clock` and a plain `expectedOwnerId` string, which keeps
-// this module inside the v2-core boundary (`.dependency-cruiser.cjs` rule `v2-core-boundary`).
+// No file access, clock, crypto or config import lives here: those arrive as the `OwnerStatePort`,
+// `PairingCodePort`, `Clock` and a plain `expectedOwnerId` string (see the `v2-core-boundary` rule).
 
 import type { Clock } from '../ports/clock';
 import {
@@ -57,8 +56,7 @@ function isProgressOutcome(kind: PairingResult['kind']): kind is 'paired' | 'alr
   return kind === 'paired' || kind === 'already-paired' || kind === 'prompt';
 }
 
-// ── Canned copy ──────────────────────────────────────────────────────────────────────────
-// Pairing is never a health answer, and none of these mention health state.
+// Canned copy. Pairing is never a health answer, and none of these mention health state.
 
 export const PAIRING_PROMPT_TEXT =
   'This is a private health assistant for one person. To connect your chat, send the ' +
@@ -111,20 +109,13 @@ export interface OwnerAdmissionDeps {
   clock: Clock;
   /** The configured owner identity. Plain string: this module must not import the config layer. */
   expectedOwnerId: string;
-  /**
-   * The closed diagnostic contract from `ports/diagnostics`. Optional only so that a caller which
-   * genuinely has no sink (a CLI admin inspection, a test asserting a refusal text) is not forced to
-   * write one; the default is silence, never a stdout print.
-   */
+  /** Diagnostic sink. Optional; the default is silence, never a stdout print. */
   diagnostics?: DiagnosticSink;
   /** Optional for tests that must not print to stdout. */
   log?: (message: string) => void;
 }
 
-/**
- * Boot-time answer, with no inbound identity involved. A daemon needs this BEFORE it can decide
- * whether it may build anything at all.
- */
+/** Boot-time answer, with no inbound identity. The daemon needs it before it builds anything. */
 export type InstallationAdmission =
   | { kind: 'bound'; ownerId: string }
   /** Owner exists but is not paired yet: pairing and emergency only, no clinical runtime. */
@@ -134,10 +125,8 @@ export type InstallationAdmission =
 export type IssueChallengeResult =
   | { kind: 'issued'; plaintext: string; expiresAt: string }
   /**
-   * `writeReason` is present only when the record COULD be read and the replacement was refused
-   * before publication. It carries the closed `OwnerWriteReason` rather than collapsing into
-   * `unavailable`, which is the word for "the record could not be read" — a different fault the
-   * operator acts on differently.
+   * `writeReason` is present only when the record could be read and the replacement was refused
+   * before publication. `unavailable` means the record could not be read: a different fault.
    */
   | {
       kind: 'refused';
@@ -146,24 +135,15 @@ export type IssueChallengeResult =
     };
 
 /**
- * What `initialize()` actually achieved. Four different facts, never collapsed into two.
+ * What `initialize()` achieved.
  *
- * - `created`: published AND confirmed.
+ * - `created`: published and confirmed.
  * - `exists`: a readable record was already there, so nothing was written.
- * - `unavailable`: an existing record could not be READ. That is owner evidence setup must refuse
- *   rather than repair.
- * - `refused`: nothing was published and nothing pre-existed. A write that demonstrably did not
- *   happen is not "the record is unavailable", and reporting it as such sent the operator to choose a
- *   fresh target for a target that was already fresh.
+ * - `unavailable`: an existing record could not be read. Setup must refuse rather than repair it.
+ * - `refused`: nothing was published and nothing pre-existed.
  * - `uncertain`: it may be published, with confirmation incomplete.
- *
- * `created` used to be reported unconditionally from an ignored replacement result, so a first run
- * whose record write failed printed "setup complete", committed the configuration document, and left a
- * daemon that refused to start (S1 C03/R02).
  */
 export type InitializeResult = 'created' | 'exists' | 'unavailable' | 'refused' | 'uncertain';
-
-// ── Transport identity validation ─────────────────────────────────────────────────────────
 
 /** A code submission is only considered when it is exactly the trimmed, upcased alphabet form. */
 function normalizeSubmission(text: string): string | undefined {
@@ -180,9 +160,7 @@ export function isWellFormedSubmission(text: string): boolean {
 }
 
 function transportIdentityProblem(identity: TransportIdentity): AdmissionReason | undefined {
-  // `chatType` was the one required identity field with no presence check here, and the one field the
-  // normaliser used to fabricate a value for. Omitting it is a missing required field, so it is
-  // refused as such — never upgraded to a private chat.
+  // A missing chatType is refused, never upgraded to a private chat.
   if (identity.chatType === undefined) return 'missing-transport-identity';
 
   const fields: [string, number][] = [
@@ -205,14 +183,11 @@ function bindingMatches(identity: TransportIdentity, binding: OwnerBinding): boo
     && identity.userId === binding.senderId;
 }
 
-// ── The service ──────────────────────────────────────────────────────────────────────────
-
 export class OwnerAdmissionService {
   /**
-   * Serializes every mutation of the record. Supported cross-process writers are already
-   * excluded by the owner workspace lease (plan 15 §2.2), so this only has to order this
-   * process's own attempts — but it must do so *around the read that computes the reserve*,
-   * or two concurrent attempts could each see allowance remaining.
+   * Serializes every mutation of the record. The owner workspace lease already excludes other
+   * processes, so this only orders this process's attempts. It must cover the read that computes
+   * the allowance, or two concurrent attempts could each see allowance remaining.
    */
   private tail: Promise<unknown> = Promise.resolve();
 
@@ -220,12 +195,7 @@ export class OwnerAdmissionService {
   private allowanceDay = '';
   private readonly allowance = new Map<string, CandidateAttempts>();
 
-  /**
-   * The sink every event in this module goes through, guarded once at construction.
-   *
-   * Guarding here rather than at each call site means a future caller cannot forget: there is one
-   * `emit`, and it cannot throw into the admission decision.
-   */
+  /** Every event goes through this sink, guarded once at construction so it cannot throw into a decision. */
   private readonly sink: DiagnosticSink;
 
   constructor(private readonly deps: OwnerAdmissionDeps) {
@@ -271,12 +241,8 @@ export class OwnerAdmissionService {
   }
 
   /**
-   * The admission decision itself, with no diagnostic side effect.
-   *
-   * Split out from `inspect` so that the decision has exactly one place that computes it and exactly
-   * one place that reports it. Emitting from inside the decision's own branches would mean a new
-   * early return could silently skip its diagnostic — and a refusal nobody recorded is the one event
-   * an operator actually needs.
+   * The admission decision itself, with no diagnostic side effect. Reporting happens in one place
+   * (`inspect`), so a new early return cannot skip its diagnostic.
    */
   private decide(identity: TransportIdentity): AdmissionDecision {
     const read = this.deps.store.read();
@@ -310,21 +276,11 @@ export class OwnerAdmissionService {
   }
 
   /**
-   * Whether this chat is the bound owner's addressable destination for SCHEDULED work.
+   * Whether this chat is the bound owner's addressable destination for scheduled work.
    *
-   * This is the authority the RR2-B1 destination guard must consult. It used to read
-   * `ProfileRegistry.getProfileForChat`, but S1 made pairing the ONLY way to reach a profile, so nothing
-   * ever paired the registry — the predicate returned `false` for the owner's own chat, and with
-   * `heartbeat.enabled` defaulting to true the owner's entire reminder subsystem was inert in the shipped
-   * daemon, silently. Jobs were still ARMED at boot for a destination that was then always refused.
-   *
-   * The invariant is unchanged and still fail-closed: a destination is authorized only by the CURRENT
-   * binding, re-read at the moment of the check (never cached), and an unreadable, missing,
-   * wrong-owner or not-yet-bound record authorizes nothing. `job.chatId` is a destination, never authority.
-   *
-   * `channel` is deliberately not compared. A scheduled job addresses a chat id, and the binding's channel
-   * records how that chat was paired; requiring both would silently refuse a legitimate job if the binding
-   * were ever re-paired on another transport.
+   * Fail-closed: only the current binding authorizes a destination, re-read at the moment of the
+   * check (never cached). An unreadable, missing, wrong-owner or not-yet-bound record authorizes
+   * nothing. `channel` is deliberately not compared: a job addresses a chat id.
    */
   ownsDestination(chatId: string): boolean {
     if (typeof chatId !== 'string' || chatId.length === 0) return false;
@@ -336,16 +292,11 @@ export class OwnerAdmissionService {
   }
 
   /**
-   * True only when this exact inbound event is the one that established the current binding — i.e. a
+   * True only when this exact inbound event is the one that established the current binding, i.e. a
    * genuine redelivery of the owner's pairing message.
    *
-   * This exists because the owner-side "is this a re-delivered code?" shortcut used to match the pairing
-   * *alphabet* alone. That alphabet is 32 symbols, so ordinary eight-letter health words qualify:
-   * `headache`, `diabetes`, `insomnia`, `swelling`, `dizziness`, `vomiting`, `weakness`, `appetite`,
-   * `coughing`. Each was answered "pairing complete" and silently dropped — never answered, never
-   * recorded, never shown to the model. Requiring the recorded pairing event id means a redelivery is
-   * still handled as pairing, and anything else from the owner is narrative.
-   *
+   * Matching the event id, not the code alphabet, matters: ordinary eight-letter health words
+   * (`headache`, `diabetes`) fit the alphabet and must reach the model as narrative.
    * Fails closed: an unreadable record is not a pairing event.
    */
   isRedeliveredPairingEvent(identity: TransportIdentity): boolean {
@@ -359,19 +310,12 @@ export class OwnerAdmissionService {
   async handlePairing(identity: TransportIdentity, text: string): Promise<PairingResult> {
     const startedAt = this.deps.clock.now().getTime();
     const { result, reason } = await this.pair(identity, text);
-    // Only `kind` and the diagnostic reason are emitted. `boundOwnerId` is an identifier and stays out
-    // of diagnostics; a chat id or owner id in a log line is both a disclosure and a rate-limit oracle.
+    // Only `kind` and the reason are emitted. A chat id or owner id in a log line would disclose it.
     this.emit(this.pairingEvent(result.kind, reason, startedAt));
     return result;
   }
 
-  /**
-   * The pairing state machine itself, with no diagnostic side effect.
-   *
-   * Split from `handlePairing` so the outcome is reported from one place instead of fifteen `finish()`
-   * branches. A new refusal branch cannot forget to report itself, and cannot accidentally report a
-   * different outcome than the one it returned.
-   */
+  /** The pairing state machine itself. `handlePairing` reports its outcome from one place. */
   private async pair(
     identity: TransportIdentity,
     text: string,
@@ -499,7 +443,7 @@ export class OwnerAdmissionService {
       return { kind: 'refused', reason: 'unavailable' };
     }
     if (state.phase === 'bound') {
-      // Rebinding or removing an owner is not supported in S1.
+      // Rebinding or removing an owner is not supported.
       return { kind: 'refused', reason: 'already-bound' };
     }
 
@@ -517,23 +461,17 @@ export class OwnerAdmissionService {
       return { kind: 'issued', plaintext: issued.plaintext, expiresAt };
     }
     if (committed.kind === 'failed') {
-      // Nothing was published, so the record still holds the previous code. `unavailable`, NOT
-      // `uncertain`: reporting a definite refusal as unconfirmed would tell the operator to inspect a
-      // record that provably did not change, which is the false "the previous record is unchanged"
-      // claim this result exists to prevent. The specific cause travels as `writeReason`.
+      // Nothing was published, so the record still holds the previous code. This is `unavailable`,
+      // not `uncertain`. The specific cause travels as `writeReason`.
       return { kind: 'refused', reason: 'unavailable', writeReason: committed.reason };
     }
-    // The stored challenge exists but its plaintext is unrecoverable by design, so say so rather than
-    // printing a code that does not match the record. Reissue to get a usable one.
+    // The stored challenge may exist but its plaintext is unrecoverable by design. Reissue for a usable code.
     return { kind: 'refused', reason: 'uncertain' };
   }
 
   /**
    * Create the initial unpaired record when none exists. Used by setup only.
-   *
-   * `created` is reported ONLY for a confirmed publication. Every other outcome is propagated, because
-   * a caller that publishes a configuration document on top of a record that may not exist produces
-   * an installation that refuses to start and reports itself complete.
+   * `created` is reported only for a confirmed publication; every other outcome is propagated.
    */
   async initialize(): Promise<InitializeResult> {
     const read = this.deps.store.read();
@@ -547,15 +485,7 @@ export class OwnerAdmissionService {
 
   /**
    * Publish a whole record and reduce the port's typed result to what policy needs.
-   *
-   * This used to infer the outcome from an errno — `EACCES`/`EPERM`/`EROFS`/`ENOSPC`/`EIO` were read
-   * as "the write demonstrably did not happen" and everything else as uncertain. That inference was
-   * wrong on the side that matters: those codes are raised after a rename has already landed, so a
-   * confirmed refusal could be reported for a record that was in fact replaced. The port now states
-   * which side of the rename failed, so policy only maps it.
-   *
-   * A THROW is still tolerated and mapped to `uncertain`, which is the only honest reading of an
-   * unacknowledged call, but it is no longer the mechanism publication truth depends on.
+   * The port states which side of the rename failed. A throw is mapped to `uncertain`.
    */
   private async replace(
     next: OwnerState,
@@ -580,13 +510,8 @@ export class OwnerAdmissionService {
   }
 
   /**
-   * Build a pairing result.
-   *
-   * `reason` carries why a non-progress outcome failed. It has a DEFAULT, so the parameter type enforces
-   * nothing here — an earlier version of this comment claimed it did, and that was false. What actually
-   * enforces a reason is `pairingEvent`, which cannot build a refusal variant without one, and review of
-   * the call sites below. Every refusal branch passes its cause explicitly; the default exists only so a
-   * future progress branch can be added without inventing a reason.
+   * Build a pairing result. `reason` says why a non-progress outcome failed; every refusal branch
+   * passes it explicitly. The default exists only for progress branches.
    */
   private finish(
     kind: PairingResult['kind'],
@@ -616,12 +541,8 @@ export class OwnerAdmissionService {
   }
 
   /**
-   * Emit through the guarded sink.
-   *
-   * The guard is applied HERE, at the single point every event in this module passes through, rather
-   * than trusting each caller to wrap its own adapter. `emit` runs inside the admission decision, so
-   * an adapter that throws would otherwise be reachable from a stranger's message and would turn a
-   * logging fault into a denial of service.
+   * Emit through the guarded sink. It runs inside the admission decision, so a throwing adapter
+   * must not be reachable from a stranger's message.
    */
   private emit(event: DiagnosticEvent): void {
     this.sink.emit(event);

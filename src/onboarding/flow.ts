@@ -24,9 +24,8 @@ export class OnboardingFlow {
   }
 
   async handle(input: string): Promise<OnboardingResult> {
-    // RR2-A2 raw-input boundary: check the raw input BEFORE the onboarding
-    // sanitizer discards metadata-like lines — those lines can be user-authored
-    // crisis text. The sanitizer still applies to ordinary onboarding answers.
+    // Check the raw input BEFORE the onboarding sanitizer discards metadata-like lines, which can
+    // be user-authored crisis text. The sanitizer still applies to ordinary onboarding answers.
     if (isEmergencyInput(input, this.emergencyKeywords)) {
       return {
         bypass: true,
@@ -80,7 +79,7 @@ export class OnboardingFlow {
 
     switch (state.currentStep) {
       case 'name': {
-        // I1: a sentence-length blob is not a name — re-ask instead of storing it.
+        // A sentence-length blob is not a name; re-ask instead of storing it.
         if (!isPlausibleName(answer)) {
           return { response: 'Sorry, that seems too long to be a name. What should I call you?' };
         }
@@ -90,7 +89,7 @@ export class OnboardingFlow {
         break;
       }
       case 'age': {
-        // I1: an age must contain a plausible number; otherwise stay on this step.
+        // An age must contain a plausible number; otherwise stay on this step.
         if (!isPlausibleAge(answer)) {
           return { response: 'Sorry, I could not catch a valid age there. What is your age in years? (for example: 56)' };
         }
@@ -100,10 +99,9 @@ export class OnboardingFlow {
         break;
       }
       case 'timezone': {
-        // forka #5: don't store the raw phrase as the timezone. Affirmative or
-        // empty → keep the offered default. Otherwise accept the answer only if
-        // it is a valid IANA zone; if it's a phrase like "yes Asia/Kolkata is
-        // right", recover the valid zone token from it; else keep the default.
+        // Do not store the raw phrase as the timezone. An affirmative or empty answer keeps the
+        // offered default. Otherwise accept a valid IANA zone, recover one from a phrase like
+        // "yes Asia/Kolkata is right", or keep the default.
         const trimmed = answer.trim();
         const fallback = answers.timezone ?? this.defaultTimezone;
         if (isAffirmative(trimmed) || trimmed === '') {
@@ -228,17 +226,16 @@ function isAffirmative(input: string): boolean {
   return /^(yes|y|correct|confirm|ok|okay)$/i.test(input.trim());
 }
 
-// I1: a name is short — reject sentence-length blobs (health facts, questions)
-// from occupying the name slot. 6 words / 60 chars covers "Rajesh Kumar Sharma".
+// A name is short: reject sentence-length blobs (health facts, questions) from occupying the name
+// slot. 6 words / 60 chars covers "Rajesh Kumar Sharma".
 function isPlausibleName(answer: string): boolean {
   const trimmed = answer.trim();
   if (trimmed.length === 0 || trimmed.length > 60) return false;
   return trimmed.split(/\s+/).length <= 6;
 }
 
-// I1: an age must contain a human-plausible number (1-120), optionally with
-// trailing words ("56 saal", "55-60 range"). The raw answer is still what gets
-// stored — validation only gates the step.
+// An age must contain a human-plausible number (1-120), optionally with trailing words ("56 saal",
+// "55-60 range"). The raw answer is still what gets stored; validation only gates the step.
 function isPlausibleAge(answer: string): boolean {
   const match = answer.match(/\d{1,3}/);
   if (!match) return false;
@@ -246,8 +243,7 @@ function isPlausibleAge(answer: string): boolean {
   return n >= 1 && n <= 120;
 }
 
-// forka #5: validate an IANA timezone without a dependency — Intl throws a
-// RangeError for an unknown zone.
+// Validate an IANA timezone without a dependency: Intl throws a RangeError for an unknown zone.
 function isValidTimezone(tz: string): boolean {
   if (!tz || /\s/.test(tz)) return false;
   try {

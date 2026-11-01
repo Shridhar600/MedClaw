@@ -1,4 +1,4 @@
-// Public surface of the config policy layer (specs/16 §1: everything else is private).
+// Public surface of the config policy layer; everything else is private.
 // No filesystem access lives behind this barrel.
 export { CONFIG_SCHEMA_VERSION } from './types';
 export type {

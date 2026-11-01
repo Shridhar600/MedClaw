@@ -1,11 +1,11 @@
 // src/scheduler/transcript-sweep-job.ts
 //
-// D4.4 — the nightly transcript-sweep runner. Deterministic, NO LLM. Reads yesterday's session
-// day-file lines + yesterday's ledger entities via injected seams, runs the pure `sweep`
-// (src/memcore), and persists the bounded result to the curiosity queue. Best-effort throughout:
-// any I/O failure logs sanitized and continues — a sweep must never crash the daemon (resilience).
+// The nightly transcript-sweep runner. Deterministic, no LLM. Reads yesterday's session day-file
+// lines and yesterday's ledger entities via injected seams, runs the pure `sweep` (src/memcore), and
+// persists the bounded result to the curiosity queue. Best effort throughout: any I/O failure logs
+// sanitized and continues, because a sweep must never crash the daemon.
 //
-// The collaborators are injected as small function ports so this runner stays decoupled from the
+// Collaborators are injected as small function ports so this runner stays decoupled from the
 // SessionManager / FactMirror / CuriosityQueue internals (the Gateway composes the real accessors).
 
 import { sweep } from '../memcore';
@@ -48,8 +48,8 @@ export interface LedgerDayRead {
 export async function runNightlySweep(deps: NightlySweepDeps): Promise<NightlySweepResult> {
   try {
     const now = deps.now ? deps.now() : new Date();
-    // now − 24h always lands on the previous UTC calendar day (UTC has no DST); the injected
-    // accessors derive the day-file key from it (shared UTC dateKey, A-H3).
+    // now - 24h always lands on the previous UTC calendar day (UTC has no DST); the injected
+    // accessors derive the day-file key from it.
     const yesterday = new Date(now.getTime() - DAY_MS);
 
     const [dayFileLines, ledgerRead, existingCuriosity] = await Promise.all([

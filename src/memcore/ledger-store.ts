@@ -302,19 +302,16 @@ export class LedgerStore {
   }
 
   /**
-   * M-6 reverse-link stamping (E1.2). For every fact that declares `replaces`/`corrects: <ref>`,
-   * stamp the reciprocal `replacedBy`/`correctedBy` on the TARGET fact. `ref` resolves by fact id
-   * first, else by entity name → the target entity's head AS OF the source fact's `createdAt`.
+   * Stamp the reciprocal `replacedBy`/`correctedBy` on the target of every fact that declares
+   * `replaces`/`corrects: <ref>`. `ref` resolves by fact id first, else by entity name to the target
+   * entity's head as of the source fact's `createdAt`.
    *
-   * H-2 (Wave E panel): the as-of anchor is what keeps this STABLE across re-runs. reconcile fires at
-   * every write, so a bare-name reverse link must always resolve to the same target — anchoring to the
-   * declaring fact's time means a version of the target created LATER (a discontinue/restart) can never
-   * become the target, so an unrelated later write can't migrate the link onto a fresh active head.
+   * The as-of anchor keeps re-runs stable: reconcile fires on every write, and a version of the target
+   * created later (a discontinue/restart) must never become the link target.
    *
-   * Runs at the single write chokepoint, so applied/confirm/discontinue paths all get it. Idempotent
-   * + self-healing. TYPE-SCOPED (cross-type reverse links are a documented deferral). M-1: the reverse
-   * field is single-valued — when two facts both replace one target, the last same-file source in
-   * array (append) order wins (the forward links preserve the full graph; documented conscious choice).
+   * Runs at the single write chokepoint, so applied/confirm/discontinue paths all get it. Idempotent,
+   * self-healing and type-scoped. The reverse field is single-valued: when two facts replace one
+   * target, the last same-file source in append order wins.
    */
   private static resolveByName(facts: LedgerFact[], entity: string, source: LedgerFact): LedgerFact | undefined {
     const byEntity = new Map<string, LedgerFact[]>();
@@ -378,8 +375,8 @@ export class LedgerStore {
   }
 
   private activeVersion(facts: LedgerFact[], entity: string): LedgerFact | null {
-    // M-5: v0 facts are parse-error quarantine sentinels (createParseErrorFact) — never real
-    // active facts. Exclude them so a corrupt block cannot surface as a ghost active fact.
+    // v0 facts are parse-error quarantine sentinels, never real active facts. Exclude them so a
+    // corrupt block cannot surface as a ghost active fact.
     const active = facts.filter(f => f.entity === entity && f.status === 'active' && f.version >= 1);
     if (active.length === 0) return null;
     if (active.length > 1) throw new Error('multiple-active-versions');
@@ -395,8 +392,8 @@ export class LedgerStore {
   }
 
   private conflictsWith(cur: LedgerFact, fields: Record<string, string | number | string[]>): boolean {
-    // Compare CANONICAL forms (INJ-b): a stored number and its re-typed string
-    // twin are the same value after one Markdown round-trip — never a conflict.
+    // Compare canonical forms: a stored number and its re-typed string twin are the same value
+    // after one Markdown round-trip, never a conflict.
     const canonicalCur = canonicalFields(cur.fields);
     for (const [key, value] of Object.entries(fields)) {
       if (key in canonicalCur) {
@@ -416,10 +413,9 @@ export class LedgerStore {
     fieldsOverride?: Record<string, string | number | string[]>,
     preserveCurrentProvenance = false,
   ): LedgerFact {
-    // SB-2 (specs/07 §5 merge-update): a superseding version MERGES the prior active/paused
-    // fact's fields with the proposal — a non-conflicting add or a single-key change must never
-    // silently DROP carried fields (dose, known_side_effects, started). An explicit fieldsOverride
-    // (dispute head A, paused-carry, confirm-write) already carries the intended merged set.
+    // A superseding version merges the prior active/paused fact's fields with the proposal, so a
+    // non-conflicting add or single-key change never drops carried fields (dose, known_side_effects,
+    // started). An explicit fieldsOverride already carries the intended merged set.
     const fields = fieldsOverride
       ? fieldsOverride
       : (current ? { ...current.fields, ...params.fields } : { ...params.fields });
@@ -445,9 +441,9 @@ export class LedgerStore {
       status,
       fields,
       provenance: pf,
-      // Medications and allergies are ALWAYS safety-relevant — the SAFETY.md net and
-      // the retract/discontinue confirmation must never depend on a caller/model flag
-      // (medical-safety). Other types honor the caller's flag as before.
+      // Medications and allergies are always safety-relevant: the SAFETY.md net and the
+      // retract/discontinue confirmation must not depend on a caller/model flag. Other types honor
+      // the caller's flag.
       safetyRelevant: isMedOrAllergy(params.type) || current?.safetyRelevant === true || params.safetyRelevant === true,
       episodeId: params.episodeId ?? current?.episodeId,
       language: params.language ?? current?.language ?? 'en',
@@ -491,7 +487,7 @@ export class LedgerStore {
       const v = this.nextVersion(allFacts, p.entity);
       const proposed = this.makeFact(p, v, 'paused', now, cur, fields);
       const changeHash = hash(`${p.entity}:${p.type}:${JSON.stringify(canonicalFields(p.fields))}`);
-      // CH: snapshot the current fact so confirm() can detect state drift.
+      // Snapshot the current fact so confirm() can detect state drift.
       const baselineCurHash = factSnapshotHash(cur);
       const token = makeToken(p.entity, changeHash, this.clock.now().getTime());
       this.tokens.set(token.uuid, { token, op: { kind: 'write', ...p, fields, baselineCurHash }, used: false });
@@ -500,8 +496,8 @@ export class LedgerStore {
 
     if (!active) {
       // cur is paused and resume was requested: supersede the paused version with an active one.
-      // H-1: resuming a med/allergy STILL requires confirmation — the resume flag must never
-      // bypass the med-class gate (medical-safety), matching every other conflicting med path.
+      // Resuming a med/allergy still requires confirmation: the resume flag must never bypass the
+      // med-class gate, matching every other conflicting med path.
       if (isMedOrAllergy(p.type)) {
         const v = this.nextVersion(allFacts, p.entity);
         const proposed = this.makeFact(p, v, 'active', now, cur);
@@ -533,9 +529,8 @@ export class LedgerStore {
     const provRank = AUTHORITY_RANK[p.provenance.source];
     const curRank = AUTHORITY_RANK[active.provenance.source];
 
-    // AR / C2: authority-rank auto-apply NEVER applies to med/allergy facts — a
-    // conflicting change to a safety-class fact routes to needs-confirmation
-    // regardless of provenance rank (specs/13 A5/A6 posture; medical-safety).
+    // Authority-rank auto-apply never applies to med/allergy facts: a conflicting change to a
+    // safety-class fact always needs confirmation, regardless of provenance rank.
     if (provRank > curRank && !isMedOrAllergy(p.type)) {
       const v = this.nextVersion(allFacts, p.entity);
       active.status = 'superseded';
@@ -549,11 +544,10 @@ export class LedgerStore {
       const vA = this.nextVersion(allFacts, p.entity);
       const vB = vA + 1;
       active.status = 'disputed';
-      // DS (SB-3): the two heads must carry the two COMPETING values.
-      // Head A = the NEW claim, preserving prior fields (known_side_effects etc.).
+      // The two heads carry the two competing values. Head A = the new claim, preserving prior fields.
       const disputeA = this.makeFact(p, vA, 'disputed', now, active, { ...active.fields, ...p.fields });
-      // Head B = the OLD active claim re-presented — its OWN fields + provenance,
-      // so the user can restore it verbatim.
+      // Head B = the old active claim re-presented with its own fields and provenance, so the user
+      // can restore it verbatim.
       const disputeB: LedgerFact = {
         ...active,
         id: `${p.entity}@v${vB}`,
@@ -578,7 +572,7 @@ export class LedgerStore {
       const v = this.nextVersion(allFacts, p.entity);
       const proposed = this.makeFact(p, v, 'active', now, active);
       const changeHash = hash(`${p.entity}:${p.type}:${JSON.stringify(canonicalFields(p.fields))}`);
-      // CH: snapshot the current fact so confirm() can detect state drift.
+      // Snapshot the current fact so confirm() can detect state drift.
       const baselineCurHash = factSnapshotHash(active);
       const token = makeToken(p.entity, changeHash, this.clock.now().getTime());
       this.tokens.set(token.uuid, { token, op: { kind: 'write', ...p, fields: p.fields, baselineCurHash }, used: false });
@@ -695,9 +689,8 @@ export class LedgerStore {
   }
 
   /**
-   * Discontinue the active version of an entity. Med/allergy discontinuation is
-   * a safety-critical change → NEEDS_CONFIRM (amendment A6 posture). Non-med types
-   * apply directly. No active version → idempotent noop.
+   * Discontinue the active version of an entity. Med/allergy discontinuation is a safety-critical
+   * change and needs confirmation; other types apply directly. No active version is an idempotent noop.
    */
   async discontinue(
     entity: string, type: FactType, provenance: Provenance,
@@ -751,9 +744,9 @@ export class LedgerStore {
   }
 
   /**
-   * Restart a previously discontinued entity as a NEW active version carrying
-   * `restartOf` = the discontinued version's id (amendment A6). Med/allergy →
-   * NEEDS_CONFIRM. Already-active or nothing-discontinued → idempotent noop.
+   * Restart a previously discontinued entity as a new active version carrying `restartOf` = the
+   * discontinued version's id. Med/allergy needs confirmation. Already-active or
+   * nothing-discontinued is an idempotent noop.
    */
   async restart(
     entity: string, type: FactType, provenance: Provenance,
@@ -782,9 +775,7 @@ export class LedgerStore {
   }
 
   /**
-   * Pause the active version, carrying a `pre_pause_summary` (amendment A2). The
-   * A2 supersession-carry (recordFact on a paused entity) already works — this is
-   * the missing public entry point. No active version → idempotent noop.
+   * Pause the active version, carrying a `pre_pause_summary`. No active version is an idempotent noop.
    */
   async pause(
     entity: string, type: FactType, provenance: Provenance,
@@ -860,9 +851,8 @@ export class LedgerStore {
   }
 
   /**
-   * Explicitly burn a token WITHOUT applying its op (user declined). The token
-   * becomes unusable immediately (MED-9/DT) instead of lingering for its full
-   * 15-minute window. Idempotent.
+   * Explicitly burn a token without applying its op (user declined), so it becomes unusable
+   * immediately instead of lingering for its full 15-minute window. Idempotent.
    */
   declineToken(tokenId: string): void {
     const stored = this.tokens.get(tokenId);
@@ -898,8 +888,8 @@ export class LedgerStore {
     }
 
     const op = stored.op;
-    // TB (SB-12): the token is marked used only AFTER the op succeeds — a failed
-    // apply (transient IO, state drift) leaves it valid so the user can retry.
+    // The token is marked used only after the op succeeds: a failed apply (transient IO, state
+    // drift) leaves it valid so the user can retry.
     try {
       const fact = await this.applyConfirmOp(op, options);
       stored.used = true;
@@ -917,25 +907,24 @@ export class LedgerStore {
   private async applyConfirmOp(op: PendingOp, options?: { winningVersion?: number }): Promise<LedgerFact> {
     if (op.kind === 'write') {
       const allFacts = await this.readForChange(op.type);
-      // Resolve the current version as active OR paused (a paused-entity update
-      // has no active version — mirrors recordFact). Without this the paused-carry
-      // branch below is unreachable and confirm() rejects (A2).
+      // Resolve the current version as active or paused (a paused-entity update has no active
+      // version, mirroring recordFact). Without this the paused-carry branch below is unreachable.
       const cur = this.activeVersion(allFacts, op.entity) ?? this.pausedVersion(allFacts, op.entity);
       if (!cur) throw new TokenRejectedError('no-active-version');
-      // CH (M2/M3-sec): reject a stale token whose target state moved since the
-      // proposal — confirming blind would clobber a newer legitimate change.
+      // Reject a stale token whose target state moved since the proposal: confirming blind would
+      // clobber a newer legitimate change.
       if (op.baselineCurHash !== undefined
         && factSnapshotHash(cur) !== op.baselineCurHash) {
         throw new TokenRejectedError('state-moved-since-proposal');
       }
       const now = this.clock.now().toISOString();
       const v = this.nextVersion(allFacts, op.entity);
-      // A confirmed resume (op.resume) reactivates a paused fact → 'active'; a plain paused-entity
-      // update stays 'paused' (H-1: resume is gated for meds but still resumes on confirm).
+      // A confirmed resume (op.resume) reactivates a paused fact to 'active'; a plain paused-entity
+      // update stays 'paused'.
       const targetStatus: FactStatus = (cur.status === 'paused' && !op.resume) ? 'paused' : 'active';
-      // SB-2: merge the confirmed proposal onto the current fact's fields so the applied head
-      // retains carried fields (known_side_effects etc.) — the proposal's keys win. This also
-      // subsumes the paused pre_pause_summary carry (kept below as belt-and-braces).
+      // Merge the confirmed proposal onto the current fact's fields so the applied head retains
+      // carried fields (known_side_effects etc.); the proposal's keys win. Also covers the paused
+      // pre_pause_summary carry (kept below as belt-and-braces).
       const writeFields = { ...cur.fields, ...op.fields };
 
       if (cur.status === 'paused'
@@ -957,8 +946,8 @@ export class LedgerStore {
         verbatim: op.verbatim,
         visibility: op.visibility,
         resume: op.resume,
-        // E1.2: carry the cross-entity links so the confirmed fact keeps its forward link and the
-        // reverse link gets stamped on the target (writeFacts → reconcileReverseLinks).
+        // Carry the cross-entity links so the confirmed fact keeps its forward link and the reverse
+        // link gets stamped on the target (writeFacts -> reconcileReverseLinks).
         replaces: op.replaces,
         corrects: op.corrects,
       };
@@ -1007,9 +996,8 @@ export class LedgerStore {
         throw new TokenRejectedError('dispute-version-not-offered');
       }
       const allFacts = await this.readForChange(op.type);
-      // Self-review IMPORTANT-3: at mint time the pre-dispute fact was flipped to
-      // `disputed`, so ANY current active version means a third write landed in
-      // the window — resolving now would create a double-active entity.
+      // At mint time the pre-dispute fact was flipped to `disputed`, so any current active version
+      // means a third write landed in the window; resolving now would create a double-active entity.
       if (allFacts.some(f => f.entity === op.entity && f.status === 'active')) {
         throw new TokenRejectedError('state-moved-since-proposal');
       }
@@ -1019,9 +1007,8 @@ export class LedgerStore {
       if (!winner || !loser) throw new TokenRejectedError('dispute-incomplete');
       winner.status = 'active';
       loser.status = 'superseded';
-      // DS (SB-3): retire the ORIGINAL pre-dispute fact too — otherwise it stays
-      // a permanent `disputed` zombie in the chain. The dispute heads carry the
-      // full competing content, so nothing is lost by superseding it.
+      // Retire the original pre-dispute fact too, otherwise it stays a permanent `disputed` zombie
+      // in the chain. The dispute heads carry the full competing content, so nothing is lost.
       const original = allFacts.find(f => f.id === op.originalId && f.status === 'disputed' && f.version !== winner.version && f.version !== loser.version);
       if (original) original.status = 'superseded';
       await this.writeFacts(op.type, allFacts, [winner, loser]);
@@ -1041,8 +1028,8 @@ export class LedgerStore {
 
     if (op.kind === 'restart') {
       const allFacts = await this.readForChange(op.type);
-      // Guard against a second restart token confirming into a SECOND active version
-      // (two coexisting restart tokens → double-active → the entity can never be retired).
+      // Guard against a second restart token confirming into a second active version (two
+      // coexisting restart tokens would leave the entity unable to be retired).
       if (this.activeVersion(allFacts, op.entity)) {
         throw new TokenRejectedError('entity-already-active');
       }
@@ -1073,15 +1060,14 @@ export class LedgerStore {
 
   async listByType(type: FactType): Promise<LedgerFact[]> {
     const allFacts = await this.readFacts(type);
-    // M-5: exclude v0 parse-error quarantine sentinels from active listings.
+    // Exclude v0 parse-error quarantine sentinels from active listings.
     return allFacts.filter(f => f.status === 'active' && f.version >= 1);
   }
 
   /**
-   * EVERY fact of a type — all entities, all versions, all statuses (incl. superseded/
-   * retracted/v0 sentinels). The FactMirror re-derivation source (P2 A1.4): re-mirroring a
-   * changed ledger file must flip a now-superseded head off `active`, which listByType
-   * (active-only) cannot express. One read per type file.
+   * Every fact of a type: all entities, all versions, all statuses (including superseded,
+   * retracted and v0 sentinels). Re-mirroring a changed ledger file needs this, because the
+   * active-only listByType cannot show a now-superseded head. One read per type file.
    */
   async listAllOfType(type: FactType): Promise<LedgerFact[]> {
     return this.readFacts(type);
@@ -1094,9 +1080,8 @@ export class LedgerStore {
   }
 
   /**
-   * SB-3 / CONTRA-02: entity names of this type that currently have MORE THAN ONE active
-   * version — a dual-active conflict the store did not auto-resolve (e.g. seeded/imported
-   * state; the store never auto-produces `disputed` for med-class, A5). Surfaced to the agent
+   * Entity names of this type that currently have more than one active version: a dual-active
+   * conflict the store did not auto-resolve (e.g. seeded or imported state). Surfaced to the agent
    * so it can ask the user to clarify, rather than silently masking one head via getActive.
    */
   async listActiveConflicts(type: FactType): Promise<string[]> {
@@ -1120,17 +1105,16 @@ export class LedgerStore {
   }
 
   /**
-   * Every safety-relevant fact currently shown on SAFETY.md — active OR resolved, across
-   * all types. This is the source the SafetyRenderer re-renders from on a D8 mutation
-   * (broader than listByType, which is active-only). Bounded to one read per type file.
+   * Every safety-relevant fact currently shown on SAFETY.md, active or resolved, across all types.
+   * The SafetyRenderer re-renders from this (broader than the active-only listByType). One read
+   * per type file.
    */
   async listSafetyRelevant(): Promise<LedgerFact[]> {
     const out: LedgerFact[] = [];
     for (const type of Object.keys(TYPE_TO_FILE) as FactType[]) {
       for (const f of await this.readFacts(type)) {
-        // DS: `disputed` facts stay visible to the SAFETY renderer (marked as
-        // under dispute) so a med/allergy never silently leaves the safety net
-        // while its dispute is unresolved.
+        // `disputed` facts stay visible to the SAFETY renderer (marked as under dispute) so a
+        // med/allergy never silently leaves the safety net while its dispute is unresolved.
         if (f.safetyRelevant && (f.status === 'active' || f.status === 'resolved' || f.status === 'disputed')) out.push(f);
       }
     }

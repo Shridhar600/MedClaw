@@ -1,11 +1,8 @@
-// src/profiles/owner-state.ts
+// Pure validation of the raw owner-record document. Adapters validate raw storage through this public decoder.
 //
-// Pure validation of the raw owner-record document (plan 15 §3: adapters validate raw storage
-// through this public decoder, never by importing an internal file).
-//
-// This module is deliberately total and closed: an unknown document shape, an unknown key, a
-// missing/blank phase or a budget overrun is `invalid`, never "a fresh installation". A record
-// that cannot be understood refuses serving; it never re-opens first-contact pairing.
+// Deliberately total and closed: an unknown shape, unknown key, missing/blank phase or budget overrun is
+// `invalid`, never "a fresh installation". A record that cannot be understood refuses serving; it never
+// re-opens first-contact pairing.
 
 import {
   PAIRING_MAX_EVENT_ID_LENGTH,
@@ -79,9 +76,8 @@ function decodeBinding(raw: unknown): OwnerBinding | undefined {
 /**
  * Validate one raw document against the configured owner identity.
  *
- * `expectedOwnerId` is a plain string, not a `ProfileId`, because this module never needs the
- * brand — the config layer is not reachable from here. Comparison is exact: a record for another
- * owner is a refusal (`owner-mismatch`), never a silent adoption.
+ * `expectedOwnerId` is a plain string because the config layer is not reachable from here. Comparison is
+ * exact: a record for another owner is a refusal (`owner-mismatch`), never a silent adoption.
  */
 export function decodeOwnerState(input: unknown, expectedOwnerId: string): OwnerStateDecode {
   if (!isPlainObject(input)) return { kind: 'invalid' };
@@ -113,7 +109,7 @@ export function decodeOwnerState(input: unknown, expectedOwnerId: string): Owner
     return { kind: 'ok', state: { ...base, phase: 'bound', binding } };
   }
 
-  // Missing, blank or unrecognised phase is NOT a fresh installation.
+  // A missing, blank or unrecognised phase is not a fresh installation.
   return { kind: 'invalid' };
 }
 

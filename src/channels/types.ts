@@ -1,10 +1,9 @@
 /**
  * Which channel this arrived on, and whether it was a one-to-one chat.
  *
- * S1 requires all three for admission: a text message with no transport identity is refused
- * rather than treated as coming from somewhere known. They are optional on the wire type only so
- * the pre-S1 direct-Router tests still describe a message shape; the admission path treats an
- * absent value as missing identity.
+ * Admission requires all three: a text message with no transport identity is refused rather than
+ * treated as coming from somewhere known. They are optional on the wire type only; the admission
+ * path treats an absent value as missing identity.
  */
 import type { MediaReference } from '../ports/media-source';
 
@@ -39,9 +38,8 @@ export interface IncomingMessage {
 /**
  * The internal shape the core works with, after admission has staged any media.
  *
- * `mediaPath` is deliberately NOT part of the wire type. A transport must never be able to assert a
- * path; only the core's own stager may, and only after admission. Keeping the two types apart makes
- * "a transport supplied a local path" unrepresentable rather than merely discouraged.
+ * `mediaPath` is deliberately not part of the wire type. A transport must never be able to assert a
+ * path; only the core's own stager may, and only after admission.
  */
 export interface AdmittedMessage extends IncomingMessage {
   /** Absolute staging path, set by the core's stager. Adopted into the workspace by the Router. */

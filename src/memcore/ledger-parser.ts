@@ -25,10 +25,9 @@ function detectValue(raw: string): string | number | string[] {
 }
 
 /**
- * The form a value takes after one Markdown round-trip (INJ-b): the parser's
- * `detectValue` coercion is the single source of truth, so conflict detection
- * and change hashes compare CANONICAL forms — a stored number vs its re-typed
- * string twin must never read as a contradiction.
+ * The form a value takes after one Markdown round-trip. The parser's `detectValue` coercion is the
+ * single source of truth, so conflict detection and change hashes compare canonical forms: a stored
+ * number and its re-typed string twin must never read as a contradiction.
  */
 export function canonicalFieldValue(value: string | number | string[]): string | number | string[] {
   if (Array.isArray(value)) return value.map(v => String(v).trim());
@@ -46,11 +45,9 @@ export function canonicalFields(
 }
 
 function parseProvenance(rawValue: string): { source: Authority; confidence: number; anchor: string; note?: string } | null {
-  // Split on the bare middot and trim each segment. An empty anchor is a legitimate
-  // state (a fact recorded before its narrative anchor is known), and the reader trims
-  // the renderer's trailing `· ` down to `·` — so tolerate a missing/empty anchor rather
-  // than rejecting the line (which silently quarantined the whole block and fabricated a
-  // v0 "active" fact on the next read).
+  // Split on the bare middot and trim each segment. An empty anchor is legitimate (a fact recorded before
+  // its narrative anchor is known) and the reader trims the renderer's trailing `· ` to `·`, so tolerate a
+  // missing/empty anchor rather than rejecting the line and quarantining the whole block.
   const parts = rawValue.split('·').map(s => s.trim());
 
   const sourceMatch = parts[0].match(/^([a-zA-Z]+)\s*\((\d+(?:\.\d+)?)\)$/);
@@ -187,8 +184,7 @@ function flattenFactForRender(fact: LedgerFact): string[] {
     if (RESERVED_TOP_LEVEL_FIELD_KEYS.has(key)) {
       continue;
     }
-    // SBX-1: sanitize the KEY too, not just the value — a key with embedded newlines/# would
-    // otherwise forge `## entity`/`### vN` structure at line start on the next parse.
+    // Sanitize the key too: a key with embedded newlines or `#` could forge `## entity`/`### vN` structure on the next parse.
     if (Array.isArray(value)) {
       lines.push(`- ${sanitizeSingleLine(key)}: ${sanitizeSingleLine(`[${value.join(', ')}]`)}`);
     } else {
@@ -250,7 +246,7 @@ export function parseLedgerFile(md: string, options: { type: FactType; profileId
         if (!Number.isSafeInteger(version) || version < 1 || !FACT_STATUSES.has(status)) {
           throw new Error('invalid-version-header');
         }
-        // Active headers have no lifecycle annotation in the canonical format.
+        // Active headers carry no lifecycle annotation.
         if (status === 'active' && vm[3] !== undefined) throw new Error('invalid-active-header');
         const fact = parseSingleVersionBlock(entityName, version, status, blockBody, options);
         if (fact) facts.push(fact);
@@ -289,8 +285,8 @@ function parseSingleVersionBlock(
   options: { type: FactType; profileId: string },
 ): LedgerFact | null {
   const bodyLines = body.split('\n');
-  // Preserve the existing lenient treatment of free-form non-bullet text, but never
-  // silently discard a line that claims to be a structured field and is malformed.
+  // Free-form non-bullet text is tolerated, but a line that claims to be a structured field and is
+  // malformed is never silently discarded.
   for (const line of bodyLines) {
     if (line.startsWith('- ') && !/^- [^:]+: .*$/.test(line)) {
       throw new Error('malformed-field-line');
@@ -375,9 +371,8 @@ function parseSingleVersionBlock(
     }
   }
 
-  // A real version block always carries a valid `- provenance:` line (the renderer
-  // always emits one). Its absence means the block is corrupt → throw so the caller
-  // quarantines it instead of FABRICATING an active fact from defaulted values.
+  // A real version block always carries a valid `- provenance:` line. Its absence means the block is corrupt:
+  // throw so the caller quarantines it instead of fabricating an active fact from defaults.
   if (!sawProvenance) {
     throw new Error(`missing provenance in ${entity}@v${version}`);
   }

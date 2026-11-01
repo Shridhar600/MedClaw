@@ -27,9 +27,8 @@ export class MemoryEngine {
   }
 
   private resolve(relativePath: string): string {
-    // SEC-m1: absolute paths are explicitly rejected. path.join would otherwise
-    // normalize an absolute path inside the workspace (no escape, but
-    // surprising — callers expect absolute paths to be refused).
+    // Absolute paths are explicitly rejected. path.join would otherwise normalize an absolute
+    // path inside the workspace (no escape, but surprising: callers expect them to be refused).
     if (path.isAbsolute(relativePath)) {
       throw new Error('Absolute paths are not allowed');
     }

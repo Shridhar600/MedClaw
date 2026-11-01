@@ -40,9 +40,8 @@ export class SchedulerAuditLog {
       try {
         rotateFileIfNeeded(this.filePath);
       } catch (error) {
-        // Rotation failures must never prevent the append itself. Sanitize the
-        // error frame (defense-in-depth: review noted this path as unreachable
-        // in practice, but the raw-object log was a PHI-leak surface).
+        // Rotation failures must never prevent the append itself. Sanitize the error frame
+        // (defense in depth): a raw error object in the log is a PHI-leak surface.
         console.warn('[audit-log] rotation check failed, continuing without rotation:', summarizeErrorForLog(error));
       }
     }
@@ -52,9 +51,8 @@ export class SchedulerAuditLog {
   }
 
   /**
-   * Reads recent audit events from the ACTIVE log file only. Rotated
-   * `.N.gz` archives are not consulted — merging archived history into
-   * this read path is a known limitation and future work.
+   * Reads recent audit events from the active log file only. Rotated `.N.gz` archives are not
+   * consulted.
    */
   async readRecent(query: SchedulerAuditLogQuery = {}): Promise<SchedulerAuditEvent[]> {
     if (query.limit === undefined) {

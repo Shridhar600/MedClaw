@@ -27,13 +27,12 @@ interface HeartbeatSchedulerOptions {
   recoveryWindowMinutes?: number;
   retryBackoffMinutes?: number;
   /**
-   * RR2-B1 (R2-10/11): destination-ownership capability, closed over the OWNING profile's
-   * identity. Optional so standalone/non-profile scheduler use keeps this module's
-   * path-agnostic interface; every actual daemon ProfileRuntime supplies it (a
-   * `canSchedule:true` factory path without one refuses scheduler activation — see
-   * `ProfileRuntime.create`). When present it gates createJob/updateJob/resume/start
-   * registration so a foreign-addressed record can never be created, re-pointed, or
-   * re-enabled unnoticed; `job.chatId` is a destination, never authority.
+   * Destination-ownership capability, closed over the owning profile's identity. Optional so
+   * standalone scheduler use stays path-agnostic; every daemon `ProfileRuntime` supplies it
+   * (a `canSchedule:true` factory path without one refuses scheduler activation). When present
+   * it gates createJob/updateJob/resume/start registration so a foreign-addressed record can
+   * never be created, re-pointed, or re-enabled unnoticed. `job.chatId` is a destination,
+   * never authority.
    */
   canAddressChat?: (chatId: string) => boolean;
 }
@@ -73,9 +72,9 @@ export class HeartbeatScheduler {
   }
 
   /**
-   * RR2-B1: is `chatId` an addressable destination for THIS profile's scheduler? Absent guard
-   * (standalone/non-profile use) keeps the legacy unguarded behavior. A throwing lookup is a
-   * refusal, never an authorization.
+   * Is `chatId` an addressable destination for this profile's scheduler? With no guard
+   * (standalone use) every destination is allowed. A throwing lookup is a refusal, never an
+   * authorization.
    */
   private isDestinationAddressable(chatId: string): boolean {
     if (!this.canAddressChat) return true;
@@ -126,8 +125,7 @@ export class HeartbeatScheduler {
   async createJob(input: CreateHeartbeatJobInput): Promise<HeartbeatJob> {
     if (this.stopping) throw new Error('heartbeat scheduler is stopped');
     this.validateCron(input.cron);
-    // RR2-B1: refuse to persist a destination this profile does not own (cron_manage's
-    // optional chatId stays; same-profile alternates pass, foreign/unpaired refuse).
+    // Refuse to persist a destination this profile does not own.
     if (!this.isDestinationAddressable(input.chatId)) {
       throw new Error('Refusing to create a heartbeat job for a chat this profile does not own.');
     }
@@ -155,8 +153,7 @@ export class HeartbeatScheduler {
       this.validateCron(nextCron);
     }
 
-    // RR2-B1: refuse both re-pointing a job at a foreign chat and re-enabling a
-    // foreign-addressed record — either would re-arm work against another profile.
+    // Refuse both re-pointing a job at a foreign chat and re-enabling a foreign-addressed record.
     const nextChatId = patch.chatId ?? current.chatId;
     const willBeEnabled = (patch.enabled ?? current.enabled) !== false;
     if (willBeEnabled && !this.isDestinationAddressable(nextChatId)) {
@@ -192,7 +189,7 @@ export class HeartbeatScheduler {
     if (!job) {
       throw new Error(`Heartbeat job not found: ${id}`);
     }
-    // RR2-B1: a persisted foreign-addressed record cannot be re-enabled unnoticed.
+    // A persisted foreign-addressed record cannot be re-enabled unnoticed.
     if (!this.isDestinationAddressable(job.chatId)) {
       throw new Error('Refusing to resume a heartbeat job addressed to a chat this profile does not own.');
     }
@@ -417,8 +414,8 @@ export class HeartbeatScheduler {
       if (!job.enabled) {
         continue;
       }
-      // RR2-B1: a persisted foreign-addressed record must not silently come back live at
-      // boot — disable + markError (same A1 boundary treatment as invalid-cron records).
+      // A persisted foreign-addressed record must not come back live at boot: disable it and
+      // mark the error, as for invalid-cron records.
       if (!this.isDestinationAddressable(job.chatId)) {
         const refusalMessage = 'heartbeat job destination is not owned by this profile';
         await this.disableInvalidJob(job, refusalMessage);

@@ -1,13 +1,11 @@
 // src/memcore/episode-store.ts
 //
-// Episodes group related facts + narrative into one health arc (a knee-injury
-// arc, a diabetes-management period — spec 03 §2.4). Each episode is one file
-// `episodes/<id>.md`, Markdown as source of truth. This store is the P1
-// write/read surface: CRUD + fact linking + a PAGED list (specs/16 §3 — the
-// pager never parses the whole directory; it reads one page of filenames and
-// parses only that page). Picking/recall logic is P2/P4 and does not live here.
+// Episodes group related facts + narrative into one health arc (a knee-injury arc, a
+// diabetes-management period). Each episode is one file `episodes/<id>.md`, Markdown as source of
+// truth. This store is the write/read surface: CRUD + fact linking + a PAGED list that reads one
+// page of filenames and parses only that page. Picking/recall logic does not live here.
 //
-// Corrupt episode files are skipped with a sanitized warning, never a crash (D2).
+// Corrupt episode files are skipped with a sanitized warning, never a crash.
 
 import * as fs from 'fs';
 import type { Clock, IdGen } from '../ports';
@@ -166,11 +164,10 @@ export class EpisodeStore {
   }
 
   /**
-   * Paged list over the sorted `episodes/` dir listing. Reads the dir ONCE for
-   * names (cheap), then reads+parses files one at a time, stopping as soon as
-   * `limit` matching episodes are collected — the full directory is never
-   * materialized (specs/16 §3). `cursor` is the last-returned episode id; names
-   * `<= cursor` are skipped. Corrupt files are skipped with a warning.
+   * Paged list over the sorted `episodes/` dir listing. Reads the dir ONCE for names (cheap), then
+   * reads and parses files one at a time, stopping as soon as `limit` matching episodes are
+   * collected, so the full directory is never materialized. `cursor` is the last-returned episode
+   * id; names `<= cursor` are skipped. Corrupt files are skipped with a warning.
    */
   async list(opts?: EpisodeListOptions): Promise<EpisodePage> {
     const limit = opts?.limit ?? Number.MAX_SAFE_INTEGER;
@@ -220,8 +217,8 @@ export class EpisodeStore {
     lines.push(`- profileId: ${episode.profileId}`);
     lines.push(`- createdAt: ${episode.createdAt}`);
     lines.push(`- updatedAt: ${episode.updatedAt}`);
-    // M-4: sanitize each array element (like the title) — a newline in an element would otherwise
-    // forge a `- status:`/meta line at line start on the next parse (same class as SBX-1).
+    // Sanitize each array element like the title: a newline in an element would otherwise forge a
+    // `- status:`/meta line at line start on the next parse.
     if (episode.bodyRegions && episode.bodyRegions.length > 0) {
       lines.push(`- bodyRegions: [${episode.bodyRegions.map(sanitizeSingleLine).join(', ')}]`);
     }

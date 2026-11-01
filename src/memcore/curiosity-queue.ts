@@ -1,17 +1,14 @@
 // src/memcore/curiosity-queue.ts
 //
-// Minimal durable curiosity queue: open follow-up / hypothesis items at
-// `curiosity.md` (D7). P4's proactive engine will PICK from this queue; in P1
-// we build only the store surface — add/list/resolve. No picking logic.
+// Minimal durable curiosity queue: open follow-up / hypothesis items in
+// `curiosity.md`. The store surface is add/list/resolve; there is no picking logic.
 //
-// G13: `CuriosityItem` is expected to grow in P4 (priority, evidence, expiry).
-// This store persists ONLY the current fields; a `- resolvedAt:` line is a
-// STORAGE-LEVEL marker appended on resolve (so resolution history survives and
-// `list()` simply excludes resolved items) — it is NOT a CuriosityItem field
-// and nothing here makes the P1 shape load-bearing for picking.
+// This store persists only the current `CuriosityItem` fields. A `- resolvedAt:` line is a
+// storage-level marker appended on resolve (so resolution history survives and `list()` simply
+// excludes resolved items); it is not a `CuriosityItem` field.
 //
 // The single-file format degrades safely: a corrupt block is skipped with a
-// sanitized warning, never a crash (D2).
+// sanitized warning, never a crash.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -57,7 +54,7 @@ export class CuriosityQueue {
         items.push(toItem(block));
       } catch (err) {
         // PHI-safe: the block id is parsed from a `## <heading>` content line, so it
-        // must NEVER be logged — a corrupt heading could carry health content.
+        // must never be logged. A corrupt heading could carry health content.
         console.warn(`[curiosity-queue] corrupt curiosity item skipped: ${summarizeErrorForLog(err)}`);
       }
     }
@@ -87,15 +84,13 @@ export class CuriosityQueue {
       if (/^- resolvedAt:/.test(lines[i])) return false;
     }
     // Insert the marker at the end of the block, preserving every other line verbatim
-    // (unknown/forward-compat keys AND free-floating content survive — no full rewrite).
+    // (unknown keys and free-floating content survive).
     let insertAt = end;
     while (insertAt > start + 1 && lines[insertAt - 1].trim() === '') insertAt--;
     lines.splice(insertAt, 0, `- resolvedAt: ${this.clock.now().toISOString()}`);
     secureWriteViaTmp(this.filePath(), `${lines.join('\n').replace(/\n+$/, '')}\n`);
     return true;
   }
-
-  // ---- internals ---------------------------------------------------------
 
   private readRaw(): string {
     try {

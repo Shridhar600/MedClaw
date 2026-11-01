@@ -1,10 +1,9 @@
 // src/cli/service-onboarding.ts
 //
-// The setup ENTRY point: validate the arguments, hand the owner off to the wizard when
+// The setup entry point: validate the arguments, hand the owner off to the wizard when
 // interactive, apply the artifacts when not, and run the chosen completion action.
 //
-// Argument parsing and configuration/artifact building moved to `./setup-config` so that this
-// module and `./setup-wizard` no longer import each other (plan 15 §2.4).
+// Argument parsing and configuration/artifact building live in `./setup-config`.
 
 import * as fs from 'fs';
 import * as os from 'os';
@@ -107,10 +106,8 @@ export function startDaemon(
       child.unref?.();
 
       timer = setTimeout(() => {
-        // forka #9: the daemon is detached (its own process group), so Ctrl-C in
-        // this wizard does NOT stop it. Write a pid file next to the config and
-        // tell the user exactly how to stop it, so a detached start is not a
-        // surprise.
+        // The daemon is detached (its own process group), so Ctrl-C in this wizard does not
+        // stop it. Write a pid file next to the config and tell the user how to stop it.
         let stopHint = '';
         if (child.pid) {
           const pidPath = path.join(path.dirname(configPath), 'redacted.pid');
@@ -193,24 +190,13 @@ export async function runServiceOnboarding(
     // `onboard --help` must not be answered by the strict parser's "unknown option" refusal, so the
     // help request is answered from the same module that owns the option list.
     //
-    // Only a help token in the LEADING OPTION position counts. Scanning the whole argv (as this used
-    // to) also matched a help token sitting in another option's VALUE position, so
-    // `onboard --provider --help` printed help and exited 0 instead of refusing the missing value.
+    // Only a help token in the leading option position counts. A help token in another option's
+    // value position (`onboard --provider --help`) must still refuse the missing value.
     //
-    // `runCli` forwards `['--config', <resolved path>, ...commandArgs]`, so the selected target sits
-    // in front of the operator's own tokens; that exact injected pair is skipped before the position
-    // check. Direct service entry has no such pair and is unaffected.
-    //
-    // C04-P02: the pair is VALIDATED before it is skipped. The old predicate skipped any leading
-    // `--config` whose value merely did not start with `-`, which is also true of `''` and `'   '`, so
-    // `['--config', '', '--help']` skipped a pair that carried no path and answered the next token with
-    // usage at exit 0. Zero is a SUCCESS status, so malformed option input must never produce it.
-    // `requireOptionValue` is the parser's own missing/blank/option-shaped rule, reused here rather
-    // than reimplemented: one policy, and no second parser or help framework.
-    //
-    // This cannot affect the real CLI path: `selectConfigPath` already refuses a present-but-empty
-    // global `--config` and resolves a valid one to an absolute path, so the injected pair is always
-    // well-formed by the time it arrives here.
+    // `runCli` forwards `['--config', <resolved path>, ...commandArgs]`, so that injected pair is
+    // skipped before the position check. The pair is validated first with `requireOptionValue`
+    // (the parser's own missing/blank/option-shaped rule): malformed option input must never
+    // produce a success exit.
     const hasLeadingConfigPair = argv[0] === '--config';
     if (hasLeadingConfigPair) {
       requireOptionValue('--config', argv[1]);
@@ -221,9 +207,9 @@ export async function runServiceOnboarding(
       return 0;
     }
 
-    // STRICT PARSE FIRST (brief §8C). Every malformed-input refusal happens here, before the
-    // wizard, before any lease, directory, template, record or config write. `parseArgs` throws a
-    // controlled `Error` naming the field or reason; this catch turns it into exit 1.
+    // Strict parse first. Every malformed-input refusal happens here, before the wizard and before
+    // any lease, directory, template, record or config write. `parseArgs` throws a controlled
+    // `Error` naming the field or reason; this catch turns it into exit 1.
     const args = parseArgs(argv);
 
     if (!args.yes) {

@@ -9,7 +9,7 @@ export interface MemoryFile {
 export interface Chunk {
   id: string;        // "<path>:<chunk_index>"
   path: string;      // Relative to workspace root
-  /** v2 metadata; optional for direct legacy callers, required on indexed live chunks. */
+  /** v2 metadata; optional for direct callers, required on indexed live chunks. */
   lane?: string;
   content: string;
   startLine: number; // First line number in source file (1-indexed)

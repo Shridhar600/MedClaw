@@ -1,22 +1,14 @@
-// src/runtime/adapters/media-stager.ts
-//
 // Bounded streaming of admitted owner media into the owner's own staging directory.
 //
-// The rules this implements exist because the previous path did none of them:
-//
-//   * the actual byte cap is enforced WHILE STREAMING. A transport's advertised size is inspected
-//     where available but never trusted: it can under-report, and by the time `arrayBuffer()`
-//     resolves the memory is already spent.
-//   * nothing is buffered whole. Chunks are written through a stream with backpressure; there is no
-//     chunks array that grows without bound.
-//   * intake is bounded: one active, four waiting, and a 30-second total wait. A refusal happens
-//     BEFORE a stream is opened where the answer is already known.
-//   * a timeout or abort can occur after an owned partial is opened. Refusal cleanup waits for
-//     source cancellation and the owned writable to close before removing that partial. Cancellation
-//     requests do not prove acknowledgement within the intake deadline. A source that finishes
+//   * The byte cap is enforced while streaming. A transport's advertised size is never trusted: it can
+//     under-report, and by the time `arrayBuffer()` resolves the memory is already spent.
+//   * Nothing is buffered whole. Chunks are written through a stream with backpressure.
+//   * Intake is bounded: one active, four waiting, and a 30-second total wait. A refusal happens before a
+//     stream is opened where the answer is already known.
+//   * A timeout or abort can occur after an owned partial is opened. Refusal cleanup waits for source
+//     cancellation and the owned writable to close before removing that partial. A source that finishes
 //     opening after the attempt ends is asked to cancel rather than streamed.
-//   * cleanup is scoped to THIS operation's own partial file. Another operation's staged file, and
-//     anything else in the directory, is untouched.
+//   * Cleanup is scoped to this operation's own partial file; other staged files are untouched.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -89,8 +81,7 @@ export class FsMediaStager {
   }
 
   async stage(ref: MediaReference | undefined, signal: AbortSignal): Promise<MediaStageResult> {
-    // Measured across the whole attempt, queue wait included: that wait is the interesting number when
-    // an owner asks why their photo was slow.
+    // Measured across the whole attempt, queue wait included.
     const startedAt = this.clock.now().getTime();
     if (!ref || (ref.kind !== 'photo' && ref.kind !== 'document')) {
       return this.refuse('unsupported', undefined, startedAt);
@@ -98,14 +89,13 @@ export class FsMediaStager {
     const limits = this.options.limits ?? DEFAULT_MEDIA_LIMITS;
     if (signal.aborted) return this.refuse('aborted', undefined, startedAt);
 
-    // The advertised size is a claim. If it already exceeds the cap we can refuse without opening a
-    // stream at all — no network, no file.
+    // The advertised size is a claim. If it already exceeds the cap we can refuse without opening a stream.
     if (typeof ref.advertisedBytes === 'number' && ref.advertisedBytes > limits.maxFileBytes) {
       return this.refuse('advertised-too-large', undefined, startedAt);
     }
 
-    // The slot is RESERVED synchronously, before the first await. Deciding queue membership after
-    // an await would let every concurrent caller observe a free slot and blow past the limit.
+    // The slot is reserved synchronously, before the first await. Deciding queue membership after an await
+    // would let every concurrent caller observe a free slot and exceed the limit.
     const timeout = new AbortController();
     const onAbort = (): void => timeout.abort();
     signal.addEventListener('abort', onAbort, { once: true });
@@ -119,31 +109,17 @@ export class FsMediaStager {
     try {
       if (this.active >= limits.maxActive) {
         if (this.waiting >= limits.maxWaiting) {
-          // Refuse rather than queue without bound: an unbounded wait is a denial of service with a
-          // memory cap and a timer behind every entry.
+          // Refuse rather than queue without bound: an unbounded wait is a denial of service.
           return this.refuse('queue-full', undefined, startedAt);
         }
         this.waiting += 1;
         try {
           await this.awaitSlot(timeout.signal);
         } catch (error) {
-          // `awaitSlot` rejects when the intake signal fires while this attempt is QUEUED, and that
-          // rejection used to escape `stage()` entirely: the queue wait had a `finally` but no
-          // `catch`, so a timeout or caller abort mid-wait threw out of a method declared
-          // `Promise<MediaStageResult>` (saved-or-refused, never a rejection). In the Gateway that
-          // throw travelled `admitAndStage` -> `deliverMessage`, so the owner got NO reply at all for
-          // that message and no `media-intake` diagnostic was emitted.
-          //
-          // Reachable in production because `Gateway.stop()` aborts the intake controller, so every
-          // attempt queued at shutdown took this path.
-          //
-          // `signal.aborted` separates the two causes: the caller's own abort is `aborted`, while the
-          // internal intake budget running out is `timeout`. Same distinction as every other abort
-          // path in this method.
-          // `awaitSlot` has exactly one reject path today (its abort listener), so an abort error is
-          // provably all that can arrive. Anything else means the primitive changed underneath us,
-          // and reporting it as 'timeout' would hide it with no diagnostic — so it is logged rather
-          // than laundered.
+          // `awaitSlot` rejects when the intake signal fires while this attempt is queued (including at shutdown,
+          // when `Gateway.stop()` aborts intake). `stage()` must resolve saved-or-refused, never reject, or the
+          // owner gets no reply. `signal.aborted` separates a caller abort from the internal intake budget
+          // running out (`timeout`). Anything but an abort error is logged rather than reported as a timeout.
           if (!isAbortError(error)) {
             console.warn('[media-stager] Queue wait failed unexpectedly:', summarizeErrorForLog(error));
           }
@@ -163,17 +139,10 @@ export class FsMediaStager {
       catch (error) { return this.refuse('source-failed', error, startedAt); }
 
       try {
-        // Raced against the intake signal. `MediaSourcePort` is a documented swap point (specs/16
-        // §2) and `open()` is allowed to ignore its signal, so awaiting it bare made a
-        // signal-ignoring source hold `maxActive: 1` FOREVER: `active` was never decremented, every
-        // later owner upload queued, and each then expired in the queue wait — all reported as
-        // 'timeout'. One wedged fetch permanently killed the owner's media path for the life of the
-        // daemon. Racing the abort is what makes "one active download" a real bound.
-        // Losing the race must still CLEAN UP the loser. If the abort wins, `open()` may resolve
-        // later with a live handle — a Telegram file connection, say — and dropping it on the floor
-        // would leak the transport for its own lifetime. So the open promise carries its own cleanup,
-        // armed only once we have actually stopped waiting. Without this, racing `open()` regressed
-        // the existing guarantee that a source finishing after the deadline is cancelled.
+        // Raced against the intake signal: `open()` may ignore its signal, and awaiting it bare would let a
+        // wedged source hold the single active slot forever, which makes "one active download" a real bound.
+        // If the abort wins, `open()` may resolve later with a live handle (a transport connection), so the
+        // open promise carries its own cleanup, armed once we have stopped waiting.
         let abandoned = false;
         const openPromise = this.source.open(ref, timeout.signal).then((handle) => {
           if (abandoned) void this.cancelOnce(handle);
@@ -220,9 +189,8 @@ export class FsMediaStager {
       const sinkClosed = new Promise<void>(resolve => { sink.once('close', resolve); });
 
       try {
-        // The signal is raced EXPLICITLY as well as handed to `pipeline`. A source whose iterator
-        // never settles cannot be interrupted by an abort signal alone, so relying on the signal
-        // alone would let a hung source keep the intake wait open forever.
+        // The signal is raced explicitly as well as handed to `pipeline`: a source whose iterator never settles
+        // cannot be interrupted by an abort signal alone.
         await withinIntake(pipeline(readableFrom(opened), counter, sink, { signal: timeout.signal }), timeout.signal);
       } catch (error) {
         // Preserve the cause at failure, even if cancellation/descriptor close spans a later deadline.
@@ -304,10 +272,8 @@ export class FsMediaStager {
   }
 
   /**
-   * Cancel an opened stream AT MOST ONCE.
-   *
-   * Several refusal paths want to cancel, and the `finally` block always tries as well; issuing it
-   * twice would double-count a source-side abort and could be read by a source as two requests.
+   * Cancel an opened stream at most once. Several refusal paths want to cancel and the `finally` block always
+   * tries as well; a second request could be read by a source as a double abort.
    */
   private async cancelOnce(opened: OpenedMedia): Promise<void> {
     if (this.cancelledSources.has(opened)) return;

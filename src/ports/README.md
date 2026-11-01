@@ -10,13 +10,13 @@ concretes — so the memory core stays liftable and test-fakeable.
 - Owner/media seams: `OwnerStatePort` (its `replace` returns the typed `OwnerStateWriteResult`),
   `PairingCodePort`, `TransportIdentity`, `AdmissionDecision`, `AdmissionReason`, `PairingResult`,
   `MediaSourcePort`, `MediaReference`, `OpenedMedia`, `MediaStageResult`, `MediaStageReason`,
-  `MediaLimits` (+ the S1 media bound constants and the shared `OWNER_RECORD_MAX_BYTES` budget).
+  `MediaLimits` (+ the media bound constants and the shared `OWNER_RECORD_MAX_BYTES` budget).
 - Observability seam: `DiagnosticSink`, `DiagnosticEvent`, `DiagnosticStage`, `StartStopReason`,
   `PairingDiagnosticReason`, plus `SILENT_DIAGNOSTIC_SINK` and `guardedDiagnosticSink`.
 - `SystemClock` / `CryptoIdGen` classes and the shared stateless singletons `systemClock` /
   `uuidIdGen` (injected as defaults across the memcore stores).
 
-**Dependencies:** none (bottom of the v2 dependency graph — ports import nothing from `src/`
+**Dependencies:** none (bottom of the dependency graph — ports import nothing from `src/`
 outside `ports/`, enforced by `arch:check`). Sibling-port imports are allowed and used where two
 seams genuinely share one vocabulary: `diagnostics.ts` references `AdmissionReason` /
 `PairingResultKind` from `owner-state.ts` and `MediaStageReason` from `media-source.ts` rather than

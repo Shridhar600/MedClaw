@@ -2,15 +2,13 @@ import { BUILT_IN_EMERGENCY_KEYWORDS } from '../safety/emergency-detector';
 import { CONFIG_SCHEMA_VERSION, type StoredConfig } from './types';
 
 /**
- * The known LOCAL Ollama endpoint, as a single authority.
+ * The known local Ollama endpoint, as a single authority.
  *
- * This value used to be written out in four places (`defaults.ts` three times,
- * `setup-config.ONDEVICE_OLLAMA_URL`, plus literals in the wizard and the provider), so "the
- * local default" was four separate authorities. The decoder now compares a cloud role's
- * `baseUrl` against exactly this string to refuse the concrete inheritance mistake, which
- * only works if there is one value to compare against.
+ * The decoder compares a cloud role's `baseUrl` against exactly this string to refuse the
+ * mistake of a cloud role inheriting the local endpoint, which only works if there is one value
+ * to compare against.
  *
- * Declared BEFORE `DEFAULT_STORED_CONFIG`, which reads it at module evaluation time.
+ * Declared before `DEFAULT_STORED_CONFIG`, which reads it at module evaluation time.
  */
 export const LOCAL_OLLAMA_BASE_URL = 'http://localhost:11434/v1';
 
@@ -140,8 +138,7 @@ export function cloneStoredDefaults(): StoredConfig {
 
 /**
  * Single authority for the session-window triggers. `src/gateway/session.ts` reads these
- * instead of repeating `?? 35/50/80/10` inline, which used to be a second authority that
- * could disagree with the config module.
+ * instead of repeating the numbers inline, so they cannot disagree with the config module.
  */
 export const DEFAULT_SESSION_WINDOW = DEFAULT_STORED_CONFIG.sessions.window as NonNullable<
   StoredConfig['sessions']['window']

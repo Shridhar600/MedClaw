@@ -1,8 +1,7 @@
 // src/indexstore/embedding-identity.ts
 //
-// Embedding provider locality check (P2 A3.1b / v2-BL-2 = specs/13 B1). The recall latency budget
-// (p50≤300ms / p95≤800ms) assumes LOCAL embeddings; a remote embeddings endpoint blows past it, so
-// the gateway logs a boot config warning. Pure — no I/O.
+// Embedding provider locality check. The recall latency budget (p50≤300ms / p95≤800ms) assumes local
+// embeddings; a remote embeddings endpoint blows past it, so the gateway logs a boot config warning. Pure — no I/O.
 
 /**
  * True when the embeddings base URL points at a non-loopback host (public or LAN). A missing,

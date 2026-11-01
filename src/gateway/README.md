@@ -46,9 +46,8 @@ inbound ─▶ admission ─▶ media staging ─▶ route ─▶ turn ─▶ ow
 Three properties depend on that order, and each has a test that fails if it is broken:
 
 1. **Admission is required and runs first.** `GatewayAdmissionDeps.admission` and `ownerId` are
-   mandatory — there is no optional fallback. This replaced `if (this.admission)` branches that silently
-   skipped the entire refusal policy on any Gateway composed without authority, and a text pass-through
-   that handed an unadmitted sender a clinical turn.
+   mandatory — there is no optional fallback. An optional admission would silently skip the entire
+   refusal policy on a Gateway composed without authority and hand an unadmitted sender a clinical turn.
 2. **Admission runs before the empty-message check**, so a chat that is not the owner cannot consume a
    reply slot at all.
 3. **Media is fetched only after admission.** The channel hands over an identity; the stager opens the
@@ -88,5 +87,5 @@ protection against hostile same-UID replacement races. Clinical inbox retention 
 Copy `src/gateway/` plus `../ports`, `../profiles`, `../channels` and the legacy core it composes. The
 Gateway is the one module that is *meant* to know about all of them — it is the composition root, so it
 sits at the top of the graph rather than inside it. A test that needs a Gateway should construct one
-with real injected collaborators, never by patching private fields: several tests used to assign
-`gateway.sessions` directly, which asserted against a machine production never builds.
+with real injected collaborators, never by patching private fields, such as assigning `gateway.sessions` directly: that asserts
+against a machine production never builds.

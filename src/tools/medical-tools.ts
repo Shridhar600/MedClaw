@@ -213,10 +213,8 @@ export function createMedicalTools(
       }
 
       try {
-        // Assemble health context from memory
         const healthContext = (await assembleHealthContext(medicalContextProvider, question)).content;
 
-        // Build prompt and call medical provider
         const messages = buildMedicalQueryPrompt(healthContext, question);
         const response = await medicalProvider.chat(messages);
 
@@ -226,7 +224,6 @@ export function createMedicalTools(
           };
         }
 
-        // Handle unexpected response type
         return {
           content: [{ type: 'text', text: 'Unexpected response format from medical provider.' }],
           isError: true,
@@ -314,10 +311,8 @@ export function createMedicalTools(
       try {
         report = await processReportFile(fullPath, mediaPath);
 
-        // Assemble health context
         const healthContext = (await assembleHealthContext(medicalContextProvider, report.contextQuery)).content;
 
-        // Build prompt and call medical provider
         const messages = buildReportAnalysisPrompt(healthContext, report, mediaPath);
         const response = report.images?.length
           ? await callMedicalVisionProvider(medicalProvider, messages, report, options)
@@ -442,8 +437,8 @@ function isLocalHostname(hostname: string): boolean {
 }
 
 function isImageOnlyFailure(error: unknown): boolean {
-  // Only a MedClaw-generated media validation error can be an "image-only" failure — a raw provider
-  // error whose message happens to contain these words must NOT be misclassified (F-2).
+  // Only a MedClaw-generated media validation error can be an "image-only" failure; a raw provider
+  // error whose message happens to contain these words must not be misclassified.
   if (!(error instanceof MediaValidationError)) return false;
   return error.message.includes('vision')
     || error.message.includes('image input')
@@ -451,9 +446,9 @@ function isImageOnlyFailure(error: unknown): boolean {
 }
 
 function buildReportErrorMessage(error: unknown, report: ProcessedReport | undefined): string {
-  // F-2 typed split: only echo a MedClaw-generated validation error's message (it describes the
-  // file/config, never health content). A raw provider error can echo the prompt (PHI), so it gets
-  // NO detail — just the canned framing.
+  // Only echo a MedClaw-generated validation error's message (it describes the file/config,
+  // never health content). A raw provider error can echo the prompt (PHI), so it gets no detail,
+  // just the canned framing.
   const detail = error instanceof MediaValidationError ? ` ${error.message}` : '';
   if (!report) {
     return `Error: Report processing failed.${detail}`;

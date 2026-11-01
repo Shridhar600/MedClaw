@@ -1,12 +1,9 @@
-// src/profiles/paths.ts
+// Pure owner-path derivation: no disk access, no config-file read, typed values in. One bundle, one
+// selected owner, no fallbacks: a path is either derived from the canonical owner base directory
+// and the validated owner ID, or it does not exist.
 //
-// Pure owner-path derivation (specs/16 §1: no disk access, no config-file read, typed
-// values in). One bundle, one selected owner, no fallbacks: a path is either derived from
-// the canonical owner base directory and the validated owner ID, or it does not exist.
-//
-// `ProfileId` is the existing branded type and stays the public identifier. The config
-// lease is deliberately NOT part of `OwnerPaths`: it belongs to a separate canonical
-// config resource resolved by installation wiring (plan 15 §7).
+// The config lease is deliberately NOT part of `OwnerPaths`: it belongs to a separate canonical
+// config resource resolved by installation wiring.
 
 import * as path from 'path';
 import type { ProfileId } from './types';

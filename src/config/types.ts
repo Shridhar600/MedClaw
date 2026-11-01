@@ -1,15 +1,10 @@
-// src/config/types.ts
+// Two distinct types by design: the source schema and the effective configuration are separate.
 //
-// Two distinct types by design (specs/16 §1 "config values arrive as typed params";
-// plan 15 §2.1 "the source schema and effective configuration are distinct types"):
-//
-//   StoredConfig   — the persisted document (schemaVersion 2). Carries owner IDENTITY
-//                    and the owner-scoped base directory. It never carries derived
-//                    paths, so there is no second path authority to disagree with.
-//   EffectiveConfig— the runtime shape existing consumers already read. It is
-//                    `StoredConfig` plus the owner paths resolved once from
-//                    `resolveOwnerPaths`, so stores stay path-agnostic and no module
-//                    re-derives a path.
+//   StoredConfig    - the persisted document (schemaVersion 2). Carries owner identity and the
+//                     owner-scoped base directory. It never carries derived paths, so there is no
+//                     second path authority to disagree with.
+//   EffectiveConfig - the runtime shape consumers read: `StoredConfig` plus the owner paths resolved
+//                     once from `resolveOwnerPaths`, so stores stay path-agnostic.
 //
 // Nothing here reads a file. Disk IO lives in `src/runtime/adapters/config-file.ts`.
 
@@ -22,16 +17,15 @@ export interface ProviderConfig {
   apiKey?: string;
   /**
    * Explicit reasoning-effort override sent to OpenAI-compatible endpoints.
-   * When unset, OpenAIProvider falls back to its name-based heuristic
-   * (gpt-5/o-series get 'none' with tools — forka #13). Explicit wins:
-   * e.g. stealth/ox-alpha REJECTS 'none' (reasoning is mandatory) and wants 'low'.
+   * When unset, OpenAIProvider falls back to its name-based heuristic. Explicit wins: some
+   * endpoints reject 'none' because reasoning is mandatory, and want 'low'.
    */
   reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high';
   allowRawMedicalMedia?: boolean;
   /**
-   * P2b spec 14 §3 / DD4 — the model's context window in tokens, for the session-window fill triggers.
-   * When unset, the SessionManager falls back to the per-model `contextWindowFor` table. Wizard-probed
-   * for Ollama; table-seeded for cloud.
+   * The model's context window in tokens, for the session-window fill triggers. When unset, the
+   * SessionManager falls back to the per-model `contextWindowFor` table. Wizard-probed for Ollama;
+   * table-seeded for cloud.
    */
   contextWindow?: number;
 }
@@ -59,21 +53,20 @@ export interface BudgetRatios {
   agent: number;
 }
 
-/** Stored memory settings. `workspace` is derived, never persisted (plan 15 §2.1). */
+/** Stored memory settings. `workspace` is derived, never persisted. */
 export interface StoredMemoryConfig {
   search: {
     hybridWeights: SearchWeights;
   };
   bootstrapMaxChars: number;
-  /** MEMORY.md per-section budget shares (E1.4); defaults 0.6 / 0.2 / 0.2. */
+  /** MEMORY.md per-section budget shares; defaults 0.6 / 0.2 / 0.2. */
   budgetRatios?: BudgetRatios;
 }
 
 /**
- * P2b spec 14 §3 — real-token window triggers. Percentages of the effective context window
- * (`providers.main.contextWindow` else the per-model table). `src/gateway/session.ts` reads
- * these through `windowThresholds()`; the defaults live only in `defaults.ts` so there is a
- * single authority for them.
+ * Real-token window triggers, as percentages of the effective context window
+ * (`providers.main.contextWindow` else the per-model table). `src/gateway/session.ts` reads these
+ * through `windowThresholds()`; the defaults live only in `defaults.ts`.
  */
 export interface SessionWindowConfig {
   pruneAtPercent: number;
@@ -84,9 +77,8 @@ export interface SessionWindowConfig {
 
 export interface SessionsConfig {
   /**
-   * Retired by P2b DD10 (idle resets). Not persisted meaning: the values are still threaded
-   * into SessionManager construction, so the key stays in the stored schema and `config set`
-   * still refuses to change it. See implementation decision D4 in the S1 report.
+   * No longer drives idle resets. The key stays in the stored schema, the values are still passed
+   * to SessionManager construction, and `config set` refuses to change it.
    */
   softResetAfterMinutes: number;
   /** @see softResetAfterMinutes */
@@ -205,9 +197,8 @@ export interface EffectiveHeartbeatConfig extends StoredHeartbeatConfig {
 }
 
 /**
- * What every runtime consumer receives. Same shape the gateway/scheduler/admin code already
- * reads (`config.memory.workspace`, `config.heartbeat.storePath`, `config.heartbeat.audit.path`),
- * with those three values now supplied by derivation instead of by a second persisted authority.
+ * What every runtime consumer receives: the stored config with the workspace, scheduler store path
+ * and audit path supplied by derivation instead of a second persisted authority.
  */
 export interface EffectiveConfig extends Omit<StoredConfig, 'memory' | 'heartbeat'> {
   memory: EffectiveMemoryConfig;

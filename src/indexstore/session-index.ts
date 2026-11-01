@@ -1,21 +1,19 @@
 // src/indexstore/session-index.ts
 //
-// SessionIndex adapter over SQLite FTS5 — verbatim `session_search` (PLAT-20, spec 14 §2) over the
-// append-only day-file archive. This is the LOSSLESSNESS substrate: prune (D3) replaces in-window tool
-// results with a marker, and the verbatim original is always retrievable here.
+// SessionIndex adapter over SQLite FTS5: verbatim `session_search` over the append-only day-file
+// archive. Pruning replaces in-window tool results with a marker, and the verbatim original is
+// always retrievable here.
 //
-// Mirrors the `SqliteKeywordIndex` idiom: opens its OWN better-sqlite3 connection to the per-profile
-// search.db (WAL + explicit busy_timeout) and imports better-sqlite3 DIRECTLY — never a gateway/legacy
-// module (v2-core boundary). It owns its own `session_turns` (metadata) + `session_turns_fts` (content)
-// tables, independent of the P0 chunk tables.
+// Like `SqliteKeywordIndex`, it opens its own better-sqlite3 connection to the per-profile
+// search.db (WAL + explicit busy_timeout) and imports better-sqlite3 directly, never a gateway
+// module. It owns its own `session_turns` (metadata) and `session_turns_fts` (content) tables.
 //
-// Per-chat isolation (Wave-D panel X-1/X-2): every row carries a `chat_id`, and the primary key is
-// `<chatId>#<file>#<line>` so two chats sharing a day-file basename never collide, and `search` filters
-// by chat so one chat can never read another chat's health turns. In the per-chat layout the directory
-// component is authoritative; a flat legacy archive falls back to the JSONL field for its scope.
+// Per-chat isolation: every row carries a `chat_id` and the primary key is `<chatId>#<file>#<line>`,
+// so two chats sharing a day-file basename never collide and `search` filters by chat. In a per-chat
+// layout the directory component is authoritative; a flat archive falls back to the JSONL field.
 //
-// A-M1: plain contentful FTS5 + a companion metadata table (NOT external-content — the content lives in
-// JSONL on disk). Anchors are the day-file `{file, line}` (physical non-empty line numbers), the same the
+// The FTS5 table is plain contentful (not external-content) because the content lives in JSONL on
+// disk. Anchors are the day-file `{file, line}` (physical non-empty line numbers), the same ones the
 // SessionManager append path assigns, so a rebuilt row resolves to the exact JSONL line.
 
 import * as fs from 'fs';
@@ -26,8 +24,8 @@ import { summarizeErrorForLog, tightenFile } from '../security';
 export interface SqliteSessionIndexConfig {
   dbPath: string;
   /**
-   * The day-file archive root. Enables rebuild-from-disk on empty / corruption / a durable dirty marker
-   * (A-MF4 / D2.3 / H5). When omitted, the index still works for incremental indexing but cannot self-heal.
+   * The day-file archive root. Enables rebuild-from-disk on empty, corrupt or dirty-marked state.
+   * When omitted, incremental indexing still works but the index cannot self-heal.
    */
   sessionsDir?: string;
 }
@@ -39,7 +37,7 @@ export interface SessionHit {
   line: number;
   role: string;
   ts: string;
-  /** The turn content, verbatim (PLAT-20: exact clinical text returned unchanged). */
+  /** The turn content, verbatim: exact clinical text is returned unchanged. */
   snippet: string;
 }
 
@@ -86,12 +84,12 @@ export class SqliteSessionIndex {
     this.db.pragma('busy_timeout = 5000');
     this.sessionsDir = config.sessionsDir;
     this.initSchema();
-    // H10: better-sqlite3 creates search.db + its -wal/-shm siblings 0644 (world-readable PHI). Tighten
-    // all three to 0600 after the WAL pragma + schema created them. Warn-and-continue (never crash).
+    // better-sqlite3 creates search.db and its -wal/-shm siblings 0644 (world-readable PHI).
+    // Tighten all three to 0600 after the schema exists. Warn and continue; never crash.
     this.hardenDbFiles();
-    // Rebuild-from-disk when the archive is present AND the index is untrustworthy: empty (post-migration
-    // / dropped — A-MF4), a durable dirty marker from a swallowed incremental failure (H5), or FTS/metadata
-    // parity is broken (a dropped derived table left stale metadata — H8). Never throws out of the ctor.
+    // Rebuild from disk when the archive is present and the index is untrustworthy: empty, a
+    // durable dirty marker from a swallowed incremental failure, or FTS/metadata parity broken.
+    // Never throws out of the constructor.
     try {
       if (this.sessionsDir && (this.isEmpty() || this.dirtyMarkerExists() || this.ftsParityBroken())) {
         // Batches below intentionally bound transaction and allocation size. Set the durable marker
@@ -111,9 +109,9 @@ export class SqliteSessionIndex {
   }
 
   /**
-   * H5: record that an incremental index write was lost (a swallowed failure in the append path), durably,
-   * so the NEXT construction rebuilds from the archive and closes the hole even though the db is non-empty.
-   * Best-effort — a marker-write failure only forgoes the durable reconcile, never crashes the turn.
+   * Durably record that an incremental index write was lost, so the next construction rebuilds from
+   * the archive even though the db is non-empty. Best effort: a marker-write failure only forgoes
+   * the durable reconcile and never crashes the turn.
    */
   markDirty(): void {
     try {
@@ -125,10 +123,10 @@ export class SqliteSessionIndex {
   }
 
   /**
-   * Verbatim search over one chat's archive. Exact-phrase first (all tokens, adjacent — PLAT-20 "all
-   * match"), OR-joined fallback for recall, ordered by recency. `chatId` scopes the result to that chat
-   * (omit only for maintenance/tests). Never throws: a corrupt/dropped derived table is reset + rebuilt
-   * from disk and retried once; any residual error degrades to an empty `failed` result (resilience).
+   * Verbatim search over one chat's archive. Exact phrase first (all tokens, adjacent), then an
+   * OR-joined fallback for recall, ordered by recency. `chatId` scopes the result to that chat
+   * (omit only for maintenance/tests). Never throws: a corrupt or dropped derived table is reset,
+   * rebuilt from disk and retried once; any residual error degrades to an empty `failed` result.
    */
   search(query: string, opts?: { chatId?: string; limit?: number }): SessionSearchResult {
     const limit = opts?.limit && opts.limit > 0 ? opts.limit : DEFAULT_LIMIT;
@@ -137,8 +135,8 @@ export class SqliteSessionIndex {
     } catch (e) {
       if (this.sessionsDir && SqliteSessionIndex.isCorruptionError(e)) {
         try {
-          // H8: a dropped/damaged derived table is not repaired by an upsert — reset both tables, then
-          // rebuild the whole archive before retrying.
+          // A dropped or damaged derived table is not repaired by an upsert: reset both tables,
+          // then rebuild the whole archive before retrying.
           this.resetDerivedTables();
           const complete = this.rebuildFromDayFiles();
           if (complete) this.clearDirtyMarker();
@@ -154,11 +152,11 @@ export class SqliteSessionIndex {
   }
 
   /**
-   * Re-index every day file under `sessionsDir` in bounded batches. A durable dirty marker covers crashes
-   * or unreadable files, so an incomplete rebuild cannot look healthy on the next boot. The line numbers
-   * remain physical non-empty positions and the archive stays the source of truth.
-   * In a per-chat layout the containing directory supplies the chat scope; a flat legacy file falls back
-   * to the embedded chatId. Idempotent via the `<chatId>#<file>#<line>` upsert.
+   * Re-index every day file under `sessionsDir` in bounded batches. A durable dirty marker covers
+   * crashes or unreadable files, so an incomplete rebuild cannot look healthy on the next boot. Line
+   * numbers remain physical non-empty positions and the archive stays the source of truth. In a
+   * per-chat layout the containing directory supplies the chat scope; a flat file falls back to the
+   * embedded chatId. Idempotent via the `<chatId>#<file>#<line>` upsert.
    */
   rebuildFromDayFiles(sessionsDir?: string): boolean {
     const root = sessionsDir ?? this.sessionsDir;
@@ -192,8 +190,8 @@ export class SqliteSessionIndex {
         if (typeof content !== 'string' || content.length === 0) return; // nothing textual to index
         const role = typeof entry.role === 'string' ? entry.role : '';
         const ts = typeof entry.timestamp === 'string' ? entry.timestamp : '';
-        // A per-chat directory is the trust boundary. Never let a JSONL field reassign a line to a
-        // different chat. Flat legacy archives have no directory scope, so use their embedded field.
+        // A per-chat directory is the trust boundary: never let a JSONL field reassign a line to a
+        // different chat. Flat archives have no directory scope, so use their embedded field.
         const chatId = subdir || (typeof entry.chatId === 'string' && entry.chatId.length > 0
           ? entry.chatId
           : undefined);
@@ -211,7 +209,7 @@ export class SqliteSessionIndex {
     return complete;
   }
 
-  /** C-12: reset stale derived anchors, rebuild from the append-only archive, then clear dirty state. */
+  /** Reset stale derived anchors, rebuild from the append-only archive, then clear dirty state. */
   reconcileFromDayFiles(): boolean {
     this.resetDerivedTables();
     const complete = this.rebuildFromDayFiles();
@@ -236,9 +234,9 @@ export class SqliteSessionIndex {
 
   private runSearch(query: string, limit: number, chatId?: string): SessionHit[] {
     const tokens = query.match(/[\p{L}\p{N}]+/gu) ?? [];
-    if (tokens.length === 0) return []; // empty / punctuation-only → no results, not an error
+    if (tokens.length === 0) return []; // empty or punctuation-only: no results, not an error
 
-    // Exact-phrase first (adjacency ⇒ all tokens present, in order). Fall back to OR for recall.
+    // Exact phrase first (adjacent, in order). Fall back to OR for recall.
     const phrase = `"${tokens.map(SqliteSessionIndex.escapeFts).join(' ')}"`;
     let hits = this.matchRows(phrase, limit, chatId);
     if (hits.length === 0 && tokens.length > 1) {
@@ -288,14 +286,14 @@ export class SqliteSessionIndex {
     `);
   }
 
-  // H8: drop + recreate both derived tables (used when a search hit corruption or a boot parity mismatch).
+  // Drop and recreate both derived tables (after search corruption or a boot parity mismatch).
   private resetDerivedTables(): void {
     this.db.exec('DROP TABLE IF EXISTS session_turns_fts; DROP TABLE IF EXISTS session_turns;');
     this.initSchema();
   }
 
-  // H8/C-11: metadata and derived FTS must have the same ids in both directions. Counts catch a lost
-  // row; the anti-joins catch an orphan FTS row with equal counts.
+  // Metadata and derived FTS must have the same ids in both directions. Counts catch a lost row;
+  // the anti-joins catch an orphan FTS row with equal counts.
   private ftsParityBroken(): boolean {
     try {
       const meta = (this.db.prepare('SELECT COUNT(*) AS c FROM session_turns').get() as { c: number }).c;
@@ -342,8 +340,8 @@ export class SqliteSessionIndex {
     }
   }
 
-  // The immediate subdirectory of `root` a day file sits in (the no-registry per-chat layout), or '' when
-  // the file is flat under root. Used only as a fallback when a JSONL entry lacks a chatId field.
+  // The immediate subdirectory of `root` a day file sits in (per-chat layout), or '' when the file
+  // is flat under root. Used only as a fallback when a JSONL entry lacks a chatId field.
   private static subdirChatId(root: string, fp: string): string {
     const rel = path.relative(root, fp);
     const parts = rel.split(path.sep);

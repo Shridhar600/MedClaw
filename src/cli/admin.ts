@@ -27,9 +27,8 @@ export interface AdminPaths {
   workspacePath?: string;
   storePath?: string;
   /**
-   * Optional override for the owner-record store. Production leaves it undefined and gets the real
-   * file adapter; a caller that must observe an unconfirmed publication (a directory flush that could
-   * not be completed) supplies its own store so the operator-facing text is the real one.
+   * Optional override for the owner-record store. Production leaves it undefined and gets the real file
+   * adapter; a caller that must observe an unconfirmed publication supplies its own store.
    */
   ownerStore?: OwnerStateStoreFactory;
 }
@@ -109,9 +108,8 @@ export async function showConfig(paths: AdminPaths = {}): Promise<string> {
  *  - the resulting document would not decode → refused before any write;
  *  - the replacement did not reach the filesystem → `failed`, original bytes preserved.
  *
- * When the rename committed but a durability step failed, the outcome is `uncertain`:
- * the message says the current content is not proven and must be inspected, and it does not
- * restore anything (plan 15 §8).
+ * When the rename committed but a durability step failed, the outcome is `uncertain`: the message says the
+ * current content is not proven and must be inspected, and nothing is restored.
  */
 export async function setConfigValue(
   configPath: string,
@@ -154,10 +152,8 @@ export async function setConfigValue(
 }
 
 /**
- * Read-validate-replace while the caller holds the config lease.
- *
- * Split out so the lease is provably held for the whole read-modify-write, and so the release
- * happens in exactly one place.
+ * Read-validate-replace while the caller holds the config lease. Split out so the lease is provably held for
+ * the whole read-modify-write and released in exactly one place.
  */
 async function applyConfigValueUnderLease(
   configPath: string,
@@ -244,10 +240,9 @@ export async function issuePairingCode(options: AdminPaths = {}): Promise<string
       ].join('\n') + '\n';
     }
     if (issued.reason === 'uncertain') {
-      // `uncertain` covers BOTH a post-rename flush that could not be confirmed AND an
-      // acknowledgement that was lost before anything is known. Only the record knows which, so this
-      // text must not assert either: "was replaced" is false when nothing was, and "unchanged" is
-      // false when the rename landed. Both directions of that claim were the R20 defect.
+      // `uncertain` covers both a post-rename flush that could not be confirmed and an acknowledgement lost before
+      // anything is known. Only the record knows which, so this text must not assert either "was replaced" or
+      // "unchanged".
       return [
         'Refused to issue a pairing code: the owner record could not be confirmed as written.',
         '',
@@ -282,9 +277,8 @@ function describePairingState(ownerRecordPath: string, ownerId: string): string 
 }
 
 /**
- * Local inspection reads are bounded. A growing Markdown file or job store above the limit
- * is reported as explicitly unavailable rather than being truncated into a healthy-looking
- * summary, and an unreadable file is never reported as an empty one.
+ * Local inspection reads are bounded. A Markdown file or job store above the limit is reported as unavailable
+ * rather than truncated into a healthy-looking summary, and an unreadable file is never reported as empty.
  */
 const MAX_INSPECTION_BYTES = 256 * 1024;
 
@@ -400,11 +394,8 @@ function heartbeatInspectionProblem(inspection: Extract<HeartbeatInspection, { k
 }
 
 /**
- * An endpoint safe to print.
- *
- * A configured base URL may carry `user:password@` userinfo, which is a credential. `redactConfig`
- * masks the `apiKey`/`botToken` KEYS but has no idea that a URL string can hold a secret, so a URL
- * printed verbatim here would leak it into terminal scrollback and any captured log.
+ * An endpoint safe to print. A configured base URL may carry `user:password@` userinfo, which is a credential;
+ * `redactConfig` masks only the `apiKey`/`botToken` keys, so a URL printed verbatim could leak it.
  */
 export function printableEndpoint(baseUrl: string | undefined, fallback: string): string {
   if (baseUrl === undefined || baseUrl.trim() === '') return fallback;
@@ -420,11 +411,8 @@ export function printableEndpoint(baseUrl: string | undefined, fallback: string)
 }
 
 /**
- * The honest remote-embedding statement (specs/13 amendment B1).
- *
- * Emitted from the ONE place every operator-facing summary is produced, so the warning cannot be
- * present in one entry mode and missing in another — which is exactly the asymmetry the cold
- * review found, where only the wizard warned. "Configured" is not "verified-ready".
+ * The remote-embedding statement. Emitted from the one place every operator-facing summary is produced, so the
+ * warning cannot be missing in one entry mode. "Configured" is not "verified-ready".
  */
 export function remoteEmbeddingWarning(): string {
   return 'WARNING: embeddings are remote — your text is sent to a cloud endpoint. The recall latency'
@@ -446,9 +434,8 @@ export function showRedactedConfigSummary(config: EffectiveConfig): string {
     lines.push(`provider api key: ${providerApiKeyConfigured(config.providers.main) ? 'configured' : 'not set'}`);
   }
 
-  // R05: the embedding role is an independent selection, so the summary names its PROVIDER and
-  // ENDPOINT as well as its model. Printing only the model is what let a cloud chat provider
-  // silently take embeddings with it and still look correct in the setup output.
+  // The embedding role is an independent selection, so the summary names its provider and endpoint as well as
+  // its model; a cloud chat provider must not silently take embeddings with it.
   lines.push(`embedding provider: ${redacted.providers.embeddings.type}`);
   lines.push(`embedding model: ${redacted.providers.embeddings.model}`);
   lines.push(
@@ -474,11 +461,8 @@ export function showRedactedConfigSummary(config: EffectiveConfig): string {
 }
 
 /**
- * Remove `user:password@` userinfo from any URL embedded in a readiness detail line.
- *
- * The provider healthcheck reports `configured: <url>`; that detail, and the review/status summary
- * that prints it, must never carry operator credentials. This sanitizes at the PRESENTATION boundary,
- * so the provider module keeps its transport behavior unchanged.
+ * Remove `user:password@` userinfo from any URL embedded in a readiness detail line. Sanitizes at the
+ * presentation boundary, so the provider module keeps its transport behavior unchanged.
  */
 function stripUrlCredentials(text: string): string {
   return text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^@\s/]+@/gi, '$1');

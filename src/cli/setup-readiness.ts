@@ -228,8 +228,7 @@ export async function preflightStartCheck(
       warnings.push(...ollama.warnings);
       blockers.push(...ollama.blockers);
       if (ollama.reachable && ollama.autoStarted) {
-        // Presentational only: the configured endpoint can carry `user:password@`, so only its
-        // sanitized form may reach operator output. (Cold re-review E1 preflight path.)
+        // The configured endpoint can carry `user:password@`, so only its sanitized form may reach output.
         warnings.push(`Ollama was started automatically for ${printableEndpoint(baseUrl, '(not set)')}.`);
       }
       reportedOllamaUrls.add(baseUrl);

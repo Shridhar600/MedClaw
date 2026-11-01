@@ -8,14 +8,12 @@ import { chunkHasStaleEntity } from '../recall';
 import * as path from 'path';
 import { contentContainsCredentials, summarizeErrorForLog, PathContainmentError } from '../security';
 
-// --- Managed-lane write guard (Task 12.6 / G1) -------------------------------------------
-// `memory_write` must never raw-overwrite an invariant-bearing managed path — that would
-// bypass versioning/confirmation (ledger), the 60/20/20 budget (MEMORY.md), the SAFETY.md
-// non-removal rule (CONTRA-03/04), or a store's ownership. The narrative lane (`memory/**`)
-// and core files (SOUL/USER/HEALTH_PROFILE/…) stay writable — the lossless guarantee lives
-// in the Task 13.3 capture hook, not a block.
+// Managed-lane write guard. `memory_write` must never raw-overwrite an invariant-bearing managed
+// path: that would bypass ledger versioning/confirmation, the MEMORY.md budget, the SAFETY.md
+// non-removal rule, or a store's ownership. The narrative lane (`memory/**`) and core files
+// (SOUL/USER/HEALTH_PROFILE/...) stay writable; the lossless guarantee comes from the capture hook.
 
-// memory_search v2 lane → path-prefix mapping (Task 12.7).
+// memory_search lane to path-prefix mapping.
 const LANE_PREFIX: Record<string, string> = {
   narrative: 'memory/',
   ledger: 'ledger/',
@@ -43,10 +41,9 @@ export const MEMORY_TOOL_MAX_BYTES = 16 * 1024;
 export const MEMORY_TOOL_MAX_TOKENS = 4_000;
 
 /**
- * Normalize a raw workspace-relative path to its RESOLVED form (PT / SB-1):
- * backslashes → slashes, then `path.posix.normalize` collapses `.` and `..`
- * segments. Returns null when `..` segments remain after normalization — the
- * path escapes above the workspace root and is never classifiable.
+ * Normalize a raw workspace-relative path to its resolved form: backslashes become slashes, then
+ * `path.posix.normalize` collapses `.` and `..`. Returns null when `..` segments remain, meaning
+ * the path escapes the workspace root and is never classifiable.
  */
 function normalizeManagedPath(p: string): string | null {
   const s = path.posix.normalize(p.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, ''));
@@ -109,11 +106,10 @@ function exceedsMemoryWriteLimit(value: string): boolean {
 }
 
 /**
- * Load the current per-entity ledger heads for the `status:active` stale-drop (E1.1). Best-effort:
- * a missing mirror or a read failure yields `available:false` (⇒ no filtering) — the search must never
- * crash or lose backward-compat because the fact mirror is degraded (resilience). `available:false` is
- * distinct from an empty-but-working mirror (empty ledger = nothing to filter, no warning owed) so the
- * caller can honestly tell the model the filter could NOT be applied (M-2).
+ * Load the current per-entity ledger heads for the `status:active` stale-drop. Best effort: a
+ * missing mirror or a read failure yields `available:false` (no filtering) instead of crashing the
+ * search. `available:false` differs from an empty-but-working mirror (nothing to filter, no warning
+ * owed) so the caller can tell the model the filter could not be applied.
  */
 async function loadEntityHeads(mirror: FactMirror | undefined): Promise<{ heads: FactRecord[]; available: boolean }> {
   if (!mirror) return { heads: [], available: false };
@@ -162,11 +158,11 @@ async function classifyManagedWrite(
   content: string,
 ): Promise<ToolResult | null> {
   const p = normalizeManagedPath(rawPath);
-  // Residual `..` after normalization = traversal above the workspace root.
+  // Residual `..` after normalization means traversal above the workspace root.
   if (p === null) return rejection(MANAGED_REJECT.traversal);
   const lower = p.toLowerCase();
 
-  // Narrative lane stays writable (append-only, lossless). Checked first so a `memory/…`
+  // The narrative lane stays writable (append-only, lossless). Checked first so a `memory/...`
   // path never collides with the `MEMORY.md` rule.
   if (lower.startsWith('memory/')) {
     if (mode !== 'append' && /^memory\/\d{4}-\d{2}-\d{2}\.md$/.test(lower)) return rejection(MANAGED_REJECT.dailyLog);
@@ -181,7 +177,7 @@ async function classifyManagedWrite(
   if (lower.startsWith('scratch/')) return rejection(MANAGED_REJECT.scratch);
 
   if (lower === 'safety.md') {
-    // Removal is only possible via overwrite — append cannot drop text (G1).
+    // Removal is only possible via overwrite; append cannot drop text.
     if (mode === 'append') return null;
     let current: string | null = null;
     try {
@@ -196,31 +192,23 @@ async function classifyManagedWrite(
     return null; // a non-dropping SAFETY.md overwrite is not destructive
   }
 
-  return null; // unmanaged path (core files, conditions/*, …) — allowed as before
+  return null; // unmanaged path (core files, conditions/*, ...)
 }
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars -- profileId reserved for Task 8 (profile-scoped index metadata)
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- profileId is reserved for profile-scoped index metadata
 export function createMemoryTools(
   engine: MemoryEngine,
   search?: MemorySearch,
   indexer?: MemoryIndexer,
   _profileId?: string,
-  // E1.1: the fact mirror powers memory_search's `status:active` stale-drop. Accepts a lazy
-  // accessor because the gateway builds the mirror AFTER these tools register — the closure reads
-  // it at execute time (boot-complete), and `undefined` degrades to no filtering.
+  // The fact mirror powers memory_search's `status:active` stale-drop. A lazy accessor is accepted
+  // because the gateway builds the mirror after these tools register; `undefined` means no filtering.
   factMirror?: FactMirror | (() => FactMirror | undefined),
   /**
-   * RR-STRUCT R-S3b (C-46, last bypass): `memory_write` used to write DIRECTLY to
-   * `MemoryEngine` — two concurrent writes to the SAME file (two turns, or a turn racing
-   * a heartbeat) could interleave, and the credential-scan-and-rollback read-modify-write
-   * was not atomic against a concurrent write. Routing the WHOLE write body through the
-   * single-writer coordinator closes that window. Optional + falls back to the direct
-   * (pre-R-S3b) call when absent, so existing single-caller test construction is
-   * unaffected — a missing coordinator degrades atomicity, never availability
-   * (resilience law). Accepts a lazy accessor because the gateway registers these tools
-   * BEFORE the memcore block builds the `WriteQueue`/`MutationCoordinator` — the closure
-   * reads it at execute time (boot-complete), exactly like `factMirror` above. A direct
-   * instance is also accepted (tests / late wiring).
+   * Single-writer coordinator for `memory_write`. The whole write body runs as one coordinator op,
+   * so the credential scan-and-rollback read-modify-write is atomic against concurrent writes to
+   * the same file. When absent, the write runs inline (less atomic, still available). A lazy
+   * accessor is accepted because the gateway registers these tools before the coordinator exists.
    */
   queue?: QueuePort | (() => QueuePort | undefined),
 ): Tool[] {
@@ -285,27 +273,23 @@ export function createMemoryTools(
           return rejection(`Write rejected: content exceeds the ${MEMORY_TOOL_MAX_BYTES}-byte / ${MEMORY_TOOL_MAX_TOKENS}-token memory tool limit.`);
         }
 
-        // The WHOLE write body — managed-lane guard, credential pre-scan, engine write,
-        // post-append full-file re-scan + rollback — runs as ONE coordinator op so the
-        // read-modify-write is atomic against every other memory-domain write. The LOGIC
-        // below is unchanged pre-R-S3b behavior, only wrapped. No embed/LLM runs in the
-        // lock (the reindex trigger stays outside, below); nothing in here re-enqueues,
-        // so the coordinator's re-entrancy guard cannot fire on this path.
+        // The whole write body (managed-lane guard, credential pre-scan, engine write, post-append
+        // re-scan and rollback) runs as one coordinator op so the read-modify-write is atomic against
+        // every other memory-domain write. No embed/LLM work runs inside the lock, and nothing in
+        // here re-enqueues.
         const doWrite = async (): Promise<ToolResult> => {
-          // Managed-lane guard (G1): refuse invariant-bearing paths before any write.
+          // Managed-lane guard: refuse invariant-bearing paths before any write.
           const managed = await classifyManagedWrite(engine, filePath, mode, content);
           if (managed) return managed;
 
           if (mode === 'append') {
-            // SEC-M2b: capture the FULL existing content pre-append — both for the
-            // tail-window pre-scan and as the rollback target if the post-append
-            // full-file re-scan catches a split-append credential that the
-            // tail-window pre-scan missed.
+            // Capture the full existing content pre-append, both for the tail-window pre-scan and
+            // as the rollback target if the post-append re-scan catches a split-append credential.
             let preAppendContent: string | null = null;
             try {
               preAppendContent = await engine.readFile(filePath);
             } catch {
-              // file doesn't exist yet, that's fine
+              // file does not exist yet
             }
             const existingTail = preAppendContent !== null && preAppendContent.length > 0
               ? preAppendContent.slice(-8192)
@@ -320,12 +304,10 @@ export function createMemoryTools(
             }
             await engine.appendToFile(filePath, content);
 
-            // SEC-M2b: re-read the ENTIRE assembled file and re-scan. A split-append
-            // can hide a label behind >8192 chars of non-alphanumeric padding so the
-            // tail-window pre-scan passes, yet the assembled file reconstructs a
-            // complete credential. On match, roll the append back to the pre-append
-            // content and reject. Cost is acceptable for health-memory files. A
-            // rollback failure must warn-and-continue (resilience) — never crash.
+            // Re-read the entire assembled file and re-scan. A split append can hide a label behind
+            // >8192 chars of padding so the tail-window pre-scan passes while the assembled file still
+            // holds a complete credential. On a match, roll the append back and reject. A rollback
+            // failure must warn and continue, never crash.
             try {
               const assembled = await engine.readFile(filePath);
               if (assembled !== null) {
@@ -346,8 +328,7 @@ export function createMemoryTools(
                 }
               }
             } catch (postScanError) {
-              // Post-append re-scan is defense-in-depth; a read failure here must
-              // not undo a legitimate append nor crash the daemon.
+              // Defense in depth: a read failure here must not undo a legitimate append or crash.
               console.warn(
                 '[memory-tools] Post-append credential re-scan failed (continuing):',
                 summarizeErrorForLog(postScanError),
@@ -366,17 +347,14 @@ export function createMemoryTools(
           return { content: [{ type: 'text', text: `Written to ${filePath}` }] };
         };
 
-        // Serialize this write against every other memory-domain writer. Absent
-        // coordinator ⇒ run inline (today's behavior): degraded atomicity, never
-        // availability (resilience law).
+        // Serialize this write against every other memory-domain writer. Without a coordinator it
+        // runs inline: less atomic, still available.
         const coordinator = getQueue();
         const result = coordinator
           ? await coordinator.enqueue('turn', { label: 'memory:write', scope: 'memory', run: doWrite })
           : await doWrite();
-        // Tier-2 stays OFF the write lock (RR-7 C-09: embeddings never run inside the
-        // single-writer lock) — fire-and-forget after the op resolves, and only on
-        // success: every rejection above returns `isError: true` from inside the op,
-        // exactly matching the pre-R-S3b "reached the indexer line" behavior.
+        // Indexing (embeddings) stays off the write lock: fire-and-forget after the op resolves, and
+        // only on success (every rejection returns `isError: true` from inside the op).
         if (indexer && !result.isError) {
           void indexer.indexFile(filePath).catch(e =>
             console.warn(`[memory-tools] Reindex failed for ${filePath}:`, summarizeErrorForLog(e)),
@@ -411,20 +389,19 @@ export function createMemoryTools(
       const limit = (params.limit as number) ?? 5;
       const lane = params.lane as string | undefined;
       const prefix = lane ? LANE_PREFIX[lane] : undefined;
-      // `status:active` (default) drops chunks whose derived ledger entity head is stale — the same
-      // rule the recall engine applies in Stage-2 (chunkHasStaleEntity), so both paths agree
-      // (CONTRA-06/08). `all` disables it. Version ordering is a fact query — use ledger_query.
+      // `status:active` (default) drops chunks whose derived ledger entity head is stale, the same
+      // rule the recall engine applies, so both paths agree. `all` disables it. Version ordering is
+      // a fact query: use ledger_query.
       const factStatus = (params.status as string) ?? 'active';
       const willStatusFilter = factStatus !== 'all';
       // Over-fetch when a lane OR the status filter can drop rows, so we still surface up to `limit`.
       const fetchK = (prefix || willStatusFilter) ? Math.max(limit * 4, 20) : limit;
       let results = await search.search(params.query as string, fetchK);
       if (prefix) results = results.filter(r => r.path.startsWith(prefix));
-      // M-2: fail OPEN but not SILENT. If a status filter was requested but the fact-status substrate
-      // is unavailable (no mirror wired, or the heads read threw), we return unfiltered results AND
-      // tell the model the filter could not be applied — a medical answer must never assume active-only
-      // filtering happened when it did not. An empty-but-working mirror is NOT unavailable (nothing to
-      // filter), so it earns no banner.
+      // Fail open but not silent. If a status filter was requested but the fact-status substrate is
+      // unavailable (no mirror wired, or the heads read threw), return unfiltered results and tell
+      // the model the filter could not be applied: a medical answer must never assume active-only
+      // filtering happened when it did not. An empty-but-working mirror is not unavailable.
       let statusUnavailable = false;
       if (willStatusFilter) {
         const { heads, available } = await loadEntityHeads(getMirror());

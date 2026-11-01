@@ -8,8 +8,7 @@ import type { ProviderConfig } from '../config/types';
 // (otherwise: "Function tools with reasoning_effort are not supported ...
 // use /v1/responses or set reasoning_effort to 'none'"). The agent loop always
 // sends tools, so without this every turn 400s. Detected by name; 'none' also
-// keeps latency low, which suits a tool-calling health agent. (A fuller move to
-// the /v1/responses API is a separate decision — see forka-test-report #13.)
+// keeps latency low, which suits a tool-calling health agent.
 function isReasoningModel(model: string): boolean {
   return /^(?:gpt-5|o[1-9])/i.test(model);
 }
@@ -78,7 +77,7 @@ export class OpenAIProvider implements LLMProvider {
     if (this.reasoningEffort !== undefined) {
       return this.reasoningEffort;
     }
-    // Name heuristic for gpt-5/o-series on chat/completions (#13): tools are
+    // Name heuristic for gpt-5/o-series on chat/completions: tools are
     // rejected with any other effort, and the agent always sends tools.
     return isReasoningModel(this.model) ? 'none' : undefined;
   }

@@ -1,7 +1,7 @@
 // src/tools/episode-tools.ts
 //
-// episode_manage (Task 12.4) — CRUD over EpisodeStore (create/update/link/close/get/list
-// with pagination). Episodes group related facts + narrative into a health arc.
+// episode_manage — CRUD over EpisodeStore (create/update/link/close/get/list with pagination). Episodes group
+// related facts + narrative into a health arc.
 
 import type { Tool, ToolResult } from './types';
 import type { EpisodeStore, Episode, EpisodeStatus } from '../memcore';
@@ -14,12 +14,9 @@ export interface EpisodeToolsDeps {
   store: EpisodeStore;
   profileId: string;
   /**
-   * RR-STRUCT R-S3 (C-46 generalization): `episode_manage` used to write DIRECTLY to
-   * `EpisodeStore` — one file per episode id, read-then-write — with no serialization against a
-   * concurrent mutation of the SAME episode (a genuine lost-update race). Routing create/update/
-   * link/close through the single-writer coordinator closes that window. Optional + falls back to
-   * the direct (pre-R-S3) call when absent, so existing single-caller test construction is
-   * unaffected — a missing coordinator degrades atomicity, never availability (resilience law).
+   * Single-writer coordinator that serializes create/update/link/close against concurrent mutation of the same
+   * episode (a read-then-write lost-update race). Optional: when absent the tool calls the store directly, which
+   * degrades atomicity, never availability.
    */
   queue?: QueuePort;
 }
@@ -37,9 +34,9 @@ function isPathContainmentError(error: unknown): boolean {
 }
 
 /**
- * SB-1: the episode lane persists caller-controlled text (title/note/regions/factIds) to a 0600
- * health file — it carries the SAME credential-rejection bar as every other write path
- * (memory_write, ledger_record, safety_note, capture). Returns a rejection or null.
+ * The episode lane persists caller-controlled text (title/note/regions/factIds) to a 0600 health file, so it
+ * carries the same credential-rejection bar as every other write path (memory_write, ledger_record,
+ * safety_note, capture). Returns a rejection or null.
  */
 function scanEpisodeInputs(...fields: (string | string[] | undefined)[]): ToolResult | null {
   const text = fields.flatMap(f => (f === undefined ? [] : Array.isArray(f) ? f : [f])).join('\n');
@@ -59,9 +56,8 @@ function renderEpisode(e: Episode): string {
 }
 
 export function createEpisodeTools(deps: EpisodeToolsDeps): Tool[] {
-  // Serialize every mutating action against the SAME per-profile single-writer used by every
-  // other memory-domain writer (RR-STRUCT R-S3). Without an injected queue, run inline — the
-  // exact pre-R-S3 behavior (fine for a single caller; loses atomicity under real concurrency).
+  // Serialize every mutating action against the same per-profile single-writer used by every other memory-domain
+  // writer. Without an injected queue, run inline (fine for a single caller; loses atomicity under concurrency).
   const mutate = <T>(label: string, run: () => Promise<T>): Promise<T> =>
     deps.queue ? deps.queue.enqueue('turn', { label, scope: 'episode', run }) : run();
 

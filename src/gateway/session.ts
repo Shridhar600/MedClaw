@@ -34,8 +34,8 @@ import {
 // constant so compaction (write), the window snapshot (derive), and resume (render) agree byte-for-byte.
 const SUMMARY_PREFIX = '[Previous conversation summary]\n';
 
-// HIGH-1: upper bound on a single day file the nightly sweep will slurp with a synchronous read
-// (64 MiB — orders of magnitude above any real day of chat). A larger file is skipped, not read.
+// Upper bound on a single day file the nightly sweep will read synchronously (64 MiB, far above any
+// real day of chat). A larger file is skipped, not read.
 const MAX_DAY_FILE_READ_BYTES = 64 * 1024 * 1024;
 
 interface Session {
@@ -46,9 +46,8 @@ interface Session {
   lastActiveAt: Date;
 }
 
-// A-H1 provenance for the nightly sweep: 'chat' = a real user/agent turn (the default, and what an
-// absent field means — legacy/migrated entries stay sweepable); 'heartbeat'/'system' = daemon-authored,
-// never mined for capture misses.
+// Provenance for the nightly sweep: 'chat' = a real user/agent turn (the default when the field is absent);
+// 'heartbeat'/'system' = daemon-authored, never mined for capture misses.
 export type JsonlOrigin = 'chat' | 'heartbeat' | 'system';
 
 interface JsonlEntry {
@@ -59,10 +58,10 @@ interface JsonlEntry {
   origin?: JsonlOrigin;
   tool_call_id?: string;
   tool_calls?: Message['tool_calls'];
-  // Backward compatibility with previous camelCase format.
+  // Alternate camelCase field names, accepted on read.
   toolCallId?: string;
   toolCalls?: Message['tool_calls'];
-  // Backward compatibility with previously persisted format.
+  // Alternate persisted field names, accepted on read.
   toolName?: string;
   toolResult?: string;
 }
@@ -74,8 +73,8 @@ interface CompactionConfig {
   keepRecentTurns: number;
 }
 
-// P2b spec 14 §3 window triggers (structural twin of config's SessionWindowConfig — kept local so
-// session.ts stays decoupled from the config module, matching the CompactionConfig precedent).
+// Window triggers. Structural twin of config's SessionWindowConfig, kept local so session.ts stays decoupled
+// from the config module.
 interface WindowConfig {
   pruneAtPercent: number;
   compactAtPercent: number;
@@ -83,9 +82,9 @@ interface WindowConfig {
   keepRecentTurns: number;
 }
 
-// A snapshot of what a compaction will summarize, captured under the write queue so the LLM can then run
-// OFF the queue (H2). `historyRef` is the identity of the history array at snapshot time — the apply
-// aborts if it was replaced since (A-MF3 live-tail re-check). `olderReal` excludes any leading summary.
+// A snapshot of what a compaction will summarize, captured under the write queue so the LLM can then run off the
+// queue. `historyRef` is the history array at snapshot time; the apply aborts if it was replaced since.
+// `olderReal` excludes any leading summary.
 interface CompactionSnapshot {
   historyRef: Message[];
   historyAnchorsRef: Array<Anchor | undefined>;
@@ -95,8 +94,6 @@ interface CompactionSnapshot {
   rangeAnchors: Anchor[];
 }
 
-// A-M4: the new canonical constructor shape. Expand-contract — the legacy positional signature keeps
-// working during the P2b Wave D-1 cutover and is removed once every caller is migrated.
 export interface SessionManagerOptions {
   sessionsPath?: string;
   softResetMinutes?: number;
@@ -104,47 +101,42 @@ export interface SessionManagerOptions {
   provider?: LLMProvider;
   toolRegistry?: ToolRegistry;
   compaction?: CompactionConfig;
-  /** P2b spec 14 §3 real-token window triggers (defaults 35/50/80/10 when absent). */
+  /** Real-token window triggers (defaults 35/50/80/10 when absent). */
   window?: WindowConfig;
-  /** P2b DD4 — the model's context window in tokens; falls back to `contextWindowFor` when unset. */
+  /** The model's context window in tokens; falls back to `contextWindowFor` when unset. */
   contextWindow?: number;
   profileId?: string;
   rotationConfig?: Partial<RotationConfig>;
   /**
-   * D1.2/A-MF5: day-file archive namespacing. `false` (registry-backed, one thread per profile) →
-   * `<sessionsPath>/YYYY-MM-DD.jsonl`. `true` (no-registry / ad-hoc, per-chat isolation) →
-   * `<sessionsPath>/<chatId>/YYYY-MM-DD.jsonl`. The Gateway sets it from whether a ProfileRegistry
-   * is present.
+   * Day-file archive layout. `false` (one thread per profile): `<sessionsPath>/YYYY-MM-DD.jsonl`.
+   * `true` (per-chat isolation): `<sessionsPath>/<chatId>/YYYY-MM-DD.jsonl`.
    */
   perChatArchive?: boolean;
 }
 
 /**
- * D2.5: the minimal seam by which the SessionManager feeds each appended archive line to the
- * `session_search` FTS index (incremental indexing). Kept structural — NOT an import of the concrete
- * indexstore adapter — so session.ts (gateway-tier) has no dependency on the index implementation.
- * Best-effort: the caller wraps every call so an index failure degrades and never blocks a turn.
+ * The minimal seam by which the SessionManager feeds each appended archive line to the `session_search` FTS
+ * index. Structural, so session.ts (gateway-tier) does not depend on the index implementation. Best-effort:
+ * the caller wraps every call so an index failure degrades and never blocks a turn.
  */
 export interface SessionTurnIndexer {
   indexTurn(chatId: string, file: string, line: number, role: string, ts: string, content: string): void;
-  /** H5: durably flag a swallowed incremental-index failure so the next boot reconciles the hole. */
+  /** Durably flag a swallowed incremental-index failure so the next boot reconciles the hole. */
   markDirty?(): void;
-  /** C-12: rebuild derived rows after migration appends records at new physical anchors. */
+  /** Rebuild derived rows after records are appended at new physical anchors. */
   reconcileFromDayFiles?(): void;
 }
 
-// --- Compaction token-budget trigger (#15) --------------------------------
-// A cheap safety-margin trigger, NOT exact accounting. `estimateTokens` is a
-// chars/4 English heuristic (20-30% error is acceptable because we compact
-// well before the real context limit); no tokenizer and no new dependency.
-// I3: retry only transient upstream conditions. OpenAI SDK errors carry a
-// numeric `status`; plain network failures (fetch TypeError) carry none.
+// Retry only transient upstream conditions. OpenAI SDK errors carry a numeric `status`; plain network failures
+// (fetch TypeError) carry none.
 function isTransientLlmError(e: unknown): boolean {
   const status = (e as { status?: unknown } | null)?.status;
   if (typeof status !== 'number') return true; // no status ⇒ network-ish ⇒ transient
   return status === 429 || status >= 500;
 }
 
+// A cheap safety-margin estimate, not exact accounting: a chars/4 English heuristic (20-30% error is fine
+// because compaction runs well before the real context limit). No tokenizer, no new dependency.
 export function estimateTokens(messages: Message[]): number {
   let chars = 0;
   for (const m of messages) {
@@ -154,10 +146,9 @@ export function estimateTokens(messages: Message[]): number {
   return Math.ceil(chars / 4);
 }
 
-// M2: the chars/4 fallback (used only when a provider omits usage) counts the session history but NOT the
-// system prompt (SAFETY + assembled memory) and tool schemas the provider actually received — those can be
-// several thousand tokens. Add a conservative overhead so the fallback errs toward triggering compaction
-// rather than under-reporting a large real prompt as near-zero. Real usage readings never use this.
+// The chars/4 fallback (used only when a provider omits usage) counts history but not the system prompt and
+// tool schemas the provider received, which can be several thousand tokens. This overhead makes the fallback
+// err toward compacting. Real usage readings never use it.
 const FALLBACK_SYSTEM_OVERHEAD_TOKENS = 3000;
 
 export type WindowTrigger = 'none' | 'prune' | 'compact' | 'emergency';
@@ -165,9 +156,8 @@ export type WindowTrigger = 'none' | 'prune' | 'compact' | 'emergency';
 export type WindowDerivationStatus = 'watermark' | 'fallback';
 
 /**
- * spec 14 §3 threshold table — the window-fill percentage maps to the compaction action. Bounds are
- * inclusive lower edges: `<prune` none; `[prune,compact)` prune; `[compact,emergency)` compact;
- * `>=emergency` emergency. Pure so the 34/35/49/50/80 boundaries are unit-tested directly.
+ * Maps the window-fill percentage to a compaction action. Bounds are inclusive lower edges: below `prune`
+ * none; `[prune,compact)` prune; `[compact,emergency)` compact; `>=emergency` emergency.
  */
 export function windowTriggerFor(
   fillPercent: number,
@@ -187,22 +177,19 @@ export function contextWindowFor(model?: string): number {
   if (/^gpt-5/.test(m) || /^o[1-9]/.test(m)) return 128000;
   if (m.includes('gpt-4o') || m.includes('gpt-4.1')) return 128000;
   if (m.includes('llama3.2')) return 128000;
-  if (m.includes('kimi')) return 262144; // Kimi K2.5/K2.6/K2.7 — 256K (shipped default main model)
+  if (m.includes('kimi')) return 262144; // 256K context (shipped default main model)
   return 8192; // medgemma / unknown
 }
 
-// --- Tool-call group integrity (#16) --------------------------------------
-// OpenAI rejects any history where a `tool` message is not a response to a
-// preceding `assistant`+`tool_calls`, or where an `assistant`+`tool_calls`
-// is not immediately followed by its tool result(s). Compaction splits on a
-// turn (user-message) boundary — never mid-group — and `stripOrphanToolMessages`
-// is the belt-and-braces sanitizer that guarantees a valid history regardless.
+// Tool-call group integrity: OpenAI rejects any history where a `tool` message does not answer a preceding
+// `assistant`+`tool_calls`, or where an `assistant`+`tool_calls` is not immediately followed by its tool
+// result(s). Compaction splits on a turn (user-message) boundary, never mid-group, and
+// `stripOrphanToolMessages` sanitizes any history that still breaks the rule.
 
-// H4 / A-M6: turn-aware retention split. A "turn" = the span from a `user` message to the next `user`
-// message (same definition prune uses). The kept (recent) slice starts ON a user message, so it always
-// begins with the user's question and NEVER an orphaned tool group or a half-turn (spec 14 §4 keeps the
-// last `keepTurns` TURNS, not messages). Returns the index at which the recent slice begins; the older
-// slice is history[0..split). Keeps everything (split 0) when there are fewer turns than `keepTurns`.
+// Turn-aware retention split. A "turn" is the span from a `user` message to the next one. The kept (recent)
+// slice starts on a user message, so it never begins with an orphaned tool group or half a turn. Returns the
+// index where the recent slice begins; the older slice is history[0..split). Returns 0 (keep everything) when
+// there are fewer turns than `keepTurns`.
 export function turnAwareSplit(history: Message[], keepTurns: number): number {
   if (keepTurns <= 0) return history.length;
   const userIdx: number[] = [];
@@ -211,17 +198,14 @@ export function turnAwareSplit(history: Message[], keepTurns: number): number {
   return userIdx[userIdx.length - keepTurns]; // the user message that starts the last `keepTurns` turns
 }
 
-// M3: strip any `sessions/<file>#L<n>` anchor a model summary may contain, so every stored anchor is
-// application-supplied and range-validated (never a model-fabricated line that could point out of range
-// or at a nonexistent file). Removes an optional wrapping "( … )" and trailing whitespace around it.
+// Strip any `sessions/<file>#L<n>` anchor a model summary may contain, so every stored anchor is
+// application-supplied and range-validated. Also removes an optional wrapping "( … )" and trailing whitespace.
 function stripModelAnchors(text: string): string {
   return text.replace(/\s*\(?sessions\/\S+#L\d+\)?/g, '');
 }
 
-// Defensive sanitizer (belt-and-braces even after the boundary snap, and
-// protects any other provider call that replays a compacted history). Drops:
-// leading/orphan `tool` messages (no matching assistant+tool_calls parent) and
-// a trailing `assistant`+`tool_calls` with no following tool result.
+// Defensive sanitizer for compacted history and any other provider replay. Drops leading/orphan `tool` messages
+// (no matching assistant+tool_calls parent) and a trailing `assistant`+`tool_calls` with no tool result.
 export function stripOrphanToolMessages(messages: Message[]): Message[] {
   const out: Message[] = [];
   for (const msg of messages) {
@@ -280,20 +264,18 @@ function stripOrphanToolMessagesWithAnchors(entries: AnchoredMessage[]): Anchore
   return out;
 }
 
-// spec 14 §3 prune marker (in-window only — the day-file archive keeps the verbatim result, retrievable
-// via session_search). One constant so the marker text is a single source of truth.
+// Marker that replaces pruned tool results in the window. The day-file archive keeps the verbatim result,
+// retrievable via session_search.
 export const PRUNED_TOOL_MARKER = '[tool result pruned — session_search to retrieve]';
 
-// spec 14 §3 / A-M6: prune keeps the LAST 5 TURNS verbatim (a "turn" = the span from one `user` message
-// to the next). This is a DIFFERENT number + purpose from compaction's keepRecentTurns (10).
+// Prune keeps the last 5 turns verbatim (a "turn" runs from one `user` message to the next). This differs from
+// compaction's keepRecentTurns.
 const PRUNE_LAST_TURNS = 5;
 
 /**
- * spec 14 §3 prune: swap the CONTENT of `tool`-role messages that fall before the last `keepTurns`
- * turns with the pruned marker. Content-swap only — the message, its role, and its `tool_call_id` are
- * kept, so tool-group integrity and OpenAI ordering hold, and nothing is removed. Lossless: the disk
- * day-file line is untouched; the verbatim original is returned by session_search. A history with
- * `<= keepTurns` turns is returned unchanged.
+ * Swaps the content of `tool`-role messages older than the last `keepTurns` turns for the pruned marker. The
+ * message, role and `tool_call_id` stay, so tool-group ordering holds. The archive line on disk is untouched.
+ * A history with `<= keepTurns` turns is returned unchanged.
  */
 export function pruneToolResults(history: Message[], keepTurns: number): Message[] {
   if (keepTurns <= 0) return history;
@@ -307,11 +289,9 @@ export function pruneToolResults(history: Message[], keepTurns: number): Message
 }
 
 /**
- * spec 14 §4.2: give every summary bullet a resolving `sessions/<file>#L<n>` anchor so nothing the
- * summary references is unreachable (the agent can session_search the specific line). Anchors are drawn
- * from `rangeAnchors` — the day-file lines of the turns that were summarized — spread across the bullets
- * (clamped), so each anchor is real and in-range. A line that already carries an anchor is left as-is;
- * blank lines are skipped. No LLM self-citation dependency.
+ * Gives every summary bullet a resolving `sessions/<file>#L<n>` anchor so nothing the summary references is
+ * unreachable. Anchors come from `rangeAnchors` (the archive lines of the summarized turns), spread across the
+ * bullets. A line that already carries an anchor is left as-is; blank lines are skipped.
  */
 export function anchorSummaryBullets(summaryText: string, rangeAnchors: Anchor[]): string {
   if (rangeAnchors.length === 0) return summaryText;
@@ -328,8 +308,8 @@ export function anchorSummaryBullets(summaryText: string, rangeAnchors: Anchor[]
     .join('\n');
 }
 
-// H11: true when the day file exists and its last byte is not '\n' (a torn/external write). Reads only
-// the final byte (via a positioned read) — never the whole file. Any error ⇒ treat as a normal append.
+// True when the day file exists and its last byte is not '\n' (a torn or external write). Reads only the final
+// byte. Any error is treated as a normal append.
 function dayFileEndsWithoutNewline(filePath: string): boolean {
   let fd: number | undefined;
   try {
@@ -361,74 +341,67 @@ export class SessionManager {
   private readonly windowConfig?: WindowConfig;
   private readonly contextWindow?: number;
   private readonly profileId: string;
-  // DD3 (A-MF1): the last window-fill reading per chat — real `usage.promptTokens` (estimated:false) or
-  // a chars/4 fallback (estimated:true). Persisted in the window state; seeded from it on resume.
-  // `triggered` marks a reading already consumed by a prune/compact/emergency this cycle so the SAME
-  // stale reading cannot re-fire every turn (A-MF3); the next recordPromptUsage clears it.
+  // The last window-fill reading per chat: real `usage.promptTokens` (estimated:false) or a chars/4 fallback
+  // (estimated:true). Persisted in the window state. `triggered` marks a reading already consumed by a
+  // prune/compact/emergency this cycle, so the same stale reading cannot re-fire; the next recordPromptUsage
+  // clears it.
   private readonly lastPromptTokensByChat: Map<string, { tokens: number; estimated: boolean; triggered?: boolean }> = new Map();
-  // A-MF3: the in-flight background compaction per chat, so a ≥50% trigger never starts a second pipeline.
+  // The in-flight background compaction per chat, so a second trigger never starts a second pipeline.
   private readonly compactionInFlight: Map<string, Promise<void>> = new Map();
   private readonly rotationConfig?: Partial<RotationConfig>;
   private readonly perChatArchive: boolean;
-  // D1.3 (A-H2): the current physical non-empty line count of each day file, keyed by full day-file
-  // path. Seeded FROM DISK on first touch this process (in-memory tracking is lost on restart and
-  // `secureAppend` does not fsync), then advanced as we append. Every anchor is computed from this
-  // count, so a fresh manager continues the numbering instead of restarting at 1.
+  // The current physical non-empty line count of each day file, keyed by full path. Seeded from disk on first
+  // touch (in-memory tracking is lost on restart and `secureAppend` does not fsync), then advanced on append,
+  // so a fresh manager continues the numbering.
   private readonly dayFileLineCounts: Map<string, number> = new Map();
-  // C-38: durable EOF watermarks are stored in SessionWindow; this process-local map avoids rereading
-  // even the current day file between successive window saves. The key is the resolved archive lane,
-  // which is per-chat in the Gateway's normal layout and per-profile in legacy flat mode.
+  // Durable EOF watermarks live in SessionWindow; this process-local map avoids rereading even the current day
+  // file between window saves. The key is the resolved archive lane.
   private readonly archiveTailsByDir: Map<string, ArchiveTail> = new Map();
   private readonly windowDerivationStatusByChat: Map<string, WindowDerivationStatus> = new Map();
-  // F8: compaction LLM calls run at 'background' semaphore priority so they never starve or collide
-  // with user turns. Injected by the Gateway (setter — the semaphore is created alongside). When
-  // unset (tests / no semaphore), the call runs directly. prepareHistory always runs BEFORE the
-  // AgentLoop acquires the semaphore, so this background acquire cannot self-deadlock (v2-H-4).
+  // Compaction LLM calls run at 'background' semaphore priority so they never starve user turns. Injected by the
+  // Gateway; when unset (tests), the call runs directly. prepareHistory runs before the AgentLoop acquires the
+  // semaphore, so this acquire cannot self-deadlock.
   private runBackground?: <T>(fn: () => Promise<T>) => Promise<T>;
-  // D2.5: the session_search FTS index. When wired, recordTurn feeds each appended archive line to it
-  // (best-effort). Optional — no index ⇒ no incremental indexing (session_search unavailable / degraded).
+  // The session_search FTS index. When wired, recordTurn feeds each appended archive line to it (best-effort).
+  // Without it there is no incremental indexing.
   private turnIndex?: SessionTurnIndexer;
-  // C-40: a summary copy is durable pending work until the sink and the cleared window state both commit.
+  // A summary copy is durable pending work until the sink and the cleared window state both commit.
   private readonly pendingSummariesByChat: Map<string, string> = new Map();
-  // RR-STRUCT R-S4 (mini-plan v3 §3.9): the ProfileRuntime lifecycle hard gate — `true` once the
-  // owning runtime has closed its SQLite handles (`isClosed()`), never merely "stopping". recordTurn
-  // feeds the SqliteSessionIndex (one of the 7 retained-and-closed handles) via appendMessagesToJsonl,
-  // so a late write after close must refuse instead of touching a closed native handle. Keyed on
-  // "closed" (not "stopping") for the SAME reason MutationCoordinator is: a turn that started before
-  // stop() must still be allowed to drain its recordTurn (see runtime.ts drainAndClose). Wired by the
-  // composition root (setter — same pattern as setBackgroundRunner). Unset (tests / no runtime) ⇒
-  // never shut down (today's behavior).
+  // Lifecycle hard gate: true once the owning runtime has closed its SQLite handles (never merely "stopping").
+  // A late recordTurn would touch a closed index handle, so it refuses instead. Keyed on "closed" so a turn that
+  // started before stop() can still drain. Wired by the composition root; unset means never shut down.
   private isShutdown: () => boolean = () => false;
 
-  /** Wire compaction LLM calls through the semaphore at background priority (F8). */
+  /** Wire compaction LLM calls through the semaphore at background priority. */
   setBackgroundRunner(run: <T>(fn: () => Promise<T>) => Promise<T>): void {
     this.runBackground = run;
   }
 
-  /** Wire the shutdown hard-gate (RR-STRUCT R-S4): recordTurn/recordPromptUsage/runCompaction
-   *  refuse with a DaemonShutdownError once the owning ProfileRuntime has closed its stores. */
+  /**
+   * Wire the shutdown hard gate: recordTurn, recordPromptUsage and runCompaction refuse with a
+   * DaemonShutdownError once the owning ProfileRuntime has closed its stores.
+   */
   setShutdownGate(isShutdown: () => boolean): void {
     this.isShutdown = isShutdown;
   }
 
-  /** RR-STRUCT R-S4: reject a late write BEFORE it touches disk/the op queue. */
+  /** Reject a late write before it touches disk or the op queue. */
   private assertNotShutdown(label: string): void {
     if (this.isShutdown()) {
       throw new DaemonShutdownError(label);
     }
   }
 
-  /** Wire the session_search FTS index for incremental per-turn indexing (D2.5). */
+  /** Wire the session_search FTS index for incremental per-turn indexing. */
   setTurnIndex(index: SessionTurnIndexer): void {
     this.turnIndex = index;
   }
 
-  // D3.4/C-29: the sink that copies each compaction summary (anchored bullets) to the chat-scoped
-  // session-summary lane. Wired by the Gateway through the WriteQueue. Optional and best-effort — a sink
-  // failure never fails compaction.
+  // The sink that copies each compaction summary (anchored bullets) to the chat-scoped session-summary lane.
+  // Wired by the Gateway through the WriteQueue. Best-effort: a sink failure never fails compaction.
   private summarySink?: (chatId: string, anchoredSummary: string) => Promise<void>;
 
-  /** Wire the compaction-summary → chat-scoped sink (D3.4 / C-29). */
+  /** Wire the compaction-summary sink. */
   setSummarySink(sink: (chatId: string, anchoredSummary: string) => Promise<void>): void {
     this.summarySink = sink;
   }
@@ -468,9 +441,8 @@ export class SessionManager {
   }
 
   /**
-   * D4.4 (nightly-sweep seam): every chat's raw JSONL day-file lines for the UTC day of `date`.
-   * Read-only + best-effort — the layout (per-chat subdir vs flat) matches the append path, a
-   * missing/unreadable file contributes nothing, blank lines are dropped, and it never throws.
+   * Every chat's raw JSONL day-file lines for the UTC day of `date`, for the nightly sweep. Read-only and
+   * best-effort: a missing or unreadable file contributes nothing, blank lines are dropped, and it never throws.
    */
   readDayFileLines(date: Date): string[] {
     const day = `${dateKey(date)}.jsonl`;
@@ -482,9 +454,8 @@ export class SessionManager {
       } catch {
         entries = []; // sessions dir unreadable — nothing to sweep
       }
-      // MEDIUM-5/F-14: readdir order is filesystem-defined; sort so the sweep's cross-chat ordering
-      // and ≤5 selection are deterministic. `isDirectory()` reflects lstat, so a symlinked chat dir
-      // (isSymbolicLink) is already excluded.
+      // readdir order is filesystem-defined; sort so the sweep's cross-chat ordering and selection are deterministic.
+      // `isDirectory()` reflects lstat, so a symlinked chat dir is already excluded.
       const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name).sort();
       for (const name of dirs) {
         try {
@@ -508,9 +479,8 @@ export class SessionManager {
       } catch {
         continue; // missing — skip
       }
-      // MEDIUM-1: reject a symlinked (or otherwise non-regular) day file — following it could read
-      // another profile's transcript (cross-profile PHI) or block on a FIFO. HIGH-1: cap the read so
-      // one pathologically large file can neither exhaust the heap nor block the loop unbounded.
+      // Reject a symlinked (or otherwise non-regular) day file: following it could read another profile's transcript
+      // (cross-profile PHI) or block on a FIFO. Cap the read so one huge file cannot exhaust the heap.
       if (!st.isFile()) continue;
       if (st.size > MAX_DAY_FILE_READ_BYTES) {
         console.warn(`[session] day file exceeds the sweep read budget, skipping: ${path.basename(f)}`);
@@ -533,10 +503,8 @@ export class SessionManager {
     return this.runBackground ? this.runBackground(fn) : fn();
   }
 
-  // I3: compaction LLM calls are the largest requests a session makes, so on
-  // shared-pool providers they hit transient upstream rate limits most often
-  // (live soak 2026-08-25: both attempts died on a 429 that passed seconds
-  // later). Bounded retry with linear backoff before the F6 degrade kicks in.
+  // Compaction LLM calls are the largest requests a session makes, so on shared-pool providers they hit transient
+  // upstream rate limits most often. Bounded retry with linear backoff before degrading.
   private compactionRetry = { attempts: 3, backoffMs: 1500 };
 
   /** Test/ops hook: tune compaction LLM retry behavior. */
@@ -587,7 +555,7 @@ export class SessionManager {
     profileId?: string,
     rotationConfig?: Partial<RotationConfig>,
   ) {
-    // A-M4 expand-contract: accept the new options object OR the legacy positional args.
+    // Accepts either an options object or positional args.
     const opts: SessionManagerOptions =
       typeof a === 'object' && a !== null
         ? a
@@ -651,28 +619,28 @@ export class SessionManager {
     return latest?.chatId;
   }
 
-  /** C-38 observability: whether the last derived window used its EOF watermark or recovery walk. */
+  /** Whether the last derived window used its EOF watermark or the recovery walk. */
   getWindowDerivationStatus(chatId: string): WindowDerivationStatus | undefined {
     return this.windowDerivationStatusByChat.get(chatId);
   }
 
   async prepareHistory(chatId: string): Promise<Message[]> {
-    // Three phases so the compaction LLM runs OFF the per-chat write queue (H2): a fast queued
-    // evaluate+prune, then (for compact/emergency) the pipeline whose LLM is off-queue and whose apply
-    // re-enters the queue (A-MF3 live tail), then a fast queued read of the resulting window.
+    // Three phases so the compaction LLM runs off the per-chat write queue: a fast queued evaluate+prune, then (for
+    // compact/emergency) the pipeline whose LLM is off-queue and whose apply re-enters the queue, then a fast queued
+    // read of the resulting window.
     const trigger = await this.enqueue(chatId, async () => {
       const session = this.sessions.get(chatId);
       if (!session) return 'none' as WindowTrigger;
-      // P2b/D1.4 (DD10): the perpetual thread NEVER idle-resets. spec 14 §3 real-token triggers replace
-      // the old chars/4 heuristic: the last window-fill reading maps to prune / compact / emergency.
+      // The perpetual thread never idle-resets. Real-token triggers map the last window-fill reading to
+      // prune / compact / emergency.
       const t = this.evaluateWindowTrigger(chatId);
       if (t !== 'none') {
-        // A-MF3: consume the reading so the SAME stale value cannot re-fire the trigger every turn (the
-        // reading only changes on the next recordPromptUsage).
+        // Consume the reading so the same stale value cannot re-fire the trigger every turn (it changes only on the next
+        // recordPromptUsage).
         const reading = this.lastPromptTokensByChat.get(chatId);
         if (reading) reading.triggered = true;
         if (t === 'prune') {
-          // ≥35%, no LLM — synchronous in this queued op (lossless; day file untouched).
+          // Prune: no LLM, synchronous in this queued op (lossless; day file untouched).
           session.history = pruneToolResults(session.history, PRUNE_LAST_TURNS);
           this.saveWindowFor(chatId);
         }
@@ -681,33 +649,32 @@ export class SessionManager {
     });
 
     if (trigger === 'compact') {
-      // ≥50% — LLM pipeline in the BACKGROUND (off-queue LLM; queued live-tail apply). Return the
-      // current (possibly over-budget) window now; the compacted one lands on a later turn.
+      // Compact: LLM pipeline in the background (off-queue LLM, queued live-tail apply). Return the current
+      // (possibly over-budget) window now; the compacted one lands on a later turn.
       this.startBackgroundCompaction(chatId);
     } else if (trigger === 'emergency') {
-      // ≥80% — reduce BEFORE the turn proceeds (awaited). A-M3: always runs, even enabled:false.
+      // Emergency: reduce before the turn proceeds (awaited). Always runs, even with compaction disabled.
       await this.runEmergencyCompaction(chatId);
     }
 
-    // DD2: the returned history IS the window — the summary system message (if any) followed by the
-    // verbatim tail — sanitized so this boundary never emits an OpenAI-rejectable history (#16).
+    // The returned history is the window: the summary system message (if any) followed by the verbatim tail,
+    // sanitized so this boundary never emits a history OpenAI would reject.
     return this.enqueue(chatId, async () =>
       stripOrphanToolMessages([...(this.sessions.get(chatId)?.history ?? [])]),
     );
   }
 
-  // spec 14 §3: map the current window-fill reading to a trigger. A reading already consumed this cycle
-  // (`triggered`) yields 'none' so the same stale value never re-fires (A-MF3).
+  // Maps the current window-fill reading to a trigger. A reading already consumed this cycle (`triggered`) yields
+  // 'none' so the same stale value never re-fires.
   private evaluateWindowTrigger(chatId: string): WindowTrigger {
     const reading = this.lastPromptTokensByChat.get(chatId);
     if (!reading || reading.triggered) return 'none';
     return windowTriggerFor(this.windowFillPercent(chatId), this.windowThresholds());
   }
 
-  // A-MF3 / H1: run at most ONE compaction pipeline per chat at a time. A concurrent trigger (a second
-  // ≥50%, or an ≥80% emergency arriving during a ≥50% compact) reuses the SAME in-flight promise instead
-  // of starting a second LLM pipeline. The LLM runs OFF the write queue (H2); only the snapshot + apply
-  // re-enter it. Never rejects out (best-effort).
+  // Run at most one compaction pipeline per chat at a time. A concurrent trigger (a second compact, or an emergency
+  // arriving during a compact) reuses the same in-flight promise. The LLM runs off the write queue; only the
+  // snapshot and apply re-enter it. Never rejects (best-effort).
   private guardedCompaction(chatId: string): Promise<void> {
     const existing = this.compactionInFlight.get(chatId);
     if (existing) return existing;
@@ -718,17 +685,16 @@ export class SessionManager {
     return p;
   }
 
-  // ≥50% background compaction (fire-and-forget). M1: honors compaction.enabled=false (no proactive
-  // compaction when disabled — the ≥80% emergency valve still protects against overflow).
+  // Background compaction (fire-and-forget). Honors compaction.enabled=false: no proactive compaction when
+  // disabled, but the emergency valve still protects against overflow.
   private startBackgroundCompaction(chatId: string): void {
     if (this.compactionConfig?.enabled === false) return;
     void this.guardedCompaction(chatId);
   }
 
-  // ≥80% emergency (awaited before the turn). When enabled + an LLM is available, summarize (reusing an
-  // in-flight pipeline, never a 2nd — H1). Then GUARANTEE the window is within budget with a no-LLM
-  // turn-aware truncate that preserves a leading summary (A-M3 escape valve + M4) — idempotent, a no-op
-  // when a just-applied compaction already brought the window to target.
+  // Emergency (awaited before the turn). When enabled and an LLM is available, summarize (reusing an in-flight
+  // pipeline). Then guarantee the window is within budget with a no-LLM turn-aware truncate that preserves a
+  // leading summary. Idempotent; a no-op when a just-applied compaction already reached the target.
   private async runEmergencyCompaction(chatId: string): Promise<void> {
     if (this.compactionConfig?.enabled !== false && this.llmProvider) {
       await this.guardedCompaction(chatId);
@@ -739,9 +705,9 @@ export class SessionManager {
     });
   }
 
-  // A-M3 / M4 overflow valve: reduce the in-memory window to a leading summary (preserved as metadata)
-  // plus the last `keepRecentTurns` turns. No LLM; swaps in memory REGARDLESS of window-save success
-  // (the caller persists best-effort) so an ≥80% emergency can never leave the window over budget.
+  // Overflow valve: reduce the in-memory window to a leading summary (kept as metadata) plus the last
+  // `keepRecentTurns` turns. No LLM. Swaps in memory regardless of window-save success (the caller persists
+  // best-effort) so an emergency can never leave the window over budget.
   private emergencyTruncate(chatId: string): void {
     const session = this.sessions.get(chatId);
     if (!session) return;
@@ -766,8 +732,8 @@ export class SessionManager {
     await this.compactionInFlight.get(chatId)?.catch(() => undefined);
   }
 
-  // Await EVERY in-flight background compaction (graceful shutdown): a fire-and-forget pipeline must not
-  // write the window / summary sink after the store closes, nor outlive the process. Never rejects.
+  // Await every in-flight background compaction (graceful shutdown): a fire-and-forget pipeline must not write the
+  // window or summary sink after the store closes. Never rejects.
   async drainCompactions(): Promise<void> {
     await Promise.all([...this.compactionInFlight.values()].map((p) => p.catch(() => undefined)));
   }
@@ -778,11 +744,9 @@ export class SessionManager {
       if (turnTrace.length === 0) {
         return [];
       }
-      // Persist-first: append to the JSONL BEFORE mutating in-memory state.
-      // If the append/rotation throws, the enqueue promise rejects and the
-      // in-memory session.history never sees the turn — no memory/disk
-      // divergence. `origin` (A-H1) is stamped so the nightly sweep can trust
-      // provenance instead of guessing from the text (heartbeat turns are daemon-authored).
+      // Persist first: append to the JSONL before mutating in-memory state. If the append or rotation throws, the
+      // enqueue promise rejects and in-memory history never sees the turn, so memory and disk cannot diverge. `origin`
+      // is stamped so the nightly sweep can trust provenance (heartbeat turns are daemon-authored).
       const anchors = await this.appendMessagesToJsonl(chatId, turnTrace, origin);
       const session = this.getOrCreateSessionState(chatId);
       session.history.push(...turnTrace);
@@ -792,16 +756,15 @@ export class SessionManager {
         session.lastActiveAt = new Date();
       }
       this.sessions.set(chatId, session);
-      // D1.5: persist the window snapshot so a restart resumes this tail from the day-file archive.
+      // Persist the window snapshot so a restart resumes this tail from the day-file archive.
       this.saveWindowFor(chatId);
       return anchors;
     });
   }
 
   /**
-   * D1.3: the current EOF anchor of `chatId`'s day file for `now` — `{file: <day-file basename>,
-   * line: <physical non-empty line count>}`. Line count is re-derived from disk on first touch this
-   * process (A-H2). Used by `/new` (window archive at EOF, DD9) and compaction (`verbatimFrom`, D3).
+   * The current EOF anchor of `chatId`'s day file for `now`: `{file: <day-file basename>, line: <physical
+   * non-empty line count>}`. The count is re-derived from disk on first touch. Used by `/new` and compaction.
    */
   currentDayFileAnchor(chatId: string, now: Date = new Date()): Anchor {
     return { file: `${dateKey(now)}.jsonl`, line: this.dayFileLineCount(this.dayFilePath(chatId, now)) };
@@ -812,10 +775,9 @@ export class SessionManager {
   }
 
   /**
-   * DD3 / A-MF1 / A-MF3: record the window-fill signal after a completed turn. `tokens` = the LAST
-   * provider call's `usage.promptTokens` (`AgentRunResult.lastPromptTokens`); `undefined` ⇒ a flagged
-   * chars/4 estimate over the current window (spec 14 §3). Routed through the op queue (mutates +
-   * persists window state) so it serializes with recordTurn / prepareHistory / compaction.
+   * Record the window-fill signal after a completed turn. `tokens` is the last provider call's
+   * `usage.promptTokens`; `undefined` means a flagged chars/4 estimate over the current window. Routed through
+   * the op queue so it serializes with recordTurn / prepareHistory / compaction.
    */
   async recordPromptUsage(chatId: string, tokens?: number): Promise<void> {
     this.assertNotShutdown('recordPromptUsage');
@@ -829,10 +791,10 @@ export class SessionManager {
   }
 
   /**
-   * DD9 `/new`: publish an empty EOF window before clearing in-memory state. The append-only day-file
-   * archive is UNTOUCHED (DD1), so the disk log continues with contiguous line numbers and stays
-   * searchable via session_search. A failed replacement write rejects the reset and leaves the old state
-   * in place; callers must not report a successful reset after that failure.
+   * `/new`: publish an empty EOF window before clearing in-memory state. The append-only day-file archive is
+   * untouched, so the disk log continues with contiguous line numbers and stays searchable via session_search.
+   * A failed replacement write rejects the reset and leaves the old state in place; callers must not report a
+   * successful reset after that failure.
    */
   async resetSession(chatId: string): Promise<void> {
     await this.enqueue(chatId, async () => {
@@ -856,8 +818,8 @@ export class SessionManager {
     });
   }
 
-  // Public compaction (the /compact command + tests). With an LLM: the full §4 pipeline (off-queue LLM,
-  // queued live-tail apply), reusing an in-flight one. Without an LLM: a synchronous turn-aware truncate.
+  // Public compaction (the /compact command). With an LLM: the full pipeline (off-queue LLM, queued live-tail
+  // apply), reusing an in-flight one. Without an LLM: a synchronous turn-aware truncate.
   async runCompaction(chatId: string): Promise<void> {
     this.assertNotShutdown('runCompaction');
     await this.retryPendingSummaries();
@@ -869,10 +831,9 @@ export class SessionManager {
   }
 
   /**
-   * spec 14 §3 prune (≥35%): replace in-window tool results older than the last 5 turns with the marker
-   * (lossless — the day file is untouched; session_search retrieves the verbatim original). No LLM;
-   * runs synchronously inside the op queue (A-MF3). The window pointer is unchanged (content-swap only),
-   * so a restart replays the verbatim tail (A-M5: prune does not survive restart, re-fires on fill).
+   * Prune: replace in-window tool results older than the last 5 turns with the marker (lossless; the day file is
+   * untouched and session_search returns the verbatim original). No LLM; runs synchronously inside the op queue.
+   * The window pointer is unchanged, so a restart replays the verbatim tail and prune re-fires as the window fills.
    */
   async pruneWindow(chatId: string): Promise<void> {
     await this.enqueue(chatId, async () => {
@@ -883,15 +844,14 @@ export class SessionManager {
     });
   }
 
-  // DD4: the effective context window — an explicit config value wins over the per-model table.
+  // The effective context window: an explicit config value wins over the per-model table.
   private effectiveContextWindow(): number {
     return this.contextWindow ?? contextWindowFor(this.llmProvider?.modelName);
   }
 
   /**
-   * The current window-fill percentage for `chatId` (spec 14 §3): the last recorded token reading (real
-   * `usage.promptTokens` or a flagged chars/4 estimate) over the effective context window. 0 when no
-   * usage has been recorded yet.
+   * The current window-fill percentage for `chatId`: the last recorded token reading (real `usage.promptTokens`
+   * or a flagged chars/4 estimate) over the effective context window. 0 when no usage has been recorded.
    */
   windowFillPercent(chatId: string): number {
     const reading = this.lastPromptTokensByChat.get(chatId);
@@ -900,7 +860,7 @@ export class SessionManager {
     return window > 0 ? (reading.tokens / window) * 100 : 0;
   }
 
-  // The window thresholds + keepRecentTurns in effect (config, else the spec-14 defaults 35/50/80/10).
+  // The window thresholds and keepRecentTurns in effect (config, else the defaults 35/50/80/10).
   private windowThresholds(): WindowConfig {
     return {
       pruneAtPercent: this.windowConfig?.pruneAtPercent ?? 35,
@@ -910,8 +870,8 @@ export class SessionManager {
     };
   }
 
-  // No-LLM compaction (no provider): a synchronous turn-aware truncate (M4 preserves a leading summary),
-  // candidate-then-swap so a failed window save keeps the old window (M5 / spec §4). Runs inside a queued op.
+  // No-LLM compaction (no provider): a synchronous turn-aware truncate that preserves a leading summary.
+  // Candidate-then-swap, so a failed window save keeps the old window. Runs inside a queued op.
   private noLlmCompact(chatId: string): void {
     const session = this.sessions.get(chatId);
     if (!session) return;
@@ -936,24 +896,24 @@ export class SessionManager {
       candidate,
       candidateAnchors,
     )) {
-      return; // M5: window save failed → keep the old window
+      return; // window save failed: keep the old window
     }
     session.history = candidate;
     session.historyAnchors = candidateAnchors;
   }
 
-  // §4 pipeline as three parts so the LLM runs OFF the write queue (H2):
+  // The pipeline in three parts so the LLM runs off the write queue:
   //   1. snapshot (queued read) → 2. flush + summary LLM (off-queue) → 3. apply (queued, live-tail).
   private async doCompaction(chatId: string): Promise<void> {
     const snap = await this.enqueue(chatId, async () => this.captureCompactionSnapshot(chatId));
-    if (!snap) return; // nothing older to summarize (H3: never re-summarizes a lone leading summary)
+    if (!snap) return; // nothing older to summarize (never re-summarizes a lone leading summary)
     const built = await this.buildCompactionSummary(chatId, snap);
-    if (!built) return; // flush/summary failed or empty ⇒ keep the OLD window (H6 / spec §4)
+    if (!built) return; // flush/summary failed or empty: keep the old window
     await this.enqueue(chatId, async () => this.applyCompaction(chatId, snap, built));
   }
 
-  // §4.1/4.2 snapshot: the real older messages to summarize (EXCLUDING any leading summary — H3), the
-  // preserved prior-summary text, and the day-file anchors for the older range. null ⇒ nothing to do.
+  // Snapshot: the real older messages to summarize (excluding any leading summary), the preserved prior-summary
+  // text, and the archive anchors for the older range. null means nothing to do.
   private captureCompactionSnapshot(chatId: string): CompactionSnapshot | null {
     const session = this.sessions.get(chatId);
     if (!session) return null;
@@ -964,7 +924,7 @@ export class SessionManager {
       && typeof first.content === 'string' && first.content.startsWith(SUMMARY_PREFIX);
     const oldSummary = hasSummary ? (first.content as string).slice(SUMMARY_PREFIX.length) : '';
     const split = turnAwareSplit(history, keepRecent);
-    const olderReal = history.slice(hasSummary ? 1 : 0, split); // exclude the leading summary (H3)
+    const olderReal = history.slice(hasSummary ? 1 : 0, split); // exclude the leading summary
     if (olderReal.length === 0) return null;
     const rangeAnchors = session.historyAnchors
       .slice(hasSummary ? 1 : 0, split)
@@ -979,9 +939,9 @@ export class SessionManager {
     };
   }
 
-  // §4 flush + summary, run OFF the write queue. H6: a flush failure is a failed step ⇒ return null (keep
-  // the old window), never fall through to a summary. H3: the prior summary is preserved verbatim and the
-  // new bullets are appended. M3: model-supplied anchors are stripped before app-supplied ones are added.
+  // Flush + summary, run off the write queue. A flush failure is a failed step: return null (keep the old window),
+  // never fall through to a summary. The prior summary is preserved verbatim and the new bullets are appended.
+  // Model-supplied anchors are stripped before app-supplied ones are added.
   private async buildCompactionSummary(chatId: string, snap: CompactionSnapshot): Promise<{ combinedSummary: string; newBullets: string } | null> {
     const doFlush = this.compactionConfig?.memoryFlush ?? true;
     if (doFlush && this.toolRegistry && this.llmProvider) {
@@ -1011,7 +971,7 @@ export class SessionManager {
           for (const c of flushResponse.toolCalls) await this.toolRegistry.execute(c.name, c.arguments);
         }
       } catch (e) {
-        // H6 / spec §4: the flush is a pipeline STEP — its failure keeps the old window (do NOT summarize).
+        // The flush is a pipeline step: its failure keeps the old window (do not summarize).
         console.warn(`[session:${chatId}] Compaction flush failed (keeping current window):`, summarizeErrorForLog(e));
         return null;
       }
@@ -1037,22 +997,22 @@ Keep it concise and structured.`;
         console.warn(`[session:${chatId}] Compaction produced no summary; keeping the current window.`);
         return null;
       }
-      // M3: strip any model-fabricated anchor, then attach app-supplied in-range anchors.
+      // Strip any model-fabricated anchor, then attach app-supplied in-range anchors.
       const newBullets = anchorSummaryBullets(stripModelAnchors(summaryText), snap.rangeAnchors);
-      // H3: preserve the prior summary verbatim (its facts + anchors), append the new bullets.
+      // Preserve the prior summary verbatim (its facts and anchors), append the new bullets.
       const combinedSummary = snap.oldSummary ? `${snap.oldSummary}\n${newBullets}` : newBullets;
       return { combinedSummary, newBullets };
     } catch (e) {
-      // spec §4: any step failing ⇒ keep the OLD window, retry next trigger. Sanitized frame only (PHI).
+      // Any step failing keeps the old window and retries on the next trigger. Sanitized frame only (PHI).
       console.warn(`[session:${chatId}] Compact turn failed (keeping current window):`, summarizeErrorForLog(e));
       return null;
     }
   }
 
-  // §4.3 apply against the LIVE tail (A-MF3): if the history array was replaced since the snapshot
-  // (emergency truncate / prune / reset), abort — the reduction already happened another way. M5:
-  // persist the candidate window FIRST; swap in memory only on success. Then copy the NEW bullets to the
-  // daily log (best-effort, idempotent — never the preserved old summary, so no double-logging — H3).
+  // Apply against the live tail: if the history array was replaced since the snapshot (emergency truncate, prune
+  // or reset), abort, because the reduction already happened another way. Persist the candidate window first; swap
+  // in memory only on success. Then copy the new bullets to the daily log (best-effort, idempotent; never the
+  // preserved old summary, so nothing is logged twice).
   private async applyCompaction(chatId: string, snap: CompactionSnapshot, built: { combinedSummary: string; newBullets: string }): Promise<void> {
     const session = this.sessions.get(chatId);
     if (!session || session.history !== snap.historyRef || session.historyAnchors !== snap.historyAnchorsRef) {
@@ -1069,7 +1029,7 @@ Keep it concise and structured.`;
     const candidate = candidateEntries.map((entry) => entry.message);
     const candidateAnchors = candidateEntries.map((entry) => entry.anchor);
     if (!this.persistCandidateWindow(chatId, built.combinedSummary, candidate, candidateAnchors, built.newBullets)) {
-      return; // M5: window save failed → keep the old window (spec §4)
+      return; // window save failed: keep the old window
     }
     session.history = candidate;
     session.historyAnchors = candidateAnchors;
@@ -1079,9 +1039,9 @@ Keep it concise and structured.`;
     }
   }
 
-  // M5: persist a candidate window (summary + a verbatim tail) WITHOUT mutating in-memory state. The
-  // candidate carries physical anchors for every retained message, so malformed archive slots do not
-  // shift its cursor. Returns true on a successful save, false (keep old window) on failure.
+  // Persist a candidate window (summary + a verbatim tail) without mutating in-memory state. The candidate carries
+  // physical anchors for every retained message, so malformed archive slots do not shift its cursor. Returns true
+  // on a successful save, false (keep the old window) on failure.
   private persistCandidateWindow(
     chatId: string,
     summaryBlock: string,
@@ -1104,19 +1064,17 @@ Keep it concise and structured.`;
     const now = nowDate.toISOString();
     const lines = messages.map(msg => JSON.stringify(this.serializeEntry(chatId, msg, now, origin)));
     const dayFilePath = this.dayFilePath(chatId, nowDate);
-    // H11 (defensive): secureAppend has no fsync, so a power-loss / external truncation can leave the
-    // day file without a trailing newline. A raw append would FUSE the new record onto the torn line,
-    // making one malformed physical line — the new (health) turn would vanish from resume + rebuild.
-    // Insert a separating newline so the new record always starts its own physical line.
+    // secureAppend has no fsync, so a power loss or external truncation can leave the day file without a trailing
+    // newline. A raw append would fuse the new record onto the torn line and lose that (health) turn on resume and
+    // rebuild. Insert a separating newline so the new record always starts its own physical line.
     const block = (dayFileEndsWithoutNewline(dayFilePath) ? '\n' : '') + lines.join('\n') + '\n';
-    // D1.3: assign each appended message a stable {file, line} anchor from the re-derived count. The
-    // first appended message takes line `count+1`; the file basename is the anchor's `file`.
+    // Assign each appended message a stable {file, line} anchor from the re-derived count. The first appended
+    // message takes line `count+1`; the file basename is the anchor's `file`.
     const startLine = this.dayFileLineCount(dayFilePath);
     const dayFile = `${dateKey(nowDate)}.jsonl`;
     const anchors: Anchor[] = messages.map((_msg, i) => ({ file: dayFile, line: startLine + i + 1 }));
-    // D1.6: the append-only day-file archive is the SOLE store (DD1) — the legacy active-file dual-write
-    // is ended, and day files are NEVER size-rotated (DD8; anchors must stay stable). Persist-first still
-    // holds: a failed append rejects the enqueue and `recordTurn` never mutates in-memory state.
+    // The append-only day-file archive is the sole store, and day files are never size-rotated (anchors must stay
+    // stable). Persist-first holds: a failed append rejects the enqueue and `recordTurn` never mutates in-memory state.
     secureAppend(dayFilePath, block);
     const endLine = startLine + lines.length;
     this.dayFileLineCounts.set(dayFilePath, endLine);
@@ -1131,10 +1089,10 @@ Keep it concise and structured.`;
       // watermark and let the next window derivation recover from the newest day file.
       this.archiveTailsByDir.delete(this.archiveDir(chatId));
     }
-    // D2.5: incrementally index each appended line for session_search (best-effort — an index failure
-    // degrades and never blocks the turn). The `{file, line}` anchor is the day-file's physical line, so
-    // an incrementally-indexed row and a disk rebuild resolve to the same JSONL line (idempotent upsert).
-    // Skip null/empty-content messages (e.g. an assistant tool-call carrier) — nothing textual to search.
+    // Incrementally index each appended line for session_search (best-effort: an index failure degrades and never
+    // blocks the turn). The `{file, line}` anchor is the day-file's physical line, so an incrementally-indexed row
+    // and a disk rebuild resolve to the same JSONL line (idempotent upsert). Skip null/empty-content messages (e.g.
+    // an assistant tool-call carrier): nothing textual to search.
     if (this.turnIndex) {
       for (let i = 0; i < messages.length; i++) {
         const content = messages[i].content;
@@ -1142,8 +1100,8 @@ Keep it concise and structured.`;
         try {
           this.turnIndex.indexTurn(chatId, anchors[i].file, anchors[i].line, messages[i].role, now, content);
         } catch (e) {
-          // H5: per-line guard — one line's index failure must not skip its siblings. Mark the index
-          // dirty so the next boot reconciles the hole from the archive. Never blocks the turn.
+          // Per-line guard: one line's index failure must not skip its siblings. Mark the index dirty so the next boot
+          // reconciles the hole from the archive.
           console.warn(`[session:${chatId}] turn indexing failed, continuing:`, summarizeErrorForLog(e));
           this.turnIndex.markDirty?.();
         }
@@ -1152,8 +1110,8 @@ Keep it concise and structured.`;
     return anchors;
   }
 
-  // D1.3 (A-H2): the day file's current physical non-empty line count, seeded FROM DISK on first
-  // touch this process (never trusted across a restart — no fsync), then advanced in memory on append.
+  // The day file's current physical non-empty line count, seeded from disk on first touch (never trusted across a
+  // restart, since there is no fsync), then advanced in memory on append.
   private dayFileLineCount(dayFilePath: string): number {
     let count = this.dayFileLineCounts.get(dayFilePath);
     if (count === undefined) {
@@ -1163,9 +1121,9 @@ Keep it concise and structured.`;
     return count;
   }
 
-  // D1.2/A-MF5: the append-only archive path for `chatId` on the day of `now`. Flat per profile
-  // (registry mode) or namespaced per chat (no-registry mode). Day boundaries use the shared UTC
-  // `dateKey` (A-H3) so a turn after local midnight lands in the correct file.
+  // The append-only archive path for `chatId` on the day of `now`: flat per profile or namespaced per chat,
+  // depending on the archive layout. Day boundaries use the shared UTC `dateKey`, so a turn after local midnight
+  // lands in the correct file.
   private dayFilePath(chatId: string, now: Date): string {
     const day = `${dateKey(now)}.jsonl`;
     const resolved = this.perChatArchive
@@ -1182,8 +1140,8 @@ Keep it concise and structured.`;
       content: msg.content ?? null,
       chatId,
     };
-    // A-H1/C-56: every current entry carries explicit provenance. Read-back remains tolerant of
-    // origin-less legacy lines, but the marker heuristic is now legacy-only.
+    // Every current entry carries explicit provenance. Read-back stays tolerant of origin-less lines, but the marker
+    // heuristic applies only to those.
     entry.origin = origin;
     if (msg.role === 'tool' && msg.tool_call_id) {
       entry.tool_call_id = msg.tool_call_id;
@@ -1216,9 +1174,8 @@ Keep it concise and structured.`;
     return message;
   }
 
-  // D1.5/A-MF5: the per-chat window state file. Registry mode = one per-profile window; no-registry
-  // mode = per-chat so distinct ad-hoc chats never share a window (N-2). Lives inside sessionsPath
-  // (test-isolated; the day-file scan ignores it — it is not a `YYYY-MM-DD.jsonl`).
+  // The per-chat window state file. One per profile in flat mode, one per chat in per-chat mode, so distinct ad-hoc
+  // chats never share a window. Lives inside sessionsPath (the day-file scan ignores it: not a `YYYY-MM-DD.jsonl`).
   private windowPath(chatId: string): string {
     const resolved = this.perChatArchive
       ? resolveContainedPath(this.sessionsPath, `session-window.${chatId}.json`)
@@ -1227,8 +1184,7 @@ Keep it concise and structured.`;
     return resolved;
   }
 
-  // D1.5/A-MF5: the day-file archive directory for `chatId` — flat per profile (registry) or namespaced
-  // per chat (no-registry). Mirrors `dayFilePath`.
+  // The day-file archive directory for `chatId`: flat per profile or namespaced per chat. Mirrors `dayFilePath`.
   private archiveDir(chatId: string): string {
     return this.perChatArchive ? resolveContainedPath(this.sessionsPath, chatId) : this.sessionsPath;
   }
@@ -1273,7 +1229,7 @@ Keep it concise and structured.`;
     const tail = this.archiveTailFor(chatId);
     if (tail?.file) window.archiveTail = tail;
     if (pendingSummary) window.pendingSummary = pendingSummary;
-    // DD3: carry the last window-fill reading so a restart resumes the trigger signal (A3).
+    // Carry the last window-fill reading so a restart resumes the trigger signal.
     const usage = this.lastPromptTokensByChat.get(chatId);
     if (usage) {
       window.lastPromptTokens = usage.tokens;
@@ -1282,8 +1238,8 @@ Keep it concise and structured.`;
     return window;
   }
 
-  // D1.5: the window as a DERIVED snapshot of in-memory history + physical archive anchors. A malformed
-  // physical slot is absent from history but remains represented by the valid messages' carried cursors.
+  // The window as a derived snapshot of in-memory history + physical archive anchors. A malformed physical slot is
+  // absent from history but remains represented by the valid messages' carried cursors.
   private deriveWindow(chatId: string): SessionWindow {
     const session = this.sessions.get(chatId);
     return this.windowForHistory(
@@ -1329,8 +1285,8 @@ Keep it concise and structured.`;
     }
   }
 
-  // D1.5: persist the window snapshot (best-effort — a save failure must never break the turn, per
-  // resilience.md; the archive on disk remains the source of truth).
+  // Persist the window snapshot (best-effort: a save failure must never break the turn; the archive on disk remains
+  // the source of truth).
   private saveWindowFor(chatId: string): boolean {
     try {
       saveWindow(this.windowPath(chatId), this.deriveWindow(chatId));
@@ -1341,9 +1297,9 @@ Keep it concise and structured.`;
     }
   }
 
-  // D1.5: resume from the window + day-file archive (NOT the legacy active file). Registry mode has one
-  // flat archive whose chatId(s) come from the entries; no-registry mode has one archive subdirectory per
-  // chatId. Absent/corrupt window ⇒ a fresh empty window at the latest-day EOF (A-L6). Never throws.
+  // Resume from the window + day-file archive. Flat mode has one archive whose chatIds come from the entries; per-chat
+  // mode has one archive subdirectory per chatId. An absent or corrupt window gives a fresh empty window at the
+  // latest-day EOF. Never throws.
   private resumeSessions(): void {
     if (!fs.existsSync(this.sessionsPath)) return;
 
@@ -1378,13 +1334,13 @@ Keep it concise and structured.`;
     }
   }
 
-  // D1.5: rebuild one chat's in-memory history = [summary system message?, ...verbatim tail], where the
-  // tail is the day-file lines after `verbatimFrom`. Sanitize torn appends (#16). Skip empty sessions.
+  // Rebuild one chat's in-memory history = [summary system message?, ...verbatim tail], where the tail is the
+  // day-file lines after `verbatimFrom`. Sanitizes torn appends. Skips empty sessions.
   private resumeChat(chatId: string): void {
     const window = resolveWindow(this.windowPath(chatId), this.archiveDir(chatId));
     this.restoreArchiveTail(chatId, this.archiveDir(chatId), window.archiveTail);
-    // DD3/A3: restore the last window-fill reading so the first post-restart turn evaluates triggers
-    // against the persisted signal (not a cold zero).
+    // Restore the last window-fill reading so the first post-restart turn evaluates triggers against the persisted
+    // signal (not a cold zero).
     if (window.lastPromptTokens !== undefined) {
       this.lastPromptTokensByChat.set(chatId, {
         tokens: window.lastPromptTokens,
@@ -1401,7 +1357,7 @@ Keep it concise and structured.`;
       try {
         entry = JSON.parse(line.raw) as JsonlEntry;
       } catch {
-        continue; // malformed physical slot — skip when reconstructing (A-H2)
+        continue; // malformed physical slot — skip when reconstructing
       }
       if (entry.chatId !== chatId) continue; // registry mode: only this chat's entries
       const message = this.entryToMessage(entry);

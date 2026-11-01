@@ -1,9 +1,6 @@
-// src/tools/safety-tools.ts
-//
-// safety_note (Task 12.5) — the agent's SAFETY.md surface. Adding a Critical Event is
-// always allowed (add-only). Removing a base allergy/medication is NOT done here: it is
-// refused and routed to ledger_update, so the change goes through the ledger (confirmation
-// + D8 re-render). CONTRA-03/04.
+// safety_note: the agent's SAFETY.md surface. Adding a Critical Event is always allowed (add-only).
+// Removing a base allergy/medication is NOT done here: it is refused and routed to ledger_update, so
+// the change goes through the ledger (confirmation plus re-render).
 
 import type { Tool, ToolResult } from './types';
 import type { SafetyView } from '../memcore';
@@ -13,11 +10,8 @@ import { contentContainsCredentials } from '../security';
 export interface SafetyToolsDeps {
   safetyView: SafetyView;
   /**
-   * RR-STRUCT R-S3 (C-46 generalization): `add-critical-event` used to write DIRECTLY to
-   * `SafetyView` (load→push→write — a read-modify-write on SAFETY.md) with no serialization
-   * against a concurrent Critical Event append. Critical Events are add-only (VANI-05) — losing
-   * one to a lost-update race is a genuine safety-log hazard. Optional + falls back to the direct
-   * (pre-R-S3) call when absent, matching every other coordinator seam in this slice.
+   * Serializes Critical Event appends against concurrent SAFETY.md read-modify-write, so an
+   * add-only event is never lost to a lost-update race. Optional: falls back to a direct call.
    */
   queue?: QueuePort;
 }
@@ -52,8 +46,8 @@ export function createSafetyTools(deps: SafetyToolsDeps): Tool[] {
         const summary = params.summary as string | undefined;
         if (!summary) return err('safety_note add-critical-event needs a summary.');
         const actionTaken = params.action_taken as string | undefined;
-        // CRED (SB-6): SAFETY.md is always-injected — the credential bar matches
-        // memory_write before anything lands on disk.
+        // SAFETY.md is always injected, so the credential bar matches memory_write and runs before
+        // anything lands on disk.
         const credScan = contentContainsCredentials(`${summary}\n${actionTaken ?? ''}`);
         if (credScan.matched) {
           return err(`Write rejected: content matches credential pattern (${credScan.pattern}). Credentials must never be stored in SAFETY.md.`);

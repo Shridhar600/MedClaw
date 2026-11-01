@@ -1,23 +1,19 @@
-// src/gateway/session-window.ts
+// The rolling context window, persisted separately from the append-only day-file archive. Disk holds
+// verbatim JSONL day files that are never rewritten; the window file is just the pointer into that
+// archive plus the compaction summary. On restart the day-file tail is replayed from `verbatimFrom`.
 //
-// P2b (spec 14 §2) — the rolling CONTEXT window, persisted SEPARATELY from the append-only day-file
-// archive. Disk = infinite verbatim JSONL day files (never rewritten); this file is just the pointer
-// into that archive plus the compaction summary. On restart the window is loaded and the day-file tail
-// is replayed from `verbatimFrom` (D1.5).
-//
-// Resilience (A-L6/N-7): an ABSENT or CORRUPT window file is NOT an error — it yields a fresh empty
-// window pointing at the EOF of the latest existing day file (the archive is intact; only the in-context
-// window restarts). `{file:'',line:0}` is used ONLY when no day files exist at all. `loadWindow` never
-// throws and never logs window CONTENT (`summaryBlock` is a PHI session summary).
+// An absent or corrupt window file is not an error: it yields a fresh empty window pointing at the
+// EOF of the latest day file (`{file:'',line:0}` only when no day files exist). `loadWindow` never
+// throws and never logs window content (`summaryBlock` is a PHI session summary).
 
 import * as fs from 'fs';
 import * as path from 'path';
 import { secureWriteViaTmp, summarizeErrorForLog } from '../security';
 
 /**
- * A stable pointer into the append-only day-file archive: a day-file basename + a 1-based PHYSICAL
- * non-empty line number. Anchors are immutable once assigned (the disk is never rewritten — DD1), so
- * compaction summaries (D3) and window resume (D1.5) can always resolve them back to the JSONL line.
+ * A stable pointer into the append-only day-file archive: a day-file basename plus a 1-based
+ * physical non-empty line number. Anchors never change once assigned, because the archive is never
+ * rewritten.
  */
 export interface Anchor {
   file: string;
@@ -47,17 +43,15 @@ export interface SessionWindow {
   lastPromptTokens?: number;
   /** True when `lastPromptTokens` is a chars/4 estimate (provider omitted usage). */
   lastPromptTokensEstimated?: boolean;
-  /** Optional C-38 durable EOF watermark; absent in pre-RR-9a window files. */
+  /** Durable EOF watermark; absent in older window files. */
   archiveTail?: ArchiveTail;
 }
 
 const DAY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.jsonl$/;
 
 /**
- * The single shared day key (A-H3): UTC `YYYY-MM-DD`, matching `NarrativeStore`'s daily-log
- * convention. Used by the day-file namer, migration bucketing, and the nightly sweep so all three
- * agree on where a day boundary is — never local time (an IST-evening sweep must read the same UTC
- * file an IST-after-midnight turn wrote).
+ * The single shared day key: UTC `YYYY-MM-DD`, matching `NarrativeStore`'s daily-log convention.
+ * Every caller must agree on the day boundary, so never use local time.
  */
 export function dateKey(now: Date): string {
   return now.toISOString().slice(0, 10);
@@ -94,12 +88,9 @@ export function loadWindow(filePath: string): SessionWindow | null {
 }
 
 /**
- * The physical non-empty line count of a JSONL day file — the anchor line count (A-H2). A malformed
- * line still occupies its slot, so an anchor's `line` is a stable physical position, immune to parse
- * errors (malformed lines are skipped only when reconstructing messages, never when counting slots).
- * This is the SINGLE definition of "day-file line count", shared by the day-file namer's anchor
- * tracking, `latestDayFileEof`, and (D2) the search-index rebuild. Returns 0 for an absent/unreadable
- * file.
+ * The physical non-empty line count of a JSONL day file. A malformed line still occupies its slot,
+ * so an anchor's `line` is a stable physical position. This is the single definition of "day-file
+ * line count". Returns 0 for an absent/unreadable file.
  */
 export function countDayFileLines(filePath: string): number {
   let count = 0;
@@ -194,11 +185,10 @@ export interface ArchiveLine {
 }
 
 /**
- * The EOF-EXCLUSIVE anchor `k` non-empty archive lines back from the end — the anchor for which
- * `readLinesAfter` returns exactly the last `k` lines. `k ≤ 0` ⇒ the archive EOF (empty tail); `k` at
- * or beyond the archive size clamps to the archive start; an empty archive ⇒ `{file:'',line:0}`. When
- * the boundary falls exactly on a day-file edge it rolls to the NEXT file's start (line 0), so the tail
- * spans whole files cleanly.
+ * The EOF-exclusive anchor `k` non-empty archive lines back from the end, so `readLinesAfter`
+ * returns exactly the last `k` lines. `k <= 0` gives the archive EOF; `k` at or beyond the archive
+ * size clamps to the archive start; an empty archive gives `{file:'',line:0}`. A boundary exactly
+ * on a day-file edge rolls to the next file's start (line 0).
  */
 export function walkBackAnchor(sessionsDir: string, k: number): Anchor {
   const files = listDayFiles(sessionsDir);
@@ -223,10 +213,9 @@ export function anchorBefore(anchor: Anchor): Anchor {
 }
 
 /**
- * Every non-empty archive line strictly AFTER `from` (exclusive) through EOF, in chronological order,
- * each with its physical `{file, line}` anchor and raw JSON text. Skips the first `from.line` lines of
- * `from.file` and every earlier day file. Malformed lines are RETAINED as raw (they occupy their
- * physical slot — anchor-stable per A-H2); the caller parses `raw` and skips failures.
+ * Every non-empty archive line strictly after `from`, through EOF, in chronological order, each with
+ * its physical `{file, line}` anchor and raw JSON text. Malformed lines are kept as raw because they
+ * occupy their physical slot; the caller parses `raw` and skips failures.
  */
 export function readLinesAfter(sessionsDir: string, from: Anchor): ArchiveLine[] {
   const out: ArchiveLine[] = [];
@@ -300,15 +289,15 @@ export function latestDayFileEof(sessionsDir: string): Anchor {
 }
 
 /**
- * The window to boot with: the persisted window when present + valid, otherwise a fresh empty window
- * anchored at the latest day file's EOF (A-L6/N-7).
+ * The window to boot with: the persisted window when present and valid, otherwise a fresh empty
+ * window anchored at the latest day file's EOF.
  */
 export function resolveWindow(filePath: string, sessionsDir: string): SessionWindow {
   const persisted = loadWindow(filePath);
   if (persisted && isValidAnchor(persisted.verbatimFrom, sessionsDir)) return persisted;
 
-  // A pending summary is source-side durable work. Preserve it even when a cursor is invalid so a
-  // torn/stale window cannot discard a summary that still needs to reach its sink.
+  // A pending summary is durable work; keep it even when the cursor is invalid so a torn or stale
+  // window cannot discard a summary that still needs to reach its sink.
   return {
     summaryBlock: '',
     verbatimFrom: latestDayFileEof(sessionsDir),

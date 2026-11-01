@@ -76,14 +76,9 @@ const INDEX_EMBED_TIMEOUT_MS = 500;
 const INDEX_EMBED_COOLDOWN_MS = 1_000;
 const HEARTBEAT_CURIOSITY_LIMIT = 5;
 /**
- * RR-STRUCT R-S4 (mini-plan v3 §3.9, Part C; closes C-27 availability / BACKLOG "Bounded shutdown
- * hard-stop"): the overall budget `drainAndClose()` gives its full drain sequence (stop producers
- * -> in-flight/sweep/compactions/background/write-queue) before abandoning whatever is still
- * running and proceeding to `closeStore()` anyway, so a single hung op (e.g. an ACTIVE provider
- * call with no timeout) can never stall shutdown forever. Not yet config-exposed — a named
- * constant (per the brief's "config or a named constant" choice) to keep this slice's diff
- * surgical; promoting it to `EffectiveConfig` (schema + onboarding + validation) is a reasonable, small
- * follow-up but out of R-S4's touched-files lane.
+ * The overall budget `drainAndClose()` gives its full drain sequence before abandoning whatever is still
+ * running and proceeding to `closeStore()`, so one hung operation (e.g. a provider call with no timeout)
+ * cannot stall shutdown forever.
  */
 const SHUTDOWN_DRAIN_BUDGET_MS = 10_000;
 
@@ -146,17 +141,12 @@ function dueCuriosityItems(items: CuriosityItem[], now: Date): CuriosityItem[] {
 }
 
 /**
- * RR-STRUCT R-S3 Part C (mini-plan v3 §3.7): a Tier-1 SAFETY read that detects drift
- * (`SafetyProjectionDirtyError`) attempts ONE on-demand re-projection from the authoritative
- * Markdown BEFORE failing the turn, via a NEW top-level `MutationCoordinator` op — never
- * re-entrant (this wraps a READ path; it is never called from inside a running write op). Loop
- * guard: the retry after a successful heal calls `safetyView.read()` DIRECTLY (not this wrapper),
- * so a persistent failure fails closed once and never spins. Lives here (not in `SafetyView`
- * itself, and not in `src/context2/`) because it needs BOTH the concrete `SafetyView` and the
- * `MutationCoordinator` — `context2` is ports-only and cannot see either concretely; `SafetyView`
- * must not call back into the write lock (that would make ITS internals coordinator-aware and
- * risk an unlocked write racing a locked one). The composition root is the only place both are
- * legitimately in scope together.
+ * A safety read that detects projection drift (`SafetyProjectionDirtyError`) attempts ONE on-demand
+ * re-projection from the authoritative Markdown before failing the turn, via a new top-level
+ * `MutationCoordinator` op. It wraps a read path and is never called from inside a running write op. The
+ * retry after a successful heal calls `safetyView.read()` directly, so a persistent failure fails closed
+ * once and never spins. It lives here because it needs both the concrete `SafetyView` and the
+ * `MutationCoordinator`; `SafetyView` itself must not call back into the write lock.
  */
 export function makeSelfHealingSafetyReader(
   safetyView: SafetyView,
@@ -196,10 +186,9 @@ export interface ProfileRuntimeDeps {
   canSchedule?: boolean;
   runScheduledJob?: (job: HeartbeatJob) => Promise<void>;
   /**
-   * RR2-B1 (R2-10/11): destination-ownership capability for this runtime's scheduler.
-   * Required whenever `canSchedule` is true — a factory path that cannot prove which chats
-   * belong to this profile refuses scheduler activation rather than constructing an
-   * unguarded production scheduler.
+   * Destination-ownership capability for this runtime's scheduler. Required whenever `canSchedule` is true:
+   * a factory path that cannot prove which chats belong to this profile refuses scheduler activation rather
+   * than constructing an unguarded production scheduler.
    */
   canAddressChat?: (chatId: string) => boolean;
   sideEffectLookup?: (entity: string) => Promise<string[]>;
@@ -228,8 +217,7 @@ export class ProfileRuntime {
   episodeStore?: EpisodeStore;
   curatedMemory?: CuratedMemory;
   writeQueue?: WriteQueue;
-  /** RR-STRUCT R-S3: the complete single-writer every model-facing mutation routes through —
-   *  wraps `writeQueue` with re-entrancy protection + the `mutate`/`selfHeal` entry points. */
+  /** The single writer every model-facing mutation routes through: wraps `writeQueue` with re-entrancy protection. */
   mutationCoordinator?: MutationCoordinator;
   capturePipeline?: CapturePipeline;
   indexer?: MemoryIndexerType;
@@ -249,31 +237,22 @@ export class ProfileRuntime {
   sweepStopping = false;
 
   /**
-   * RR-STRUCT R-S4 (mini-plan v3 §3.9, Part A): the single source-of-truth lifecycle state —
-   * a one-way progression `running -> stopping -> closed`. Replaces the old ad-hoc pair of
-   * independent `stopping`/`closed` booleans (which could in principle diverge) with one field;
-   * `stopping`/`closed` below are now DERIVED getters so every existing internal read site
-   * (`this.stopping`, `runtime.closed`, etc.) keeps working unchanged. `isStopping()`/
-   * `isClosed()` (the public seam the R-1 tests + callers use) are unchanged in behavior.
+   * The single source-of-truth lifecycle state, a one-way progression `running -> stopping -> closed`.
+   * `stopping`/`closed` below are derived from it.
    */
   private lifecycleState: 'running' | 'stopping' | 'closed' = 'running';
 
   /**
-   * C01 (R01): drain-phase continuations that have been STARTED and not yet really settled.
+   * Drain-phase continuations that have been started and not yet really settled.
    *
-   * `drainAndClose()` abandons a phase at the shared budget, but the phase keeps running. That
-   * continuation can still touch owner resources (the nightly sweep's `curiosity.md` write is the
-   * concrete case), so it must remain visible to `getShutdownDisposition()` until its own `finally`
-   * runs. `lifecycleState === 'closed'`, a cleared store field and a `Promise.race` timeout winner
-   * are all explicitly NOT settlement.
-   *
-   * Instance-local, populated and drained only by `withBudget`, in the same idiom as
-   * `backgroundOperations`/`inFlightOperations` above. No global registry, no new port.
+   * `drainAndClose()` abandons a phase at the shared budget, but the phase keeps running and can still touch
+   * owner resources (the nightly sweep's `curiosity.md` write is the concrete case), so it must stay visible
+   * to `getShutdownDisposition()` until its own `finally` runs. A closed lifecycle state, a cleared store
+   * field and a `Promise.race` timeout winner are not settlement.
    */
   private readonly unsettledDrainWork = new Set<Promise<unknown>>();
 
-  /** `true` from the moment `beginStopping()` runs through `closed` (inclusive) — matches the
-   *  pre-R-S4 field's semantics exactly (never resets to false once past `running`). */
+  /** `true` from the moment `beginStopping()` runs through `closed` (inclusive). Never resets once past `running`. */
   get stopping(): boolean {
     return this.lifecycleState !== 'running';
   }
@@ -307,30 +286,21 @@ export class ProfileRuntime {
     return this.closed;
   }
 
-  /** RR-STRUCT R-S4 (mini-plan v3 §3.9, Part A): the explicit lifecycle state, for diagnostics
-   *  and tests. `isStopping()`/`isClosed()` remain the public seam production callers consult. */
+  /** The explicit lifecycle state, for diagnostics and tests. */
   getLifecycleState(): 'running' | 'stopping' | 'closed' {
     return this.lifecycleState;
   }
 
   /**
-   * C01 (R01): whether this runtime still has real work that can touch owner resources.
+   * Whether this runtime still has real work that can touch owner resources.
    *
-   * This is the truthful half of `isClosed()`, and the two deliberately disagree. `isClosed()`
-   * answers "did `closeStore()` run"; this answers "has everything that started actually finished".
-   * Plan 15 §2.2 makes the second question the one that gates installation-ownership release: a
-   * runtime that closed its stores while a drain phase was abandoned at the 10s budget still has a
-   * continuation running, so it reports `pending`.
+   * `isClosed()` answers "did `closeStore()` run"; this answers "has everything that started actually
+   * finished". The second question gates installation-ownership release: a runtime that closed its stores
+   * while a drain phase was abandoned at the budget still has a continuation running, so it reports `pending`.
    *
-   * Reported sources, all instance-local:
-   *  - `unsettledDrainWork`: a drain phase started by `drainAndClose()` that has not settled. This
-   *    covers phases abandoned at the shared deadline AND phases fired best-effort after it.
-   *  - `sweepInFlight`: the nightly sweep promise, when a sweep was launched outside the drain.
-   *  - `inFlightOperations` / `backgroundOperations` / `reindexTails`: the class's existing tracked
-   *    operation sets, for work that arrives after the drain phase that would have awaited it.
-   *
-   * S5 still owns bounded cancellation; forever-pending work therefore means retained ownership,
-   * not a promise that shutdown ever completes.
+   * Reported sources, all instance-local: unsettled drain phases, the nightly sweep promise, and the tracked
+   * in-flight, background and reindex operation sets. Work that never settles means retained ownership, not a
+   * promise that shutdown completes.
    */
   getShutdownDisposition(): 'pending' | 'quiescent' {
     if (this.unsettledDrainWork.size > 0) return 'pending';
@@ -338,11 +308,9 @@ export class ProfileRuntime {
     if (this.inFlightOperations.size > 0) return 'pending';
     if (this.backgroundOperations.size > 0) return 'pending';
     if (this.reindexTails.size > 0) return 'pending';
-    // A drain that began but never reached `closeStore()` (a phase escaping with an uncaught
-    // failure, so `lifecycleState` is still `stopping`) has NOT released anything. Today every phase
-    // body catches internally so this is unreachable; the term is here so a future phase cannot turn
-    // that into a false `quiescent` over still-open handles. Reporting `pending` is the safe
-    // direction: it retains ownership until the operator intervenes.
+    // A drain that began but never reached `closeStore()` has not released anything. Every phase body catches
+    // internally, so this is unreachable today; it keeps a future phase from turning that into a false
+    // `quiescent` over still-open handles. `pending` is the safe direction: it retains ownership.
     if (this.stopping && !this.closed) return 'pending';
     return 'quiescent';
   }
@@ -363,9 +331,6 @@ export class ProfileRuntime {
     } = deps;
 
     const runtime = new ProfileRuntime(profileId, memoryWorkspace, config);
-    // `lifecycleState` already defaults to 'running' on a fresh instance (RR-STRUCT R-S4 Part A);
-    // no explicit reset needed (the old `stopping`/`closed` field assignments here were redundant
-    // even before R-S4 — a fresh instance's field initializers already produced the same values).
     runtime.pendingIndexDeltas.clear();
 
     secureMkdir(path.dirname(dbPath));
@@ -407,10 +372,8 @@ export class ProfileRuntime {
     runtime.registry = registry;
 
     try {
-      // R-S3b: `memory_write` routes through the single-writer. The coordinator does NOT
-      // exist yet at this point (built below in the memcore block), so pass a LAZY
-      // accessor read at execute time — passing the instance directly would capture
-      // `undefined` and silently never route. Same shape as the `factMirror` accessor.
+      // `memory_write` routes through the single-writer. The coordinator does not exist yet at this point, so
+      // pass a lazy accessor read at execute time; passing the instance directly would capture `undefined`.
       for (const tool of createMemoryTools(memory, search, indexer, profileId, () => runtime.factMirror, () => runtime.mutationCoordinator)) {
         registry.register(tool);
       }
@@ -453,10 +416,8 @@ export class ProfileRuntime {
         },
       });
       runtime.writeQueue = writeQueue;
-      // RR-STRUCT R-S4 (mini-plan v3 §3.9, Part B): the isShutdown port keys on `isClosed()`
-      // (post-closeStore), NOT `isStopping()` — an in-flight mutation that started before stop()
-      // began must still be allowed to drain (see runtime.ts drainAndClose / the coordinator's
-      // own doc comment). A port (not a direct gateway import) keeps `src/capture` v2-core-clean.
+      // The isShutdown port keys on `isClosed()` (post-closeStore), not `isStopping()`: an in-flight mutation
+      // that started before stop() must still be allowed to drain. A port keeps `src/capture` free of gateway imports.
       const mutationCoordinator = new MutationCoordinator(writeQueue, () => runtime.isClosed());
       runtime.mutationCoordinator = mutationCoordinator;
 
@@ -510,23 +471,14 @@ export class ProfileRuntime {
         (Object.entries(TYPE_TO_FILE) as [FactType, string][]).map(([t, f]) => [f, t]),
       );
 
-      // Tier-1 (RR-STRUCT R-S3, mini-plan v3 §3.6/§3.7): SYNCHRONOUS, LOCAL-only derivation —
-      // called from INSIDE the SAME write-lock op that produced the change (CapturePipeline /
-      // ledger-tools), so the write and its projections land atomically relative to any read.
-      // Everything here is local (SQLite/fs, no network/LLM, <5ms budget): FactMirror update,
-      // the pending-chunk-delta buffer, and the index-dirty checkpoint. `takeIndexDelta` is a
-      // ONE-SHOT CONSUME (LedgerStore clears it once read) — it is taken exactly ONCE, here, and
-      // its `entities` list drives an ENTITY-SCOPED `replaceScope` (RR-9b's write-amplification
-      // optimization — a whole-type `replaceType` rewrite on every mutation was the exact thing
-      // RR-9b closed; downgrading it without cause would reopen that finding) with a whole-type
-      // `replaceType` fallback only when no delta is available (e.g. a confirm/discontinue path
-      // that does not push a pendingIndexDelta). Because every Tier-1 step is now serialized by
-      // the OUTER single-writer lock (only one can ever run at a time, period), the `mirrorTails`
-      // per-type promise chain that used to guard the — previously UNLOCKED, async — mirror write
-      // against ITSELF is redundant and was removed. A FactMirror-write failure warns and
-      // continues (fail-SOFT: recall reads current facts from the ledger itself, not the mirror; the
-      // next mutation's Tier-1 step retries; boot's full rebuild is the ultimate backstop) — it
-      // must NEVER abort the write itself.
+      // Tier-1: synchronous, local-only derivation, called from inside the same write-lock op that produced the
+      // change, so the write and its projections land atomically relative to any read. Everything here is local
+      // (SQLite/fs, no network or LLM): FactMirror update, the pending-chunk-delta buffer and the index-dirty
+      // checkpoint. `takeIndexDelta` is a one-shot consume, taken exactly once here; its `entities` list drives an
+      // entity-scoped `replaceScope` (avoiding whole-type rewrites on every mutation), with a whole-type
+      // `replaceType` fallback only when no delta is available. A FactMirror-write failure warns and continues:
+      // recall reads current facts from the ledger itself, the next mutation retries, and boot rebuilds fully.
+      // It must never abort the write itself.
       const tier1Rederive = {
         rederive: async (relPaths: string[]): Promise<void> => {
           if (runtime.stopping || runtime.closed) return;
@@ -563,16 +515,13 @@ export class ProfileRuntime {
           }
         },
       };
-      /** ledger-tools.ts's confirm/discontinue paths key by FactType (they never had a relPath to
-       *  begin with) — thin adapter onto the SAME Tier-1 closure so both callers share identical
-       *  entity-scoped/whole-type fallback behavior. */
+      /** Adapter for ledger-tools' confirm/discontinue paths, which key by FactType: reuses the Tier-1 closure above. */
       const tier1RederiveType = (type: FactType): Promise<void> =>
         tier1Rederive.rederive([`ledger/${TYPE_TO_FILE[type]}`]);
 
-      // Tier-2 (async, OFF the write lock — RR-7 C-09: embeddings never run inside the
-      // single-writer lock). ONLY the embedding-triggering background reindex remains here — the
-      // delta-consume + FactMirror + dirty-marker bookkeeping all moved to Tier-1 above (they are
-      // local/sync and need to run exactly once, before Tier-1 returns).
+      // Tier-2 (async, off the write lock): embeddings never run inside the single-writer lock. Only the
+      // embedding-triggering background reindex remains here; the delta, FactMirror and dirty-marker
+      // bookkeeping run in Tier-1.
       const tier2Rederive = {
         rederive: async (relPaths: string[]): Promise<void> => {
           if (runtime.stopping || runtime.closed) return;
@@ -792,9 +741,8 @@ export class ProfileRuntime {
     runtime.sessions = sessions;
     runtime.turnCoordinator = new TurnCoordinator(runtime, semaphore, reconcile);
 
-    // RR-STRUCT R-S4 (mini-plan v3 §3.9, Part B): same gate predicate + same "closed, not
-    // stopping" reasoning as the MutationCoordinator wiring above — recordTurn/recordPromptUsage/
-    // runCompaction must still be allowed to drain a turn that started before stop().
+    // Same gate predicate as the MutationCoordinator wiring above: closed, not stopping, so
+    // recordTurn/recordPromptUsage/runCompaction can still drain a turn that started before stop().
     sessions.setShutdownGate(() => runtime.isClosed());
     sessions.setBackgroundRunner((fn) => semaphore.run('background', fn));
     if (runtime.sessionSummarySink) {
@@ -818,8 +766,8 @@ export class ProfileRuntime {
     }
 
     if (deps.canSchedule && deps.runScheduledJob && config.heartbeat.enabled) {
-      // RR2-B1: refuse scheduler activation without a destination-ownership guard — never
-      // construct an unguarded production scheduler (fail-closed, sanitized, no throw).
+      // Refuse scheduler activation without a destination-ownership guard: never construct an unguarded
+      // production scheduler (fail closed, sanitized, no throw).
       if (!deps.canAddressChat) {
         console.warn(
           '[gateway] Heartbeat scheduler not activated: no destination ownership guard ' +
@@ -853,10 +801,9 @@ export class ProfileRuntime {
     schedulerPaths: { storePath: string; auditLogPath: string };
     runScheduledJob: (job: HeartbeatJob) => Promise<void>;
     /**
-     * RR2-B1 (R2-10/11): REQUIRED for production — the destination-ownership capability
-     * closed over THIS runtime's profileId. Threaded into the scheduler so
-     * createJob/updateJob/resume/start registration can refuse foreign destinations, and
-     * the dispatch trigger stays owner-bound (the Gateway closure captures this runtime).
+     * Required for production: the destination-ownership capability closed over this runtime's profileId.
+     * Threaded into the scheduler so job creation/update/resume/start can refuse foreign destinations, and the
+     * dispatch trigger stays owner-bound.
      */
     canAddressChat: (chatId: string) => boolean;
   }): Promise<void> {
@@ -896,7 +843,7 @@ export class ProfileRuntime {
   }
 
   beginStopping(): void {
-    // One-way progression (RR-STRUCT R-S4 Part A): never regress 'closed' back to 'stopping'.
+    // One-way progression: never regress 'closed' back to 'stopping'.
     if (this.lifecycleState === 'running') {
       this.lifecycleState = 'stopping';
     }
@@ -904,23 +851,17 @@ export class ProfileRuntime {
   }
 
   /**
-   * RR-STRUCT R-S4 (mini-plan v3 §3.9, Part C): drains the SAME sequence R-S1/R-S2 established
-   * (stop producers -> drain in-flight/sweep/compactions/background/write-queue -> close every
-   * SQLite handle once) — this does NOT reorder that sequence. What's new is a BOUNDED overall
-   * budget wrapped around it: `withBudget` computes one shared deadline
-   * (`SHUTDOWN_DRAIN_BUDGET_MS` from `beginStopping()`'s moment) and races each phase against the
-   * time remaining under it. A phase that is still running when the shared deadline passes is
-   * ABANDONED (never awaited further — but still started, so it keeps making best-effort progress
-   * in the background) and recorded in `stillPending` for one sanitized warning; every later phase
-   * then sees ~0ms remaining and is abandoned immediately too, fast-forwarding straight to
-   * `closeStore()`. This is corruption-safe: `better-sqlite3` is fully synchronous, so no SQL
-   * statement is ever mid-execution across an `await` — closing a handle can only ever run BEFORE
-   * or AFTER one of its synchronous statements, never DURING one (JS's single-threaded, non-
-   * preemptive execution model guarantees this) — so an abandoned op's next DB call either
-   * completes cleanly (if it wins the race) or throws a plain, already-caught "database is
-   * closed"-style error / hits the Part B write-gate (if it loses it). Never re-introduces the
-   * crude unconditional 10s cap RR-7 removed: a fast drain (the overwhelming common case) is
-   * unaffected — every phase gets the FULL remaining budget, not a per-phase slice.
+   * Drains the shutdown sequence (stop producers, drain in-flight/sweep/compactions/background/write-queue,
+   * close every SQLite handle once) under a bounded overall budget. `withBudget` computes one shared deadline
+   * (`SHUTDOWN_DRAIN_BUDGET_MS`) and races each phase against the time remaining. A phase still running at the
+   * deadline is abandoned (never awaited further, but still started so it makes best-effort progress) and
+   * recorded in `stillPending` for one sanitized warning; later phases are abandoned immediately, going
+   * straight to `closeStore()`.
+   *
+   * This is corruption-safe: `better-sqlite3` is synchronous, so no SQL statement is ever mid-execution across
+   * an `await`. An abandoned op's next DB call either completes cleanly or throws an already-caught
+   * "database is closed" error / hits the write gate. A fast drain is unaffected: every phase gets the full
+   * remaining budget, not a per-phase slice.
    */
   async drainAndClose(): Promise<void> {
     if (this.closed) return;
@@ -930,10 +871,9 @@ export class ProfileRuntime {
     const stillPending: string[] = [];
 
     const withBudget = async (label: string, work: () => Promise<void>): Promise<void> => {
-      // C01 (R01): register the phase's continuation the moment it STARTS, and unregister it only
-      // when it really settles. This function RETURNING is not that point — that is the whole defect:
-      // an abandoned phase keeps running, so `getShutdownDisposition()` must keep reporting
-      // `pending` (and the installation must keep its leases) until the phase's own settlement.
+      // Register the phase's continuation the moment it starts, and unregister it only when it really settles.
+      // An abandoned phase keeps running, so `getShutdownDisposition()` must keep reporting `pending` (and the
+      // installation must keep its leases) until the phase's own settlement.
       const register = (started: Promise<void>): Promise<void> => {
         this.unsettledDrainWork.add(started);
         void started.then(
@@ -944,8 +884,8 @@ export class ProfileRuntime {
       };
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
-        // Budget already exhausted by an earlier phase: fire this phase for best-effort
-        // background progress, but do not make shutdown wait on it any further.
+        // Budget already exhausted by an earlier phase: fire this phase for best-effort background progress,
+        // but do not make shutdown wait on it.
         stillPending.push(label);
         void register(work());
         return;
@@ -956,11 +896,9 @@ export class ProfileRuntime {
         timer.unref?.();
       });
       try {
-        // C01 (R01): `register`'s own rejection callback already observes the phase promise, and a
-        // phase that rejects must not become a derived unhandled rejection here — otherwise an
-        // abandoned-then-failed phase would surface as a process-level warning with nothing left to
-        // attribute it. `firstError` keeps the existing "drain throws the first real failure"
-        // behaviour; the label is added so the message names which phase failed.
+        // `register`'s own rejection callback already observes the phase promise, so a phase that rejects after
+        // being abandoned does not become an unhandled rejection. `firstError` keeps the first real failure; the
+        // label names which phase failed.
         const outcome = await Promise.race([
           register(work()).then(
             () => 'done' as const,
@@ -1037,8 +975,7 @@ export class ProfileRuntime {
     });
 
     if (stillPending.length > 0) {
-      // Sanitized: phase LABELS only (constant strings, defined above — never operation content),
-      // matching the PHI-never-in-logs invariant.
+      // Sanitized: phase labels only (constant strings, never operation content), per the PHI-never-in-logs invariant.
       console.warn(
         `[gateway] Shutdown drain budget (${SHUTDOWN_DRAIN_BUDGET_MS}ms) exceeded; proceeding to close ` +
         `stores with operations still in flight: ${stillPending.join(', ')}`,

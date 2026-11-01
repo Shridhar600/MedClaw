@@ -1,8 +1,7 @@
-// Public surface of the profiles module (specs/16 §1: everything else is private).
+// Public surface of the profiles module; everything else is private.
 //
-// `resolveOwnerPaths` and friends are pure path derivation. `ProfileRegistry` is GONE as of the S1 T5
-// cutover: it owned chat->identity resolution, CRUD, a workspace-migration copy and a default-profile
-// grant, and every one of those duplicated or contradicted owner admission. Nothing re-exports it.
+// `resolveOwnerPaths` and friends are pure path derivation. Chat-to-identity resolution is owned by
+// owner admission, not by a registry.
 export { resolveOwnerPaths, derivedPathsFor, asProfileId, isValidProfileId, OWNER_ID_PATTERN } from './paths';
 export type { OwnerPaths } from './paths';
 export { WriteQueue, replayJournal } from './write-queue';

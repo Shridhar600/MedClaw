@@ -17,11 +17,11 @@ interface AgentRunContext {
   chatId?: string;
   turnId?: string;
   origin?: SemaphorePriority;
-  /** The assembler mode for this turn (Gateway owns the origin→mode mapping — H-4). */
+  /** The assembler mode for this turn (the Gateway owns the origin→mode mapping). */
   mode?: AssemblerMode;
 }
 
-/** The per-turn system prompt + an optional feedback sink for the B7 <used> ids. */
+/** The per-turn system prompt + an optional feedback sink for the <used> ids. */
 export interface PreparedSystem {
   messages: Message[];
   recordUsed?: (usedIds: string[]) => Promise<void>;
@@ -29,8 +29,10 @@ export interface PreparedSystem {
   healthContextTouched?: boolean;
 }
 
-/** Builds the system prompt fresh for a turn (D9). Recall + assembly happen inside; SAFETY is
- *  re-rendered every turn. A thrown InvariantViolationError aborts the turn (medical-safety). */
+/**
+ * Builds the system prompt fresh for a turn. Recall + assembly happen inside; SAFETY is re-rendered every turn.
+ * A thrown InvariantViolationError aborts the turn (medical-safety).
+ */
 export type PrepareSystem = (mode: AssemblerMode, userMessage: string) => Promise<PreparedSystem>;
 
 export class AgentLoop {
@@ -44,8 +46,8 @@ export class AgentLoop {
     private readonly config: AgentConfig,
     private readonly semaphore?: LLMSemaphore,
   ) {
-    // A static Message[] (legacy/test construction) becomes a constant supplier; a function is used
-    // per turn. This replaces the boot-cached system prompt with per-turn assembly (D9).
+    // A static Message[] becomes a constant supplier; a function is used per turn (per-turn assembly, not a
+    // boot-cached system prompt).
     this.prepareSystem = typeof systemSource === 'function'
       ? systemSource
       : async () => ({ messages: systemSource });
@@ -73,9 +75,9 @@ export class AgentLoop {
     conversationHistory: Message[],
     runContext?: AgentRunContext,
   ): Promise<AgentRunResult> {
-    // Per-turn system assembly (D9): SAFETY + recall are rebuilt for this turn. A SAFETY-invariant
-    // violation here throws and aborts THIS turn (medical-safety > resilience) — the Gateway's outer
-    // handler turns it into a safe fallback reply, the daemon never crashes.
+    // Per-turn system assembly: SAFETY + recall are rebuilt for this turn. A SAFETY-invariant violation here throws
+    // and aborts this turn (medical-safety > resilience); the Gateway's outer handler turns it into a safe fallback
+    // reply, so the daemon never crashes.
     const mode: AssemblerMode = runContext?.mode ?? 'chat';
     const prepared = await this.prepareSystem(mode, userMessage);
     const messages: Message[] = [
@@ -85,8 +87,8 @@ export class AgentLoop {
     ];
     const trace: Message[] = [];
     const usedTools: string[] = [];
-    // A-MF1: the last provider call's promptTokens is the window-fill signal. Overwritten each call so
-    // the FINAL call (full accumulated context) is the value surfaced on the result.
+    // The last provider call's promptTokens is the window-fill signal. Overwritten each call so the final call
+    // (full accumulated context) is the value surfaced on the result.
     let lastPromptTokens: number | undefined;
 
     const tools: ToolSchema[] = this.registry.getAvailable(runContext?.origin).map(t => ({
@@ -100,14 +102,14 @@ export class AgentLoop {
 
     for (let iteration = 0; iteration < this.config.maxIterations; iteration++) {
       const response = await this.provider.chat(messages, tools);
-      // A-MF1 / H7: the LAST provider call's reading wins — assign every iteration (undefined included).
-      // If the final call omits usage, we surface `undefined` (⇒ chars/4 estimate downstream), NOT a
-      // stale earlier-iteration count that under-reports the largest (final) prompt and skips a trigger.
+      // The last provider call's reading wins: assign every iteration (undefined included). If the final call omits
+      // usage, surface `undefined` (chars/4 estimate downstream), not a stale earlier count that under-reports the
+      // largest (final) prompt and skips a trigger.
       lastPromptTokens = response.usage?.promptTokens;
 
       if (response.type === 'text') {
-        // B7 <used> tag is parsed + stripped BEFORE health-classification / disclaimer / persist /
-        // send (H-3); a missing/garbled tag is simply no signal, never an error.
+        // The <used> tag is parsed + stripped before health-classification / disclaimer / persist / send; a
+        // missing or garbled tag is simply no signal, never an error.
         const { ids: usedIds, stripped: rawText } = parseUsedTag(response.text);
         if (usedIds.length > 0 && prepared.recordUsed) {
           try { await prepared.recordUsed(usedIds); } catch { /* recordUsage is best-effort + guarded */ }
@@ -127,9 +129,9 @@ export class AgentLoop {
         };
       }
 
-      // Tool calls — execute ALL the model requested this turn (C4.1); never drop the tail. OpenAI
-      // strict ordering: ONE assistant message carrying every tool_call, then one `tool` result per
-      // call (in request order). Executed sequentially — the win is not silently dropping calls.
+      // Tool calls — execute all the model requested this turn; never drop the tail. OpenAI strict ordering: one
+      // assistant message carrying every tool_call, then one `tool` result per call (in request order). Executed
+      // sequentially.
       const calls = response.toolCalls;
       for (const c of calls) usedTools.push(c.name);
       // Tool args routinely carry PHI (memory content, health queries, report paths) — log the tool
@@ -149,14 +151,13 @@ export class AgentLoop {
       trace.push(toolRequestMessage);
 
       for (const c of calls) {
-        // Per-call isolation (M-2): registry.execute THROWS for an unknown/denied tool name (a
-        // hallucinated name in a parallel batch). Catch it and surface an error result matched to
-        // THIS tool_call_id so every call still gets exactly one `tool` message (OpenAI ordering
-        // stays valid) and the good calls' work is not discarded by one bad name.
+        // Per-call isolation: registry.execute throws for an unknown/denied tool name (e.g. a hallucinated name in a
+        // parallel batch). Catch it and surface an error result matched to this tool_call_id so every call still gets
+        // exactly one `tool` message (OpenAI ordering stays valid) and the good calls' work is not discarded.
         let resultText: string;
         try {
-          // RR-STRUCT R-S3: thread the provider's per-call id through so a tool can build a
-          // collision-free idempotency key for two parallel same-tool calls in this turn.
+          // Thread the provider's per-call id through so a tool can build a collision-free idempotency key for two
+          // parallel same-tool calls in this turn.
           const toolResult = await this.registry.execute(c.name, c.arguments, { ...runContext, toolCallId: c.id });
           resultText = toolResult.content.map(r => r.text).join('\n');
         } catch (e) {

@@ -1,43 +1,22 @@
-// src/runtime/adapters/directory-lease.ts
-//
 // Concrete local resource lease: a non-recursive `mkdir` at 0700 with private holder metadata.
 //
-// THE CLAIM IS THE MKDIR. There is no staging directory and no rename. This was not always true, and
-// the difference is a data-safety bug rather than a style preference. The adapter used to build the
-// lease under a temporary name and `rename` it into place, reasoning that "a same filesystem
-// directory rename is atomic and fails when the destination is a non-empty directory". That last
-// clause is only half of POSIX `rename(2)`: it also *replaces* an existing destination that is an
-// EMPTY directory. An unknown lease left at a claim path — precisely the shape a crash between
-// claiming and publishing leaves behind — was therefore deleted and reported as this process's own
-// ownership. Verified on this host: `rename` over an empty directory succeeds, over a non-empty one
-// returns ENOTEMPTY, and over a dangling symlink returns ENOTDIR.
+// The claim is the `mkdir` itself. There is no staging directory and no rename, because POSIX
+// `rename(2)` replaces an existing EMPTY destination directory, which would let a leftover lease be
+// taken as this process's own ownership. Non-recursive `mkdir` refuses with EEXIST for every
+// existing entry (empty or populated directory, file, symlink, dangling symlink), and every one is
+// refused as `busy`, never taken.
 //
-// Non-recursive `mkdir` is the only no-replace directory claim Node exposes (`linkat` on a directory
-// and `renameat2(RENAME_NOREPLACE)` are not reachable from its public API), and it refuses with
-// EEXIST for every existing entry shape: empty or populated directory, regular file, symlink to a
-// directory, and dangling symlink — the last of which `existsSync` reports as absent. Every one of
-// those is an occupied claim path, and every one is refused as `busy`, never taken.
+// The claim becomes visible one syscall before the holder record lands, so a contender inside that
+// window cannot read the holder and reports `malformed-holder`. It refuses immediately: it never
+// steals, waits, clears or repairs the claim. An unreadable holder is busy and never auto-recovered.
 //
-// The cost is honest and stated: the claim becomes visible one syscall before the holder record lands,
-// so a contender inside that window cannot read the holder and truthfully reports `malformed-holder`.
-// It refuses immediately — it never steals, waits for publication, clears or repairs the claim. That
-// is exactly plan 15 §2.2's rule that an unreadable holder is busy and never auto-recovered.
-//
-// The primitive was proved on this actual filesystem with real child processes before being
-// integrated (see the S1 report, T2). Observed on `darwin arm64`, Node v26.7.0, local APFS
-// (`statfs` type 26): 8 independent child processes released by an IPC barrier produced exactly
-// one winner and seven `EEXIST` refusals; re-acquisition while held refused immediately with no
-// retry; the next contender succeeded after release; a foreign token could not steal; release was
-// idempotent; a malformed lease stayed busy and was never auto-cleared.
-//
-// Known limits, stated rather than papered over:
-//  - Only a local filesystem is covered. `mkdir` exclusivity is not a portable guarantee on a
-//    network filesystem, and Windows semantics are not addressed. No dependency or OS change is
-//    made to manufacture one.
+// Known limits:
+//  - Only a local filesystem is covered. `mkdir` exclusivity is not portable to network filesystems,
+//    and Windows semantics are not addressed.
 //  - A kill or crash can leave a stale lease, or a claim whose holder record never landed. Clearing
 //    either is a deliberate operator action after the recorded process is confirmed gone; there is
 //    no TTL theft and no automatic unlock.
-//  - Hostile same-UID descriptor races are out of scope (existing backlog item).
+//  - Hostile same-UID descriptor races are out of scope.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -101,8 +80,7 @@ export class DirectoryLease implements ResourceLeasePort {
         kind: 'unavailable',
         resource: target.kind,
         reason: 'unsafe-parent',
-        // Bounded AND truthful: "create the directory" is actionable for a missing parent and
-        // impossible for a name already taken by a file.
+        // A missing parent is fixable by creating it; a name taken by a file is not.
         guidance:
           parentState === 'not-a-directory'
             ? `The ${target.kind} resource cannot be owned because a path component in its location is not a directory. Choose a different --config or --state-root target.`
@@ -111,16 +89,15 @@ export class DirectoryLease implements ResourceLeasePort {
     }
 
     // The claim is one non-recursive `mkdir` at the lease path itself: it succeeds for exactly one
-    // caller and refuses with EEXIST for every existing entry, so an unknown lease can never be
-    // replaced, cleared or repaired here. Nothing is checked before it and nothing is renamed over
-    // it afterwards.
+    // caller and refuses with EEXIST for every existing entry, so an unknown lease is never
+    // replaced, cleared or repaired here.
     try {
       fs.mkdirSync(leasePath, { mode: DIR_MODE });
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === 'EEXIST' || code === 'ENOTEMPTY') {
-        // Something is already at the claim path. That entry is left exactly as it is, and is never
-        // interpreted as free — including a dangling symlink, which `existsSync` would call absent.
+        // Something is already at the claim path. Leave it as it is and never treat it as free
+        // (a dangling symlink included, which `existsSync` would call absent).
         return this.describeBusy(target, leasePath);
       }
       if (code === 'ENOENT' || code === 'ENOTDIR') {
@@ -139,12 +116,9 @@ export class DirectoryLease implements ResourceLeasePort {
       };
     }
 
-    // `mkdir`'s mode is umask-affected, so the owner-only mode is established HERE, before the
-    // holder write — not after it. Two reasons, both learned the hard way:
-    //  - a umask that strips owner bits would otherwise leave the claim at 0000, making the holder
-    //    write fail EACCES and the failed-attempt cleanup unable to read the directory it must
-    //    remove, permanently stranding the installation behind its own artifact;
-    //  - a 0000 claim in the window before the chmod would also be unreadable to a contender.
+    // `mkdir`'s mode is umask-affected, so set the owner-only mode here, before the holder write.
+    // A umask that strips owner bits would leave the claim at 0000: the holder write would fail and
+    // the failed-attempt cleanup could not read the directory it must remove.
     try {
       fs.chmodSync(leasePath, DIR_MODE);
     } catch {
@@ -158,11 +132,8 @@ export class DirectoryLease implements ResourceLeasePort {
         encoding: 'utf8',
         mode: FILE_MODE,
       });
-      // `writeFileSync`'s mode is umask-affected too, so under a umask that strips owner bits the
-      // record would be created unreadable. That is not cosmetic: release is token-checked by READING
-      // this file, so an unreadable record makes the caller's own lease impossible to release — the
-      // lease would survive a successful acquisition and strand the installation. Establish the mode
-      // explicitly, exactly as for the claim directory above.
+      // `writeFileSync`'s mode is umask-affected too. Release reads this file to check the token, so
+      // an unreadable record would make the caller's own lease impossible to release.
       try {
         fs.chmodSync(holderPath, FILE_MODE);
       } catch {
@@ -170,8 +141,7 @@ export class DirectoryLease implements ResourceLeasePort {
       }
     } catch {
       // The claim exists but is not a usable lease. Remove exactly the artifact this attempt just
-      // created — never another holder's — so the target is retryable instead of stranded behind a
-      // leftover plan 15 §2.2 forbids clearing automatically.
+      // created, never another holder's, so the target stays retryable.
       removeClaimedLease(leasePath);
       return {
         kind: 'unavailable',
@@ -196,8 +166,7 @@ export class DirectoryLease implements ResourceLeasePort {
         if (releaseLeaseIfOwned(leasePath, holder.token)) {
           return;
         }
-        // A malformed or replaced lease is never deleted by us; leaving it visible is the honest
-        // outcome, and the operator still sees a lease to inspect.
+        // A malformed or replaced lease is never deleted by us; it stays visible for the operator.
       },
     };
   }
@@ -282,8 +251,8 @@ function removeClaimedLease(leasePath: string): void {
   } catch {
     // Best effort: a leftover claim is visible and inspectable, never silently reused.
   }
-  // Restore owner-only mode first, so the removal below can actually LIST the directory even if the
-  // umask created it narrower than intended. Without this the cleanup could fail on its own artifact.
+  // Restore owner-only mode first so the removal below can list the directory even if the umask
+  // created it narrower than intended.
   try {
     fs.chmodSync(leasePath, DIR_MODE);
   } catch {
@@ -310,9 +279,8 @@ export function describeLeaseForLocalInspection(
   canonicalResourcePath: string,
 ): { present: boolean; resource?: LeaseHolder['kind']; pid?: number; pidAlive?: boolean; readable: boolean } {
   const leasePath = leasePathFor(canonicalResourcePath);
-  // `lstat`, not `existsSync`: a DANGLING symlink at the claim path is an occupied claim path —
-  // acquisition refuses it as busy — but `existsSync` follows the link and reports it absent. This
-  // helper must not tell an operator the installation is free while the daemon refuses it.
+  // `lstat`, not `existsSync`: acquisition treats a dangling symlink at the claim path as occupied,
+  // so inspection must not report the installation as free.
   let claimExists: boolean;
   try {
     fs.lstatSync(leasePath);

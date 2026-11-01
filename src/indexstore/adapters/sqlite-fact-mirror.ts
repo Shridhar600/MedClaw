@@ -1,13 +1,12 @@
 // src/indexstore/adapters/sqlite-fact-mirror.ts
 //
-// FactMirror adapter over SQLite — the rebuildable-from-Markdown mirror of the ledger that
-// recall Stage 1 reads (P2 Task A1, specs/07 §4). Opens its OWN better-sqlite3 connection to
-// the per-profile search.db (WAL permits multiple connections; explicit busy_timeout per D6)
-// and imports better-sqlite3 DIRECTLY — never src/memory/ (the v2→legacy boundary forbids it).
-// The DB path is injected by the composition layer (Gateway).
+// FactMirror adapter over SQLite — the rebuildable-from-Markdown mirror of the ledger that recall
+// Stage 1 reads. Opens its OWN better-sqlite3 connection to the per-profile search.db (WAL permits
+// multiple connections; explicit busy_timeout) and imports better-sqlite3 DIRECTLY, never
+// src/memory/. The DB path is injected by the composition layer (Gateway).
 //
-// Schema ownership (v2-M-3): this layer owns `facts` (+ chunk_stats/events in later A-tasks);
-// the P0 sqlite-store owns chunks/chunks_fts/chunks_vec0/meta on the same file.
+// Schema ownership: this layer owns `facts` (+ chunk_stats/events); the sqlite-store owns
+// chunks/chunks_fts/chunks_vec0/meta on the same file.
 
 import Database from 'better-sqlite3';
 import { summarizeErrorForLog } from '../../security';
@@ -75,7 +74,7 @@ export class SqliteFactMirror implements FactMirror {
   }
 
   async *queryActive(type?: string, entity?: string): AsyncIterable<FactRecord> {
-    // Active head only; v0 quarantine sentinels (version < 1) are never surfaced (M-5).
+    // Active head only; v0 quarantine sentinels (version < 1) are never surfaced.
     let sql = "SELECT json FROM facts WHERE status = 'active' AND version >= 1";
     const params: unknown[] = [];
     if (type !== undefined) {
@@ -94,7 +93,7 @@ export class SqliteFactMirror implements FactMirror {
   }
 
   async *queryPaused(type?: string): AsyncIterable<FactRecord> {
-    // Paused head only; v0 quarantine sentinels never surface (M-5). KNEE-08 substrate.
+    // Paused head only; v0 quarantine sentinels never surface.
     let sql = "SELECT json FROM facts WHERE status = 'paused' AND version >= 1";
     const params: unknown[] = [];
     if (type !== undefined) {
@@ -110,10 +109,9 @@ export class SqliteFactMirror implements FactMirror {
 
   async *queryEntityHeads(): AsyncIterable<FactRecord> {
     // One lifecycle head per (type, entity): active wins over terminal/non-active records, then
-    // version/createdAt/id provide deterministic ordering. v0 quarantine sentinels are excluded.
-    // The window query selects only one candidate JSON row per group. The JS reducer remains as a
-    // defensive semantic belt-and-braces check, but it now sees a bounded result set rather than
-    // parsing every historical version on every recall turn.
+    // version/createdAt/id give deterministic ordering. v0 quarantine sentinels are excluded.
+    // The window query selects one candidate JSON row per group, so the JS reducer (a defensive
+    // check) sees a bounded result set rather than every historical version on every recall turn.
     const rows = this.db.prepare(`
       SELECT json FROM (
         SELECT f.json AS json,
@@ -189,7 +187,7 @@ export class SqliteFactMirror implements FactMirror {
     `);
   }
 
-  /** Rebuild the pre-RR-5 id-only table so same-name facts in different types can coexist. */
+  /** Rebuild the legacy id-only table so same-name facts in different types can coexist. */
   private migrateLegacyPrimaryKey(): void {
     const columns = this.db.prepare('PRAGMA table_info(facts)').all() as Array<{ name: string; pk: number }>;
     const primaryKey = columns.filter(c => c.pk > 0).sort((a, b) => a.pk - b.pk).map(c => c.name);

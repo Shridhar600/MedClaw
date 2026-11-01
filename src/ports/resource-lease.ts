@@ -3,7 +3,7 @@
 // Ownership seam for the two local resources a MedClaw installation contends on:
 // the selected configuration document and the selected owner workspace.
 //
-// Interface-only (specs/16 §2). The contract is deliberately small:
+// Interface-only. The contract is deliberately small:
 //
 //  - there is no check-then-create, no TTL, no renewal and no steal;
 //  - a contended or unrecognised lease is `busy` with honest local-inspection guidance, never

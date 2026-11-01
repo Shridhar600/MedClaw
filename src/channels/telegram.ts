@@ -32,9 +32,8 @@ export class TelegramChannel implements Channel {
   readonly name = 'telegram';
   private bot: Bot;
   private messageHandler?: (msg: IncomingMessage) => Promise<void>;
-  // Reconnect state for the polling long-poll lifecycle. Network blips or a
-  // bad/expired token make bot.start() reject; without an explicit .catch the
-  // rejected promise becomes an unhandledRejection and the daemon dies (RES-P0-2).
+  // Reconnect state for the polling lifecycle. A network blip or a bad token makes bot.start()
+  // reject; an unhandled rejection would kill the daemon, so it is caught and retried.
   private running = false;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private reconnectDelayMs = 1000;
@@ -44,17 +43,13 @@ export class TelegramChannel implements Channel {
   /**
    * @param botToken Bot token. Used for polling only.
    *
-   * There is deliberately no staging path and no trusted-base argument any more. The channel emits an
-   * opaque `MediaReference` and never fetches, writes or names a file, so it has no filesystem
-   * authority to contain. Containment belongs to `FsMediaStager`, which is constructed once by the
-   * Gateway against the selected owner's lane. The old `stagingPath`/`trustedStagingBase` pair existed
-   * solely for `downloadFile`, which buffered the whole body with `arrayBuffer()` and was dead code.
+   * The channel emits an opaque `MediaReference` and never fetches, writes or names a file, so it
+   * has no filesystem authority to contain. Containment belongs to `FsMediaStager`.
    */
   constructor(botToken: string) {
     this.bot = new Bot(botToken);
-    // grammY's error boundary: any error thrown by handlers/middleware that is
-    // not caught inside the handler lands here. Without it, such errors crash
-    // the polling loop (RES-P0-1). Sanitized via summarizeErrorForLog (PHI bind).
+    // grammY's error boundary: errors thrown by handlers or middleware and not caught there would
+    // otherwise crash the polling loop. Sanitized via summarizeErrorForLog (PHI-safe).
     this.bot.catch((botError) => {
       console.error('[telegram] Bot error boundary:', summarizeErrorForLog(botError));
     });
@@ -79,10 +74,8 @@ export class TelegramChannel implements Channel {
             : undefined,
         });
       } catch (e) {
-        // Handler errors propagate PHI-bearing user text through grammY's error
-        // boundary — log the sanitized frame only here (the boundary at
-        // construction also sanitizes). Token redaction is retained for the
-        // download-error logs below; handler errors carry no token URL.
+        // Handler errors can carry PHI-bearing user text through grammY's error boundary, so log
+        // only the sanitized frame.
         console.error('[telegram] Handler error:', summarizeErrorForLog(e));
         throw e; // allow grammY to retry
       }
@@ -172,10 +165,8 @@ export class TelegramChannel implements Channel {
   async connect(): Promise<void> {
     console.log('[telegram] Starting bot polling...');
     this.running = true;
-    // grammY 1.42.0 PollingOptions exposes limit/timeout/allowed_updates/
-    // drop_pending_updates/onStart — there is no built-in polling backoff field,
-    // so reconnect-with-exponential-backoff is handled by startPolling()'s
-    // rejection handler below (RES-P0-2 + RES-P2-4).
+    // grammY's PollingOptions has no built-in backoff, so reconnect with exponential backoff is
+    // handled by startPolling()'s rejection handler.
     this.startOptions = {
       onStart: (info) => console.log(`[telegram] Bot @${info.username} connected`),
     };
@@ -184,18 +175,16 @@ export class TelegramChannel implements Channel {
 
   private startPolling(): void {
     if (!this.running) return;
-    // bot.start() resolves only on stop(); a rejection here is a polling
-    // startup failure (network blip, transient 5xx, bad token). Attach an
-    // explicit rejection handler so it never becomes an unhandledRejection.
+    // bot.start() resolves only on stop(); a rejection is a polling startup failure (network blip,
+    // transient 5xx, bad token). Handle it explicitly so it never becomes an unhandled rejection.
     void this.bot.start(this.startOptions).then(
       () => {
-        // Clean polling end: reset backoff so a later manual reconnect starts
-        // fresh. On shutdown `running` is already false.
+        // Clean polling end: reset backoff so a later manual reconnect starts fresh.
         this.reconnectDelayMs = 1000;
       },
       (err: unknown) => {
-        // Token-redaction is NOT enough — grammY/Telegram errors can echo full
-        // message bodies (PHI). summarizeErrorForLog excludes the message body.
+        // Token redaction is not enough: grammY/Telegram errors can echo message bodies (PHI).
+        // summarizeErrorForLog excludes the message body.
         console.warn('[telegram] Polling start failed:', summarizeErrorForLog(err));
         if (!this.running) return;
         this.scheduleReconnect();

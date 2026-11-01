@@ -25,15 +25,15 @@ export interface LedgerFact {
   version: number;
   supersedes?: string;
   supersededBy?: string;
-  // Cross-ENTITY links (distinct from same-entity supersedes/supersededBy).
-  // replaces/replacedBy = clinical substitution (naproxen replaces ibuprofen, KNEE-04).
-  // corrects/correctedBy = mistaken-entity correction (DAD-10, spec-09 field names).
+  // Cross-entity links (distinct from same-entity supersedes/supersededBy).
+  // replaces/replacedBy = clinical substitution (naproxen replaces ibuprofen).
+  // corrects/correctedBy = mistaken-entity correction.
   replaces?: string;
   replacedBy?: string;
   corrects?: string;
   correctedBy?: string;
   status: FactStatus;
-  /** Set on a `discontinued` fact (spec-09 CONTRA-01 `reason` maps here). */
+  /** Set on a `discontinued` fact. */
   discontinuedReason?: string;
   fields: Record<string, string | number | string[]>;
   provenance: Provenance;
@@ -76,8 +76,8 @@ export interface NarrativeNote {
   createdAt: string;
 }
 
-// `missing-data` (DD7, spec 14 §5): the nightly transcript sweep files these when a user-mentioned
-// entity had no same-day ledger event — "Did I miss logging X yesterday?". med-lexicon hits are critical.
+// `missing-data`: the nightly transcript sweep files these when a user-mentioned entity had no same-day
+// ledger event ("Did I miss logging X yesterday?"). Medication-lexicon hits are critical.
 export type CuriosityKind = 'follow-up' | 'medication-reminder' | 'lab-correlation' | 'information-gap' | 'insight' | 'missing-data';
 
 export interface CuriosityItem {
@@ -111,7 +111,7 @@ export interface LedgerFactInput {
   text?: string;
 }
 
-/** Input for a narrative-only note (CHAT-06) — the lossless lane, no structured fact. */
+/** Input for a narrative-only note: the lossless lane, no structured fact. */
 export interface NarrativeNoteInput {
   text: string;
   language?: string;
@@ -120,8 +120,8 @@ export interface NarrativeNoteInput {
 }
 
 /**
- * Input for a metric reading (DIAB-02). Recorded as a `metric`-type ledger fact whose
- * `fields` always carry a `date` (F19) plus a narrative note.
+ * Input for a metric reading. Recorded as a `metric`-type ledger fact whose
+ * `fields` always carry a `date` plus a narrative note.
  */
 export interface MetricPointInput {
   entity: string;
@@ -133,7 +133,7 @@ export interface MetricPointInput {
   safetyRelevant?: boolean;
 }
 
-/** Input for a mistaken-entity correction (DAD-10): retract `wrong`, record `corrected`. */
+/** Input for a mistaken-entity correction: retract `wrong`, record `corrected`. */
 export interface LedgerCorrectionInput {
   wrong: { entity: string; type: FactType };
   corrected: LedgerFactInput;
@@ -177,7 +177,7 @@ export interface StoredToken {
 }
 
 export type RecordFactResult =
-  | { kind: 'applied'; fact: LedgerFact; /** CT (SB-2): set when a correction's companion retract needs user confirmation — the tool layer must relay it (DAD-10). */ pendingRetract?: ConfirmationToken }
+  | { kind: 'applied'; fact: LedgerFact; /** Set when a correction's companion retract needs user confirmation; the tool layer must relay it. */ pendingRetract?: ConfirmationToken }
   | { kind: 'needs-confirmation'; token: ConfirmationToken; current: LedgerFact; proposed: LedgerFact; /** CT: relayed correction-retract token (may accompany a pending corrected arm too). */ pendingRetract?: ConfirmationToken }
   | { kind: 'disputed'; versions: [LedgerFact, LedgerFact]; disputeToken: ConfirmationToken; /** CT: relayed correction-retract token. */ pendingRetract?: ConfirmationToken; /** An existing dispute offered again with a fresh token; nothing was written. */ reopened?: true };
 

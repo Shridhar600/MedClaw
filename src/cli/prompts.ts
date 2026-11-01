@@ -108,11 +108,9 @@ export async function askText(
   return normalizePromptValue(answer, defaultValue);
 }
 
-// Reading piped stdin with fs.readFileSync(0) is not safe: when the pipe is
-// non-blocking and the parent has not written yet (a real race under load on
-// Node 26), it throws EAGAIN — and a short read leaves later prompts with no
-// answers, which used to spin the wizard's re-prompt loops forever. Read to
-// EOF ourselves, retrying transient EAGAIN with a bounded blocking backoff.
+// Reading piped stdin with fs.readFileSync(0) is not safe: when the pipe is non-blocking and the parent has not
+// written yet (a real race under load on Node 26), it throws EAGAIN, and a short read leaves later prompts with no
+// answers. Read to EOF ourselves, retrying transient EAGAIN with a bounded blocking backoff.
 const PIPED_STDIN_TIMEOUT_MS = 30_000;
 
 export function readAllStdinSync(): string {

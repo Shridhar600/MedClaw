@@ -49,7 +49,7 @@ Fresh structural parents and this caller's own lease metadata do not make a fres
 non-empty, while genuinely unrelated prior content still refuses under both leases — otherwise setup can
 never run twice on a clean directory.
 
-## Acquisition preconditions (C02)
+## Acquisition preconditions
 
 A lease is a directory, so it cannot exist before its parent does, and a lease must be claimed before
 its resource can be read. Setup therefore does one thing before `acquireOwnership` asks for anything:

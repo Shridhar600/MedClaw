@@ -26,8 +26,8 @@ A channel does **no work on an unauthenticated sender's behalf.** Concretely:
 - **No path construction from transport data.** `displayName` is presentation metadata and is never
   trusted as a path component; the staging layer generates its own names.
 
-This split became load-bearing in S1 rather than stylistic. Before it, a media message could cause work
-before anyone had established who was asking.
+This split is a safety boundary, not a style choice. A media message must cause no work before the core
+has established who is asking.
 
 `MediaReference` deliberately carries **no local path and no fetchable URL**: a path would be authority,
 and a URL in the core would be a request the core issued on a stranger's say-so.

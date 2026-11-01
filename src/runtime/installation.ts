@@ -1,13 +1,7 @@
 // src/runtime/installation.ts
 //
-// The local writer/reader services that own the selected configuration document.
-//
-// T1 scope: strict read + honest commit reporting. T2 adds the resource leases and the
-// `InstallationService` writer lifetime on top of exactly these primitives, so the
-// ownership model has one place to live.
-//
-// Nothing here decides policy: decoding is `src/config`, bounded IO is
-// `src/runtime/adapters/config-file.ts`, and selection is `src/runtime/startup.ts`.
+// Local writer/reader services for the selected configuration document. Decoding lives in
+// `src/config`, bounded IO in `adapters/config-file.ts`, and selection in `startup.ts`.
 
 import * as fs from 'fs';
 import * as os from 'os';
@@ -146,17 +140,10 @@ export { writeConfigFile, readConfigFile, canonicalizeConfigPath };
 export type { ConfigWriteOutcome, ConfigFileSync };
 
 // ── Resource ownership ────────────────────────────────────────────────────────────────
-// Installation is the composition root for local writers. The acquisition order is fixed and
-// every supported writer follows it:
-//
-//   1. acquire the CONFIG lease, keyed on the canonical configuration path;
-//   2. read and validate the configuration INSIDE that lease;
-//   3. acquire the OWNER WORKSPACE lease for the selected owner;
-//   4. on failure at (3), release only the lease this caller acquired at (1).
-//
-// No provider probe, model call, prompt wait or spawned daemon happens inside a critical section.
-// A stale, unknown or malformed lease is always `busy` with operator guidance; nothing is ever
-// cleared automatically and no TTL can steal ownership.
+// Every writer acquires in this order: (1) the CONFIG lease on the canonical config path, (2) read and
+// validate the config inside it, (3) the OWNER WORKSPACE lease, (4) on failure at (3), release only the
+// lease acquired at (1). No provider probe, model call, prompt wait or spawned daemon runs inside a
+// critical section. A stale, unknown or malformed lease is always `busy`; nothing is auto-cleared.
 
 /** The two leases one caller holds, plus the identity they were acquired for. */
 export interface InstallationOwnership {
@@ -192,26 +179,21 @@ export type SetupResult =
   | { kind: 'unavailable'; resource: 'config' | 'owner'; reason: LeaseUnavailableReason; guidance: string }
   | { kind: 'not-fresh'; message: string }
   /**
-   * Setup reached a real attempt and stopped part-way: a required record was not confirmed created,
-   * or a published document's durability could not be confirmed. Distinct from `not-fresh`, which
-   * means "there was existing owner evidence here and setup refuses to touch it".
+   * Setup stopped part-way: a required record was not confirmed created, or a published document's
+   * durability could not be confirmed. Distinct from `not-fresh`, which means existing owner
+   * evidence was found and left untouched.
    */
   | { kind: 'incomplete'; message: string };
 
 /**
  * Refuse any pre-existing installation state. Returns the refusal text, or `undefined` when the
- * target is genuinely fresh. This replaces `--force`: there is no overwrite, no resume and no
- * unsolicited wipe, and a stale credential file or existing piece of owner evidence is left exactly
- * where it is.
+ * target is fresh. There is no overwrite, resume or wipe: stale credentials and existing owner
+ * evidence stay where they are.
  *
- * The caller must already hold BOTH leases when this runs (plan 15 §2.2), which is what makes the
- * answer trustworthy: nothing can appear or vanish between the check and the commit.
- *
- * `workspaceLease` is excluded, and so is the directory that holds it. Acquiring the owner lease
- * necessarily creates that metadata — plan §2.2 requires that "fresh structural parents/own lease
- * metadata do not make fresh setup falsely nonempty", and a check that counted them would refuse
- * every setup that ran while any contender held the lease. Anything else in the workspace, including
- * a sibling file inside the lease's own directory, is real owner content and still refuses.
+ * The caller must hold BOTH leases, so nothing can appear or vanish between the check and the commit.
+ * `workspaceLease` and the directory holding it are excluded, because acquiring the owner lease
+ * creates that metadata. Anything else in the workspace, including a sibling file in the lease's
+ * directory, is owner content and refuses.
  */
 export function assertFreshInstallation(
   configPath: string,
@@ -286,15 +268,9 @@ type StructuralScaffold = { ok: true } | { ok: false; reason: LeaseUnavailableRe
 /**
  * Create only the private structural directories on the way to `target`, at 0700.
  *
- * Deliberately NOT `secureMkdir`: that helper calls `tightenDir` on the leaf, so handing it an
- * already-existing directory `chmod`s it. Scaffolding must never change the mode of a directory it
- * did not create — an existing ancestor is somebody else's, possibly a symlink whose target lives
- * outside this installation, and plan 15 §2.2/§7 give setup no authority over it.
- *
- * An already-existing component is left completely alone: not created, not `chmod`ed, not removed. An
- * `EEXIST` from `mkdir` only proves that an entry is present — not that this process made it, and not
- * that it is a usable directory — so it is accepted without further action and the lease's own
- * parent-state check decides whether it works.
+ * Deliberately NOT `secureMkdir`, which tightens the leaf's mode: scaffolding must never change the
+ * mode of a directory it did not create. An existing component is left alone (`EEXIST` is accepted),
+ * and the lease's own parent-state check decides whether it is usable.
  */
 function scaffoldStructuralParents(target: string): StructuralScaffold {
   const missing: string[] = [];
@@ -312,9 +288,8 @@ function scaffoldStructuralParents(target: string): StructuralScaffold {
       fs.mkdirSync(directory, { mode: 0o700 });
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      // An entry is already there, so this component needs no creation, and its mode is not ours to
-      // change. Whether it is a usable directory is decided by the lease's own parent-state check,
-      // which refuses honestly if it is a file or a symlink to one.
+      // An entry is already there. Leave its mode alone; the lease's parent-state check refuses
+      // honestly if it is a file or a symlink to one.
       if (code === 'EEXIST') continue;
       if (code === 'ENOENT' || code === 'ENOTDIR') {
         return {
@@ -358,11 +333,8 @@ interface OwnerRecordAttempt {
 
 /**
  * Build the unpaired owner record. `initialize()` is a no-op when one already exists and refuses
- * when the existing record is unreadable — setup must not overwrite or repair an existing record.
- *
- * `ownerStore` is the one injection seam: production builds the real file adapter, and a test that
- * has to prove what setup does when the RECORD WRITE fails or comes back unconfirmed supplies its own
- * port instead of mocking the surrounding lease machinery.
+ * when the existing record is unreadable: setup must not overwrite or repair an existing record.
+ * `ownerStore` is the injection seam; production builds the real file adapter.
  */
 async function createUnpairedOwnerRecord(
   ownerRecordPath: string,
@@ -493,36 +465,19 @@ export class InstallationService {
   /**
    * Commit a NEW installation, holding both leases across the whole commit.
    *
-   * The mirror image of {@link acquireOwnership}, and it exists as a separate method for a real
-   * reason: that method READS the owner identity out of an existing document, so it cannot serve a
-   * fresh install where no document exists yet. Setup therefore takes the prospective identity from
-   * the caller and derives the owner paths from it, while keeping the identical lease order —
-   * config first, validate inside it, then the owner workspace — and the identical rule that only the
-   * leases this caller acquired are ever released.
-   *
-   * Why this is not optional bookkeeping: before it existed, setup ran a freshness CHECK and then
-   * wrote the owner record and the configuration document holding no lease at all. A running daemon
-   * holds both leases, so nothing stopped setup from committing a second installation beside it, and
-   * two concurrent setups both passed the check. The CLI and the daemon then disagreed about which
-   * document was authoritative. Plan 15 §2.2 requires "short-lived setup/config/pairing writers hold
-   * both until their commit/refusal completes"; this is that requirement, implemented once, here.
-   *
-   * Wizard choices are gathered BEFORE this is called, so no prompt wait, provider probe or spawned
-   * daemon happens inside a critical section.
+   * Unlike {@link acquireOwnership}, which reads the owner identity from an existing document, setup
+   * takes the prospective identity from the caller. The lease order is the same (config, validate,
+   * owner workspace) and only the leases this caller acquired are released. Wizard choices are
+   * gathered BEFORE this call, so no prompt wait, provider probe or spawned daemon runs inside a
+   * critical section.
    */
   async setup(input: SetupInput): Promise<SetupResult> {
     const { config: configToPersist, ownerId } = input;
     const { canonicalPath } = canonicalizeConfigPath(input.configPath);
 
-    // The structural parents the CONFIG lease needs, created before acquisition. The lease is a
-    // directory beside the document, so it cannot exist until its parent does, and real setup used
-    // to refuse here with "its parent directory is missing" — which made the advertised first run
-    // into `~/.redacted/config.json` impossible without the operator pre-creating a private folder.
-    //
-    // This creates STRUCTURE ONLY: empty private directories on the path to the document, nothing
-    // else. No template, no owner record, no config bytes, and no authority of any kind — plan 15 §7
-    // is explicit that creating the parents a lease needs grants nothing, and that a fresh target
-    // must be re-checked under both leases before anything is published into it.
+    // Create the structural parents the CONFIG lease needs. The lease is a directory beside the
+    // document, so its parent must exist first. This creates empty private directories only, grants
+    // no authority, and freshness is re-checked under both leases before anything is published.
     const scaffolded = scaffoldStructuralParents(path.dirname(canonicalPath));
     if (!scaffolded.ok) {
       return {
@@ -565,9 +520,8 @@ export class InstallationService {
         };
       }
 
-      // Structural parents needed for the lease itself, created under the config lease. Creating
-      // them grants no authority, and `assertFreshInstallation` is explicitly told to ignore this
-      // caller's own lease metadata so a fresh target is not mistaken for an existing install.
+      // Structural parents for the lease, created under the config lease. They grant no authority, and
+      // `assertFreshInstallation` ignores this caller's own lease metadata.
       secureMkdir(path.dirname(ownerPaths.workspaceLease));
 
       const acquired = await this.leases.tryAcquire({
@@ -587,12 +541,8 @@ export class InstallationService {
         };
       }
 
-      // Claim the lease IMMEDIATELY, before any further call that could throw. Assigning it after the
-      // freshness check meant an `EACCES` from `readdirSync` on an unreadable-but-present workspace
-      // (mode 0300, a restored backup, an ACL) escaped the `try` and left the owner lease ON DISK.
-      // `finally` released only the config lease, so the target stayed permanently `busy`, reporting a
-      // PID that had already exited — and plan 15 §2.2 forbids automatic recovery, so the target was
-      // unusable until the operator removed it by hand. From here on, every path releases it.
+      // Claim the lease immediately, before any call that could throw, so every path below releases
+      // it. A throw before this point would leave the owner lease on disk and the target `busy`.
       ownerLease = acquired;
 
       // Freshness is decided UNDER BOTH LEASES, which is what makes it trustworthy: nothing can
@@ -615,13 +565,9 @@ export class InstallationService {
       const record = attempt.result;
       if (record !== 'created') {
         if (record === 'uncertain') {
-          // `uncertain` means the outcome of the publication is UNKNOWN, not that it happened. A store
-          // whose replacement throws before touching the disk — the lost-acknowledgement case — lands
-          // here with nothing written at all, so this message must assert neither publication nor
-          // nonpublication. A readback may establish that a record is present and readable; it can
-          // never establish that the record was durably published, and an unreadable readback does not
-          // establish absence either. Publishing no configuration and keeping whatever bytes are there
-          // is unchanged: this is still not a fresh install and not an empty target.
+          // `uncertain` means the publication outcome is UNKNOWN, so the message must assert neither
+          // publication nor nonpublication. A readback can show a record is readable, never that it
+          // was durably published.
           return {
             kind: 'incomplete',
             message:
@@ -635,9 +581,8 @@ export class InstallationService {
           };
         }
         if (record === 'refused') {
-          // Nothing was published, and nothing pre-existed either: this target was fresh and the
-          // filesystem refused the write. It is incomplete, NOT not-fresh — telling the operator to
-          // choose a different --state-root would be advice for a problem they do not have.
+          // Nothing was published and nothing pre-existed: the filesystem refused the write. This is
+          // `incomplete`, not `not-fresh`, so the operator is not told to pick a different target.
           return {
             kind: 'incomplete',
             message:

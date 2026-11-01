@@ -1,6 +1,6 @@
 // src/ports/owner-state.ts
 //
-// Interface-only enrollment records and IO seams (plan 15 §3). Nothing here imports an app
+// Interface-only enrollment records and IO seams. Nothing here imports an app
 // module: `ownerId` is a plain string so this file stays inside the v2-core boundary and does
 // not reach up into `src/profiles`.
 //
@@ -9,7 +9,7 @@
 // `src/profiles/owner-state.ts`. This file only declares the shapes and the fixed budgets that
 // both sides must agree on.
 
-// ── Fixed budgets (plan 15 §2.3). Owning-module constants, not configuration knobs. ────────
+// ── Fixed budgets. Owning-module constants, not configuration knobs. ───────────────────────
 
 /** Pairing code alphabet: no I/O/1/0 ambiguity, no easily-confused glyphs. */
 export const PAIRING_CODE_SYMBOLS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -52,11 +52,11 @@ export type OwnerReadReason = 'unreadable' | 'too-large' | 'invalid-document' | 
 
 // ── Publication ──────────────────────────────────────────────────────────────────────────
 //
-// Publication truth belongs HERE, at the seam that owns the rename, not in policy. Policy used to
-// guess it from an errno (`EACCES`/`EPERM`/`EROFS`/`ENOSPC`/`EIO` meant "definitely did not
-// happen"), which is unsound in both directions: those same codes are raised AFTER a rename has
-// landed, and any other code — including a lost acknowledgement — leaves the outcome unknown. Only
-// the adapter knows which side of the rename it failed on.
+// Publication truth belongs here, at the seam that owns the rename, not in policy. Guessing it
+// from an errno (`EACCES`/`EPERM`/`EROFS`/`ENOSPC`/`EIO` meaning "definitely did not happen") is
+// unsound in both directions: those same codes are raised after a rename has landed, and any
+// other code, including a lost acknowledgement, leaves the outcome unknown. Only the adapter
+// knows which side of the rename it failed on.
 
 /** Why a replacement was not confirmed published. A closed set: never an errno, message or path. */
 export type OwnerWriteReason = 'too-large' | 'write-failed' | 'flush-failed';
@@ -87,15 +87,12 @@ export interface TransportIdentity {
   chatId: string;
   userId: string;
   /**
-   * The chat type the transport ASSERTED, or `undefined` when it asserted none.
+   * The chat type the transport asserted, or `undefined` when it asserted none.
    *
-   * The key stays required so every producer must state the field explicitly, but `undefined` is a
-   * representable value on purpose. It was previously impossible to represent absence here, which is
-   * exactly why `transportIdentityOf` had to fabricate `'private'` for an omitted field — the single
-   * chat type that grants owner health access. Plan 15 §3 also requires that "missing transport
-   * identity is refused", which cannot hold while absence is unrepresentable.
-   *
-   * `undefined` is refused as `missing-transport-identity`, never treated as private.
+   * The key stays required so every producer must state the field explicitly, but `undefined` is
+   * representable on purpose: otherwise absence would have to be faked as `'private'`, the one
+   * chat type that grants owner health access. `undefined` is refused as
+   * `missing-transport-identity`, never treated as private.
    */
   chatType: 'private' | 'group' | 'supergroup' | 'channel' | 'local' | undefined;
   eventId: string;

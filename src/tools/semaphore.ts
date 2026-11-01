@@ -1,6 +1,6 @@
-// Priority order (highest first): user > heartbeat > background. `background` (F8) is for work that
-// must never starve or collide with user turns — compaction LLM calls, future P4/P5 writers — and
-// deliberately sits below heartbeat so it does not consume heartbeat queue slots (v2-H-4).
+// Priority order (highest first): user > heartbeat > background. `background` is for work that
+// must never starve or collide with user turns (such as compaction LLM calls) and
+// deliberately sits below heartbeat so it does not consume heartbeat queue slots.
 export type SemaphorePriority = 'user' | 'heartbeat' | 'background';
 
 /** Typed overload sentinel. Callers must branch on the type, not the message. */

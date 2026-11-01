@@ -1,14 +1,14 @@
 // src/memcore/transcript-sweep.ts
 //
-// Deterministic nightly transcript sweep (spec 14 §5, PD-17 dreaming step 1.5 — NO LLM).
+// Deterministic nightly transcript sweep (no LLM).
 // Diff yesterday's session JSONL against yesterday's ledger writes: any entity-ish mention in a
-// user chat turn that had no same-day ledger event AND no existing curiosity item becomes a
+// user chat turn that had no same-day ledger event and no existing curiosity item becomes a
 // `missing-data` curiosity question ("Did I miss logging X yesterday?"). Capture misses become
 // questions, not silent loss.
 //
-// PURE: no I/O, no clock, no randomness — fully unit-testable. The scheduler job (D4.4) supplies the
-// day-file lines, yesterday's ledger entities, and the current unresolved curiosity items, then
-// persists the bounded result.
+// Pure: no I/O, no clock, no randomness. The scheduler job supplies the day-file lines,
+// yesterday's ledger entities, and the current unresolved curiosity items, then persists the
+// bounded result.
 
 import type { AddCuriosityInput } from './curiosity-queue';
 import type { CuriosityItem } from './types';
@@ -25,13 +25,13 @@ export interface SweepLexicon {
 export interface SweepInput {
   /** Raw JSONL lines from yesterday's day file(s) (one serialized `JsonlEntry` per line). */
   dayFileLines: string[];
-  /** NORMALIZED entity names that had a ledger write yesterday (see `normalizeEntity`). */
+  /** Normalized entity names that had a ledger write yesterday (see `normalizeEntity`). */
   ledgerEntitiesForDay: Set<string>;
-  /** Current UNRESOLVED curiosity items — used to dedup a recurring miss across nights (DD7). */
+  /** Current unresolved curiosity items, used to dedup a recurring miss across nights. */
   existingCuriosity: CuriosityItem[];
   /** Keyword lexicon; defaults to `DEFAULT_SWEEP_LEXICON` when omitted. */
   lexicon?: SweepLexicon;
-  /** Bound on items filed per night (spec 14 §5: ≤5). */
+  /** Bound on items filed per night. */
   maxItems?: number;
 }
 
@@ -39,8 +39,7 @@ export interface SweepResult {
   items: AddCuriosityInput[];
 }
 
-// A common, deliberately small default lexicon. The real deployment can pass a richer one; the
-// sweep never depends on a specific term being present (a miss it can't classify is simply not filed).
+// A deliberately small default lexicon. A miss the sweep cannot classify is simply not filed.
 export const DEFAULT_SWEEP_LEXICON: SweepLexicon = {
   med: [
     'ibuprofen', 'naproxen', 'acetaminophen', 'paracetamol', 'aspirin', 'metformin', 'insulin',
@@ -60,7 +59,7 @@ const DEFAULT_MAX_ITEMS = 5;
 // dose entity strips inner whitespace ("500 mg" -> "500mg") so both spellings collapse to one.
 const DOSE_RE = /\b(\d+(?:\.\d+)?)\s?(mcg|mg|ml|iu|units?|tablets?|pills?|puffs?|g)\b/gi;
 
-/** Lowercase + trim + collapse internal whitespace. Applied to BOTH mentions and ledger entities. */
+/** Lowercase, trim and collapse internal whitespace. Applied to both mentions and ledger entities. */
 export function normalizeEntity(s: string): string {
   return s.toLowerCase().trim().replace(/\s+/g, ' ');
 }
@@ -75,13 +74,12 @@ interface Mention {
   category: Category;
   /** Transcript turn index (mining order). */
   turn: number;
-  /** Character offset within the turn (MEDIUM-4: a composite (turn, pos) key — no fixed stride that a
-   *  >1,000,000-char turn could overflow). */
+  /** Character offset within the turn. */
   pos: number;
 }
 
 // Only a medication-lexicon hit is critical. A bare dose ("500 mg") with no medication context is a
-// real capture miss but NON-critical (spec 14 §5: "non-critical unless med lexicon") — MEDIUM-3.
+// real capture miss but non-critical.
 function isCritical(category: Category): boolean {
   return category === 'med';
 }
@@ -116,8 +114,7 @@ function extractTurnMentions(content: string, lexicon: SweepLexicon, turn: numbe
   if (!hasMed) {
     for (const m of content.matchAll(DOSE_RE)) {
       const pos = m.index ?? 0;
-      // MEDIUM-3: a dose immediately followed by `/` is a concentration/rate (mg/dL, mg/kg), not a
-      // plain dose — skip it rather than truncate it into a junk entity.
+      // A dose followed by `/` is a concentration/rate (mg/dL, mg/kg), not a plain dose.
       if (content[pos + m[0].length] === '/') continue;
       const dose = normalizeEntity(`${m[1]}${m[2]}`).replace(/\s+/g, '');
       found.push({ surface: m[0], entity: dose, category: 'med-dose', turn, pos });
@@ -126,9 +123,9 @@ function extractTurnMentions(content: string, lexicon: SweepLexicon, turn: numbe
   return found;
 }
 
-// A user turn qualifies for mining only when it is a real chat turn (A-H1): role 'user', origin
-// 'chat' (default when the field is absent — legacy/migrated turns stay sweepable), and NOT a
-// daemon heartbeat prompt (its first physical line is the literal `[Heartbeat Trigger]` marker).
+// A user turn qualifies for mining only when it is a real chat turn: role 'user', origin 'chat'
+// (the default when the field is absent), and not a daemon heartbeat prompt (its first physical
+// line is the literal `[Heartbeat Trigger]` marker).
 function userChatContent(line: string): string | null {
   let entry: { role?: unknown; content?: unknown; origin?: unknown };
   try {
@@ -137,9 +134,8 @@ function userChatContent(line: string): string | null {
     return null; // malformed line — skip, never throw (resilience)
   }
   if (entry.role !== 'user') return null;
-  // MEDIUM-2: trust an EXPLICIT persisted origin. Only fall back to the `[Heartbeat Trigger]` marker
-  // heuristic for legacy entries that carry no origin — so a genuine chat turn whose text happens to
-  // start with that marker is mined, not silently suppressed.
+  // Trust an explicit persisted origin. Only fall back to the `[Heartbeat Trigger]` marker for
+  // entries that carry no origin, so a genuine chat turn that starts with that text is still mined.
   const hasOrigin = typeof entry.origin === 'string';
   const origin = hasOrigin ? (entry.origin as string) : 'chat';
   if (origin !== 'chat') return null;
@@ -189,7 +185,7 @@ export function sweep(input: SweepInput): SweepResult {
     candidates.push(m);
   }
 
-  // A-L3 selection order: med-critical first, then transcript order (stable within each group).
+  // Selection order: med-critical first, then transcript order (stable within each group).
   candidates.sort((a, b) => {
     const ca = isCritical(a.category) ? 0 : 1;
     const cb = isCritical(b.category) ? 0 : 1;

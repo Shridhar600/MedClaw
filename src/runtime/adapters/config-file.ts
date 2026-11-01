@@ -1,19 +1,18 @@
 // src/runtime/adapters/config-file.ts
 //
-// Bounded, honest filesystem access to the persisted configuration document.
+// Bounded filesystem access to the persisted configuration document.
 //
-// Three properties this adapter exists to guarantee:
+// Three properties this adapter guarantees:
 //
-//  1. The read cap is enforced on the OPENED read, not on a `stat` promise: a file that
+//  1. The read cap is enforced on the opened read, not on a `stat`: a file that
 //     grows between stat and read is still refused.
 //  2. A config symlink resolves to its target before anything is written, and a
-//     hard-linked config (`nlink > 1`) is refused outright. Claiming alias coherence
-//     after a rename would be false.
-//  3. A write reports `committed` / `uncertain` / `failed` honestly. `failed` means the
+//     hard-linked config (`nlink > 1`) is refused outright.
+//  3. A write reports `committed` / `uncertain` / `failed`. `failed` means the
 //     replacement never happened and the original bytes are intact. `uncertain` means the
-//     rename DID land but a later durability step failed — the caller must not claim the
+//     rename did land but a later durability step failed: the caller must not claim the
 //     old bytes remain, must not blindly restore them, and must not claim crash
-//     durability that the flush evidence does not support (plan 15 §8).
+//     durability the flush evidence does not support.
 //
 // The filesystem sync step is injected so the uncertainty boundary is provable in a real
 // flow without a real power loss.
@@ -64,8 +63,7 @@ const realSync: ConfigFileSync = {
     fs.fsyncSync(fd);
   },
   syncDir(dirPath: string): void {
-    // Directory fsync is a POSIX durability request; a filesystem that rejects it is
-    // reported honestly rather than treated as success.
+    // Directory fsync is a POSIX durability request; a filesystem that rejects it is reported, not ignored.
     let fd: number | undefined;
     try {
       fd = fs.openSync(dirPath, 'r');
@@ -92,11 +90,9 @@ export interface CanonicalPathResult {
  * Resolve the path that actually holds the bytes.
  *
  * An existing path is canonicalized with `realpath`, so a symlinked config resolves to its target.
- * A FRESH path — one with no document yet, which is exactly what first-run setup has — is resolved
- * through its nearest existing ancestor instead of being taken on its lexical spelling: the ancestor
- * is `realpath`ed and the remaining components are re-attached below it. That keeps the lease key, the
- * reported canonical path and the bytes later written provably the same object even when new parents
- * sit below a symlinked existing ancestor, instead of three strings that happen to agree today.
+ * A fresh path (no document yet, as in first-run setup) is resolved through its nearest existing
+ * ancestor: the ancestor is `realpath`ed and the remaining components are re-attached below it. That
+ * keeps the lease key, the reported path and the written bytes pointing at the same object.
  */
 export function canonicalizeConfigPath(targetPath: string): CanonicalPathResult {
   const absolute = path.resolve(targetPath);
@@ -111,9 +107,8 @@ export function canonicalizeConfigPath(targetPath: string): CanonicalPathResult 
     if (code !== 'ENOENT') return { canonicalPath: absolute, refusal: 'unreadable' };
   }
 
-  // Fresh path: it is absent, so `missing` is the truthful refusal — for the reader that means "no
-  // document selected", and it never blocks the writer, which only refuses hard links and
-  // non-regular targets.
+  // Fresh path: `missing` means "no document selected" to the reader and never blocks the writer,
+  // which only refuses hard links and non-regular targets.
   return { canonicalPath: resolveFreshTarget(absolute) ?? absolute, refusal: 'missing' };
 }
 
@@ -121,10 +116,9 @@ export function canonicalizeConfigPath(targetPath: string): CanonicalPathResult 
  * The path a not-yet-existing target will occupy: the `realpath` of its nearest existing ancestor
  * directory plus the components below it.
  *
- * The remainder is validated by construction rather than by a filter. Every component comes from
- * `path.basename` of an already-absolute, already-normalized path, so it can be neither a separator
- * nor `.`/`..`, and the walk stops at the first ancestor that exists. `undefined` means no usable
- * ancestor directory could be resolved at all, and the caller keeps the lexical path.
+ * Every component comes from `path.basename` of an absolute, normalized path, so it can be neither a
+ * separator nor `.`/`..`. `undefined` means no usable ancestor could be resolved; the caller keeps
+ * the lexical path.
  */
 function resolveFreshTarget(absolute: string): string | undefined {
   const remainder: string[] = [];

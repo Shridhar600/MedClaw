@@ -29,12 +29,10 @@ Everything else here is private: `admin.ts` (inspection and the `config set` wri
 dispatching any command, and passes the resolved absolute path down explicitly.
 
 This is load-bearing, not tidiness. The locked precedence is
-`--config > REDACTED_CONFIG_PATH > ~/.redacted/config.json`, and the CLI used to re-derive it by hand
-as `configPath ?? defaultRuntimeConfigPath()` at eight call sites across this module and `admin.ts`.
-That expression silently skips the environment step, so a daemon could serve one installation while
-`status`, `config show`, `config set` and `pairing issue` read or mutated another. `onboard` went
-further and manufactured a `--config` flag containing the default, which by the precedence outranked
-the environment outright.
+`--config > REDACTED_CONFIG_PATH > ~/.redacted/config.json`. Re-deriving it per command (for example
+as `configPath ?? defaultRuntimeConfigPath()`) would skip the environment step, so a daemon could serve
+one installation while `status`, `config show`, `config set` and `pairing issue` read or mutated
+another. For the same reason `onboard` must not manufacture a `--config` flag from the default.
 
 Consequences of the single resolution point:
 
@@ -43,7 +41,7 @@ Consequences of the single resolution point:
 - In `admin.ts`, any function still called without a path resolves via `selectConfigPath()` rather
   than the home default, so direct callers honour the environment too.
 - A present-but-empty `--config` is a usage error, and a relative value resolves against the cwd.
-  Both used to fall through silently.
+  Neither falls through silently.
 
 `tests/cli/config-selection.test.ts` proves this through the real `runCli` with two complete
 installations on disk.
@@ -158,7 +156,5 @@ Copy `src/cli/` plus `src/runtime/`, `src/config/`, `src/profiles/`, `src/ports/
 expected to know about the services it drives — but it holds no policy of its own. If a rule starts
 being enforced here rather than in the service behind it, that rule is in the wrong module.
 
-The proper shared-core REPL is deferred to P3. The obsolete dev chat writer was removed once the
-verified Telegram owner cutover landed, so there is deliberately no interactive chat surface here
-today — `handleTestMessage` on the Gateway is a test seam, not a CLI channel, and it still runs the
-same admission policy as a transport.
+There is deliberately no interactive chat surface here — `handleTestMessage` on the Gateway is a test
+seam, not a CLI channel, and it still runs the same admission policy as a transport.

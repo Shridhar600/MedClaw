@@ -1,21 +1,16 @@
 // src/channels/telegram-media-source.ts
 //
-// The production `MediaSourcePort`: retrieves Telegram attachment bytes AFTER admission.
-//
-// This is the adapter that makes T4's media path real. Until it existed, `src/` contained no
-// `MediaSourcePort` implementation at all, so every attachment was refused with "Attachments cannot be
-// accepted by this installation right now" — while the transport quietly substituted placeholder text
-// ("Sent a photo") that reached the model as if it were the whole message.
+// The production `MediaSourcePort`: retrieves Telegram attachment bytes after admission.
 //
 // Three properties this must have, and why:
 //
 // 1. **It is only ever reached after admission.** The Gateway calls it from `admitAndStage`, after
 //    `admission.inspect()` has returned `owner`. Nothing in the channel calls it. That ordering is the
 //    entire security value of the seam; this file must not be reachable from a message handler.
-// 2. **It streams and never buffers whole.** `TelegramChannel.downloadFile` — the dead predecessor —
-//    did `Buffer.from(await response.arrayBuffer())`, so a 10 MB cap was enforced only AFTER the whole
-//    body was in memory. Here the body is a `ReadableStream` exposed as an `AsyncIterable`, and the
-//    caller's byte counter is what stops it. A lying or absent `file_size` cannot get past it.
+// 2. **It streams and never buffers whole.** The body is a `ReadableStream` exposed as an
+//    `AsyncIterable`, and the caller's byte counter is what stops it, so the size cap is enforced
+//    while streaming, not after the whole body is in memory. A lying or absent `file_size` cannot
+//    get past it.
 // 3. **It carries no authority.** The `fileId` is treated as opaque. It is never logged, never placed
 //    in a path, and never used to build a filename.
 

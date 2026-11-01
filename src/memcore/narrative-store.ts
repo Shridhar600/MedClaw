@@ -1,13 +1,12 @@
 // src/memcore/narrative-store.ts
 //
-// The narrative lane: append-only daily logs at `memory/YYYY-MM-DD.md`. This is
-// the lossless record of what the user said (CHAT-06) and the anchor target the
-// structured ledger points back to (KNEE-01 cross-anchor). Writes are additive —
-// a prior entry is never mutated or removed. The day-granularity date lives in
-// the file header ONLY (amendment C6); individual entries carry a HH:MM time.
+// The narrative lane: append-only daily logs at `memory/YYYY-MM-DD.md`. This is the lossless record of what
+// the user said and the anchor target the structured ledger points back to. Writes are additive — a prior entry
+// is never mutated or removed. The day-granularity date lives in the file header only; individual entries carry
+// a HH:MM time.
 //
-// A verbatim user quote is stored EXACTLY, blockquoted, and tagged with its
-// language, so nothing is paraphrased away before the agent sees it.
+// A verbatim user quote is stored exactly, blockquoted, and tagged with its language, so nothing is paraphrased
+// away before the agent sees it.
 
 import * as fs from 'fs';
 import { isUtf8 } from 'node:buffer';
@@ -81,9 +80,8 @@ export class NarrativeStore {
   }
 
   /**
-   * Append a narrative entry. `date` (YYYY-MM-DD) overrides the clock-derived day
-   * so the narrative and ledger lanes agree on the same day (F20). Returns the
-   * on-disk anchor of the entry's primary line.
+   * Append a narrative entry. `date` (YYYY-MM-DD) overrides the clock-derived day so the narrative and ledger
+   * lanes agree on the same day. Returns the on-disk anchor of the entry's primary line.
    */
   async append(entry: { text: string; language?: string; verbatim?: string; date?: string }): Promise<NarrativeAppendResult> {
     const now = this.clock.now();
@@ -128,8 +126,8 @@ export class NarrativeStore {
   }
 
   /**
-   * Record a ledger cross-reference under `## Ledger writes` (`- <entity> → <factId>`).
-   * Lets a narrative day point at the structured facts captured that day (KNEE-01).
+   * Record a ledger cross-reference under `## Ledger writes` (`- <entity> → <factId>`), so a narrative day can
+   * point at the structured facts captured that day.
    */
   async appendLedgerAnchor(date: string, entity: string, factId: string): Promise<string> {
     const entryLine = `- ${entity} → ${factId}`;
@@ -161,9 +159,9 @@ export class NarrativeStore {
   }
 
   /**
-   * Append a compaction summary block under `## Session summary` in the chat-scoped state lane (C-29).
-   * The bullets carry `sessions/<file>#L<n>` anchors back to verbatim day-file lines. Reuses the heading
-   * if it already exists for that chat and day.
+   * Append a compaction summary block under `## Session summary` in the chat-scoped state lane. The bullets carry
+   * `sessions/<file>#L<n>` anchors back to verbatim day-file lines. Reuses the heading if it already exists for
+   * that chat and day.
    */
   async appendSessionSummary(chatId: string, date: string, summary: string): Promise<string> {
     const fp = this.sessionSummaryPath(chatId, date);

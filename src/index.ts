@@ -34,16 +34,14 @@ type SignalTarget = {
   off(event: 'SIGTERM' | 'SIGINT', listener: () => void): void;
 };
 
-// Global last-resort safety net (RES-P1-3). The daemon MUST NEVER crash from a
-// stray rejection/throw in an optional subsystem (resilience law:
-// try→catch→log→fallback→continue). Both handlers log sanitized and CONTINUE;
-// they deliberately do NOT process.exit. Every load-bearing subsystem (telegram,
-// scheduler, store, gateway) already wraps its own errors and degrades, so an
-// error reaching here is a bug worth logging, not a reason to take the daemon
-// down. The synchronous-fatal startup path is still handled by main().catch.
+// Global last-resort safety net. The daemon must never crash from a stray rejection/throw in an optional
+// subsystem (try→catch→log→fallback→continue). Both handlers log sanitized and continue; they deliberately do
+// not process.exit. Every load-bearing subsystem already wraps its own errors and degrades, so an error
+// reaching here is a bug worth logging, not a reason to take the daemon down. The synchronous-fatal startup
+// path is still handled by main().catch.
 //
-// Returning a teardown lets tests remove the listeners against a fake target so
-// they never leak onto the real process (jest installs its own handlers).
+// Returning a teardown lets tests remove the listeners against a fake target so they never leak onto the real
+// process (jest installs its own handlers).
 export function installGlobalSafetyNet(target: SafetyNetTarget = process as unknown as SafetyNetTarget): () => void {
   const onUnhandled = (reason: unknown): void => {
     console.error('[main] Unhandled rejection (continuing):', summarizeErrorForLog(reason));
@@ -66,10 +64,8 @@ export function reportFatalStartupError(error: unknown): void {
 }
 
 /**
- * How long to keep observing for quiescence after `stop()` resolves.
- *
- * S1 owns only the narrow release guard: stop is not treated as quiescence. Bounded pending
- * construction cancellation and one shared stop deadline are S5.
+ * How long to keep observing for quiescence after `stop()` resolves. A resolved stop is not treated as
+ * quiescence.
  */
 export const QUIESCENCE_OBSERVE_MS = 250;
 
@@ -110,10 +106,8 @@ export async function startDaemon(
 
   try {
     const config = effectiveConfigFor(owned.ownership.stored);
-    // Owner authority is composed HERE, from the identity ownership already resolved. Before this,
-    // the production boot built a Gateway with no admission at all, so the S1 refusal policy and the
-    // unpaired-only boot rule never ran on a real daemon: a stranger's first DM still auto-paired and
-    // reached the owner's runtime. Plan 15 §5 requires the daemon root to gate its own build APIs.
+    // Owner authority is composed here, from the identity ownership already resolved. The daemon root must gate its
+    // own build APIs: without admission, a stranger's first DM would auto-pair and reach the owner's runtime.
     const diagnostics = new ConsoleDiagnosticSink();
     const authority = composeOwnerAuthority(owned.ownership, diagnostics);
     // The media source is only ever consulted AFTER admission returns `owner` (see

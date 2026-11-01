@@ -1,24 +1,21 @@
 // src/memcore/safety-view.ts
 //
 // SAFETY.md — the Safety Constitution. Always injected, code-enforced, agent add-only.
-// This is a rendered VIEW of the ledger: the machine sections (allergies, medications,
-// conditions, …) are regenerated on every render from exactly the facts where
-// `safetyRelevant && status ∈ {active, resolved}` (specs/03 §3; plan Task 4).
+// This is a rendered VIEW of the ledger: the machine sections (allergies, medications, conditions, …)
+// are regenerated on every render from the facts where `safetyRelevant && status ∈ {active,
+// resolved}`, plus disputed facts (marked).
 //
 // Non-machine content is never touched by the renderer:
-//   - `## Critical Events` (agent add-only) is preserved verbatim; there is no API to
-//     remove an event (VANI-05).
-//   - `## Notes (user)` is preserved verbatim (specs/07 §3).
-//   - Any OTHER section (e.g. onboarding-seeded emergency contact) is preserved verbatim
-//     too — silently dropping hand-written content on first render would be data loss.
+//   - `## Critical Events` (agent add-only) is preserved verbatim; there is no API to remove an event.
+//   - `## Notes (user)` and any other section (e.g. a seeded emergency contact) are preserved
+//     verbatim, because silently dropping hand-written content would be data loss.
 //
-// No date token is ever written anywhere in the file (amendment C6a / G3). A Critical
-// Event carries a `date` for the caller's bookkeeping, but the render omits it entirely;
-// the day-granularity date lives only in the narrative anchor L3 references.
+// No date token is ever written to the file. A Critical Event carries a `date` for the caller's
+// bookkeeping, but the render omits it.
 //
-// Removal of base allergy/medication entries is refused in code without an explicit
-// `userConfirmed` (CONTRA-03/04, DAD-11). Removal is still a view-side strip: the ledger
-// fact must be retracted/discontinued first, then the next render keeps it out.
+// Removing a base allergy/medication entry is refused in code without an explicit `userConfirmed`.
+// Removal is a view-side strip: the ledger fact must be retracted first, then the next render keeps
+// it out.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -49,7 +46,7 @@ interface SafetyProjectionState {
   contentHash: string;
 }
 
-/** A Critical Event. `date` is caller bookkeeping only — the render NEVER emits it (C6a). */
+/** A Critical Event. `date` is caller bookkeeping only; the render NEVER emits it. */
 export interface CriticalEvent {
   date: string;
   summary: string;
@@ -89,8 +86,8 @@ function stableValue(value: unknown): unknown {
 }
 
 export class SafetyView {
-  // The clock is part of the stable constructor contract (mirrors the other memcore
-  // stores). P1 renders are date-free by design (C6a), so it is currently reserved.
+  // The clock is part of the stable constructor contract (mirrors the other memcore stores). Renders
+  // are date-free by design, so it is currently reserved.
   constructor(
     private readonly rootDir: string,
     private readonly clock: Clock = systemClock,
@@ -146,8 +143,8 @@ export class SafetyView {
   }
 
   /**
-   * Append a Critical Event (agent add-only). The `date` is accepted for the caller's
-   * bookkeeping but is NEVER written to SAFETY.md (C6a/G3). Returns the full rendered file.
+   * Append a Critical Event (agent add-only). The `date` is accepted for the caller's bookkeeping
+   * but is NEVER written to SAFETY.md. Returns the full rendered file.
    */
   async addCriticalEvent(ev: CriticalEvent): Promise<string> {
     const { items } = this.load();
@@ -162,11 +159,10 @@ export class SafetyView {
   }
 
   /**
-   * Remove a base (machine-section) entry from the rendered view. Removal of a
-   * med/allergy-class entry — and, conservatively, ANY machine-section entry — is
-   * refused in code without an explicit `userConfirmed` (CONTRA-03/04). Critical Events
-   * are not machine sections, so no API can remove them. Idempotent no-op when the
-   * entity is not present. Returns the full rendered file.
+   * Remove a base (machine-section) entry from the rendered view. Removal of any machine-section
+   * entry, med/allergy class especially, is refused without an explicit `userConfirmed`. Critical
+   * Events are not machine sections, so no API can remove them. A no-op when the entity is absent.
+   * Returns the full rendered file.
    */
   async removeEntry(entity: string, opts: { userConfirmed: boolean }): Promise<string> {
     const { items } = this.load();
@@ -188,10 +184,9 @@ export class SafetyView {
   }
 
   /**
-   * Current on-disk SAFETY.md, or null when the file does not exist yet (ENOENT — an empty safety
-   * constitution is allowed, PLAT-04). ANY OTHER read error (EACCES/EISDIR/I/O) THROWS — this is the
-   * always-injected safety constitution, so it fails CLOSED: the caller (assembler) aborts the turn
-   * rather than shipping a prompt with no SAFETY (H-1; medical-safety > resilience).
+   * Current on-disk SAFETY.md, or null when the file does not exist yet (an empty constitution is
+   * allowed). ANY OTHER read error THROWS: this is the always-injected safety constitution, so it
+   * fails CLOSED and the caller aborts the turn rather than shipping a prompt with no SAFETY.
    */
   async read(): Promise<string | null> {
     if (this.dirtyMarkerExists()) {
@@ -245,8 +240,8 @@ export class SafetyView {
   // ---- internals ---------------------------------------------------------
 
   private renderMachineSections(facts: LedgerFact[]): ParsedItem[] {
-    // DS: `disputed` facts stay on SAFETY.md (marked) so a safety-relevant fact
-    // never silently leaves the always-injected net while its dispute is open.
+    // `disputed` facts stay on SAFETY.md (marked) so a safety-relevant fact never silently leaves
+    // the always-injected net while its dispute is open.
     const eligible = facts.filter(f =>
       f.safetyRelevant && (f.status === 'active' || f.status === 'resolved' || f.status === 'disputed'));
     const byEntity = new Map<string, LedgerFact[]>();
@@ -304,10 +299,9 @@ export class SafetyView {
   }
 
   /**
-   * Load the current file, degrading on corrupt read: warn (sanitized), then build from
-   * a fresh skeleton while preserving any salvageable raw bytes in a quarantine note
-   * (D2/F24). A corrupt file is one that fails to read as UTF-8 — either a read error or
-   * a decode that produced replacement characters. Never crashes.
+   * Load the current file. On a corrupt read (read error or replacement characters) warn with a
+   * sanitized message and build from a fresh skeleton, preserving salvageable raw bytes in a
+   * quarantine side file. Never crashes.
    */
   private load(): { items: ParsedItem[] } {
     const fp = this.filePath();
@@ -342,9 +336,8 @@ export class SafetyView {
   private quarantinedItems(salvaged: string | null): ParsedItem[] {
     const items = this.freshItems();
     if (salvaged) {
-      // Salvaged bytes go to a 0600 SIDE file; only a constant, date-free pointer is
-      // inlined into the always-injected SAFETY.md (no `-->` breakout, no injection
-      // surface, no C6a date leak).
+      // Salvaged bytes go to a 0600 SIDE file; only a constant, date-free pointer is inlined into
+      // the always-injected SAFETY.md, so there is no injection surface.
       items.push({ kind: 'quarantine', lines: [quarantineToSideFile(this.filePath(), salvaged)] });
     }
     return items;
