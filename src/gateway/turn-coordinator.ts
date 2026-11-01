@@ -2,6 +2,7 @@ import type { AdmittedMessage } from '../channels';
 import type { AgentRunResult, Message } from '../providers/types';
 import { OnboardingFlow } from '../onboarding/flow';
 import { OnboardingStore } from '../onboarding/store';
+import type { SeedFact } from '../onboarding/seed-facts';
 import { HEARTBEAT_NOOP } from '../scheduler/delivery-policy';
 import {
   HeartbeatPreemptedError,
@@ -381,18 +382,46 @@ export class TurnCoordinator {
     return result;
   }
 
+  private onboardingFlow(): OnboardingFlow {
+    const { workspace, config } = this.runtime;
+    return new OnboardingFlow(
+      new OnboardingStore(workspace),
+      workspace,
+      config.heartbeat.timezone,
+      config.emergency?.keywords,
+      (facts) => this.recordSeedFacts(facts),
+    );
+  }
+
+  /** Onboarding answers go through the same capture pipeline as chat, so SAFETY.md and recall see them. */
+  private async recordSeedFacts(facts: SeedFact[]): Promise<string[]> {
+    const pipeline = this.runtime.capturePipeline;
+    if (!pipeline) throw new Error('capture pipeline unavailable');
+    const capturedAt = new Date().toISOString();
+    const pending: string[] = [];
+    for (const fact of facts) {
+      const result = await pipeline.ingest({
+        profileId: String(this.runtime.profileId),
+        source: 'onboarding',
+        kind: 'ledger-fact',
+        idempotencyKey: `onboarding:${fact.type}:${fact.entity}:${JSON.stringify(fact.fields)}`,
+        payload: {
+          entity: fact.entity,
+          type: fact.type,
+          fields: fact.fields,
+          provenance: { source: 'user', confidence: 0.9, anchor: '', capturedAt },
+          text: `From onboarding: ${fact.type} ${fact.entity}`,
+        },
+      });
+      if (result && result.kind !== 'applied') pending.push(fact.entity);
+    }
+    return pending;
+  }
+
   private async handleOnboarding(chatId: string, input: string): Promise<string | undefined> {
-    const workspace = this.runtime.workspace;
-    const config = this.runtime.config;
     const sessions = this.requireSessions();
     if (input.trim() === '/onboarding restart' || input.trim() === '/profile update') {
-      const flow = new OnboardingFlow(
-        new OnboardingStore(workspace),
-        workspace,
-        config.heartbeat.timezone,
-        config.emergency?.keywords,
-      );
-      const result = await flow.handle('restart onboarding');
+      const result = await this.onboardingFlow().handle('restart onboarding');
       try {
         await sessions.recordTurn(chatId, [
           { role: 'user', content: input },
@@ -404,12 +433,7 @@ export class TurnCoordinator {
       return result.response;
     }
 
-    const flow = new OnboardingFlow(
-      new OnboardingStore(workspace),
-      workspace,
-      config.heartbeat.timezone,
-      config.emergency?.keywords,
-    );
+    const flow = this.onboardingFlow();
     if (await flow.isComplete()) return undefined;
 
     const result = await flow.handle(input);

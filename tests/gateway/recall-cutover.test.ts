@@ -315,6 +315,70 @@ describe('Gateway — current facts follow the ledger', () => {
   });
 });
 
+// Onboarding is the owner's first health record: the meds, allergies and conditions they give at setup
+// must land in the ledger, so SAFETY.md and every later reply carry them — not only a prose profile.
+describe('Gateway — onboarding seeds the health record', () => {
+  let tmpDir: string;
+  let gateway: Gateway;
+  let workspace: string;
+
+  beforeEach(() => {
+    tmpDir = makeTestTemp('redacted-onboarding-seed-');
+    workspace = fixtureOwner(tmpDir).workspace;
+  });
+  afterEach(async () => {
+    try { await gateway?.stop(); } catch { /* ignore */ }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('meds, allergies and conditions given at setup reach SAFETY.md and the next reply', async () => {
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    await gateway.start();
+    try {
+      const answers = [
+        'hi', 'Asha', '54', 'yes', 'type 2 diabetes', 'Metformin 500mg twice daily, vitamin D3 1000 IU',
+        'penicillin (hives) and peanuts', 'walk daily', 'morning reminders', 'confirm',
+      ];
+      let reply = '';
+      for (const [i, text] of answers.entries()) reply = await gateway.handleTestMessage('chat-1', text, `o${i}`);
+      expect(reply).toMatch(/onboarding is complete/i);
+
+      const safety = fs.readFileSync(path.join(workspace, 'SAFETY.md'), 'utf8');
+      for (const entity of ['penicillin', 'peanuts', 'metformin', 'vitamin d3']) expect(safety).toContain(entity);
+      expect(fs.readFileSync(path.join(workspace, 'ledger', 'medications.md'), 'utf8')).toContain('500mg twice daily');
+      expect(fs.readFileSync(path.join(workspace, 'ledger', 'allergies.md'), 'utf8')).toContain('hives');
+
+      const seen = captureProvider(gateway);
+      await gateway.handleTestMessage('chat-1', 'how am I doing?', 'after');
+      expect(lastSystemOf(seen)).toContain('type 2 diabetes');
+    } finally {
+      warn.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  it('"none" answers record nothing', async () => {
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    await gateway.start();
+    try {
+      const answers = ['hi', 'Ravi', '30', 'yes', 'none', 'no', 'none known', 'sleep better', 'none', 'confirm'];
+      for (const [i, text] of answers.entries()) await gateway.handleTestMessage('chat-1', text, `o${i}`);
+      for (const file of ['conditions.md', 'medications.md', 'allergies.md']) {
+        expect(fs.existsSync(path.join(workspace, 'ledger', file))).toBe(false);
+      }
+    } finally {
+      warn.mockRestore();
+      log.mockRestore();
+    }
+  });
+});
+
+const lastSystemOf = (seen: Message[][]): string => String(seen[seen.length - 1][0].content);
+
 // A secret pasted into chat (a caption, an onboarding answer, a plain message) is refused at the
 // door: it never reaches the provider and never lands in any file under the owner's state.
 describe('Gateway — secrets in inbound messages', () => {

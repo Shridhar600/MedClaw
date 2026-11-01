@@ -1,4 +1,6 @@
 import { writeOnboardingProfile } from './profile-writer';
+import { onboardingSeedFacts, type SeedFact } from './seed-facts';
+import { summarizeErrorForLog } from '../security';
 import { OnboardingStore } from './store';
 import type { OnboardingAnswers, OnboardingResult, OnboardingState, OnboardingStep } from './types';
 import { EMERGENCY_RESPONSE, isEmergencyInput } from '../safety/emergency-detector';
@@ -13,6 +15,8 @@ export class OnboardingFlow {
     private readonly workspacePath: string,
     private readonly defaultTimezone: string,
     private readonly emergencyKeywords: readonly string[] = [],
+    /** Records seed facts in the health record; returns the entities it could not apply as-is. */
+    private readonly recordFacts?: (facts: SeedFact[]) => Promise<string[]>,
   ) {}
 
   async isComplete(): Promise<boolean> {
@@ -138,12 +142,13 @@ export class OnboardingFlow {
         nextStep = 'confirmation';
         response = this.renderConfirmation(answers);
         break;
-      case 'confirmation':
+      case 'confirmation': {
         if (!CONFIRM_PATTERN.test(answer)) {
           response = 'Reply confirm to save this profile, or restart onboarding to begin again.';
           break;
         }
         await writeOnboardingProfile(this.workspacePath, answers);
+        const seedNote = await this.seedHealthRecord(answers);
         await this.store.save({
           ...state,
           status: 'complete',
@@ -154,8 +159,9 @@ export class OnboardingFlow {
         });
         return {
           completed: true,
-          response: 'Your onboarding is complete. I saved this profile locally and can now answer normally.',
+          response: `Your onboarding is complete. I saved this profile locally and can now answer normally.${seedNote}`,
         };
+      }
       default:
         nextStep = 'name';
         response = 'What is your preferred name?';
@@ -169,6 +175,21 @@ export class OnboardingFlow {
       updatedAt: new Date().toISOString(),
     });
     return { response };
+  }
+
+  /** Put the meds, allergies and conditions into the health record; returns a note for the owner. */
+  private async seedHealthRecord(answers: OnboardingAnswers): Promise<string> {
+    const facts = onboardingSeedFacts(answers);
+    if (!this.recordFacts || facts.length === 0) return '';
+    try {
+      const pending = await this.recordFacts(facts);
+      return pending.length === 0
+        ? ''
+        : `\nThese differ from what I already had, so I left them unchanged: ${pending.join(', ')}. Tell me in chat if they changed.`;
+    } catch (error) {
+      console.warn('[onboarding] seeding the health record failed:', summarizeErrorForLog(error));
+      return '\nI could not add your medications, allergies and conditions to the health record just now. Please mention them in chat.';
+    }
   }
 
   private renderConfirmation(answers: OnboardingAnswers): string {
