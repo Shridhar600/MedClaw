@@ -1,8 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { createMemoryTools } from '../../src/tools/memory-tools';
 import { MemoryEngine } from '../../src/memory/memory-engine';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('memory_list tool', () => {
   let tmpDir: string;
@@ -10,7 +10,7 @@ describe('memory_list tool', () => {
   let tools: ReturnType<typeof createMemoryTools>;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-list-tool-'));
+    tmpDir = makeTestTemp('redacted-list-tool-');
     engine = new MemoryEngine(tmpDir);
     tools = createMemoryTools(engine);
   });

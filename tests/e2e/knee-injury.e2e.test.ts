@@ -1,0 +1,120 @@
+import * as fs from 'fs';
+import * as path from 'path';
+import { Gateway } from '../../src/gateway/gateway';
+import type { EffectiveConfig } from '../../src/config/types';
+import type { LLMProvider, LLMResponse } from '../../src/providers/types';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+import { makeTestTemp } from '../helpers/test-temp';
+
+const CHAT_BINDING = 'owner-chat';
+
+const today = (): string => new Date().toISOString().slice(0, 10);
+
+/** A deterministic provider that replays a fixed response script (tool-calls then a final text). */
+class ScriptedProvider implements LLMProvider {
+  readonly modelName = 'scripted-e2e';
+  private i = 0;
+  constructor(private readonly script: LLMResponse[]) {}
+  async chat(): Promise<LLMResponse> {
+    return this.script[Math.min(this.i++, this.script.length - 1)];
+  }
+  async embed(): Promise<number[]> {
+    return new Array(768).fill(0);
+  }
+}
+
+function makeConfig(tmpDir: string): EffectiveConfig {
+const owner = fixtureOwner(tmpDir);
+  return {
+  schemaVersion: 2,
+  ...ownerSelection(owner),
+    providers: {
+      main: { type: 'ollama', model: 'unused', baseUrl: 'http://127.0.0.1:9/v1' },
+      medical: { type: 'ollama', model: 'unused', baseUrl: 'http://127.0.0.1:9/v1' },
+      embeddings: { type: 'ollama', model: 'unused', baseUrl: 'http://127.0.0.1:9/v1' },
+    },
+    channels: { telegram: { enabled: false, botToken: '' } },
+    tools: { allow: ['*'], deny: [] },
+    memory: {
+      workspace: owner.workspace,
+      search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
+      bootstrapMaxChars: 20000,
+    },
+    sessions: {
+      compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
+    },
+    heartbeat: {
+      enabled: false,
+      timezone: 'Asia/Kolkata',
+      storePath: owner.storePath,
+      recovery: { enabled: false, windowMinutes: 60 },
+      retry: { maxRetries: 3, backoffMinutes: 5 },
+      rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
+      audit: { path: owner.auditLogPath },
+      policy: {
+        quietHours: { enabled: true, start: '22:00', end: '07:00' },
+        skipIfChatActiveWithinMinutes: 60,
+        defaults: {
+          morningCheckIn: { enabled: false, cron: '0 8 * * *', prompt: 'Morning' },
+          eveningSummary: { enabled: false, cron: '0 21 * * *', prompt: 'Evening' },
+        },
+      },
+    },
+    agent: { maxIterations: 15 },
+  };
+}
+
+const KNEE_01_SCRIPT: LLMResponse[] = [
+  { type: 'tool_call', toolCalls: [{ id: 'c1', name: 'ledger_record', arguments: { entity: 'knee-injury', type: 'condition', fields: { status: 'active' }, source: 'user', note: 'injured my knee on the trek, limping' } }] },
+  { type: 'tool_call', toolCalls: [{ id: 'c2', name: 'ledger_record', arguments: { entity: 'limping', type: 'symptom', fields: { related_to: 'knee-injury' }, source: 'user', note: 'limping' } }] },
+  { type: 'tool_call', toolCalls: [{ id: 'c3', name: 'ledger_record', arguments: { entity: 'ibuprofen', type: 'medication', fields: { dose: '400mg PRN' }, source: 'user', note: 'taking ibuprofen 400mg as needed' } }] },
+  { type: 'text', text: 'Sorry about your knee — rest, ice, and ibuprofen as needed. If it worsens, see a clinician.' },
+];
+
+describe('E2E (real Gateway.handleTestMessage)', () => {
+  let tmpDir: string;
+  let workspace: string;
+  let gateway: Gateway;
+
+  beforeEach(() => {
+    tmpDir = makeTestTemp('redacted-knee-e2e-');
+    workspace = fixtureOwner(tmpDir).workspace;
+  });
+  afterEach(async () => {
+    try { await gateway?.stop(); } catch { /* ignore */ }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('captures the injury across both lanes with cross-anchors; SAFETY excludes the transient injury', async () => {
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const errorLog = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    await gateway.start();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway.runtimeInstance!.turnCoordinator as any).handleOnboarding = async (): Promise<null> => null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (gateway as any).agentLoop.provider = new ScriptedProvider(KNEE_01_SCRIPT);
+
+    await gateway.handleTestMessage('owner-chat', "Hey, I injured my knee on the trek today. What should I do? I'm limping.");
+
+    warn.mockRestore();
+    errorLog.mockRestore();
+
+    expect(fs.readFileSync(path.join(workspace, 'ledger', 'conditions.md'), 'utf8')).toContain('knee-injury');
+    expect(fs.readFileSync(path.join(workspace, 'ledger', 'symptoms.md'), 'utf8')).toContain('limping');
+    expect(fs.readFileSync(path.join(workspace, 'ledger', 'medications.md'), 'utf8')).toContain('ibuprofen');
+
+    const day = fs.readFileSync(path.join(workspace, 'memory', `${today()}.md`), 'utf8');
+    expect(day).toContain('injured my knee on the trek');
+    expect(day).toContain('## Ledger writes');
+    for (const e of ['knee-injury', 'limping', 'ibuprofen']) expect(day).toContain(`${e} →`);
+
+    // SAFETY.md must NOT list the transient, non-safety-relevant injury.
+    const safety = fs.existsSync(path.join(workspace, 'SAFETY.md'))
+      ? fs.readFileSync(path.join(workspace, 'SAFETY.md'), 'utf8')
+      : '';
+    expect(safety).not.toContain('knee-injury');
+  });
+});

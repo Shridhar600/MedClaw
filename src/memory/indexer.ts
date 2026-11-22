@@ -79,8 +79,6 @@ export class MemoryIndexer {
         const relativePath = path.relative(this.workspacePath, file);
         await this.indexFileInternal(relativePath, dimensionAvailable);
       }
-      // The global identity is informational only. Per-file freshness is checked against the
-      // file_hashes row, so it must never be advanced before files have had a chance to re-embed.
       if (dimensionAvailable) this.store.setEmbeddingModel(this.embeddingModelName);
     } finally {
       this.isIndexing = false;
@@ -172,8 +170,6 @@ export class MemoryIndexer {
       for (const chunk of preparedChunks) this.store.upsertChunk(chunk);
       this.store.upsertFileHash(relativePath, nextHash);
     } else {
-      // A newly-created source has no prior chunks. The full replacement API is
-      // safe here and also records the per-file model identity for future deltas.
       this.store.replaceFileIndex(relativePath, preparedChunks, nextHash, this.embeddingModelName);
     }
     if (!hadEmbeddingFailure && !this.store.isFileIndexCurrent(relativePath, delta.hash, this.embeddingModelName)) {
@@ -218,8 +214,6 @@ export class MemoryIndexer {
       preparedChunks.push(chunk);
     }
 
-    // Do not publish a completed snapshot if the source changed while embeddings were in flight.
-    // A later index call will read and publish the newer generation.
     const currentContent = fs.readFileSync(absolutePath, 'utf-8');
     if (this.computeHash(currentContent) !== hash) {
       console.warn(`[indexer] Source changed while indexing ${relativePath}; stale result discarded`);
@@ -250,8 +244,6 @@ export class MemoryIndexer {
       return false;
     }
     try {
-      // A failed store operation is different from an embedding outage. Do not publish either
-      // state as a valid dimension, and let the next call retry the probe.
       this.store.ensureVecTable(probe.length);
       this.embeddingDimension = probe.length;
       this.dimensionProbeState = 'available';

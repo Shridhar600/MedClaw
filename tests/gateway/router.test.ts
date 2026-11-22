@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 
 jest.mock('fs', () => {
@@ -7,13 +6,18 @@ jest.mock('fs', () => {
   return { ...actual, renameSync: jest.fn(actual.renameSync) };
 });
 
-import type { AppConfig } from '../../src/config/types';
-import type { IncomingMessage } from '../../src/channels/types';
+import type { EffectiveConfig } from '../../src/config/types';
+import type { AdmittedMessage } from '../../src/channels/types';
 import type { ProfileRuntime } from '../../src/gateway/runtime';
 import type { ProfileId } from '../../src/profiles/types';
-import { ProfileRegistry } from '../../src/profiles/registry';
-import { GatewayMessageRouter, sweepStagedMedia } from '../../src/gateway/router';
+import { GatewayMessageRouter, sweepStagedMedia } from '../../src/gateway';
+import { stageMediaFixture } from '../helpers/media-artifact-fixture';
+import { bindOwnerFixture, TEST_OWNER_CHAT } from '../helpers/owner-authority-fixture';
+import type { OwnerAdmissionService } from '../../src/profiles';
 import { TurnQueueFullError } from '../../src/gateway/turn-coordinator';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { makeTestTemp } from '../helpers/test-temp';
+import { EMERGENCY_RESPONSE } from '../../src/safety/emergency-detector';
 
 function deferred<T = void>() {
   let resolve!: (value?: T | PromiseLike<T>) => void;
@@ -21,8 +25,11 @@ function deferred<T = void>() {
   return { promise, resolve };
 }
 
-function makeConfig(workspace: string): AppConfig {
+function makeConfig(workspace: string): EffectiveConfig {
+const owner = fixtureOwner(workspace);
   return {
+  schemaVersion: 2,
+  ...ownerSelection(owner),
     providers: {
       main: { type: 'ollama', model: 'test-main' },
       medical: { type: 'ollama', model: 'test-medical' },
@@ -32,9 +39,7 @@ function makeConfig(workspace: string): AppConfig {
     tools: { allow: ['*'], deny: [] },
     memory: { workspace, search: { hybridWeights: { vector: 0.7, keyword: 0.3 } }, bootstrapMaxChars: 20_000 },
     sessions: {
-      softResetAfterMinutes: 240,
-      hardResetAfterMinutes: 1440,
-      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+      compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
     },
     heartbeat: {
       enabled: false,
@@ -53,7 +58,7 @@ function makeConfig(workspace: string): AppConfig {
         },
       },
     },
-    agent: { maxIterations: 5, disclaimerEnabled: false },
+    agent: { maxIterations: 5 },
   };
 }
 
@@ -70,7 +75,7 @@ function makeRuntime(workspace: string) {
     },
     trackBackgroundOperation: jest.fn((_label: string, operation: () => Promise<void>) => { void operation(); }),
     turnCoordinator: {
-      runUser: jest.fn().mockImplementation(async (_incoming: IncomingMessage, egress: (text: string) => Promise<void>) => {
+      runUser: jest.fn().mockImplementation(async (_incoming: AdmittedMessage, egress: (text: string) => Promise<void>) => {
         await egress('agent reply');
         return 'agent reply';
       }),
@@ -78,8 +83,29 @@ function makeRuntime(workspace: string) {
   };
 }
 
-function message(text: string, mediaPath?: string): IncomingMessage {
-  return { chatId: 'chat-1', userId: 'user-1', text, ...(mediaPath ? { mediaPath } : {}) };
+function message(text: string, mediaPath?: string, chatId: string = TEST_OWNER_CHAT): AdmittedMessage {
+  return {
+    channel: 'telegram',
+    chatId,
+    userId: 'user-1',
+    chatType: 'private',
+    eventId: `telegram:${chatId}:${mediaPath ? 'media' : 'text'}`,
+    text,
+    ...(mediaPath ? { mediaPath } : {}),
+  };
+}
+
+async function ownerRouterDeps(
+  workspace: string,
+  chatId: string = TEST_OWNER_CHAT,
+): Promise<{ admission: OwnerAdmissionService; ownerId: ProfileId }> {
+  const bound = await bindOwnerFixture(
+    path.join(workspace, '.state', 'owner-access.json'),
+    'default',
+    chatId,
+    { channel: 'telegram', userId: 'user-1' },
+  );
+  return { admission: bound.admission, ownerId: bound.ownerId };
 }
 
 describe('GatewayMessageRouter media lifecycle', () => {
@@ -88,7 +114,7 @@ describe('GatewayMessageRouter media lifecycle', () => {
   let staging: string;
 
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-router-'));
+    root = makeTestTemp('redacted-router-');
     workspace = path.join(root, 'workspace');
     staging = path.join(root, 'staging', 'media');
     fs.mkdirSync(workspace, { recursive: true });
@@ -103,8 +129,9 @@ describe('GatewayMessageRouter media lifecycle', () => {
     fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
     fs.writeFileSync(stagedPath, 'report bytes', { mode: 0o600 });
     const runtime = makeRuntime(workspace);
-    const seen: IncomingMessage[] = [];
-    runtime.turnCoordinator.runUser.mockImplementation(async (incoming: IncomingMessage, egress: (text: string) => Promise<void>) => {
+    const { admission, ownerId } = await ownerRouterDeps(workspace);
+    const seen: AdmittedMessage[] = [];
+    runtime.turnCoordinator.runUser.mockImplementation(async (incoming: AdmittedMessage, egress: (text: string) => Promise<void>) => {
       seen.push(incoming);
       await egress('processed');
       return 'processed';
@@ -112,6 +139,8 @@ describe('GatewayMessageRouter media lifecycle', () => {
     const router = new GatewayMessageRouter({
       config: runtime.config,
       runtime: runtime as unknown as ProfileRuntime,
+      admission,
+      ownerId,
       stagingDir: staging,
       buildBootStatusText: () => 'status',
     });
@@ -132,9 +161,12 @@ describe('GatewayMessageRouter media lifecycle', () => {
     fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
     fs.writeFileSync(stagedPath, 'report bytes', { mode: 0o600 });
     const runtime = makeRuntime(workspace);
+    const { admission, ownerId } = await ownerRouterDeps(workspace);
     const router = new GatewayMessageRouter({
       config: runtime.config,
       runtime: runtime as unknown as ProfileRuntime,
+      admission,
+      ownerId,
       stagingDir: staging,
       buildBootStatusText: () => 'status',
     });
@@ -149,8 +181,9 @@ describe('GatewayMessageRouter media lifecycle', () => {
     fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
     fs.writeFileSync(stagedPath, 'report bytes', { mode: 0o600 });
     const runtime = makeRuntime(workspace);
-    const seen: IncomingMessage[] = [];
-    runtime.turnCoordinator.runUser.mockImplementation(async (incoming: IncomingMessage, egress: (text: string) => Promise<void>) => {
+    const { admission, ownerId } = await ownerRouterDeps(workspace);
+    const seen: AdmittedMessage[] = [];
+    runtime.turnCoordinator.runUser.mockImplementation(async (incoming: AdmittedMessage, egress: (text: string) => Promise<void>) => {
       seen.push(incoming);
       await egress('processed');
       return 'processed';
@@ -158,6 +191,8 @@ describe('GatewayMessageRouter media lifecycle', () => {
     const router = new GatewayMessageRouter({
       config: runtime.config,
       runtime: runtime as unknown as ProfileRuntime,
+      admission,
+      ownerId,
       stagingDir: staging,
       buildBootStatusText: () => 'status',
     });
@@ -185,14 +220,13 @@ describe('GatewayMessageRouter media lifecycle', () => {
     const stagedPath = path.join(staging, 'refused-report.pdf');
     fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
     fs.writeFileSync(stagedPath, 'private report', { mode: 0o600 });
-    const registry = new ProfileRegistry(path.join(root, 'profiles'));
-    registry.getOrCreateDefaultProfile();
-    registry.pairChatToProfile('owner-chat', 'default' as ProfileId);
     const runtime = makeRuntime(workspace);
+    const { admission, ownerId } = await ownerRouterDeps(workspace);
     const router = new GatewayMessageRouter({
       config: runtime.config,
       runtime: runtime as unknown as ProfileRuntime,
-      profileRegistry: registry,
+      admission,
+      ownerId,
       stagingDir: staging,
       buildBootStatusText: () => 'status',
     });
@@ -200,7 +234,7 @@ describe('GatewayMessageRouter media lifecycle', () => {
 
     const reply = await router.route({ ...message('hello', stagedPath), chatId: 'stranger-chat' }, egress);
 
-    expect(reply).toContain('not recognized');
+    expect(reply).toMatch(/not connected to this assistant/i);
     expect(fs.existsSync(stagedPath)).toBe(false);
     expect(runtime.turnCoordinator.runUser).not.toHaveBeenCalled();
     expect(fs.existsSync(path.join(workspace, 'reports'))).toBe(false);
@@ -213,9 +247,12 @@ describe('GatewayMessageRouter media lifecycle', () => {
     fs.writeFileSync(outside, 'outside bytes', { mode: 0o600 });
     fs.symlinkSync(outside, stagedPath);
     const runtime = makeRuntime(workspace);
+    const { admission, ownerId } = await ownerRouterDeps(workspace);
     const router = new GatewayMessageRouter({
       config: runtime.config,
       runtime: runtime as unknown as ProfileRuntime,
+      admission,
+      ownerId,
       stagingDir: staging,
       buildBootStatusText: () => 'status',
     });
@@ -234,9 +271,12 @@ describe('GatewayMessageRouter media lifecycle', () => {
     const outside = path.join(root, 'outside-report.pdf');
     fs.writeFileSync(outside, 'outside bytes', { mode: 0o600 });
     const runtime = makeRuntime(workspace);
+    const { admission, ownerId } = await ownerRouterDeps(workspace);
     const router = new GatewayMessageRouter({
       config: runtime.config,
       runtime: runtime as unknown as ProfileRuntime,
+      admission,
+      ownerId,
       stagingDir: staging,
       buildBootStatusText: () => 'status',
     });
@@ -259,7 +299,7 @@ describe('GatewayMessageRouter media lifecycle', () => {
     fs.writeFileSync(orphan, 'orphan', { mode: 0o600 });
     fs.symlinkSync(realStaging, staging);
 
-    sweepStagedMedia(staging);
+    sweepStagedMedia(staging, root);
 
     expect(fs.existsSync(orphan)).toBe(true);
   });
@@ -273,9 +313,12 @@ describe('GatewayMessageRouter media lifecycle', () => {
     fs.writeFileSync(path.join(realParent, 'media', 'ancestor-link.pdf'), 'report bytes', { mode: 0o600 });
     fs.symlinkSync(realParent, stagingParent, 'dir');
     const runtime = makeRuntime(workspace);
+    const { admission, ownerId } = await ownerRouterDeps(workspace);
     const router = new GatewayMessageRouter({
       config: runtime.config,
       runtime: runtime as unknown as ProfileRuntime,
+      admission,
+      ownerId,
       stagingDir: stagingPath,
       stagingBaseDir: root,
       buildBootStatusText: () => 'status',
@@ -296,13 +339,17 @@ describe('GatewayMessageRouter media lifecycle', () => {
     const realReports = path.join(root, 'real-reports');
     const stagedPath = path.join(staging, 'symlink-report.pdf');
     fs.mkdirSync(realReports, { recursive: true, mode: 0o755 });
+    fs.chmodSync(realReports, 0o755); // The symlink target starts loose regardless of the process umask.
     fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
     fs.writeFileSync(stagedPath, 'report bytes', { mode: 0o600 });
     fs.symlinkSync(realReports, path.join(workspace, 'reports'), 'dir');
     const runtime = makeRuntime(workspace);
+    const { admission, ownerId } = await ownerRouterDeps(workspace);
     const router = new GatewayMessageRouter({
       config: runtime.config,
       runtime: runtime as unknown as ProfileRuntime,
+      admission,
+      ownerId,
       stagingDir: staging,
       buildBootStatusText: () => 'status',
     });
@@ -314,12 +361,11 @@ describe('GatewayMessageRouter media lifecycle', () => {
     expect(fs.existsSync(stagedPath)).toBe(false);
   });
 
-  it('sweeps orphaned staged files at boot', () => {
-    const orphan = path.join(staging, 'orphan.bin');
+  it('sweeps orphaned staged files at boot', async () => {
     fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(orphan, 'orphan', { mode: 0o600 });
+    const orphan = await stageMediaFixture(root, staging, 'orphan');
 
-    sweepStagedMedia(staging);
+    expect(sweepStagedMedia(staging, root)).toEqual({ kind: 'complete', inspected: 1, removed: 1 });
 
     expect(fs.existsSync(orphan)).toBe(false);
   });
@@ -331,7 +377,7 @@ describe('GatewayMessageRouter routing decisions', () => {
   let staging: string;
 
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-router-decisions-'));
+    root = makeTestTemp('redacted-router-decisions-');
     workspace = path.join(root, 'workspace');
     staging = path.join(root, 'staging', 'media');
     fs.mkdirSync(workspace, { recursive: true });
@@ -345,13 +391,13 @@ describe('GatewayMessageRouter routing decisions', () => {
     const stagedPath = path.join(staging, 'emergency-report.pdf');
     fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
     fs.writeFileSync(stagedPath, 'report bytes', { mode: 0o600 });
-    const registry = new ProfileRegistry(path.join(root, 'profiles'));
-    registry.getOrCreateDefaultProfile();
     const runtime = makeRuntime(workspace);
+    const { admission, ownerId } = await ownerRouterDeps(workspace);
     const router = new GatewayMessageRouter({
       config: runtime.config,
       runtime: runtime as unknown as ProfileRuntime,
-      profileRegistry: registry,
+      admission,
+      ownerId,
       stagingDir: staging,
       buildBootStatusText: () => 'status',
     });
@@ -362,11 +408,12 @@ describe('GatewayMessageRouter routing decisions', () => {
       chatId: 'new-chat',
     }, egress);
 
-    expect(reply).toContain('emergency');
-    expect(registry.getProfileForChat('new-chat')).toBeUndefined();
+    expect(reply).toBe(EMERGENCY_RESPONSE);
+    expect(admission.ownsDestination('new-chat')).toBe(false);
     expect(fs.existsSync(stagedPath)).toBe(false);
     expect(fs.existsSync(path.join(workspace, 'reports'))).toBe(false);
     expect(runtime.sessions.recordTurn).not.toHaveBeenCalled();
+    expect(runtime.turnCoordinator.runUser).not.toHaveBeenCalled();
     expect(egress).toHaveBeenCalledWith(reply);
   });
 
@@ -374,14 +421,13 @@ describe('GatewayMessageRouter routing decisions', () => {
     const stagedPath = path.join(staging, 'resolved-emergency-report.pdf');
     fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
     fs.writeFileSync(stagedPath, 'report bytes', { mode: 0o600 });
-    const registry = new ProfileRegistry(path.join(root, 'profiles'));
-    registry.getOrCreateDefaultProfile();
-    registry.pairChatToProfile('chat-1', 'default' as ProfileId);
     const runtime = makeRuntime(workspace);
+    const { admission, ownerId } = await ownerRouterDeps(workspace);
     const router = new GatewayMessageRouter({
       config: runtime.config,
       runtime: runtime as unknown as ProfileRuntime,
-      profileRegistry: registry,
+      admission,
+      ownerId,
       stagingDir: staging,
       buildBootStatusText: () => 'status',
     });
@@ -396,6 +442,7 @@ describe('GatewayMessageRouter routing decisions', () => {
 
   it('sends a resolved emergency immediately without entering the coordinator', async () => {
     const runtime = makeRuntime(workspace);
+    const { admission, ownerId } = await ownerRouterDeps(workspace);
     const normalEntered = deferred();
     const releaseNormal = deferred();
     runtime.turnCoordinator.runUser.mockImplementationOnce(async () => {
@@ -406,6 +453,8 @@ describe('GatewayMessageRouter routing decisions', () => {
     const router = new GatewayMessageRouter({
       config: runtime.config,
       runtime: runtime as unknown as ProfileRuntime,
+      admission,
+      ownerId,
       stagingDir: staging,
       buildBootStatusText: () => 'status',
     });
@@ -426,9 +475,12 @@ describe('GatewayMessageRouter routing decisions', () => {
 
   it('returns status without entering the coordinator', async () => {
     const runtime = makeRuntime(workspace);
+    const { admission, ownerId } = await ownerRouterDeps(workspace);
     const router = new GatewayMessageRouter({
       config: runtime.config,
       runtime: runtime as unknown as ProfileRuntime,
+      admission,
+      ownerId,
       stagingDir: staging,
       buildBootStatusText: () => 'status text',
     });
@@ -441,10 +493,13 @@ describe('GatewayMessageRouter routing decisions', () => {
 
   it('emits the bounded-queue canned reply when the coordinator rejects a fourth request', async () => {
     const runtime = makeRuntime(workspace);
+    const { admission, ownerId } = await ownerRouterDeps(workspace);
     runtime.turnCoordinator.runUser.mockRejectedValue(new TurnQueueFullError());
     const router = new GatewayMessageRouter({
       config: runtime.config,
       runtime: runtime as unknown as ProfileRuntime,
+      admission,
+      ownerId,
       stagingDir: staging,
       buildBootStatusText: () => 'status',
     });
@@ -457,13 +512,13 @@ describe('GatewayMessageRouter routing decisions', () => {
   });
 });
 
-describe('GatewayMessageRouter emergency raw-input boundary (RR2-A2)', () => {
+describe('GatewayMessageRouter emergency raw-input boundary', () => {
   let root: string;
   let workspace: string;
   let staging: string;
 
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-router-rr2a2-'));
+    root = makeTestTemp('redacted-router-');
     workspace = path.join(root, 'workspace');
     staging = path.join(root, 'staging', 'media');
     fs.mkdirSync(workspace, { recursive: true });
@@ -475,9 +530,12 @@ describe('GatewayMessageRouter emergency raw-input boundary (RR2-A2)', () => {
 
   it('treats metadata-looking TEXT as user-authored and escalates without calling runUser', async () => {
     const runtime = makeRuntime(workspace);
+    const { admission, ownerId } = await ownerRouterDeps(workspace);
     const router = new GatewayMessageRouter({
       config: runtime.config,
       runtime: runtime as unknown as ProfileRuntime,
+      admission,
+      ownerId,
       stagingDir: staging,
       buildBootStatusText: () => 'status',
     });
@@ -492,17 +550,23 @@ describe('GatewayMessageRouter emergency raw-input boundary (RR2-A2)', () => {
 
   it('does not escalate when crisis words appear only in metadata fields', async () => {
     const runtime = makeRuntime(workspace);
+    const { admission, ownerId } = await ownerRouterDeps(workspace);
     const router = new GatewayMessageRouter({
       config: runtime.config,
       runtime: runtime as unknown as ProfileRuntime,
+      admission,
+      ownerId,
       stagingDir: staging,
       buildBootStatusText: () => 'status',
     });
 
     const reply = await router.route(
       {
-        chatId: 'chat-1',
-        userId: 'I want to kill myself',
+        channel: 'telegram',
+        chatId: TEST_OWNER_CHAT,
+        userId: 'user-1',
+        chatType: 'private',
+        eventId: 'telegram:metadata-1',
         text: 'What is a normal healthy breakfast?',
         replyToMessageId: 'I want to kill myself',
         mediaPath: 'reports/I want to kill myself.pdf',
@@ -515,39 +579,45 @@ describe('GatewayMessageRouter emergency raw-input boundary (RR2-A2)', () => {
   });
 
   it('does not consume first-contact pairing for a raw-label emergency', async () => {
-    const registry = new ProfileRegistry(path.join(root, 'profiles'));
-    registry.getOrCreateDefaultProfile();
     const runtime = makeRuntime(workspace);
+    const { admission, ownerId } = await ownerRouterDeps(workspace);
     const router = new GatewayMessageRouter({
       config: runtime.config,
       runtime: runtime as unknown as ProfileRuntime,
-      profileRegistry: registry,
+      admission,
+      ownerId,
       stagingDir: staging,
       buildBootStatusText: () => 'status',
     });
     const egress = jest.fn().mockResolvedValue(undefined);
 
     const reply = await router.route(
-      { chatId: 'new-chat', userId: 'user-1', text: 'User id: I want to kill myself' },
+      {
+        channel: 'telegram',
+        chatId: 'new-chat',
+        userId: 'user-1',
+        chatType: 'private',
+        eventId: 'telegram:new-chat:raw-label',
+        text: 'User id: I want to kill myself',
+      },
       egress,
     );
 
-    expect(reply).toMatch(/emergency/i);
-    expect(registry.getProfileForChat('new-chat')).toBeUndefined();
+    expect(reply).toBe(EMERGENCY_RESPONSE);
+    expect(admission.ownsDestination('new-chat')).toBe(false);
     expect(runtime.turnCoordinator.runUser).not.toHaveBeenCalled();
     expect(runtime.sessions.recordTurn).not.toHaveBeenCalled();
     expect(egress).toHaveBeenCalledWith(reply);
   });
 
   it('persists and sends a resolved raw-label emergency before any normal turn', async () => {
-    const registry = new ProfileRegistry(path.join(root, 'profiles'));
-    registry.getOrCreateDefaultProfile();
-    registry.pairChatToProfile('chat-1', 'default' as ProfileId);
     const runtime = makeRuntime(workspace);
+    const { admission, ownerId } = await ownerRouterDeps(workspace);
     const router = new GatewayMessageRouter({
       config: runtime.config,
       runtime: runtime as unknown as ProfileRuntime,
-      profileRegistry: registry,
+      admission,
+      ownerId,
       stagingDir: staging,
       buildBootStatusText: () => 'status',
     });

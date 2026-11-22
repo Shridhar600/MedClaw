@@ -1,4 +1,4 @@
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { ProfileId } from '../../src/profiles/types';
 import type { ProfileRuntime } from '../../src/gateway/runtime';
 import { TurnCoordinator } from '../../src/gateway/turn-coordinator';
@@ -14,7 +14,7 @@ type GatewayWithRuntime = {
 /** Attach a structural runtime double to a Gateway without exercising the production boot path. */
 export function attachGatewayTestRuntime(
   gateway: unknown,
-  config: AppConfig,
+  config: EffectiveConfig,
   overrides: Record<string, unknown> = {},
 ): ProfileRuntime {
   const runtime: Record<string, unknown> = {
@@ -26,11 +26,10 @@ export function attachGatewayTestRuntime(
     trackBackgroundOperation: (_label: string, operation: () => Promise<void>): void => {
       try {
         void operation().catch(() => undefined);
-      } catch {
-        // Test-only runtime double: background failure is intentionally swallowed.
-      }
+      } catch { /* ignore */ }
     },
     beginStopping: (): void => undefined,
+    getShutdownDisposition: (): 'quiescent' => 'quiescent',
     initializeScheduler: async (options: {
       schedulerPaths: { storePath: string; auditLogPath: string };
       runScheduledJob: (job: HeartbeatJob) => Promise<void>;

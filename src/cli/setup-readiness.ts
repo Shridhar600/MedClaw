@@ -1,6 +1,7 @@
 import { spawn, type SpawnOptions } from 'child_process';
+import { printableEndpoint } from './admin';
 import * as fs from 'fs';
-import type { AppConfig } from '../config/types';
+import type { EffectiveConfig } from '../config/types';
 import { validateConfig } from '../config/validation';
 import { providerEnvVar } from '../config/provider-env';
 import { probeOllamaCatalog, verifyTelegramToken, type HealthcheckOptions } from '../providers/healthcheck';
@@ -42,9 +43,9 @@ function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function configuredProviders(config: AppConfig): Array<{
+function configuredProviders(config: EffectiveConfig): Array<{
   label: 'providers.main' | 'providers.medical' | 'providers.embeddings';
-  provider: AppConfig['providers']['main'];
+  provider: EffectiveConfig['providers']['main'];
 }> {
   return [
     { label: 'providers.main', provider: config.providers.main },
@@ -53,12 +54,12 @@ function configuredProviders(config: AppConfig): Array<{
   ];
 }
 
-function hasProviderApiKey(provider: AppConfig['providers']['main']): boolean {
+function hasProviderApiKey(provider: EffectiveConfig['providers']['main']): boolean {
   const envVar = providerEnvVar(provider.type);
   return Boolean(provider.apiKey?.trim() || (envVar && process.env[envVar]?.trim()));
 }
 
-function providerDisplayName(provider: AppConfig['providers']['main']): string {
+function providerDisplayName(provider: EffectiveConfig['providers']['main']): string {
   switch (provider.type) {
     case 'openai':
       return 'OpenAI';
@@ -137,7 +138,7 @@ export async function ensureOllamaRuntime(
   };
 }
 
-export function getRequiredOllamaModels(config: AppConfig): string[] {
+export function getRequiredOllamaModels(config: EffectiveConfig): string[] {
   return [config.providers.main, config.providers.medical, config.providers.embeddings]
     .filter((provider) => provider.type === 'ollama')
     .map((provider) => provider.model.trim())
@@ -150,7 +151,7 @@ export function getMissingOllamaModels(requiredModels: string[], availableModels
 }
 
 export async function verifyTelegramRuntime(
-  config: AppConfig,
+  config: EffectiveConfig,
   dependencies: SetupReadinessDependencies = {},
 ): Promise<TelegramRuntimeCheck> {
   if (!config.channels.telegram.enabled) {
@@ -179,7 +180,7 @@ export async function verifyTelegramRuntime(
 }
 
 export async function preflightStartCheck(
-  config: AppConfig,
+  config: EffectiveConfig,
   configPath: string,
   dependencies: SetupReadinessDependencies = {},
 ): Promise<StartPreflightReport> {
@@ -227,14 +228,16 @@ export async function preflightStartCheck(
       warnings.push(...ollama.warnings);
       blockers.push(...ollama.blockers);
       if (ollama.reachable && ollama.autoStarted) {
-        warnings.push(`Ollama was started automatically for ${baseUrl}.`);
+        // The configured endpoint can carry `user:password@`, so only its sanitized form may reach output.
+        warnings.push(`Ollama was started automatically for ${printableEndpoint(baseUrl, '(not set)')}.`);
       }
       reportedOllamaUrls.add(baseUrl);
     }
 
     if (ollama.reachable && !ollama.models.includes(provider.model)) {
       blockers.push(
-        `Missing Ollama model for ${label} at ${baseUrl}: ${provider.model}. Run \`ollama pull ${provider.model}\` against that endpoint.`,
+        `Missing Ollama model for ${label} at ${printableEndpoint(baseUrl, '(not set)')}: ${provider.model}.`
+        + ` Run \`ollama pull ${provider.model}\` against that endpoint.`,
       );
     }
   }

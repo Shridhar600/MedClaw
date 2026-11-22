@@ -37,7 +37,6 @@ describe('LLMSemaphore', () => {
       job2Started.resolve();
     });
 
-    // job2 should not start yet — job1 is still running
     await expect(Promise.race([job2Started.promise, Promise.resolve('timeout')])).resolves.toBe('timeout');
 
     job1Done.resolve();
@@ -65,7 +64,6 @@ describe('LLMSemaphore', () => {
       order.push('heartbeat-start');
     });
 
-    // heartbeat should not start yet
     await expect(Promise.race([pHb.then(() => 'hb-done'), Promise.resolve('timeout')])).resolves.toBe('timeout');
 
     userDone.resolve();
@@ -75,7 +73,7 @@ describe('LLMSemaphore', () => {
     expect(order).toEqual(['user-start', 'user-end', 'heartbeat-start']);
   });
 
-  it('drains background priority only after user AND heartbeat (F8)', async () => {
+  it('drains background priority only after user AND heartbeat', async () => {
     const order: string[] = [];
     const blockerRunning = deferred();
     const blockerDone = deferred();
@@ -88,7 +86,6 @@ describe('LLMSemaphore', () => {
     });
     await blockerRunning.promise;
 
-    // Enqueue in reverse-priority order while the blocker holds the semaphore.
     const pBg = sem.run('background', async () => { order.push('bg'); });
     const pHb = sem.run('heartbeat', async () => { order.push('hb'); });
     const pUser = sem.run('user', async () => { order.push('user2'); });
@@ -96,7 +93,6 @@ describe('LLMSemaphore', () => {
     blockerDone.resolve();
     await Promise.all([pBlock, pBg, pHb, pUser]);
 
-    // Priority order wins over enqueue order: user > heartbeat > background.
     expect(order).toEqual(['block-start', 'block-end', 'user2', 'hb', 'bg']);
   });
 
@@ -134,7 +130,6 @@ describe('LLMSemaphore', () => {
       order.push('hb2-start');
     });
 
-    // Give hb2 time to be queued
     await Promise.resolve();
 
     const pUser = sem.run('user', async () => {
@@ -146,7 +141,6 @@ describe('LLMSemaphore', () => {
     await pUser;
     await pHb2;
 
-    // user should run before hb2 even though hb2 was queued first
     expect(order).toEqual(['hb1-start', 'hb1-end', 'user-start', 'hb2-start']);
   });
 
@@ -254,7 +248,6 @@ describe('LLMSemaphore', () => {
   });
 
   it('an 11th queued heartbeat rejects with queue-full error while user jobs are still accepted', async () => {
-    // Occupy the running slot so subsequent heartbeats stay queued.
     const blockerRunning = deferred();
     const blockerDone = deferred();
     const pBlocker = sem.run('heartbeat', async () => {
@@ -263,20 +256,15 @@ describe('LLMSemaphore', () => {
     });
     await blockerRunning.promise;
 
-    // Queue MAX_QUEUED_HEARTBEATS (10) heartbeats behind the running one.
     const queued: Array<Promise<void>> = [];
     for (let i = 0; i < 10; i++) {
       queued.push(sem.run('heartbeat', async () => {}));
     }
 
-    // The 11th queued heartbeat must be rejected immediately, with the typed
-    // sentinel the gateway instanceof-checks (never a message-string contract).
     const overflow = sem.run('heartbeat', async () => {});
     await expect(overflow).rejects.toThrow('heartbeat queue full');
     await expect(overflow).rejects.toBeInstanceOf(HeartbeatQueueFullError);
 
-    // The independent user cap still leaves room for a user job while the
-    // heartbeat queue is full.
     const userResult = sem.run('user', async () => 'user-ok');
 
     blockerDone.resolve();
@@ -306,7 +294,6 @@ describe('LLMSemaphore', () => {
       }));
     }
 
-    // Let the heartbeats settle into the queue before the user job arrives.
     await Promise.resolve();
 
     const pUser = sem.run('user', async () => {

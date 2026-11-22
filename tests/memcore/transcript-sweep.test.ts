@@ -1,7 +1,6 @@
 import { sweep } from '../../src/memcore/transcript-sweep';
 import type { SweepLexicon } from '../../src/memcore/transcript-sweep';
 
-// A controlled lexicon so the goldens don't couple to the default term set.
 const LEX: SweepLexicon = {
   med: ['naproxen', 'metformin', 'insulin', 'lisinopril'],
   symptom: ['headache', 'nausea', 'dizziness'],
@@ -39,12 +38,11 @@ describe('transcript sweep — golden', () => {
     expect(med!.description).toContain('yesterday');
     expect(sym).toBeDefined();
     expect(sym!.critical).toBeFalsy();
-    // A-L3: med-critical items are selected/ordered first.
     expect(items[0].relatedEntity).toBe('naproxen');
   });
 });
 
-describe('transcript sweep — only real user chat turns are mined (A-H1)', () => {
+describe('transcript sweep — only real user chat turns are mined', () => {
   it('ignores assistant and tool turns', () => {
     const lines = [
       asstLine('you should consider naproxen'),
@@ -115,13 +113,12 @@ describe('transcript sweep — dedup and bounds', () => {
     ];
     const { items } = sweep({ dayFileLines: lines, ledgerEntitiesForDay: new Set(), existingCuriosity: [], lexicon: LEX });
     expect(items).toHaveLength(5);
-    // all 4 meds selected first, then one symptom
     expect(items.filter(i => i.critical)).toHaveLength(4);
     expect(items.slice(0, 4).every(i => i.critical)).toBe(true);
   });
 });
 
-describe('transcript sweep — ledger-events-for-day seam (D4.3)', () => {
+describe('transcript sweep — ledger-events-for-day seam', () => {
   it('files no item for a mention that HAS a same-day ledger event', () => {
     const lines = [userLine('took naproxen today')];
     const { items } = sweep({
@@ -157,7 +154,7 @@ describe('transcript sweep — number+unit dose patterns', () => {
   });
 });
 
-describe('transcript sweep — deterministic transcript ordering (A-L3, MEDIUM-4)', () => {
+describe('transcript sweep — deterministic transcript ordering', () => {
   it('keeps transcript order even when the first turn exceeds the 1,000,000-char stride', () => {
     const huge = 'x '.repeat(600_000) + 'headache'; // > 1,000,000 chars, symptom near the end
     const lines = [userLine(huge), userLine('then some nausea')];
@@ -165,14 +162,14 @@ describe('transcript sweep — deterministic transcript ordering (A-L3, MEDIUM-4
     expect(items.map(i => i.relatedEntity)).toEqual(['headache', 'nausea']); // earlier turn first
   });
 
-  it('orders two med-criticals by transcript position (A-L3 tie-break)', () => {
+  it('orders two med-criticals by transcript position (tie-break)', () => {
     const lines = [userLine('took naproxen'), userLine('and metformin')];
     const { items } = sweep({ dayFileLines: lines, ledgerEntitiesForDay: new Set(), existingCuriosity: [], lexicon: LEX });
     expect(items.map(i => i.relatedEntity)).toEqual(['naproxen', 'metformin']);
   });
 });
 
-describe('transcript sweep — origin field (MEDIUM-2)', () => {
+describe('transcript sweep — origin field', () => {
   it('MINES an explicit origin:chat turn even when its text starts with the heartbeat marker', () => {
     const lines = [userLine('[Heartbeat Trigger]\ntook naproxen', { origin: 'chat' })];
     const { items } = sweep({ dayFileLines: lines, ledgerEntitiesForDay: new Set(), existingCuriosity: [], lexicon: LEX });

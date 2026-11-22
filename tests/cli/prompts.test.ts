@@ -1,7 +1,5 @@
 import * as prompts from '../../src/cli/prompts';
 
-// The raw CJS module object — spyable, unlike the ts-jest __importStar clone
-// produced by `import * as fs`, whose getter-only properties reject spyOn.
 const fs = jest.requireActual<typeof import('fs')>('fs');
 
 describe('cli prompts', () => {

@@ -1,7 +1,5 @@
-// tests/providers/ollama.test.ts
 import { OllamaProvider } from '../../src/providers/ollama';
 
-// Mock the HTTP call so tests don't need Ollama running
 global.fetch = jest.fn() as typeof fetch;
 
 describe('OllamaProvider', () => {
@@ -138,5 +136,28 @@ describe('OllamaProvider', () => {
 
     const result = await provider.chat([{ role: 'user', content: 'Hi' }]);
     expect(result.usage).toBeUndefined();
+  });
+
+  it('fails a request that never answers instead of hanging the turn', async () => {
+    (global.fetch as jest.Mock).mockImplementationOnce((_url: string, init: { signal: AbortSignal }) =>
+      new Promise((_resolve, reject) => init.signal.addEventListener('abort', () => reject(init.signal.reason))));
+    const slow = new OllamaProvider({ type: 'ollama', baseUrl: 'http://localhost:11434/v1', model: 'm' }, 50);
+    await expect(slow.chat([{ role: 'user', content: 'Hi' }])).rejects.toThrow();
+  });
+
+  it('reports an empty reply as a provider error', async () => {
+    (global.fetch as jest.Mock).mockResolvedValueOnce({ ok: true, json: async () => ({ choices: [] }) });
+    await expect(provider.chat([{ role: 'user', content: 'Hi' }])).rejects.toThrow('no choices');
+  });
+
+  it('turns malformed tool arguments into an empty call the tool layer can refuse', async () => {
+    (global.fetch as jest.Mock).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'memory_get', arguments: '{"path": "SOUL.md"' } }] } }],
+      }),
+    });
+    const result = await provider.chat([{ role: 'user', content: 'Hi' }]);
+    expect(result).toMatchObject({ type: 'tool_call', toolCalls: [{ id: 'c1', name: 'memory_get', arguments: {} }] });
   });
 });

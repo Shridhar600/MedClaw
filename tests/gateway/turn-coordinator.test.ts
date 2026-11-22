@@ -1,16 +1,17 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { AgentLoop } from '../../src/agent/agent-loop';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import type { ProfileRuntime } from '../../src/gateway/runtime';
 import type { IncomingMessage } from '../../src/channels/types';
 import { OnboardingFlow } from '../../src/onboarding/flow';
 import { ToolRegistry } from '../../src/tools/registry';
 import { HeartbeatPreemptedError, LLMSemaphore } from '../../src/tools/semaphore';
-import { TurnCoordinator, TurnQueueFullError } from '../../src/gateway/turn-coordinator';
+import { TurnCoordinator, TurnQueueFullError, type HeartbeatTurnResult } from '../../src/gateway/turn-coordinator';
 import type { LLMProvider, LLMResponse, Message } from '../../src/providers/types';
 import { DaemonShutdownError } from '../../src/shared/errors';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { makeTestTemp } from '../helpers/test-temp';
 
 function deferred<T = void>() {
   let resolve!: (value?: T | PromiseLike<T>) => void;
@@ -22,8 +23,11 @@ function deferred<T = void>() {
   return { promise, resolve, reject };
 }
 
-function makeConfig(workspace: string): AppConfig {
+function makeConfig(workspace: string): EffectiveConfig {
+const owner = fixtureOwner(workspace);
   return {
+  schemaVersion: 2,
+  ...ownerSelection(owner),
     providers: {
       main: { type: 'ollama', model: 'test-main' },
       medical: { type: 'ollama', model: 'test-medical' },
@@ -33,9 +37,7 @@ function makeConfig(workspace: string): AppConfig {
     tools: { allow: ['*'], deny: [] },
     memory: { workspace, search: { hybridWeights: { vector: 0.7, keyword: 0.3 } }, bootstrapMaxChars: 20_000 },
     sessions: {
-      softResetAfterMinutes: 240,
-      hardResetAfterMinutes: 1440,
-      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+      compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
     },
     heartbeat: {
       enabled: false,
@@ -54,7 +56,7 @@ function makeConfig(workspace: string): AppConfig {
         },
       },
     },
-    agent: { maxIterations: 5, disclaimerEnabled: false },
+    agent: { maxIterations: 5 },
   };
 }
 
@@ -69,7 +71,7 @@ type SessionDouble = {
 type RuntimeDouble = {
   profileId: 'default';
   workspace: string;
-  config: AppConfig;
+  config: EffectiveConfig;
   agentLoop: { run: jest.Mock };
   sessions: SessionDouble;
   capturePipeline?: { ingest: jest.Mock<Promise<void>> };
@@ -77,7 +79,7 @@ type RuntimeDouble = {
 };
 
 function makeRuntime(): RuntimeDouble {
-  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-turn-coordinator-'));
+  const workspace = makeTestTemp('redacted-turn-coordinator-');
   fs.mkdirSync(path.join(workspace, '.redacted'), { recursive: true });
   fs.writeFileSync(
     path.join(workspace, '.redacted', 'onboarding.json'),
@@ -166,7 +168,7 @@ describe('TurnCoordinator whole-turn serialization', () => {
 
     expect(runtime.sessions.prepareHistory).toHaveBeenCalledTimes(2);
     expect(runtime.sessions.prepareHistory.mock.results[1].value).toBeDefined();
-    expect(runtime.agentLoop.run.mock.calls[1][1]).toEqual([{ role: 'user', content: 'first\n\nUser id: user-1' }]);
+    expect(runtime.agentLoop.run.mock.calls[1][1]).toEqual([{ role: 'user', content: 'first' }]);
   });
 
   it('allows independent chats to enter their agents concurrently', async () => {
@@ -185,7 +187,7 @@ describe('TurnCoordinator whole-turn serialization', () => {
     const chatA = coordinator.runUser(message('A', 'chat-a'), egress, noEmergency);
     const chatB = coordinator.runUser(message('B', 'chat-b'), egress, noEmergency);
     await bothEntered.promise;
-    expect(entered).toEqual(new Set(['A\n\nUser id: user-1', 'B\n\nUser id: user-1']));
+    expect(entered).toEqual(new Set(['A', 'B']));
 
     release.resolve();
     await Promise.all([chatA, chatB]);
@@ -248,7 +250,7 @@ describe('TurnCoordinator heartbeat preemption', () => {
       provider,
       new ToolRegistry({ allow: ['*'], deny: [] }),
       [],
-      { maxIterations: 5, disclaimerEnabled: false },
+      { maxIterations: 5 },
       semaphore,
     );
     (runtime as unknown as { agentLoop: AgentLoop }).agentLoop = loop;
@@ -280,6 +282,34 @@ describe('TurnCoordinator heartbeat preemption', () => {
     expect(provider.chat).toHaveBeenCalledTimes(1);
   });
 
+  it('a user message evicts queued heartbeats instead of being refused when the queue is full', async () => {
+    const release = deferred();
+    const firstStarted = deferred();
+    runtime.agentLoop.run.mockImplementation(async (input: string) => {
+      if (input === 'hb-1') {
+        firstStarted.resolve();
+        await release.promise;
+      }
+      return response(`reply:${input}`);
+    });
+    const coordinator = new TurnCoordinator(runtime as unknown as ProfileRuntime, new LLMSemaphore());
+    const heartbeat = (input: string): Promise<HeartbeatTurnResult> => coordinator.runHeartbeat({
+      chatId: 'chat-full', input, egress: jest.fn().mockResolvedValue(undefined), afterDelivery: jest.fn().mockResolvedValue(undefined),
+    });
+
+    const active = heartbeat('hb-1');
+    await firstStarted.promise;
+    const queued = [heartbeat('hb-2'), heartbeat('hb-3')];
+    const egress = jest.fn().mockResolvedValue(undefined);
+    const user = coordinator.runUser(message('are my meds ok?', 'chat-full'), egress, noEmergency);
+    release.resolve();
+
+    expect(await user).toBe('reply:are my meds ok?');
+    expect((await active).status).toBe('sent');
+    expect((await Promise.all(queued)).map((r) => r.status)).toEqual(['preempted', 'preempted']);
+    expect(runtime.agentLoop.run.mock.calls.map((call) => call[0])).toEqual(['hb-1', 'are my meds ok?']);
+  });
+
   it('does not abort a heartbeat after its provider call is already in flight', async () => {
     const semaphore = new LLMSemaphore();
     const providerStarted = deferred();
@@ -296,7 +326,7 @@ describe('TurnCoordinator heartbeat preemption', () => {
       provider,
       new ToolRegistry({ allow: ['*'], deny: [] }),
       [],
-      { maxIterations: 5, disclaimerEnabled: false },
+      { maxIterations: 5 },
       semaphore,
     );
     (runtime as unknown as { agentLoop: AgentLoop }).agentLoop = loop;
@@ -370,17 +400,7 @@ describe('TurnCoordinator deterministic front-of-turn onboarding', () => {
   });
 });
 
-// RR-STRUCT R-S4 (mini-plan v3 §3.9, Part B): every caller of a gated write must turn a
-// DaemonShutdownError into a benign, sanitized-logged no-op — never crash, never rethrow to
-// process level. executeUser already had a catch around recordTurn/recordPromptUsage (the
-// existing `persistFailed` pattern) that handles ANY error the same way, DaemonShutdownError
-// included — this describe block proves that holds for the NEW error type without needing a code
-// change there. executeHeartbeat had NO local catch around recordTurn before R-S4 (a genuine gap:
-// it would have propagated to Gateway.handleScheduledJob's catch, which calls
-// scheduler.recordFailure — treating a benign shutdown-time abandonment as a real job failure) —
-// runHeartbeat now catches DaemonShutdownError the same way it already catches
-// HeartbeatPreemptedError, returning a new `{status: 'abandoned'}` outcome instead.
-describe('TurnCoordinator RR-STRUCT R-S4 — DaemonShutdownError graceful handling', () => {
+describe('TurnCoordinator — DaemonShutdownError graceful handling', () => {
   let runtime: RuntimeDouble;
 
   beforeEach(() => {

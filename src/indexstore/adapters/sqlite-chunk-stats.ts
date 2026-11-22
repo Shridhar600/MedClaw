@@ -1,8 +1,3 @@
-// src/indexstore/adapters/sqlite-chunk-stats.ts
-//
-// ChunkStatsWriter adapter over SQLite — recall usage telemetry (P2 Task A3, specs/07 §6 Stage 4).
-// The `chunk_stats` schema existed since P0 but nothing ever wrote it; this closes that. Own
-// better-sqlite3 connection to the per-profile search.db (WAL + busy_timeout); mirror-layer owned.
 
 import Database from 'better-sqlite3';
 import { summarizeErrorForLog } from '../../security';

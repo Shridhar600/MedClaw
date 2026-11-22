@@ -1,10 +1,3 @@
-/**
- * Shared test fixtures for the memcore/profiles Wave A/B suites.
- *
- * Deterministic clocks + id generators + a LedgerFact builder so store, view,
- * and pipeline tests never depend on wall-clock time or random ids (jest trap:
- * fake timers need setSystemTime; these fixtures sidestep that for pure stores).
- */
 import type { Clock, IdGen } from '../../src/ports';
 import type { FactType, LedgerFact } from '../../src/memcore';
 
@@ -45,10 +38,6 @@ export const tick = (ms: number): Promise<void> => new Promise(resolve => setTim
 
 const DEFAULT_CREATED_AT = '2026-08-18T00:00:00.000Z';
 
-/**
- * Build a fully-formed LedgerFact for store/view/pipeline tests.
- * Overrides win over defaults (spread last), so callers set only what a case needs.
- */
 export function fact(entity: string, type: FactType, o: Partial<LedgerFact> = {}): LedgerFact {
   const version = o.version ?? 1;
   const createdAt = o.createdAt ?? DEFAULT_CREATED_AT;

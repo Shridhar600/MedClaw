@@ -1,29 +1,30 @@
-import * as os from 'os';
-import * as path from 'path';
-import type { AppConfig } from './types';
 import { BUILT_IN_EMERGENCY_KEYWORDS } from '../safety/emergency-detector';
+import { CONFIG_SCHEMA_VERSION, type StoredConfig } from './types';
 
-export const DEFAULT_CONFIG: AppConfig = {
+export const LOCAL_OLLAMA_BASE_URL = 'http://localhost:11434/v1';
+
+export const DEFAULT_STORED_CONFIG: StoredConfig = Object.freeze({
+  schemaVersion: CONFIG_SCHEMA_VERSION,
   providers: {
     main: {
       type: 'ollama',
-      baseUrl: 'http://localhost:11434/v1',
+      baseUrl: LOCAL_OLLAMA_BASE_URL,
       model: 'kimi-k2.5:cloud',
     },
     medical: {
       type: 'ollama',
-      baseUrl: 'http://localhost:11434/v1',
+      baseUrl: LOCAL_OLLAMA_BASE_URL,
       model: 'aadide/medgemma-1.5-4b-it-Q4_K_S:latest',
     },
     embeddings: {
       type: 'ollama',
-      baseUrl: 'http://localhost:11434/v1',
+      baseUrl: LOCAL_OLLAMA_BASE_URL,
       model: 'embeddinggemma:latest',
     },
   },
   channels: {
     telegram: {
-      enabled: true,
+      enabled: false,
       botToken: '',
     },
   },
@@ -32,7 +33,6 @@ export const DEFAULT_CONFIG: AppConfig = {
     deny: ['exec'],
   },
   memory: {
-    workspace: path.join(os.homedir(), '.redacted', 'workspace'),
     search: {
       hybridWeights: { vector: 0.7, keyword: 0.3 },
     },
@@ -40,11 +40,8 @@ export const DEFAULT_CONFIG: AppConfig = {
     budgetRatios: { health: 0.6, life: 0.2, agent: 0.2 },
   },
   sessions: {
-    softResetAfterMinutes: 240,
-    hardResetAfterMinutes: 1440,
     compaction: {
       enabled: true,
-      triggerAtTokenPercent: 80,
       memoryFlush: true,
       keepRecentTurns: 10,
     },
@@ -58,7 +55,6 @@ export const DEFAULT_CONFIG: AppConfig = {
   heartbeat: {
     enabled: true,
     timezone: 'Asia/Kolkata',
-    storePath: path.join(os.homedir(), '.redacted', 'heartbeats', 'jobs.json'),
     policy: {
       quietHours: {
         enabled: true,
@@ -93,23 +89,26 @@ export const DEFAULT_CONFIG: AppConfig = {
       maxGlobalTriggersPerMinute: 10,
       maxPerChatTriggersPerMinute: 3,
     },
-    audit: {
-      path: path.join(os.homedir(), '.redacted', 'heartbeats', 'audit.jsonl'),
-    },
   },
   agent: {
     maxIterations: 15,
-    disclaimerEnabled: true,
   },
   emergency: {
     keywords: [...BUILT_IN_EMERGENCY_KEYWORDS],
   },
   profiles: {
-    baseDir: path.join(os.homedir(), '.redacted'),
+    baseDir: '~/.redacted',
     defaultProfileId: 'default',
   },
-};
+}) as StoredConfig;
 
-export function cloneDefaultConfig(): AppConfig {
-  return structuredClone(DEFAULT_CONFIG);
+/**
+ * Deep copy so a caller can never mutate the shared defaults.
+ */
+export function cloneStoredDefaults(): StoredConfig {
+  return structuredClone(DEFAULT_STORED_CONFIG);
 }
+
+export const DEFAULT_SESSION_WINDOW = DEFAULT_STORED_CONFIG.sessions.window as NonNullable<
+  StoredConfig['sessions']['window']
+>;

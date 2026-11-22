@@ -1,15 +1,15 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { SessionManager } from '../../src/gateway/session';
 import { SqliteSessionIndex } from '../../src/indexstore';
 import { dateKey } from '../../src/gateway/session-window';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const tmpDirs: string[] = [];
 
 function tmp(): { sessionsPath: string; dbPath: string } {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-sesswire-'));
+  const dir = makeTestTemp('redacted-sesswire-');
   tmpDirs.push(dir);
   const sessionsPath = path.join(dir, 'sessions');
   fs.mkdirSync(sessionsPath, { recursive: true });
@@ -20,7 +20,7 @@ afterAll(() => {
   for (const d of tmpDirs) fs.rmSync(d, { recursive: true, force: true });
 });
 
-describe('SessionManager × SqliteSessionIndex wiring (D2.5)', () => {
+describe('SessionManager × SqliteSessionIndex wiring', () => {
   test('recordTurn indexes each appended turn so session_search finds it without an explicit rebuild', async () => {
     const { sessionsPath, dbPath } = tmp();
     const mgr = new SessionManager({ sessionsPath });
@@ -46,7 +46,6 @@ describe('SessionManager × SqliteSessionIndex wiring (D2.5)', () => {
     const index = new SqliteSessionIndex({ dbPath, sessionsDir: sessionsPath });
     mgr.setTurnIndex(index);
 
-    // assistant tool-call message has null content; the tool result at line 3 must still index at line 3.
     await mgr.recordTurn('chat1', [
       { role: 'user', content: 'check my ibuprofen' },
       { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'x', arguments: '{}' } }] },

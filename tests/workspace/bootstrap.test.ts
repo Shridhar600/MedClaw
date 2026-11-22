@@ -1,14 +1,14 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { ensureWorkspaceBootstrap, listWorkspaceTemplateFiles } from '../../src/workspace/bootstrap';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('workspace bootstrap', () => {
   let tmpDir: string;
   let workspacePath: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-workspace-bootstrap-'));
+    tmpDir = makeTestTemp('redacted-workspace-bootstrap-');
     workspacePath = path.join(tmpDir, 'workspace');
   });
 

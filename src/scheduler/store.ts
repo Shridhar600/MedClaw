@@ -221,8 +221,7 @@ export class HeartbeatStore {
     const quarantinedPath = `${this.filePath}.corrupt-${Date.now()}`;
     secureMkdir(path.dirname(this.filePath));
     fs.renameSync(this.filePath, quarantinedPath);
-    // The quarantined copy may inherit a loose mode; tighten so the corrupt
-    // PHI-bearing payload is not left world-readable.
+    // The quarantined copy may inherit a loose mode; tighten so the PHI-bearing payload is not world-readable.
     tightenFile(quarantinedPath);
     return quarantinedPath;
   }

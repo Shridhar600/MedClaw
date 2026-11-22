@@ -1,23 +1,13 @@
-// src/config/types.ts
+
+export const CONFIG_SCHEMA_VERSION = 2 as const;
 
 export interface ProviderConfig {
   type: 'ollama' | 'openai' | 'anthropic' | 'google' | 'openrouter';
   baseUrl?: string;
   model: string;
   apiKey?: string;
-  /**
-   * Explicit reasoning-effort override sent to OpenAI-compatible endpoints.
-   * When unset, OpenAIProvider falls back to its name-based heuristic
-   * (gpt-5/o-series get 'none' with tools — forka #13). Explicit wins:
-   * e.g. stealth/ox-alpha REJECTS 'none' (reasoning is mandatory) and wants 'low'.
-   */
   reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high';
   allowRawMedicalMedia?: boolean;
-  /**
-   * P2b spec 14 §3 / DD4 — the model's context window in tokens, for the session-window fill triggers.
-   * When unset, the SessionManager falls back to the per-model `contextWindowFor` table. Wizard-probed
-   * for Ollama; table-seeded for cloud.
-   */
   contextWindow?: number;
 }
 
@@ -33,21 +23,27 @@ export interface ToolsConfig {
   deny: string[];
 }
 
-export interface MemoryConfig {
-  workspace: string;
-  search: {
-    hybridWeights: { vector: number; keyword: number };
-  };
-  bootstrapMaxChars: number;
-  /** MEMORY.md per-section budget shares (E1.4); defaults 0.6 / 0.2 / 0.2. */
-  budgetRatios?: { health: number; life: number; agent: number };
+export interface SearchWeights {
+  vector: number;
+  keyword: number;
 }
 
-/**
- * P2b spec 14 §3 — real-token window triggers. Percentages of the effective context window
- * (`providers.main.contextWindow` else the per-model table). Optional in the type so pre-P2b config
- * literals still compile; `DEFAULT_CONFIG` supplies it and `deepMerge` fills it into partial configs.
- */
+export interface BudgetRatios {
+  health: number;
+  life: number;
+  agent: number;
+}
+
+/** Stored memory settings. `workspace` is derived, never persisted. */
+export interface StoredMemoryConfig {
+  search: {
+    hybridWeights: SearchWeights;
+  };
+  bootstrapMaxChars: number;
+  /** MEMORY.md per-section budget shares; defaults 0.6 / 0.2 / 0.2. */
+  budgetRatios?: BudgetRatios;
+}
+
 export interface SessionWindowConfig {
   pruneAtPercent: number;
   compactAtPercent: number;
@@ -56,17 +52,11 @@ export interface SessionWindowConfig {
 }
 
 export interface SessionsConfig {
-  /** @deprecated P2b: idle resets are retired (DD10). Read for one release; warns; triggers nothing. */
-  softResetAfterMinutes: number;
-  /** @deprecated P2b: idle resets are retired (DD10). Read for one release; warns; triggers nothing. */
-  hardResetAfterMinutes: number;
   compaction: {
     enabled: boolean;
-    triggerAtTokenPercent: number;
     memoryFlush: boolean;
     keepRecentTurns: number;
   };
-  /** P2b spec 14 §3 window triggers (defaults 35/50/80/10). */
   window?: SessionWindowConfig;
 }
 
@@ -106,37 +96,33 @@ export interface HeartbeatRateLimitConfig {
   maxPerChatTriggersPerMinute: number;
 }
 
-export interface HeartbeatAuditConfig {
-  path: string;
-}
-
-export interface HeartbeatConfig {
+/** Stored heartbeat settings. `storePath` and `audit.path` are derived, never persisted. */
+export interface StoredHeartbeatConfig {
   enabled: boolean;
   timezone: string;
-  storePath: string;
   policy: HeartbeatPolicyConfig;
   recovery: HeartbeatRecoveryConfig;
   retry: HeartbeatRetryConfig;
   rateLimit: HeartbeatRateLimitConfig;
-  audit: HeartbeatAuditConfig;
 }
 
 export interface AgentConfig {
   maxIterations: number;
-  disclaimerEnabled: boolean;
 }
 
 export interface EmergencyConfig {
-  /** Literal phrases that extend the built-in emergency detector. */
+  /** Literal phrases that extend the built-in emergency detector. Built-ins are always kept. */
   keywords: string[];
 }
 
-export interface ProfileConfig {
+export interface ProfilesConfig {
   baseDir: string;
   defaultProfileId: string;
 }
 
-export interface AppConfig {
+/** The persisted document. Unknown keys, prototype keys and legacy path aliases are refused. */
+export interface StoredConfig {
+  schemaVersion: typeof CONFIG_SCHEMA_VERSION;
   providers: {
     main: ProviderConfig;
     medical: ProviderConfig;
@@ -144,10 +130,34 @@ export interface AppConfig {
   };
   channels: ChannelConfig;
   tools: ToolsConfig;
-  memory: MemoryConfig;
+  memory: StoredMemoryConfig;
   sessions: SessionsConfig;
-  heartbeat: HeartbeatConfig;
+  heartbeat: StoredHeartbeatConfig;
   agent: AgentConfig;
   emergency?: EmergencyConfig;
-  profiles?: ProfileConfig;
+  profiles: ProfilesConfig;
 }
+
+export interface DerivedOwnerPaths {
+  workspace: string;
+  schedulerStorePath: string;
+  auditLogPath: string;
+}
+
+export interface EffectiveMemoryConfig extends StoredMemoryConfig {
+  /** `<baseDir>/profiles/<ownerId>` — resolved once, injected, never re-derived. */
+  workspace: string;
+}
+
+export interface EffectiveHeartbeatConfig extends StoredHeartbeatConfig {
+  storePath: string;
+  audit: { path: string };
+}
+
+export interface EffectiveConfig extends Omit<StoredConfig, 'memory' | 'heartbeat'> {
+  memory: EffectiveMemoryConfig;
+  heartbeat: EffectiveHeartbeatConfig;
+}
+
+/** Provider env-var name for a provider type. `ollama` is local and needs no key. */
+export type ProviderType = ProviderConfig['type'];

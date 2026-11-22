@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import {
   loadWindow,
@@ -9,14 +8,11 @@ import {
   dateKey,
   type SessionWindow,
 } from '../../src/gateway/session-window';
+import { makeTestTemp } from '../helpers/test-temp';
 
-// P2b Wave D-1 / Task D1.1 — SessionWindow state file (the rolling window persisted separately from
-// the append-only day-file archive; spec 14 §2). Absent OR corrupt ⇒ a fresh empty window pointing at
-// the latest day file's EOF (A-L6/N-7); {file:'',line:0} only when no day files exist.
-
-describe('session-window (D1.1)', () => {
+describe('session-window', () => {
   let dir: string;
-  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sw-')); });
+  beforeEach(() => { dir = makeTestTemp('sw-'); });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
   const win = (over: Partial<SessionWindow> = {}): SessionWindow => ({
@@ -65,7 +61,7 @@ describe('session-window (D1.1)', () => {
     expect(latestDayFileEof(path.join(dir, 'does-not-exist'))).toEqual({ file: '', line: 0 });
   });
 
-  it('resolveWindow: absent window + day files ⇒ empty window at latest-day EOF (A-L6/N-7)', () => {
+  it('resolveWindow: absent window + day files ⇒ empty window at latest-day EOF', () => {
     fs.writeFileSync(path.join(dir, '2026-08-25.jsonl'), 'x\ny\n');
     const p = path.join(dir, 'session-window.json');
     expect(resolveWindow(p, dir)).toEqual({
@@ -82,7 +78,7 @@ describe('session-window (D1.1)', () => {
     });
   });
 
-  it('resolveWindow: corrupt window + day files ⇒ latest-day EOF, not {file:"",line:0} (N-7)', () => {
+  it('resolveWindow: corrupt window + day files ⇒ latest-day EOF, not {file:"",line:0}', () => {
     fs.writeFileSync(path.join(dir, '2026-08-25.jsonl'), 'x\ny\n');
     const p = path.join(dir, 'session-window.json');
     fs.writeFileSync(p, '{corrupt');
@@ -95,21 +91,18 @@ describe('session-window (D1.1)', () => {
   it('resolveWindow: a present, valid window is returned unchanged', () => {
     const p = path.join(dir, 'session-window.json');
     const w = win({ lastPromptTokens: 99 });
-    // A valid persisted cursor must resolve to an existing day file and physical slot.
     fs.writeFileSync(path.join(dir, '2026-08-25.jsonl'), 'a\nb\nc\nd\n');
     saveWindow(p, w);
     expect(resolveWindow(p, dir)).toEqual(w);
   });
 });
 
-describe('dateKey (A-H3 — one shared UTC day key)', () => {
+describe('dateKey (one shared UTC day key)', () => {
   it('returns the UTC YYYY-MM-DD (matching NarrativeStore)', () => {
     expect(dateKey(new Date('2026-08-25T14:00:00.000Z'))).toBe('2026-08-25');
   });
 
-  it('a 00:30 IST turn maps to the PREVIOUS UTC day (TZ-agnostic archive; H-3)', () => {
-    // 2026-08-26 00:30 +05:30 == 2026-08-25 19:00 UTC → the archive day is 2026-08-25,
-    // the same file the IST-evening sweep reads. (No local-TZ drift.)
+  it('a 00:30 IST turn maps to the PREVIOUS UTC day (TZ-agnostic archive; )', () => {
     expect(dateKey(new Date('2026-08-26T00:30:00.000+05:30'))).toBe('2026-08-25');
   });
 });

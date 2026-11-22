@@ -1,17 +1,21 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
 import { ContextAssembler } from '../../src/agent/context';
 import { InvariantViolationError } from '../../src/shared/errors';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+import { makeTestTemp } from '../helpers/test-temp';
+import { ownerTools } from '../helpers/owner-tools';
 
-// Task 13 — the v2 memory core wired behind the live Gateway: ledger/episode/safety tool
-// groups registered per profile, the ledger tools driving both lanes + SAFETY.md, the
-// per-turn narrative capture hook (F4/CHAT-06), and the boot-time SAFETY invariant (D9).
+const CHAT_BINDING = 'chat-1';
 
-function makeConfig(tmpDir: string): AppConfig {
+function makeConfig(tmpDir: string): EffectiveConfig {
+const owner = fixtureOwner(tmpDir);
   return {
+  schemaVersion: 2,
+  ...ownerSelection(owner),
     providers: {
       main: { type: 'ollama', model: 'kimi-k2.5:cloud', baseUrl: 'http://localhost:11434/v1' },
       medical: { type: 'ollama', model: 'medgemma', baseUrl: 'http://localhost:11434/v1' },
@@ -20,23 +24,21 @@ function makeConfig(tmpDir: string): AppConfig {
     channels: { telegram: { enabled: false, botToken: '' } },
     tools: { allow: ['*'], deny: [] },
     memory: {
-      workspace: path.join(tmpDir, 'workspace'),
+      workspace: owner.workspace,
       search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
       bootstrapMaxChars: 20000,
     },
     sessions: {
-      softResetAfterMinutes: 240,
-      hardResetAfterMinutes: 1440,
-      compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+      compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
     },
     heartbeat: {
       enabled: false,
       timezone: 'Asia/Kolkata',
-      storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+      storePath: owner.storePath,
       recovery: { enabled: false, windowMinutes: 60 },
       retry: { maxRetries: 3, backoffMinutes: 5 },
       rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-      audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+      audit: { path: owner.auditLogPath },
       policy: {
         quietHours: { enabled: true, start: '22:00', end: '07:00' },
         skipIfChatActiveWithinMinutes: 60,
@@ -46,20 +48,20 @@ function makeConfig(tmpDir: string): AppConfig {
         },
       },
     },
-    agent: { maxIterations: 15, disclaimerEnabled: true },
+    agent: { maxIterations: 15 },
   };
 }
 
 const today = (): string => new Date().toISOString().slice(0, 10);
 
-describe('Gateway memory-core wiring (Task 13)', () => {
+describe('Gateway memory-core wiring', () => {
   let tmpDir: string;
   let gateway: Gateway;
   let workspace: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-memcore-wire-'));
-    workspace = path.join(tmpDir, 'workspace');
+    tmpDir = makeTestTemp('redacted-memcore-wire-');
+    workspace = fixtureOwner(tmpDir).workspace;
   });
   afterEach(async () => {
     try { await gateway?.stop(); } catch { /* ignore */ }
@@ -67,10 +69,10 @@ describe('Gateway memory-core wiring (Task 13)', () => {
   });
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const registryOf = (): any => (gateway as any).agentLoop.registry;
+  const registryOf = (): any => ownerTools((gateway as any).agentLoop.registry);
 
   it('registers the ledger, episode, and safety tool groups', async () => {
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     await gateway.start();
     warn.mockRestore();
@@ -80,7 +82,7 @@ describe('Gateway memory-core wiring (Task 13)', () => {
   });
 
   it('ledger_record via the registry writes the ledger, SAFETY.md, and the narrative cross-anchor', async () => {
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     await gateway.start();
     warn.mockRestore();
@@ -97,13 +99,12 @@ describe('Gateway memory-core wiring (Task 13)', () => {
     expect(narrative).toContain('metformin →');
   });
 
-  it('captures raw user text into the narrative lane every turn (F4/CHAT-06)', async () => {
-    gateway = new Gateway(makeConfig(tmpDir));
+  it('captures raw user text into the narrative lane every turn', async () => {
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     await gateway.start();
     warn.mockRestore();
 
-    // Skip onboarding + stub the agent so turns reach the capture + agent path deterministically.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (gateway.runtimeInstance!.turnCoordinator as any).handleOnboarding = async (): Promise<null> => null;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -117,13 +118,11 @@ describe('Gateway memory-core wiring (Task 13)', () => {
     expect(narrative).toContain('now my knee hurts too');
   });
 
-  it('aborts boot when the SAFETY.md injection invariant is violated (D9)', async () => {
-    // The real assembler injects SAFETY.md non-truncatably (Task 5). Here we force the guard
-    // to fire and assert start() does NOT swallow it — the daemon refuses to start.
+  it('aborts boot when the SAFETY.md injection invariant is violated', async () => {
     const spy = jest.spyOn(ContextAssembler.prototype, 'buildSystemMessages')
       .mockRejectedValue(new InvariantViolationError('SAFETY.md was not injected in full'));
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    gateway = new Gateway(makeConfig(tmpDir));
+    gateway = new Gateway(makeConfig(tmpDir), await bindGatewayOwner(makeConfig(tmpDir), CHAT_BINDING));
 
     await expect(gateway.start()).rejects.toBeInstanceOf(InvariantViolationError);
 

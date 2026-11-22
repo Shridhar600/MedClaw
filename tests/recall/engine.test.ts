@@ -2,7 +2,7 @@ import { RecallEngine, DEFAULT_RECALL_CONFIG } from '../../src/recall';
 import type { RecallDeps } from '../../src/recall';
 import type { FactRecord, FactMirror } from '../../src/ports';
 import {
-  FakeFactMirror, FakeVectorIndex, FakeKeywordIndex, FakeEmbedding, FakeChunkStats, ThrowingChunkStats, fixedClock, chunkHit,
+  FakeFactMirror, currentFactsOf, FakeVectorIndex, FakeKeywordIndex, FakeEmbedding, FakeChunkStats, ThrowingChunkStats, fixedClock, chunkHit,
 } from './fakes';
 
 function frec(over: Partial<FactRecord> & { id: string; entity: string }): FactRecord {
@@ -14,19 +14,21 @@ function frec(over: Partial<FactRecord> & { id: string; entity: string }): FactR
 }
 
 function makeEngine(over: Partial<RecallDeps> = {}): RecallEngine {
+  const factMirror = over.factMirror ?? new FakeFactMirror();
   return new RecallEngine({
     embedding: over.embedding ?? new FakeEmbedding(),
     vectorIndex: over.vectorIndex ?? new FakeVectorIndex(),
     keywordIndex: over.keywordIndex ?? new FakeKeywordIndex(),
-    factMirror: over.factMirror ?? new FakeFactMirror(),
+    factMirror,
     chunkStats: over.chunkStats ?? new FakeChunkStats(),
     clock: over.clock ?? fixedClock('2026-10-01T00:00:00.000Z'),
     config: over.config ?? DEFAULT_RECALL_CONFIG,
+    currentFacts: over.currentFacts ?? currentFactsOf(factMirror),
   });
 }
 
 describe('RecallEngine — Stage 1 (active ledger)', () => {
-  it('injects active clinical facts, excludes discontinued, includes paused with pre_pause_summary (KNEE-08)', async () => {
+  it('injects active clinical facts, excludes discontinued, includes paused with pre_pause_summary', async () => {
     const mirror = new FakeFactMirror([
       frec({ id: 'metformin@v1', entity: 'metformin', type: 'medication', status: 'active', fields: { dose: '500mg' } }),
       frec({ id: 'naproxen@v1', entity: 'naproxen', type: 'medication', status: 'discontinued' }),
@@ -60,7 +62,6 @@ describe('RecallEngine — Stage 1 (active ledger)', () => {
       config: { ...DEFAULT_RECALL_CONFIG, ledgerBudget: 50 },
     }).run({ profileId: 'default', userMessage: 'hello' });
     expect(r.ledgerTokens).toBeLessThanOrEqual(50);
-    // 60 long facts cannot all fit in 50 tokens
     expect(r.ledger).not.toContain('entity-number-59');
   });
 });
@@ -79,16 +80,12 @@ describe('RecallEngine — Stage 2 (hybrid narrative recall)', () => {
     expect(r.indexStatus).toBe('full');
   });
 
-  it('CONTRA-10: suppresses chunks whose ledger entity has a newer active version', async () => {
-    // Dates kept recent so the surviving v3 chunk is not separately decayed away — this isolates
-    // the suppression mechanism (older versions dropped because the entity head is newer).
+  it('suppresses chunks whose ledger entity has a newer active version', async () => {
     const mirror = new FakeFactMirror([
       frec({ id: 'metformin@v1', entity: 'metformin', version: 1, status: 'retracted', createdAt: '2026-09-28T00:00:00.000Z' }),
       frec({ id: 'metformin@v2', entity: 'metformin', version: 2, status: 'superseded', createdAt: '2026-09-29T00:00:00.000Z' }),
       frec({ id: 'metformin@v3', entity: 'metformin', version: 3, status: 'active', createdAt: '2026-09-30T00:00:00.000Z' }),
     ]);
-    // Version statements live in the ledger file → lane 'ledger'; newer-active suppression is scoped
-    // to ledger-lane chunks (see the F2 fix-pass test — narrative mentions are NOT version-suppressed).
     const chunks = [
       chunkHit({ id: 'ck1', content: 'metformin 500mg noted', lane: 'ledger', createdAt: '2026-09-28T00:00:00.000Z', score: 0.9 }),
       chunkHit({ id: 'ck2', content: 'metformin 850mg noted', lane: 'ledger', createdAt: '2026-09-29T00:00:00.000Z', score: 0.9 }),
@@ -101,7 +98,7 @@ describe('RecallEngine — Stage 2 (hybrid narrative recall)', () => {
     expect(r.narrative).not.toContain('850mg');
   });
 
-  it('KNEE-10: suppresses chunks for a discontinued entity (stale fail-closed)', async () => {
+  it('suppresses chunks for a discontinued entity (stale fail-closed)', async () => {
     const mirror = new FakeFactMirror([
       frec({ id: 'naproxen@v2', entity: 'naproxen', version: 2, status: 'discontinued', createdAt: '2026-08-15T00:00:00.000Z' }),
     ]);
@@ -112,12 +109,10 @@ describe('RecallEngine — Stage 2 (hybrid narrative recall)', () => {
     expect(r.injectedChunkIds).toHaveLength(0);
   });
 
-  it('KNEE-06: a dormant safety_relevant fact clears the 0.3 threshold despite age (decay=1)', async () => {
+  it('a dormant safety_relevant fact clears the 0.3 threshold despite age (decay=1)', async () => {
     const mirror = new FakeFactMirror([
       frec({ id: 'knee@v2', entity: 'knee-injury', type: 'condition', version: 2, status: 'resolved', safetyRelevant: true, authority: 'report', createdAt: '2026-07-01T00:00:00.000Z' }),
     ]);
-    // A knee chunk ~90 days old. Non-safety it would decay to exp(-90/120)=0.47 → raw ~0.32 < 0.5 (dropped);
-    // safety_relevant → decay=1 → raw 0.68 ≥ 0.3 (kept). lane 'ledger' → safety threshold applies.
     const knee = chunkHit({ id: 'knee-ck', content: 'knee injury MCL sprain avoid heavy leg loading', lane: 'ledger', createdAt: '2026-07-01T00:00:00.000Z', score: 0.8 });
     const r = await makeEngine({
       factMirror: mirror,
@@ -129,9 +124,7 @@ describe('RecallEngine — Stage 2 (hybrid narrative recall)', () => {
     expect(hit?.safetyRelevant).toBe(true);
   });
 
-  it('VANI-10 (recall half): finds a dormant chest-pain episode on "chest tightness"', async () => {
-    // "chest tightness" ↔ "chest pain" carries both semantic + keyword overlap; a ~30-day-old
-    // non-safety episode needs that combined signal to clear 0.5 after decay.
+  it('finds a dormant chest-pain episode on "chest tightness"', async () => {
     const episode = chunkHit({ id: 'ep-chest', content: 'chest pain episode — diagnosed as anxiety attack', lane: 'episode', createdAt: '2026-09-01T00:00:00.000Z', score: 0.85 });
     const r = await makeEngine({
       vectorIndex: new FakeVectorIndex([episode]),
@@ -141,7 +134,7 @@ describe('RecallEngine — Stage 2 (hybrid narrative recall)', () => {
     expect(r.narrative).toContain('anxiety attack');
   });
 
-  it('CHAT-08: returns at most finalTopK results within the narrative token budget', async () => {
+  it('returns at most finalTopK results within the narrative token budget', async () => {
     const chunks = Array.from({ length: 10 }, (_, i) =>
       chunkHit({ id: `big${i}`, content: `health note number ${i} with enough words to matter here`, createdAt: '2026-10-01T00:00:00.000Z', score: 0.9 }));
     const r = await makeEngine({ vectorIndex: new FakeVectorIndex(chunks), config: { ...DEFAULT_RECALL_CONFIG, narrativeBudget: 60 } })
@@ -159,7 +152,7 @@ describe('RecallEngine — Stage 2 (hybrid narrative recall)', () => {
     expect(r.hits[0].id).toBe('dup-a'); // higher raw retained
   });
 
-  it('CHAT-07: health-lane content is biased above non-health rants of similar relevance', async () => {
+  it('health-lane content is biased above non-health rants of similar relevance', async () => {
     const health = Array.from({ length: 4 }, (_, i) =>
       chunkHit({ id: `h${i}`, content: `stress and chest tightness note ${i}`, lane: 'episode', createdAt: '2026-10-01T00:00:00.000Z', score: 0.75 }));
     const rants = Array.from({ length: 3 }, (_, i) =>
@@ -175,7 +168,7 @@ describe('RecallEngine — Stage 2 (hybrid narrative recall)', () => {
 });
 
 describe('RecallEngine — Stage 3 (deterministic side-effect correlation)', () => {
-  it('DIAB-05: a new symptom matching an active med side effect emits a CHECK line with the temporal window', async () => {
+  it('a new symptom matching an active med side effect emits a CHECK line with the temporal window', async () => {
     const mirror = new FakeFactMirror([
       frec({
         id: 'jardiance@v1', entity: 'jardiance', type: 'medication', status: 'active', safetyRelevant: true,
@@ -232,7 +225,7 @@ describe('RecallEngine — Stage 3 (deterministic side-effect correlation)', () 
   });
 });
 
-describe('RecallEngine — Wave C fix-pass (M-1: mode-gated narrative)', () => {
+describe('RecallEngine — mode-gated narrative', () => {
   it('narrative:false skips embed + bumpInjected but still returns the Stage-1 ledger', async () => {
     const embedding = new FakeEmbedding();
     const embedSpy = jest.spyOn(embedding, 'embed');
@@ -299,7 +292,7 @@ describe('RecallEngine — Stage 4 (feedback + auto-mute)', () => {
     expect((await stats.get('injected'))?.usedCount).toBe(1);
   });
 
-  it('B4: auto-mutes a non-exempt chunk injected ≥20 with 0 uses', async () => {
+  it('auto-mutes a non-exempt chunk injected ≥20 with 0 uses', async () => {
     const stats = new FakeChunkStats();
     stats.seed('rant', 20, 0);
     const chunk = chunkHit({ id: 'rant', content: 'the same movie rant injected many times', lane: 'narrative', createdAt: '2026-10-01T00:00:00.000Z', score: 0.9 });
@@ -308,7 +301,7 @@ describe('RecallEngine — Stage 4 (feedback + auto-mute)', () => {
     expect(r.injectedChunkIds).not.toContain('rant');
   });
 
-  it('B4: never auto-mutes a safety_relevant chunk even at 20 injected / 0 used', async () => {
+  it('never auto-mutes a safety_relevant chunk even at 20 injected / 0 used', async () => {
     const stats = new FakeChunkStats();
     stats.seed('knee-ck', 20, 0);
     const mirror = new FakeFactMirror([
@@ -323,7 +316,7 @@ describe('RecallEngine — Stage 4 (feedback + auto-mute)', () => {
     expect(r.injectedChunkIds).toContain('knee-ck');
   });
 
-  it('B4: never auto-mutes a ledger|episode-lane chunk even at 20 injected / 0 used', async () => {
+  it('never auto-mutes a ledger|episode-lane chunk even at 20 injected / 0 used', async () => {
     const stats = new FakeChunkStats();
     stats.seed('ep', 20, 0);
     const chunk = chunkHit({ id: 'ep', content: 'a recurring episode note about sleep', lane: 'episode', createdAt: '2026-10-01T00:00:00.000Z', score: 0.9 });
@@ -334,8 +327,7 @@ describe('RecallEngine — Stage 4 (feedback + auto-mute)', () => {
 });
 
 describe('RecallEngine — resilience (never crashes the turn)', () => {
-  it('a throwing factMirror fails closed for narrative suppression while preserving turn safety', async () => {
-    // An async-iterable that rejects on iteration (avoids a yield-less generator, require-yield).
+  it('an unreadable fact source fails closed: a visible warning, no stale narrative', async () => {
     const boom = (): AsyncIterable<FactRecord> => ({
       [Symbol.asyncIterator]: () => ({ next: () => Promise.reject(new Error('boom')) }),
     });
@@ -346,7 +338,7 @@ describe('RecallEngine — resilience (never crashes the turn)', () => {
     const chunk = chunkHit({ id: 'c', content: 'a note that scores well enough here', createdAt: '2026-10-01T00:00:00.000Z', score: 0.9 });
     const r = await makeEngine({ factMirror: throwingMirror, vectorIndex: new FakeVectorIndex([chunk]) })
       .run({ profileId: 'default', userMessage: 'note' });
-    expect(r.ledger).toBe('');  // stage 1 degraded
+    expect(r.ledger).toMatch(/could not be read/);  // stage 1 says so instead of going silently empty
     expect(r.checkNotes).toBe('');  // stage 3 degraded
     // A failed head read must never disable stale suppression and look healthy.
     expect(r.narrative).toBe('');
@@ -354,7 +346,7 @@ describe('RecallEngine — resilience (never crashes the turn)', () => {
   });
 });
 
-describe('RecallEngine — Stage 2 degrade (PLAT-11 keyword-only)', () => {
+describe('RecallEngine — Stage 2 degrade (keyword-only)', () => {
   const kw = () => chunkHit({ id: 'kw1', content: 'sleep has been rough lately per keyword search', createdAt: '2026-10-01T00:00:00.000Z', score: 0.8 });
 
   it('embed throw → keyword-only status, keyword hits still returned', async () => {
@@ -379,10 +371,8 @@ describe('RecallEngine — Stage 2 degrade (PLAT-11 keyword-only)', () => {
   });
 });
 
-describe('RecallEngine — Wave B fix-pass (panel findings)', () => {
-  // F1: the pre-decay floor must not drop safety_relevant chunks (B6 "OR safety_relevant" carve-out).
-  // With the floor configured ABOVE both chunks' base, only the safety chunk (exempt) survives.
-  it('F1: a safety_relevant chunk is exempt from the pre-decay floor; a non-safety peer is not', async () => {
+describe('RecallEngine — ranking and mute guards', () => {
+  it('a safety_relevant chunk is exempt from the pre-decay floor; a non-safety peer is not', async () => {
     const mirror = new FakeFactMirror([
       frec({ id: 'knee@v1', entity: 'knee-injury', type: 'condition', status: 'resolved', safetyRelevant: true, createdAt: '2026-09-15T00:00:00.000Z' }),
     ]);
@@ -399,9 +389,7 @@ describe('RecallEngine — Wave B fix-pass (panel findings)', () => {
     expect(r.hits.map(h => h.id)).not.toContain('plain'); // non-safety floored out at 0.47 < 0.5
   });
 
-  // F2: newer-active suppression is scoped to ledger-lane version statements; a narrative adverse-event
-  // mention of an active med is NOT suppressed by a later routine dose update.
-  it('F2: an adverse-event narrative for an active med survives a newer active head', async () => {
+  it('an adverse-event narrative for an active med survives a newer active head', async () => {
     const mirror = new FakeFactMirror([
       frec({ id: 'met@v2', entity: 'metformin', version: 2, status: 'active', safetyRelevant: true, createdAt: '2026-09-01T00:00:00.000Z' }),
     ]);
@@ -411,8 +399,7 @@ describe('RecallEngine — Wave B fix-pass (panel findings)', () => {
     expect(r.narrative).toContain('felt shaky and sweaty');
   });
 
-  // F2b: a ledger-lane older version IS still suppressed (CONTRA-10 preserved).
-  it('F2b: a ledger-lane chunk older than the active head is still suppressed', async () => {
+  it('a ledger-lane chunk older than the active head is still suppressed', async () => {
     const mirror = new FakeFactMirror([
       frec({ id: 'met@v2', entity: 'metformin', version: 2, status: 'active', createdAt: '2026-09-30T00:00:00.000Z' }),
     ]);
@@ -422,8 +409,7 @@ describe('RecallEngine — Wave B fix-pass (panel findings)', () => {
     expect(r.narrative).not.toContain('500mg');
   });
 
-  // F4: suppression tolerates plural/inflected mentions (KNEE-10 must not leak on "UTIs").
-  it('F4: a plural mention of a discontinued entity is still suppressed', async () => {
+  it('a plural mention of a discontinued entity is still suppressed', async () => {
     const mirror = new FakeFactMirror([
       frec({ id: 'uti@v2', entity: 'uti', type: 'condition', version: 2, status: 'discontinued', createdAt: '2026-08-01T00:00:00.000Z' }),
     ]);
@@ -433,7 +419,7 @@ describe('RecallEngine — Wave B fix-pass (panel findings)', () => {
     expect(r.injectedChunkIds).not.toContain('utick');
   });
 
-  it('C-21: a disputed entity is suppressed from automatic narrative recall', async () => {
+  it('a disputed entity is suppressed from automatic narrative recall', async () => {
     const mirror = new FakeFactMirror([
       frec({ id: 'dose-change@v2', entity: 'dose-change', type: 'medication', version: 2, status: 'disputed' }),
     ]);
@@ -444,8 +430,7 @@ describe('RecallEngine — Wave B fix-pass (panel findings)', () => {
     expect(r.narrative).not.toContain('dose-change was 10mg');
   });
 
-  // F8: a throwing chunkStats.get must not sink the whole turn (per-dependency resilience).
-  it('F8: a throwing chunkStats read degrades to no-mute, recall still surfaces', async () => {
+  it('a throwing chunkStats read degrades to no-mute, recall still surfaces', async () => {
     const chunk = chunkHit({ id: 'ck', content: 'a decent health note about energy levels', lane: 'narrative', createdAt: '2026-10-01T00:00:00.000Z', score: 0.9 });
     const r = await makeEngine({ vectorIndex: new FakeVectorIndex([chunk]), chunkStats: new ThrowingChunkStats() })
       .run({ profileId: 'default', userMessage: 'energy' });
@@ -453,8 +438,7 @@ describe('RecallEngine — Wave B fix-pass (panel findings)', () => {
     expect(r.indexStatus).not.toBe('failed');
   });
 
-  // F8b: a keyword-arm throw must not discard already-gathered vec candidates; status stays 'full'.
-  it('F8b: a keyword-index throw preserves vec candidates (status full)', async () => {
+  it('a keyword-index throw preserves vec candidates (status full)', async () => {
     const vecHit = chunkHit({ id: 'v', content: 'a solid vector-found health note here', createdAt: '2026-10-01T00:00:00.000Z', score: 0.9 });
     const r = await makeEngine({
       vectorIndex: new FakeVectorIndex([vecHit]),
@@ -464,8 +448,7 @@ describe('RecallEngine — Wave B fix-pass (panel findings)', () => {
     expect(r.indexStatus).toBe('full');
   });
 
-  // F6: an empty embedding vector is an outage → keyword-only + status, not a silent 'full'.
-  it('F6: an empty embedding vector degrades to keyword-only', async () => {
+  it('an empty embedding vector degrades to keyword-only', async () => {
     const kw = chunkHit({ id: 'kw', content: 'keyword note about sleep quality lately', createdAt: '2026-10-01T00:00:00.000Z', score: 0.8 });
     const r = await makeEngine({
       embedding: new FakeEmbedding({ vector: [] }),
@@ -476,8 +459,8 @@ describe('RecallEngine — Wave B fix-pass (panel findings)', () => {
     expect(r.narrative).not.toContain('vector note');
   });
 
-  // F3: Stage-1 budget must prioritize safety rows (allergy) so they are never silently evicted.
-  it('F3: an allergy (safety) row survives the ledger budget even when placed last, and truncation is flagged', async () => {
+  // Stage-1 budget must prioritize safety rows (allergy) so they are never silently evicted.
+  it('an allergy (safety) row survives the ledger budget even when placed last, and truncation is flagged', async () => {
     const facts: FactRecord[] = [];
     for (let i = 0; i < 40; i++) {
       facts.push(frec({ id: `g${i}`, entity: `goal-number-${i}`, type: 'goal', fields: { note: 'a reasonably long non-safety goal detail line' } }));
@@ -491,8 +474,7 @@ describe('RecallEngine — Wave B fix-pass (panel findings)', () => {
     expect(r.ledgerTruncated).toBe(true);
   });
 
-  // F7: Stage-3 correlates only recent(90d) meds; a long-standing med does not fire on every mention.
-  it('F7: a med started >90d ago does not emit a side-effect CHECK', async () => {
+  it('a med started >90d ago does not emit a side-effect CHECK', async () => {
     const mirror = new FakeFactMirror([
       frec({ id: 'jard@v1', entity: 'jardiance', type: 'medication', status: 'active', fields: { started: '2024-01-01', known_side_effects: ['genital-yeast-infection'] } }),
     ]);
@@ -501,8 +483,7 @@ describe('RecallEngine — Wave B fix-pass (panel findings)', () => {
     expect(r.checkNotes).toBe('');
   });
 
-  // F15: an entity with both an active head and an older paused version renders once (active wins).
-  it('F15: an entity active head is not double-rendered with its older paused version', async () => {
+  it('an entity active head is not double-rendered with its older paused version', async () => {
     const mirror = new FakeFactMirror([
       frec({ id: 'gym@v3', entity: 'gym-goal', type: 'goal', version: 3, status: 'active', fields: { target: '3x/week' } }),
       frec({ id: 'gym@v2', entity: 'gym-goal', type: 'goal', version: 2, status: 'paused', fields: { pre_pause_summary: '2x/week moderate' } }),

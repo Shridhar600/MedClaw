@@ -6,9 +6,7 @@ export interface Chunk {
   startLine: number;
   endLine: number;
   createdAt: string;
-  // The dense embedding to index. Optional so a chunk may be stored as searchable
-  // metadata (e.g. keyword-only) without a vector; the vector index skips vec rows for
-  // chunks without one.
+  // Optional: a chunk may be stored as keyword-only metadata. The vector index skips chunks without one.
   embedding?: number[];
 }
 

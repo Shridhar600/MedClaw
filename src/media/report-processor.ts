@@ -1,13 +1,25 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { Worker } from 'worker_threads';
-import { PDFParse } from 'pdf-parse';
 import type { ImageAttachment } from '../providers/types';
 import { MediaValidationError } from '../shared/errors';
 
 const workerGlobal = globalThis as unknown as { Worker?: typeof Worker };
 workerGlobal.Worker ??= Worker;
-PDFParse.setWorker(path.join(path.dirname(require.resolve('pdf-parse')), 'pdf.worker.mjs'));
+
+let pdfParseModule: Promise<typeof import('pdf-parse')> | undefined;
+
+async function loadPdfParse(): Promise<typeof import('pdf-parse').PDFParse> {
+  pdfParseModule ??= (async () => {
+    const loaded = await import('pdf-parse');
+    loaded.PDFParse.setWorker(
+      path.join(path.dirname(require.resolve('pdf-parse')), 'pdf.worker.mjs'),
+    );
+    return loaded;
+  })();
+  const loaded = await pdfParseModule;
+  return loaded.PDFParse;
+}
 
 export type ProcessedReportKind = 'text' | 'pdf-text' | 'image' | 'pdf-image';
 
@@ -104,6 +116,7 @@ async function processPdfReport(
     throw new MediaValidationError('File has a .pdf extension but does not look like a PDF document.');
   }
 
+  const PDFParse = await loadPdfParse();
   const parser = new PDFParse({ data: pdfData });
   try {
     const textResult = await parser.getText({ first: maxPdfPages });

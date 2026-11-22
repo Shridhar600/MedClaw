@@ -1,14 +1,15 @@
-import type { IncomingMessage } from '../channels/types';
+import type { AdmittedMessage } from '../channels';
 import type { AgentRunResult, Message } from '../providers/types';
 import { OnboardingFlow } from '../onboarding/flow';
 import { OnboardingStore } from '../onboarding/store';
+import type { SeedFact } from '../onboarding/seed-facts';
 import { HEARTBEAT_NOOP } from '../scheduler/delivery-policy';
 import {
   HeartbeatPreemptedError,
   LLMSemaphore,
   type SemaphorePriority,
 } from '../tools/semaphore';
-import { summarizeErrorForLog } from '../security';
+import { contentContainsCredentials, summarizeErrorForLog } from '../security';
 import type { HeartbeatJob } from '../scheduler/types';
 import type { ProfileRuntime } from './runtime';
 import { DaemonShutdownError } from '../shared/errors';
@@ -16,6 +17,7 @@ import { DaemonShutdownError } from '../shared/errors';
 const SESSION_RESET_FAILURE_RESPONSE = "I couldn't start a fresh session right now. Please try again in a moment.";
 const AGENT_FAILURE_RESPONSE = "I'm having trouble right now. Please try again in a moment.";
 const SESSION_RESET_RESPONSE = 'Starting fresh session. Your health memory is preserved.';
+const CREDENTIAL_REFUSAL_RESPONSE = "That message looks like it contains a password or API key, so I didn't read or save it. Please send it again without the secret.";
 const COMPACTION_RESPONSE = 'Compacted the conversation. Older turns are summarized; recent context is kept. Nothing is lost — ask me to look anything up.';
 
 export const MAX_QUEUED_TURNS_WAITING = 2;
@@ -23,13 +25,11 @@ export const MAX_QUEUED_TURNS_WAITING = 2;
 export type TurnEgress = (text: string) => Promise<void>;
 export type EmergencyResponse = (input: string) => string | undefined;
 
-export async function captureUserTurn(runtime: ProfileRuntime, incoming: IncomingMessage): Promise<void> {
+export async function captureUserTurn(runtime: ProfileRuntime, incoming: AdmittedMessage): Promise<void> {
   const pipeline = runtime.capturePipeline;
   if (!pipeline || incoming.text.trim().length === 0) return;
   try {
     await pipeline.ingest({
-      profileId: String(runtime.profileId),
-      source: 'chat',
       kind: 'narrative-note',
       payload: { text: incoming.text },
       ...(incoming.messageId ? { idempotencyKey: `chat:${incoming.chatId}:${incoming.messageId}` } : {}),
@@ -39,7 +39,7 @@ export async function captureUserTurn(runtime: ProfileRuntime, incoming: Incomin
   }
 }
 
-export function scheduleBackgroundCapture(runtime: ProfileRuntime, incoming: IncomingMessage): void {
+export function scheduleBackgroundCapture(runtime: ProfileRuntime, incoming: AdmittedMessage): void {
   runtime.trackBackgroundOperation('emergency capture', () => captureUserTurn(runtime, incoming));
 }
 
@@ -55,29 +55,11 @@ export interface HeartbeatTurnRequest {
   input: string;
   egress: TurnEgress;
   afterDelivery: (result: AgentRunResult) => Promise<void>;
-  /**
-   * RR-STRUCT R-S3b (C-39 for heartbeats): stable per-OCCURRENCE identity
-   * (`heartbeatTurnId`), threaded into the `AgentLoop` run-context so a tool called
-   * inside a heartbeat (e.g. `ledger_record`) builds a deterministic idempotency key —
-   * a scheduler RETRY of the same occurrence returns the cached original instead of
-   * double-writing. Absent ⇒ `AgentLoop` falls back to its in-memory sequence number
-   * (today's behavior).
-   */
+  /** Stable per-occurrence id; a scheduler retry then reuses the cached tool result instead of double-writing. */
   turnId?: string;
 }
 
-/**
- * RR-STRUCT R-S3b: the heartbeat occurrence key — `${job.id}:${job.lastRunAt}`.
- *
- * `lastRunAt` is set by `HeartbeatStore.markRun` AFTER the trigger completes
- * (`scheduler/runtime.ts` `executeJobBody`), and NO retry/failure/outcome path touches
- * it (`retry-policy` patches, `markError`, `recordOutcome` all leave it alone) — so it
- * is STABLE across a RETRY of one occurrence (the retry dedupes the write it already
- * made) but DISTINCT across occurrences (tomorrow's recurring reminder is NOT dropped
- * as a duplicate of tonight's — a static `job.id` alone WOULD drop it). A missing
- * `lastRunAt` (e.g. a never-yet-run job) yields `undefined`: no key, today's
- * per-call behavior — never a random/unstable one.
- */
+/** `${job.id}:${job.lastRunAt}`: stable across a retry of one occurrence, distinct across occurrences. */
 export function heartbeatTurnId(job: Pick<HeartbeatJob, 'id' | 'lastRunAt'>): string | undefined {
   if (!job.lastRunAt) return undefined;
   return `${job.id}:${job.lastRunAt}`;
@@ -87,18 +69,12 @@ export type HeartbeatTurnResult =
   | { status: 'sent'; result: AgentRunResult }
   | { status: 'noop'; result: AgentRunResult }
   | { status: 'preempted'; error: HeartbeatPreemptedError }
-  /**
-   * RR-STRUCT R-S4 (mini-plan v3 §3.9, Part B): the runtime closed its stores mid-drain — this
-   * heartbeat turn was abandoned by the bounded hard-stop (Part C) or lost the shutdown race.
-   * Distinct from 'preempted' (a live user turn evicted it) and from an actual failure — a
-   * shutdown-time abandonment is expected/benign and must NOT be recorded via
-   * `scheduler.recordFailure` (Gateway.handleScheduledJob only branches on 'preempted'; an
-   * 'abandoned' result falls through harmlessly, exactly like 'sent'/'noop').
-   */
+  /** The runtime closed its stores mid-drain; expected and benign, never recorded as a failure. */
   | { status: 'abandoned'; error: DaemonShutdownError };
 
 interface QueueEntry {
   execute: () => Promise<void>;
+  reject: (error: unknown) => void;
 }
 
 interface ChatQueue {
@@ -119,7 +95,7 @@ export class TurnCoordinator {
   ) {}
 
   runUser(
-    incoming: IncomingMessage,
+    incoming: AdmittedMessage,
     egress: TurnEgress,
     emergencyResponse: EmergencyResponse,
   ): Promise<string> {
@@ -139,9 +115,7 @@ export class TurnCoordinator {
         return { status: 'preempted', error };
       }
       if (error instanceof DaemonShutdownError) {
-        // Log-and-drop (never crash, never error-scare, never rethrown to process level): the
-        // heartbeat's write was refused because the runtime already closed its stores. Do not
-        // attempt egress/afterDelivery against a runtime/channel that is mid-teardown.
+        // Log-and-drop: never touch a channel or runtime that is mid-teardown.
         console.warn('[gateway] Heartbeat turn abandoned by shutdown (log-and-drop):', summarizeErrorForLog(error));
         return { status: 'abandoned', error };
       }
@@ -151,6 +125,10 @@ export class TurnCoordinator {
 
   private enqueue<T>(chatId: string, priority: SemaphorePriority, operation: () => Promise<T>): Promise<T> {
     const queue = this.queues.get(chatId) ?? { user: [], heartbeat: [], draining: false };
+    // The owner outranks waiting check-ins: evict them rather than refuse the owner.
+    if (priority === 'user') {
+      for (const waiting of queue.heartbeat.splice(0)) waiting.reject(new HeartbeatPreemptedError());
+    }
     const waitingCount = queue.user.length + queue.heartbeat.length;
     if (waitingCount >= this.maxQueuedTurnsWaiting) {
       return Promise.reject(new TurnQueueFullError());
@@ -163,6 +141,7 @@ export class TurnCoordinator {
 
     const promise = new Promise<T>((resolve, reject) => {
       const entry: QueueEntry = {
+        reject,
         execute: async () => {
           try {
             resolve(await operation());
@@ -208,7 +187,7 @@ export class TurnCoordinator {
   }
 
   private async executeUser(
-    incoming: IncomingMessage,
+    incoming: AdmittedMessage,
     egress: TurnEgress,
     emergencyResponse: EmergencyResponse,
   ): Promise<string> {
@@ -229,6 +208,9 @@ export class TurnCoordinator {
       await sessions.runCompaction(chatId);
       return this.emit(egress, COMPACTION_RESPONSE);
     }
+
+    // Secrets are refused before any path can record, capture or send them.
+    if (contentContainsCredentials(text).matched) return this.emit(egress, CREDENTIAL_REFUSAL_RESPONSE);
 
     const agentInput = this.buildAgentInput(incoming);
 
@@ -258,8 +240,7 @@ export class TurnCoordinator {
       return onboarding;
     }
 
-    // Keep the post-onboarding emergency check as a separate safety boundary. The Router normally
-    // handles the same emergency before this turn enters the coordinator.
+    // Separate safety boundary; the Router normally catches this emergency first.
     const postOnboardingEmergency = emergencyResponse(text);
     if (postOnboardingEmergency) {
       try {
@@ -284,13 +265,9 @@ export class TurnCoordinator {
     let result: AgentRunResult;
     try {
       const history = await sessions.prepareHistory(chatId);
-      // RR-STRUCT R-S3: derive `turnId` from the real Telegram messageId when available (the same
-      // identity `captureUserTurn` already keys its idempotencyKey on above) rather than letting
-      // AgentLoop fall back to an in-memory, restart-resetting sequence number — tool-call
-      // idempotency keys built from `context.turnId` need a value that is STABLE across a replayed
-      // delivery of the SAME message, which an in-process counter is not.
+      // Message-derived turnId keeps tool idempotency keys stable across a replay.
       const turnId = incoming.messageId ? `chat:${chatId}:${incoming.messageId}` : undefined;
-      result = await this.requireAgentLoop().run(agentInput, history, { chatId, mode: 'chat', turnId });
+      result = await this.requireAgentLoop().run(agentInput, history, { chatId, origin: 'user', mode: 'chat', turnId });
     } catch (error) {
       console.error('[gateway] Agent error:', summarizeErrorForLog(error));
       await this.persistFailureTrace(chatId, agentInput, AGENT_FAILURE_RESPONSE);
@@ -329,8 +306,7 @@ export class TurnCoordinator {
       return result.text;
     }
 
-    // Keep the production contract: a failed transcript write must not schedule a policy
-    // reconciliation from a turn whose durable state is uncertain.
+    // A failed transcript write must not schedule reconciliation from uncertain state.
     if (!persistFailed && this.reconcile) {
       try {
         await this.reconcile(chatId);
@@ -344,9 +320,7 @@ export class TurnCoordinator {
   private async executeHeartbeat(request: HeartbeatTurnRequest): Promise<AgentRunResult> {
     const sessions = this.requireSessions();
     const history = await sessions.prepareHistory(request.chatId);
-    // RR-STRUCT R-S3b: mirror `executeUser`'s message-derived `turnId` — the heartbeat's
-    // per-occurrence `turnId` (when supplied) is what tool-call idempotency keys are
-    // built from; `undefined` keeps `AgentLoop`'s sequence fallback (today's behavior).
+    // Mirrors executeUser: a per-occurrence turnId feeds idempotency keys.
     const result = await this.requireAgentLoop().run(
       request.input,
       history,
@@ -370,18 +344,47 @@ export class TurnCoordinator {
     return result;
   }
 
+  private onboardingFlow(): OnboardingFlow {
+    const { workspace, config } = this.runtime;
+    return new OnboardingFlow(
+      new OnboardingStore(workspace),
+      workspace,
+      config.heartbeat.timezone,
+      config.emergency?.keywords,
+      (facts) => this.recordSeedFacts(facts),
+    );
+  }
+
+  /** Onboarding answers go through the capture pipeline like chat. */
+  private async recordSeedFacts(facts: SeedFact[]): Promise<string[]> {
+    const pipeline = this.runtime.capturePipeline;
+    if (!pipeline) throw new Error('capture pipeline unavailable');
+    const capturedAt = new Date().toISOString();
+    const pending: string[] = [];
+    for (const seed of facts) {
+      const fact = seed.type === 'medication'
+        ? { ...seed, fields: { ...seed.fields, known_side_effects: await this.runtime.sideEffectLookup(seed.entity).catch(() => []) } }
+        : seed;
+      const result = await pipeline.ingest({
+        kind: 'ledger-fact',
+        idempotencyKey: `onboarding:${fact.type}:${fact.entity}:${JSON.stringify(fact.fields)}`,
+        payload: {
+          entity: fact.entity,
+          type: fact.type,
+          fields: fact.fields,
+          provenance: { source: 'user', confidence: 0.9, anchor: '', capturedAt },
+          text: `From onboarding: ${fact.type} ${fact.entity}`,
+        },
+      });
+      if (result && result.kind !== 'applied') pending.push(fact.entity);
+    }
+    return pending;
+  }
+
   private async handleOnboarding(chatId: string, input: string): Promise<string | undefined> {
-    const workspace = this.runtime.workspace;
-    const config = this.runtime.config;
     const sessions = this.requireSessions();
     if (input.trim() === '/onboarding restart' || input.trim() === '/profile update') {
-      const flow = new OnboardingFlow(
-        new OnboardingStore(workspace),
-        workspace,
-        config.heartbeat.timezone,
-        config.emergency?.keywords,
-      );
-      const result = await flow.handle('restart onboarding');
+      const result = await this.onboardingFlow().handle('restart onboarding');
       try {
         await sessions.recordTurn(chatId, [
           { role: 'user', content: input },
@@ -393,12 +396,7 @@ export class TurnCoordinator {
       return result.response;
     }
 
-    const flow = new OnboardingFlow(
-      new OnboardingStore(workspace),
-      workspace,
-      config.heartbeat.timezone,
-      config.emergency?.keywords,
-    );
+    const flow = this.onboardingFlow();
     if (await flow.isComplete()) return undefined;
 
     const result = await flow.handle(input);
@@ -414,7 +412,7 @@ export class TurnCoordinator {
     return result.response;
   }
 
-  private buildAgentInput(incoming: IncomingMessage): string {
+  private buildAgentInput(incoming: AdmittedMessage): string {
     const parts: string[] = [incoming.text];
     if (incoming.mediaPath) {
       parts.push('', `Uploaded media path (relative to workspace): ${incoming.mediaPath}`);
@@ -422,9 +420,7 @@ export class TurnCoordinator {
     if (incoming.replyToMessageId) {
       parts.push('', `Reply to message id: ${incoming.replyToMessageId}`);
     }
-    if (incoming.userId) {
-      parts.push('', `User id: ${incoming.userId}`);
-    }
+    // The transport sender id is never appended: it would reach the provider and the session window; mirrors router.ts.
     return parts.join('\n');
   }
 

@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { SqliteStore } from '../../src/memory/sqlite-store';
+import { makeTestTemp } from '../helpers/test-temp';
 
 function cosineSimilarity(a: number[], b: number[]): number {
   if (a.length !== b.length) return 0;
@@ -21,7 +21,7 @@ describe('vec0 ANN Search', () => {
   let warnSpy: jest.SpyInstance;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-vec0-'));
+    tmpDir = makeTestTemp('redacted-vec0-');
     store = new SqliteStore(path.join(tmpDir, 'test.db'));
     store.ensureVecTable(4);
     warnSpy = jest.spyOn(console, 'warn').mockImplementation();
@@ -74,9 +74,7 @@ describe('vec0 ANN Search', () => {
     const vecResults = store.vectorSearch(queryFloat32, 5);
 
     expect(vecResults.length).toBeGreaterThan(0);
-    // Top result should be chunk0 (most similar to query)
     expect(vecResults[0].chunkId).toBe('chunk0:0');
-    // Both methods return the same set of top-K chunks (order may differ on ties)
     const vecIds = new Set(vecResults.map(r => r.chunkId));
     const jsIds = new Set(jsResults.map(r => r.chunkId));
     expect(vecIds).toEqual(jsIds);
@@ -125,7 +123,7 @@ describe('vec0 ANN Search', () => {
   });
 
   it('profile-scoped indexes isolated', () => {
-    const tmpDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-vec0-2-'));
+    const tmpDir2 = makeTestTemp('redacted-vec0-2-');
     const store2 = new SqliteStore(path.join(tmpDir2, 'test.db'));
     store2.ensureVecTable(4);
 
@@ -144,20 +142,15 @@ describe('vec0 ANN Search', () => {
     fs.rmSync(tmpDir2, { recursive: true });
   });
 
-  // P0 gate: "Recall query < 200ms @ 5K chunks" (plan §P0 Gate Verification
-  // Checklist). Uses the real embedding dimension (embeddinggemma = 768) and
-  // deterministic synthetic vectors — no embedding provider needed.
-  describe('P0 gate: ANN performance @ 5K chunks', () => {
+  describe('ANN performance @ 5K chunks', () => {
     it('vectorSearch top-10 over 5000 chunks (768 dims) completes in <200ms', () => {
       const DIM = 768;
       const CHUNKS = 5000;
-      const perfDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-vec0-perf-'));
+      const perfDir = makeTestTemp('redacted-vec0-perf-');
       const perfStore = new SqliteStore(path.join(perfDir, 'perf.db'));
       try {
         perfStore.ensureVecTable(DIM);
 
-        // Deterministic pseudo-random vectors (mulberry32) so the test is
-        // reproducible and needs no embedding provider.
         let seed = 0x9e3779b9;
         const rand = (): number => {
           seed |= 0; seed = (seed + 0x6d2b79f5) | 0;
@@ -179,8 +172,6 @@ describe('vec0 ANN Search', () => {
         }
 
         const query = new Float32Array(makeVec());
-        // Warm-up query (page cache, statement prep), then measure 3 runs
-        // and gate on the median to damp CI jitter.
         perfStore.vectorSearch(query, 10);
         const timings: number[] = [];
         let results: ReturnType<typeof perfStore.vectorSearch> = [];
@@ -190,8 +181,6 @@ describe('vec0 ANN Search', () => {
           timings.push(performance.now() - start);
         }
 
-        // Guard: if sqlite-vec failed to load, vectorSearch returns [] instantly
-        // and the timing would be meaningless — the gate requires real results.
         expect(results).toHaveLength(10);
         const median = timings.sort((a, b) => a - b)[1];
         expect(median).toBeLessThan(200);

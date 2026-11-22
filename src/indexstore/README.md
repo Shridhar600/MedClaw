@@ -8,16 +8,15 @@ handles incremental chunk/embed on write.
 - `SqliteVecIndex` — `VectorIndex` adapter backed by sqlite-vec. Opens its OWN
   `better-sqlite3` connection to the injected `search.db` (WAL permits multiple
   connections) and imports `better-sqlite3` + `sqlite-vec` DIRECTLY — never `src/memory/`
-  (the v2→legacy boundary forbids it). Targets the same `chunks` + `chunks_vec0` tables
-  idempotently and self-migrates the two columns the port carries beyond P0's schema
+  (the module boundary forbids it). Targets the same `chunks` + `chunks_vec0` tables
+  idempotently and self-migrates the two columns the port carries beyond the base schema
   (`lane`, `created_at`). Dimension is fixed eagerly via config or lazily on the first
-  embedded upsert; a mismatch throws `VectorDimensionMismatchError` (B3).
+  embedded upsert; a mismatch throws `VectorDimensionMismatchError`.
 - `VectorDimensionMismatchError`, `SqliteVecIndexConfig`.
 
-**P1 scope (specs/16 §8 obligation — no waiver, G2):** the port seam + the shared contract
-(`tests/ports/vector-index.contract.ts`), NOT a live write-path swap. P0's indexer stays
-the primary writer; the adapter's writes are exercised by the contract suite against a temp
-DB. Live wiring is P2.
+**Scope:** the port seam and the shared contract (`tests/ports/vector-index.contract.ts`).
+This adapter is not the live write path yet. The indexer stays the primary writer; the
+adapter's writes are exercised by the contract suite against a temp DB.
 
 **Dependencies:** ports (vector-index), security (sanitized logging), better-sqlite3 +
 sqlite-vec (npm).

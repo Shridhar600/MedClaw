@@ -1,14 +1,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { CuriosityQueue } from '../../src/memcore/curiosity-queue';
 import type { CuriosityItem } from '../../src/memcore';
 import { fixedClock, seqIdGen } from '../helpers/memcore-fixtures';
+import { makeTestTemp } from '../helpers/test-temp';
 
 let tmpDir: string;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-curiosity-'));
+  tmpDir = makeTestTemp('redacted-curiosity-');
 });
 
 afterEach(() => {
@@ -97,7 +97,7 @@ describe('CuriosityQueue.list', () => {
   });
 });
 
-describe('CuriosityQueue missing-data kind (DD7)', () => {
+describe('CuriosityQueue missing-data kind', () => {
   it('round-trips a missing-data item through add/list', async () => {
     const s = new CuriosityQueue(tmpDir, fixedClock('2026-08-18T10:00:00Z'), seqIdGen('cq'), 'p1');
     await s.add(item({
@@ -138,7 +138,7 @@ describe('CuriosityQueue missing-data kind (DD7)', () => {
 });
 
 describe('CuriosityQueue.resolve', () => {
-  it('removes the item from list() and returns true; false for an unknown id', async () => {
+  it('removes the item from list and returns true; false for an unknown id', async () => {
     const s = new CuriosityQueue(tmpDir, fixedClock('2026-08-18T10:00:00Z'), seqIdGen('cq'), 'p1');
     await s.add(item());
     await s.add(item({ description: 'second' }));
@@ -167,13 +167,11 @@ describe('CuriosityQueue corrupt-file handling', () => {
   it('degrades with a warning instead of crashing when curiosity.md is corrupt', async () => {
     const s = new CuriosityQueue(tmpDir, fixedClock('2026-08-18T10:00:00Z'), seqIdGen('cq'), 'p1');
     await s.add(item());
-    // Corrupt the file with garbage after the first block.
     fs.appendFileSync(path.join(tmpDir, 'curiosity.md'), '## broken\nno metadata here\n');
 
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       const items = await s.list();
-      // First item survives; the corrupt block is skipped.
       expect(items.map(i => i.description)).toEqual(['no report after Wednesday visit']);
       expect(warnSpy).toHaveBeenCalled();
     } finally {

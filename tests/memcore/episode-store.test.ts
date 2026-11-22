@@ -1,13 +1,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { EpisodeStore } from '../../src/memcore/episode-store';
 import { fixedClock, seqIdGen } from '../helpers/memcore-fixtures';
+import { makeTestTemp } from '../helpers/test-temp';
 
 let tmpDir: string;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-episodes-'));
+  tmpDir = makeTestTemp('redacted-episodes-');
 });
 
 afterEach(() => {
@@ -33,7 +33,7 @@ describe('EpisodeStore.create', () => {
   });
 
   it('rejects a symlinked episodes lane before writing outside the profile root', async () => {
-    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-episode-outside-'));
+    const outside = makeTestTemp('redacted-episode-outside-');
     try {
       fs.symlinkSync(outside, path.join(tmpDir, 'episodes'), 'dir');
       const s = new EpisodeStore(tmpDir, fixedClock('2026-08-18T10:00:00Z'), seqIdGen('ep'));
@@ -81,7 +81,6 @@ describe('EpisodeStore.update', () => {
     expect(ep!.status).toBe('resolved');
     expect(ep!.note).toBe('healed');
     expect(ep!.updatedAt).toBe('2026-08-20T10:00:00.000Z');
-    // createdAt untouched
     expect(ep!.createdAt).toBe('2026-08-18T10:00:00.000Z');
   });
 
@@ -104,7 +103,6 @@ describe('EpisodeStore.link', () => {
     const ep = await s.link('ep-1', ['ibuprofen@v1', 'knee-pain@v1']);
     expect(ep!.linkedFactIds).toEqual(['ibuprofen@v1', 'knee-pain@v1']);
 
-    // link is idempotent on re-add
     const ep2 = await s.link('ep-1', ['ibuprofen@v1', 'mri@v1']);
     expect(ep2!.linkedFactIds).toEqual(['ibuprofen@v1', 'knee-pain@v1', 'mri@v1']);
   });
@@ -122,7 +120,7 @@ describe('EpisodeStore.remove', () => {
 });
 
 describe('EpisodeStore.list (paged)', () => {
-  it('list({limit:2}) returns 2 episodes + a cursor; the cursor returns the last (Task 7)', async () => {
+  it('list({limit:2}) returns 2 episodes + a cursor; the cursor returns the last ', async () => {
     const s = new EpisodeStore(tmpDir, fixedClock('2026-08-18T10:00:00Z'), seqIdGen('ep'));
     await s.create({ title: 'one', profileId: 'p1' });
     await s.create({ title: 'two', profileId: 'p1' });
@@ -137,7 +135,7 @@ describe('EpisodeStore.list (paged)', () => {
     expect(page2.nextCursor).toBeUndefined();
   });
 
-  it('list() with no limit returns every episode', async () => {
+  it('list with no limit returns every episode', async () => {
     const s = new EpisodeStore(tmpDir, fixedClock('2026-08-18T10:00:00Z'), seqIdGen('ep'));
     await s.create({ title: 'one', profileId: 'p1' });
     await s.create({ title: 'two', profileId: 'p1' });
@@ -158,11 +156,10 @@ describe('EpisodeStore.list (paged)', () => {
     expect(open.nextCursor).toBeUndefined();
   });
 
-  it('parses only the first page — a corrupt third file is never touched on page 1 (specs/16 §3)', async () => {
+  it('parses only the first page — a corrupt third file is never touched on page 1', async () => {
     const s = new EpisodeStore(tmpDir, fixedClock('2026-08-18T10:00:00Z'), seqIdGen('ep'));
     await s.create({ title: 'one', profileId: 'p1' });
     await s.create({ title: 'two', profileId: 'p1' });
-    // Third file is corrupt; if the pager parsed the whole dir it would hit it.
     fs.mkdirSync(path.join(tmpDir, 'episodes'), { recursive: true });
     fs.writeFileSync(path.join(tmpDir, 'episodes', 'ep-3.md'), 'not a real episode');
 
@@ -175,7 +172,6 @@ describe('EpisodeStore.list (paged)', () => {
       warnSpy.mockRestore();
     }
 
-    // Advancing with the cursor hits the corrupt file and skips it, not a crash.
     const page2 = await s.list({ limit: 2, cursor: 'ep-2' });
     expect(page2.items).toEqual([]);
   });
@@ -185,7 +181,6 @@ describe('EpisodeStore corrupt-file handling', () => {
   it('skips a corrupt episode file with a warning instead of crashing', async () => {
     const s = new EpisodeStore(tmpDir, fixedClock('2026-08-18T10:00:00Z'), seqIdGen('ep'));
     await s.create({ title: 'good', profileId: 'p1' });
-    // Hand-write a corrupt file (no title / metadata).
     fs.mkdirSync(path.join(tmpDir, 'episodes'), { recursive: true });
     fs.writeFileSync(path.join(tmpDir, 'episodes', 'bad.md'), 'not a real episode');
 

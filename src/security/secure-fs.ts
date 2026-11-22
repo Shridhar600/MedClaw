@@ -1,9 +1,3 @@
-// src/security/secure-fs.ts
-//
-// Filesystem permission helpers enforcing the threat-model §5.1 compensating
-// control: every PHI-bearing directory is created 0o700 and every PHI-bearing
-// file 0o600. The daemon must never crash because of a chmod failure, so every
-// mode operation degrades to a `console.warn` and continues.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -12,11 +6,6 @@ import { summarizeErrorForLog } from './log';
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 
-// PPHI (SB-14): warn carries the OPERATION and the target BASENAME (a file-type
-// name, never identifying) plus a sanitized error IDENTITY — never the
-// absolute path and never err.message, which can echo directory structure or
-// content. Native fs errors can fail `instanceof Error` across realm boundaries
-// (jest VMs; mirrors the better-sqlite3 trap), so fall back to name/code.
 function safeReason(err: unknown): string {
   if (err instanceof Error) return summarizeErrorForLog(err);
   const e = err as { name?: unknown; code?: unknown };
@@ -34,8 +23,6 @@ function warn(operation: string, target: string, err: unknown): void {
 export function secureMkdir(dirPath: string, options: { recursive?: boolean } = {}): void {
   const recursive = options.recursive ?? true;
   fs.mkdirSync(dirPath, { recursive, mode: DIR_MODE });
-  // mkdirSync's `mode` is umask-affected and is a no-op for a pre-existing
-  // directory, so tighten the leaf explicitly to guarantee 0o700.
   tightenDir(dirPath);
 }
 
@@ -126,8 +113,6 @@ export function secureWrite(
   encoding: BufferEncoding = 'utf8',
 ): void {
   secureMkdir(path.dirname(filePath));
-  // Tighten a pre-existing loose file we are about to overwrite, so an attacker
-  // cannot have widened it on disk between creation and this overwrite.
   tightenFile(filePath);
   fs.writeFileSync(filePath, content, encoding);
   try {
@@ -137,12 +122,6 @@ export function secureWrite(
   }
 }
 
-/**
- * Atomic-style write: write a tmp file at 0o600, rename over the target, then
- * chmod the final path 0o600. The post-rename chmod defends against umask
- * widening of the tmp and against a cross-filesystem rename fallback
- * (copy+delete) that can drop the temp mode. Warn-and-continue on chmod failure.
- */
 export function secureWriteViaTmp(
   filePath: string,
   content: string | NodeJS.ArrayBufferView,
@@ -174,11 +153,6 @@ export function secureWriteViaTmp(
   }
 }
 
-/**
- * Append to a file, ensuring 0o600. New files are chmod'd once on creation;
- * pre-existing loose files are tightened on first touch. Subsequent appends to
- * an already-0600 file perform only a cheap statSync (no chmod). Warn-and-continue.
- */
 export function secureAppend(filePath: string, content: string, encoding: BufferEncoding = 'utf8'): void {
   secureMkdir(path.dirname(filePath));
   const existed = fs.existsSync(filePath);

@@ -1,4 +1,6 @@
 import { writeOnboardingProfile } from './profile-writer';
+import { onboardingSeedFacts, type SeedFact } from './seed-facts';
+import { summarizeErrorForLog } from '../security';
 import { OnboardingStore } from './store';
 import type { OnboardingAnswers, OnboardingResult, OnboardingState, OnboardingStep } from './types';
 import { EMERGENCY_RESPONSE, isEmergencyInput } from '../safety/emergency-detector';
@@ -13,6 +15,8 @@ export class OnboardingFlow {
     private readonly workspacePath: string,
     private readonly defaultTimezone: string,
     private readonly emergencyKeywords: readonly string[] = [],
+    /** Records seed facts; returns entities it could not apply as-is. */
+    private readonly recordFacts?: (facts: SeedFact[]) => Promise<string[]>,
   ) {}
 
   async isComplete(): Promise<boolean> {
@@ -20,9 +24,7 @@ export class OnboardingFlow {
   }
 
   async handle(input: string): Promise<OnboardingResult> {
-    // RR2-A2 raw-input boundary: check the raw input BEFORE the onboarding
-    // sanitizer discards metadata-like lines — those lines can be user-authored
-    // crisis text. The sanitizer still applies to ordinary onboarding answers.
+    // Check raw input: the sanitizer can drop metadata-like lines that hold crisis text.
     if (isEmergencyInput(input, this.emergencyKeywords)) {
       return {
         bypass: true,
@@ -76,7 +78,6 @@ export class OnboardingFlow {
 
     switch (state.currentStep) {
       case 'name': {
-        // I1: a sentence-length blob is not a name — re-ask instead of storing it.
         if (!isPlausibleName(answer)) {
           return { response: 'Sorry, that seems too long to be a name. What should I call you?' };
         }
@@ -86,7 +87,6 @@ export class OnboardingFlow {
         break;
       }
       case 'age': {
-        // I1: an age must contain a plausible number; otherwise stay on this step.
         if (!isPlausibleAge(answer)) {
           return { response: 'Sorry, I could not catch a valid age there. What is your age in years? (for example: 56)' };
         }
@@ -96,10 +96,7 @@ export class OnboardingFlow {
         break;
       }
       case 'timezone': {
-        // forka #5: don't store the raw phrase as the timezone. Affirmative or
-        // empty → keep the offered default. Otherwise accept the answer only if
-        // it is a valid IANA zone; if it's a phrase like "yes Asia/Kolkata is
-        // right", recover the valid zone token from it; else keep the default.
+        // Never store the raw phrase; keep the default unless a valid IANA zone is found.
         const trimmed = answer.trim();
         const fallback = answers.timezone ?? this.defaultTimezone;
         if (isAffirmative(trimmed) || trimmed === '') {
@@ -138,12 +135,13 @@ export class OnboardingFlow {
         nextStep = 'confirmation';
         response = this.renderConfirmation(answers);
         break;
-      case 'confirmation':
+      case 'confirmation': {
         if (!CONFIRM_PATTERN.test(answer)) {
           response = 'Reply confirm to save this profile, or restart onboarding to begin again.';
           break;
         }
         await writeOnboardingProfile(this.workspacePath, answers);
+        const seedNote = await this.seedHealthRecord(answers);
         await this.store.save({
           ...state,
           status: 'complete',
@@ -154,8 +152,9 @@ export class OnboardingFlow {
         });
         return {
           completed: true,
-          response: 'Your onboarding is complete. I saved this profile locally and can now answer normally.',
+          response: `Your onboarding is complete. I saved this profile locally and can now answer normally.${seedNote}`,
         };
+      }
       default:
         nextStep = 'name';
         response = 'What is your preferred name?';
@@ -169,6 +168,20 @@ export class OnboardingFlow {
       updatedAt: new Date().toISOString(),
     });
     return { response };
+  }
+
+  private async seedHealthRecord(answers: OnboardingAnswers): Promise<string> {
+    const facts = onboardingSeedFacts(answers);
+    if (!this.recordFacts || facts.length === 0) return '';
+    try {
+      const pending = await this.recordFacts(facts);
+      return pending.length === 0
+        ? ''
+        : `\nThese differ from what I already had, so I left them unchanged: ${pending.join(', ')}. Tell me in chat if they changed.`;
+    } catch (error) {
+      console.warn('[onboarding] seeding the health record failed:', summarizeErrorForLog(error));
+      return '\nI could not add your medications, allergies and conditions to the health record just now. Please mention them in chat.';
+    }
   }
 
   private renderConfirmation(answers: OnboardingAnswers): string {
@@ -207,17 +220,14 @@ function isAffirmative(input: string): boolean {
   return /^(yes|y|correct|confirm|ok|okay)$/i.test(input.trim());
 }
 
-// I1: a name is short — reject sentence-length blobs (health facts, questions)
-// from occupying the name slot. 6 words / 60 chars covers "Rajesh Kumar Sharma".
+// 6 words / 60 chars covers "Rajesh Kumar Sharma"; anything more is a sentence.
 function isPlausibleName(answer: string): boolean {
   const trimmed = answer.trim();
   if (trimmed.length === 0 || trimmed.length > 60) return false;
   return trimmed.split(/\s+/).length <= 6;
 }
 
-// I1: an age must contain a human-plausible number (1-120), optionally with
-// trailing words ("56 saal", "55-60 range"). The raw answer is still what gets
-// stored — validation only gates the step.
+// 1-120, optionally with trailing words; the raw answer is stored, validation only gates the step.
 function isPlausibleAge(answer: string): boolean {
   const match = answer.match(/\d{1,3}/);
   if (!match) return false;
@@ -225,8 +235,7 @@ function isPlausibleAge(answer: string): boolean {
   return n >= 1 && n <= 120;
 }
 
-// forka #5: validate an IANA timezone without a dependency — Intl throws a
-// RangeError for an unknown zone.
+// Intl throws a RangeError for an unknown zone, so no dependency is needed.
 function isValidTimezone(tz: string): boolean {
   if (!tz || /\s/.test(tz)) return false;
   try {

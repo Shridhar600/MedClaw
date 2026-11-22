@@ -1,17 +1,10 @@
-import type { ProviderConfig } from '../config/types';
-
-export type SetupStepId =
-  | 'environment'
-  | 'workspace'
-  | 'provider'
-  | 'telegram'
-  | 'preferences'
-  | 'review';
+import type { ProviderConfig } from '../config';
 
 export type ReviewAction =
   | 'apply'
-  | 'workspace'
+  | 'state'
   | 'provider'
+  | 'embeddings'
   | 'telegram'
   | 'preferences'
   | 'cancel';
@@ -20,11 +13,23 @@ export type CompletionAction = 'start' | 'review-config' | 'exit';
 
 export interface SetupWizardState {
   configPath: string;
-  workspace: string;
+  /** The only path the owner chooses: workspace, stores and the owner record all derive from it. */
+  stateRoot: string;
+  /** Owner identity, validated with the config decoder's grammar. */
+  ownerId: string;
   provider: ProviderConfig['type'];
   mainModel: string;
   medicalModel: string;
+  /** Explicit medical selection survives the wizard; absent means the local default. */
+  medicalProvider?: ProviderConfig['type'];
+  medicalApiKey?: string;
+  /** Independent of `provider`: a cloud main provider must not silently move embeddings to cloud. */
+  embeddingProvider: ProviderConfig['type'];
   embeddingModel: string;
+  /** Explicit endpoint for the embedding role only. Never inherited from the main role. */
+  embeddingUrl?: string;
+  /** Explicit key for the embedding role only. Never copied from the main role's key. */
+  embeddingApiKey?: string;
   ollamaUrl?: string;
   apiKey?: string;
   telegramEnabled: boolean;
@@ -38,27 +43,3 @@ export interface SummaryRow {
   value: string;
   secret?: boolean;
 }
-
-export const SETUP_STEP_ORDER: readonly SetupStepId[] = [
-  'environment',
-  'workspace',
-  'provider',
-  'telegram',
-  'preferences',
-  'review',
-];
-
-export const REVIEW_ACTIONS: readonly ReviewAction[] = [
-  'apply',
-  'workspace',
-  'provider',
-  'telegram',
-  'preferences',
-  'cancel',
-];
-
-export const COMPLETION_ACTIONS: readonly CompletionAction[] = [
-  'start',
-  'review-config',
-  'exit',
-];

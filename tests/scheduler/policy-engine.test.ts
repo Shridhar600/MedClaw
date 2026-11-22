@@ -1,8 +1,8 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import type { HeartbeatPolicyConfig } from '../../src/config/types';
 import { buildDesiredHeartbeatJobs } from '../../src/scheduler/policy-engine';
+import { makeTestTemp } from '../helpers/test-temp';
 
 function makeHeartbeatPolicy(): HeartbeatPolicyConfig {
   return {
@@ -28,7 +28,7 @@ describe('policy-engine', () => {
   let workspacePath: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-policy-engine-'));
+    tmpDir = makeTestTemp('redacted-policy-engine-');
     workspacePath = path.join(tmpDir, 'workspace');
     fs.mkdirSync(workspacePath, { recursive: true });
   });

@@ -1,8 +1,7 @@
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import { ContextAssembler } from '../../src/agent/context';
 import { MemoryEngine } from '../../src/memory/memory-engine';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('ContextAssembler', () => {
   let tmpDir: string;
@@ -10,7 +9,7 @@ describe('ContextAssembler', () => {
   let assembler: ContextAssembler;
 
   beforeEach(async () => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-ctx-'));
+    tmpDir = makeTestTemp('redacted-ctx-');
     engine = new MemoryEngine(tmpDir);
     assembler = new ContextAssembler(engine, 20000);
 
@@ -39,7 +38,6 @@ describe('ContextAssembler', () => {
   });
 
   it('skips missing optional files gracefully', async () => {
-    // HEARTBEAT.md and MEMORY.md not created — should not throw
     await expect(assembler.buildSystemMessages()).resolves.not.toThrow();
   });
 
@@ -88,7 +86,7 @@ describe('ContextAssembler', () => {
     expect(system).not.toContain("Yesterday's Log");
   });
 
-  it('injects a non-empty SAFETY.md in full and never truncates it (PLAT-05)', async () => {
+  it('injects a non-empty SAFETY.md in full and never truncates it', async () => {
     const safety = '# SAFETY\n' + 'ALLERGY: penicillin — anaphylaxis. '.repeat(40);
     await engine.writeFile('SAFETY.md', safety);
     // Tiny budget, far smaller than SAFETY.md — the budget must NOT cut SAFETY.md.
@@ -110,7 +108,7 @@ describe('ContextAssembler', () => {
     expect(system.indexOf('## SAFETY.md')).toBeLessThan(system.indexOf('## SOUL.md'));
   });
 
-  it('skips an empty SAFETY.md and builds normally (PLAT-04)', async () => {
+  it('skips an empty SAFETY.md and builds normally', async () => {
     await engine.writeFile('SAFETY.md', '   \n\t  ');
     const messages = await assembler.buildSystemMessages();
     const system = messages[0].content ?? '';

@@ -1,14 +1,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { SqliteChunkStats } from '../../src/indexstore';
+import { makeTestTemp } from '../helpers/test-temp';
 
 let tmpDir: string;
 let stats: SqliteChunkStats;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-chunkstats-'));
+  tmpDir = makeTestTemp('redacted-chunkstats-');
   stats = new SqliteChunkStats({ dbPath: path.join(tmpDir, 'search.db') });
 });
 afterEach(() => {
@@ -16,9 +16,7 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-// P2 A3: chunk_stats is finally WRITTEN (the schema existed in P0 but nothing fed it — the single
-// most important recall learning signal). Stage 4 bumps injected/used; get() reads them back.
-describe('SqliteChunkStats (recall Stage-4 telemetry, P2 A3)', () => {
+describe('SqliteChunkStats', () => {
   it('bumpInjected increments injected_count and accumulates across calls', async () => {
     await stats.bumpInjected(['a', 'b']);
     await stats.bumpInjected(['a']);

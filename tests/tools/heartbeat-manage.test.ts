@@ -1,9 +1,9 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { HeartbeatStore } from '../../src/scheduler/store';
 import { HeartbeatScheduler } from '../../src/scheduler/runtime';
 import { createHeartbeatManageTool } from '../../src/tools/heartbeat-manage';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('heartbeat_manage tool', () => {
   let tmpDir: string;
@@ -15,7 +15,7 @@ describe('heartbeat_manage tool', () => {
   let trigger: jest.Mock;
 
   beforeEach(async () => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-heartbeat-manage-'));
+    tmpDir = makeTestTemp('redacted-heartbeat-manage-');
     workspacePath = path.join(tmpDir, 'workspace');
     storePath = path.join(tmpDir, 'heartbeats', 'jobs.json');
     auditPath = path.join(tmpDir, 'heartbeats', 'audit.jsonl');

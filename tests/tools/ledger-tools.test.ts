@@ -1,19 +1,20 @@
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 
 import { createLedgerTools } from '../../src/tools/ledger-tools';
 import { LedgerStore, NarrativeStore, SafetyView, CuriosityQueue } from '../../src/memcore';
 import { CapturePipeline, makeSafetyRenderer as makeSharedSafetyRenderer, type QueuePort } from '../../src/capture';
 import { mutableClock, seqIdGen } from '../helpers/memcore-fixtures';
 import type { Tool } from '../../src/tools/types';
+import { makeTestTemp } from '../helpers/test-temp';
+import { AgentLoop } from '../../src/agent/agent-loop';
+import { ToolRegistry } from '../../src/tools/registry';
+import type { LLMProvider, LLMResponse, ToolSchema } from '../../src/providers/types';
 
 const DAY = '2026-08-20T10:00:00.000Z';
 
-// W-C/D MED-15: the SAME adapter expression Gateway ships.
 const makeSafetyRenderer = makeSharedSafetyRenderer;
 
-describe('ledger tools (Task 12.1–12.3)', () => {
+describe('ledger tools', () => {
   let tmp: string;
   let ledger: LedgerStore;
   let view: SafetyView;
@@ -33,7 +34,7 @@ describe('ledger tools (Task 12.1–12.3)', () => {
   };
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-ledgertool-'));
+    tmp = makeTestTemp('redacted-ledgertool-');
     build();
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -54,14 +55,14 @@ describe('ledger tools (Task 12.1–12.3)', () => {
     expect(r.content[0].text).toMatch(/[0-9a-f]{12}/); // token id surfaced
   });
 
-  it('DIAB-06: auto-populates known_side_effects for a medication via sideEffectLookup', async () => {
+  it('auto-populates known_side_effects for a medication via sideEffectLookup', async () => {
     build({ sideEffectLookup: async () => ['nausea', 'dizziness'] });
     await byName('ledger_record').execute({ entity: 'lisinopril', type: 'medication', fields: {} });
     const f = await ledger.getActive('lisinopril', 'medication');
     expect(f!.fields.known_side_effects).toEqual(['nausea', 'dizziness']);
   });
 
-  it('DIAB-06: falls back to [] when sideEffectLookup throws (never absent)', async () => {
+  it('falls back to [] when sideEffectLookup throws (never absent)', async () => {
     build({ sideEffectLookup: async () => { throw new Error('llm down'); } });
     await byName('ledger_record').execute({ entity: 'atorvastatin', type: 'medication', fields: {} });
     const f = await ledger.getActive('atorvastatin', 'medication');
@@ -146,18 +147,15 @@ describe('ledger tools (Task 12.1–12.3)', () => {
     await byName('ledger_record').execute({ entity: 'metformin', type: 'medication', fields: { dose: '500mg' }, note: 'v1' });
     await byName('ledger_record').execute({ entity: 'metformin', type: 'medication', fields: { notes: 'took with food' } });
     const r = await byName('ledger_query').execute({ entity: 'metformin', type: 'medication', status: 'all' });
-    // W-C/D MED-15 (T3): assert the CHAIN SHAPE, not a regex over rendered text.
     const chain = await ledger.getChain('metformin', 'medication');
     expect(chain).toHaveLength(2);
     expect(chain.map(f => f.version).sort()).toEqual([1, 2]);
-    // And the rendered text reflects both versions.
     expect(r.content[0].text).toContain('v1');
     expect(r.content[0].text).toContain('v2');
   });
 });
 
-// ── I2: malformed model args must return a clean tool error, never a raw throw ──
-describe('ledger tools arg validation (I2)', () => {
+describe('ledger tools arg validation', () => {
   let tmp: string;
   let tools: Tool[];
   const byName = (n: string): Tool => tools.find(t => t.name === n)!;
@@ -174,7 +172,7 @@ describe('ledger tools arg validation (I2)', () => {
   };
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-ledgerarg-'));
+    tmp = makeTestTemp('redacted-ledgerarg-');
     build();
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -204,8 +202,7 @@ describe('ledger tools arg validation (I2)', () => {
   });
 });
 
-// I2 review follow-ups: close the remaining TypeError/corruption vectors.
-describe('ledger tools arg validation — review findings (I2)', () => {
+describe('ledger tools arg validation', () => {
   let tmp: string;
   let ledger: LedgerStore;
   let tools: Tool[];
@@ -223,7 +220,7 @@ describe('ledger tools arg validation — review findings (I2)', () => {
   };
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-ledgerarg2-'));
+    tmp = makeTestTemp('redacted-ledgerarg2-');
     build();
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -260,5 +257,143 @@ describe('ledger tools arg validation — review findings (I2)', () => {
     const r = await byName('ledger_update').execute({ tokenId, confirm: true, winningVersion: 'two' } as never);
     expect(r.isError).toBe(true);
     expect(r.content[0].text).toContain('winningVersion');
+  });
+});
+
+describe('ledger tools — owner lifecycle across restarts', () => {
+  let tmp: string;
+  let ledger: LedgerStore;
+  let view: SafetyView;
+  let tools: Tool[];
+  const byName = (n: string): Tool => tools.find(t => t.name === n)!;
+  const tokenOf = (text: string): string => (text.match(/tokenId="([0-9a-f]{12})"/) ?? [])[1]!;
+  const boot = (): void => {
+    const clock = mutableClock(DAY);
+    ledger = new LedgerStore(tmp, clock);
+    const narrative = new NarrativeStore(tmp, clock);
+    view = new SafetyView(tmp, clock);
+    const curiosity = new CuriosityQueue(tmp, clock, seqIdGen('cur'), 'default');
+    const safety = makeSafetyRenderer({
+      render: (facts) => view.render(facts),
+      listSafetyRelevant: () => ledger.listSafetyRelevant(),
+      markDirty: () => view.markDirty(),
+    });
+    const queue: QueuePort = { enqueue: async (_p, op) => op.run() };
+    const pipeline = new CapturePipeline({ queue, ledger, narrative, safety, curiosity });
+    tools = createLedgerTools({ pipeline, ledger, safety, queue, clock });
+  };
+  const expectCleanChain = async (entity: string, type: 'medication' | 'symptom'): Promise<void> => {
+    const chain = await ledger.getChain(entity, type);
+    expect(new Set(chain.map(f => f.id)).size).toBe(chain.length);
+    expect(chain.filter(f => f.status === 'active')).toHaveLength(1);
+    expect(chain.filter(f => f.status === 'disputed')).toHaveLength(0);
+  };
+
+  beforeEach(() => {
+    tmp = makeTestTemp('redacted-ledgerlife-');
+    boot();
+  });
+  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  it('a medication stopped and later taken again gets a new version, not a second v1', async () => {
+    await byName('ledger_record').execute({ entity: 'lisinopril', type: 'medication', fields: { dose: '10mg' } });
+    const removal = await byName('ledger_remove').execute({ entity: 'lisinopril', type: 'medication', reason: 'stopped' });
+    expect((await byName('ledger_update').execute({ tokenId: tokenOf(removal.content[0].text), confirm: true })).isError).toBeFalsy();
+
+    boot();
+    const again = await byName('ledger_record').execute({ entity: 'lisinopril', type: 'medication', fields: { dose: '10mg' } });
+    expect(again.isError).toBeFalsy();
+    expect(again.content[0].text).toContain('lisinopril@v3');
+
+    boot();
+    await expectCleanChain('lisinopril', 'medication');
+    expect(await view.read()).toContain('lisinopril');
+  });
+
+  it('a dispute left unanswered past a restart can still be resolved by re-stating it', async () => {
+    await byName('ledger_record').execute({ entity: 'headache', type: 'symptom', fields: { severity: 'mild' } });
+    const minted = await byName('ledger_record').execute({ entity: 'headache', type: 'symptom', fields: { severity: 'severe' } });
+    expect(minted.content[0].text).toContain('disputed');
+
+    boot(); // the first dispute token died with the old process
+    const restated = await byName('ledger_record').execute({ entity: 'headache', type: 'symptom', fields: { severity: 'severe' } });
+    expect(restated.content[0].text).toContain('open dispute');
+    const severeVersion = Number((restated.content[0].text.match(/v(\d+): severity=severe/) ?? [])[1]);
+
+    const resolved = await byName('ledger_update').execute({
+      tokenId: tokenOf(restated.content[0].text), confirm: true, winningVersion: severeVersion,
+    });
+    expect(resolved.isError).toBeFalsy();
+
+    boot();
+    await expectCleanChain('headache', 'symptom');
+    expect((await ledger.getActive('headache', 'symptom'))!.fields.severity).toBe('severe');
+  });
+
+  it('a model-invented reserved or colon field key is refused and never corrupts the ledger', async () => {
+    for (const key of ['created_at', 'visibility', 'dose: morning', 'time:of:day', ' dose']) {
+      const r = await byName('ledger_record').execute({ entity: 'metformin', type: 'medication', fields: { [key]: '500mg' } });
+      expect(r.isError).toBe(true);
+    }
+    await byName('ledger_record').execute({ entity: 'metformin', type: 'medication', fields: { dose: '500mg' } });
+
+    boot();
+    expect((await ledger.getActive('metformin', 'medication'))!.fields.dose).toBe('500mg');
+    expect(fs.readdirSync(`${tmp}/ledger`).filter(f => f.includes('.corrupt-'))).toHaveLength(0);
+  });
+
+  it('a background check-in can neither see nor use the ledger write and confirm tools', async () => {
+    await byName('ledger_record').execute({ entity: 'warfarin', type: 'medication', fields: { dose: '10mg' } });
+    const proposal = await byName('ledger_record').execute(
+      { entity: 'warfarin', type: 'medication', fields: { dose: '0mg' } },
+      { chatId: 'chat-1', turnId: 'owner-turn' },
+    );
+    const tokenId = tokenOf(proposal.content[0].text);
+
+    const registry = new ToolRegistry({ allow: ['*'], deny: [] });
+    for (const tool of tools) registry.register(tool);
+    const offered: string[][] = [];
+    const scripted: LLMResponse[] = [
+      { type: 'tool_call', toolCalls: [
+        { id: 'c1', name: 'ledger_update', arguments: { tokenId, confirm: true } },
+        { id: 'c2', name: 'ledger_remove', arguments: { entity: 'warfarin', type: 'medication' } },
+      ] },
+      { type: 'text', text: 'Checked in.' },
+    ];
+    const provider: LLMProvider = {
+      async chat(_messages, toolSchemas?: ToolSchema[]): Promise<LLMResponse> {
+        offered.push((toolSchemas ?? []).map((t) => t.function.name));
+        return scripted.shift()!;
+      },
+      async embed(): Promise<number[]> { return []; },
+    };
+    const loop = new AgentLoop(provider, registry, [], { maxIterations: 3 });
+
+    const result = await loop.run('[Heartbeat Trigger] check in', [], { chatId: 'chat-1', origin: 'heartbeat', mode: 'heartbeat' });
+
+    expect(offered[0]).toEqual(expect.arrayContaining(['ledger_query']));
+    expect(offered[0]).not.toEqual(expect.arrayContaining(['ledger_update']));
+    expect(offered[0]).not.toEqual(expect.arrayContaining(['ledger_record']));
+    expect(offered[0]).not.toEqual(expect.arrayContaining(['ledger_remove']));
+    expect(result.trace.filter((m) => m.role === 'tool').every((m) => /owner/i.test(String(m.content)))).toBe(true);
+    expect((await ledger.getActive('warfarin', 'medication'))!.fields.dose).toBe('10mg');
+
+    const owner = await byName('ledger_update').execute({ tokenId, confirm: true }, { chatId: 'chat-1', turnId: 'next-owner-turn' });
+    expect(owner.isError).toBeFalsy();
+    expect((await ledger.getActive('warfarin', 'medication'))!.fields.dose).toBe('0mg');
+  });
+
+  it('a SAFETY refresh failure after a confirmed change reports the change as applied', async () => {
+    await byName('ledger_record').execute({ entity: 'warfarin', type: 'medication', fields: { dose: '5mg' } });
+    const proposal = await byName('ledger_record').execute({ entity: 'warfarin', type: 'medication', fields: { dose: '10mg' } });
+    const renderSpy = jest.spyOn(view, 'render').mockRejectedValueOnce(new Error('render failure'));
+
+    const confirmed = await byName('ledger_update').execute({ tokenId: tokenOf(proposal.content[0].text), confirm: true });
+    renderSpy.mockRestore();
+
+    expect(confirmed.isError).toBeFalsy();
+    expect(confirmed.content[0].text).toContain('Confirmed');
+    expect(fs.existsSync(`${tmp}/.state/safety-view.dirty`)).toBe(true);
+    expect((await ledger.getActive('warfarin', 'medication'))!.fields.dose).toBe('10mg');
   });
 });

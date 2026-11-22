@@ -9,8 +9,6 @@ import {
 import { fixedClock } from '../helpers/memcore-fixtures';
 import { InvariantViolationError } from '../../src/shared/errors';
 
-// ---- fakes -------------------------------------------------------------------
-
 function makeReader(files: Record<string, string>): WorkspaceReader {
   return { async readFile(rel: string) { return Object.prototype.hasOwnProperty.call(files, rel) ? files[rel] : null; } };
 }
@@ -20,7 +18,6 @@ function makeSafety(content: string | null): SafetyReader {
 
 const CLOCK = fixedClock('2026-08-24T10:00:00.000Z');
 
-// A fully-populated skeleton (no date tokens inside the file bytes).
 const FULL_FILES: Record<string, string> = {
   'SOUL.md': 'You are a caring health companion.',
   'HEALTH_PROFILE.md': 'Name: Sam. Age band: 30s.',
@@ -54,9 +51,7 @@ function belowBoundary(report: { sections: ContextSection[]; cacheBoundaryIndex:
   return report.sections.slice(report.cacheBoundaryIndex);
 }
 
-// ---- tests -------------------------------------------------------------------
-
-describe('ContextAssembler v2 — chat-mode injection map (C1)', () => {
+describe('ContextAssembler v2 — chat-mode injection map', () => {
   it('constructs with injected readers without throwing', () => {
     expect(() => make(FULL_FILES, SAFETY)).not.toThrow();
   });
@@ -87,19 +82,17 @@ describe('ContextAssembler v2 — chat-mode injection map (C1)', () => {
     expect(report.content).toContain(SAFETY);
     const safetySection = report.sections.find(s => s.key === 'SAFETY.md')!;
     expect(safetySection.content).toBe(SAFETY);
-    // Something got truncated/dropped under the tiny budget.
     expect(report.truncated).toBe(true);
-    // The oversized SOUL did not survive in full.
     expect(report.content).not.toContain(bigSoul);
   });
 
-  it('skips an empty SAFETY (PLAT-04) and does not throw the invariant', async () => {
+  it('skips an empty SAFETY and does not throw the invariant', async () => {
     const report = await make(FULL_FILES, '   ').assemble('default', 'chat', RECALL);
     expect(keys(report.sections)).not.toContain('SAFETY.md');
     expect(report.sections[0].key).toBe('SOUL.md');
   });
 
-  it('renders recalled hits WITH their ids so the model can cite them in <used> (H-3/B7)', async () => {
+  it('renders recalled hits WITH their ids so the model can cite them in <used>', async () => {
     const report = await make(FULL_FILES, SAFETY).assemble('default', 'chat', RECALL);
     const recall = report.sections.find(s => s.key === 'recall')!;
     expect(recall.content).toContain('[narrative:2026-06-01#L2]');
@@ -136,7 +129,7 @@ describe('ContextAssembler v2 — chat-mode injection map (C1)', () => {
     expect(ledger?.content).toContain('… (truncated)');
   });
 
-  it('the runtime clock date lives ONLY below the cache boundary (PLAT-22 / H-2)', async () => {
+  it('the runtime clock date lives ONLY below the cache boundary', async () => {
     const report = await make(FULL_FILES, SAFETY).assemble('default', 'chat', RECALL);
     const above = aboveBoundary(report).map(s => s.content).join('\n');
     const runtime = report.sections.find(s => s.key === 'runtime')!;
@@ -166,7 +159,6 @@ describe('ContextAssembler v2 — chat-mode injection map (C1)', () => {
   });
 
   it('retires the blanket daily-log dump in favor of RECALL (parity — no silent vanish)', async () => {
-    // Even if today's/yesterday's logs exist on disk, the assembler does not read them as sections.
     const withLogs = {
       ...FULL_FILES,
       'memory/2026-08-24.md': 'TODAY-LOG-UNIQUE-BODY',
@@ -178,7 +170,7 @@ describe('ContextAssembler v2 — chat-mode injection map (C1)', () => {
     expect(keys(report.sections).some(k => k.startsWith('memory/'))).toBe(false);
   });
 
-  it('never drops the RUNTIME date line under budget pressure (L-1)', async () => {
+  it('never drops the RUNTIME date line under budget pressure', async () => {
     const bigSoul = 'X'.repeat(8000);
     const report = await make({ ...FULL_FILES, 'SOUL.md': bigSoul }, SAFETY, 60).assemble('default', 'chat', RECALL);
     const runtime = report.sections.find(s => s.key === 'runtime');
@@ -194,7 +186,7 @@ describe('ContextAssembler v2 — chat-mode injection map (C1)', () => {
   });
 });
 
-describe('ContextAssembler v2 — SAFETY fails closed (H-1)', () => {
+describe('ContextAssembler v2 — SAFETY fails closed', () => {
   it('aborts the turn when a present SAFETY cannot be read (never ships a SAFETY-less prompt)', async () => {
     const throwingSafety: SafetyReader = { async read() { throw new Error('EACCES: permission denied'); } };
     const asm = new ContextAssembler({
@@ -203,7 +195,7 @@ describe('ContextAssembler v2 — SAFETY fails closed (H-1)', () => {
     await expect(asm.assemble('default', 'chat', RECALL)).rejects.toThrow();
   });
 
-  it('still treats a genuinely absent/empty SAFETY as allowed (PLAT-04, no throw)', async () => {
+  it('still treats a genuinely absent/empty SAFETY as allowed (no throw)', async () => {
     const asm = new ContextAssembler({
       reader: makeReader(FULL_FILES), safety: makeSafety(null), maxChars: 100_000, clock: CLOCK,
     });
@@ -211,7 +203,7 @@ describe('ContextAssembler v2 — SAFETY fails closed (H-1)', () => {
   });
 });
 
-describe('ContextAssembler v2 — turn modes (C2)', () => {
+describe('ContextAssembler v2 — turn modes', () => {
   it('heartbeat is lite: SAFETY + checklist + active-ledger, but no MEMORY/USER and no user-recall', async () => {
     const report = await make(FULL_FILES, SAFETY).assemble('default', 'heartbeat', RECALL);
     const k = keys(report.sections);
@@ -224,13 +216,13 @@ describe('ContextAssembler v2 — turn modes (C2)', () => {
     expect(k).not.toContain('check');
   });
 
-  it('heartbeat injects Stage-1 active-ledger facts (KNEE-02)', async () => {
+  it('heartbeat injects Stage-1 active-ledger facts', async () => {
     const report = await make(FULL_FILES, SAFETY).assemble('default', 'heartbeat', RECALL);
     const ledger = report.sections.find(s => s.key === 'active-ledger')!;
     expect(ledger.content).toContain('metformin (medication) active');
   });
 
-  it('subagent is PHI-minimal: never SAFETY/SOUL/USER/MEMORY/recall, and leaks no PHI (KNEE-05 half)', async () => {
+  it('subagent is PHI-minimal: never SAFETY/SOUL/USER/MEMORY/recall, and leaks no PHI', async () => {
     const report = await make(FULL_FILES, SAFETY).assemble('default', 'subagent', RECALL);
     const k = keys(report.sections);
     expect(k).not.toContain('SAFETY.md');
@@ -343,7 +335,7 @@ describe('ContextAssembler v2 — turn modes (C2)', () => {
   });
 });
 
-describe('assertCacheDiscipline (C1.3 structural guard)', () => {
+describe('assertCacheDiscipline (.3 structural guard)', () => {
   const stable = (key: string): ContextSection => ({ key, title: key, layer: 2, cacheStable: true, budget: 100, content: 'x' });
   const volatile = (key: string): ContextSection => ({ key, title: key, layer: 3, cacheStable: false, budget: 100, content: 'y' });
 

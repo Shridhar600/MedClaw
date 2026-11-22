@@ -1,22 +1,24 @@
 import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import { Gateway } from '../../src/gateway/gateway';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
+import {} from '../helpers/test-config';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { bindGatewayOwner } from '../helpers/gateway-owner-deps';
+import { makeTestTemp } from '../helpers/test-temp';
 
-// RES-P2-1: one tool-group factory failure must NOT crash boot — remaining
-// groups still register.
+const CHAT_BINDING = 'owner-chat';
+
 jest.mock('../../src/tools/memory-tools', () => ({
   createMemoryTools: jest.fn(() => {
     throw new Error('memory tools factory blew up PHI marker glucose');
   }),
 }));
 
-describe('Gateway boot tool-group degradation (RES-P2-1)', () => {
+describe('Gateway boot tool-group degradation', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-tool-degrade-'));
+    tmpDir = makeTestTemp('redacted-tool-degrade-');
   });
 
   afterEach(() => {
@@ -24,8 +26,10 @@ describe('Gateway boot tool-group degradation (RES-P2-1)', () => {
     jest.restoreAllMocks();
   });
 
-  function makeConfig(): AppConfig {
+  function makeConfig(): EffectiveConfig {
     return {
+    schemaVersion: 2,
+    ...ownerSelection(fixtureOwner(tmpDir)),
       providers: {
         main: { type: 'ollama', model: 'kimi-k2.5:cloud', baseUrl: 'http://localhost:11434/v1' },
         medical: { type: 'ollama', model: 'medgemma', baseUrl: 'http://localhost:11434/v1' },
@@ -34,23 +38,21 @@ describe('Gateway boot tool-group degradation (RES-P2-1)', () => {
       channels: { telegram: { enabled: false, botToken: '' } },
       tools: { allow: ['*'], deny: [] },
       memory: {
-        workspace: path.join(tmpDir, 'workspace'),
+        workspace: fixtureOwner(tmpDir).workspace,
         search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
         bootstrapMaxChars: 20000,
       },
       sessions: {
-        softResetAfterMinutes: 240,
-        hardResetAfterMinutes: 1440,
-        compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+        compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
       },
       heartbeat: {
         enabled: false,
         timezone: 'Asia/Kolkata',
-        storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+        storePath: fixtureOwner(tmpDir).storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 3, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-        audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+        audit: { path: fixtureOwner(tmpDir).auditLogPath },
         policy: {
           quietHours: { enabled: true, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,
@@ -60,24 +62,22 @@ describe('Gateway boot tool-group degradation (RES-P2-1)', () => {
           },
         },
       },
-      agent: { maxIterations: 15, disclaimerEnabled: true },
+      agent: { maxIterations: 15 },
     };
   }
 
   it('memory-tools factory failure does not crash boot; medical tools still register, failure warned sanitized', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const error = jest.spyOn(console, 'error').mockImplementation(() => undefined);
-    const gateway = new Gateway(makeConfig());
+    const gateway = new Gateway(makeConfig(), await bindGatewayOwner(makeConfig(), CHAT_BINDING));
 
     await expect(gateway.start()).resolves.toBeUndefined();
 
-    // Boot continued despite the memory-tools factory throwing.
     const warned = warn.mock.calls.flat().map(String).join('\n');
     expect(warned).toContain('Memory tools unavailable');
     // PHI marker from the failure message never leaked (summarizeErrorForLog).
     expect(warned).not.toContain('glucose');
 
-    // The medical tool group (which did NOT throw) still registered its tools.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const registry = (gateway as any).agentLoop.registry;
     const available = registry.getAvailable() as Array<{ name: string }>;

@@ -25,15 +25,12 @@ export interface LedgerFact {
   version: number;
   supersedes?: string;
   supersededBy?: string;
-  // Cross-ENTITY links (distinct from same-entity supersedes/supersededBy).
-  // replaces/replacedBy = clinical substitution (naproxen replaces ibuprofen, KNEE-04).
-  // corrects/correctedBy = mistaken-entity correction (DAD-10, spec-09 field names).
   replaces?: string;
   replacedBy?: string;
   corrects?: string;
   correctedBy?: string;
   status: FactStatus;
-  /** Set on a `discontinued` fact (spec-09 CONTRA-01 `reason` maps here). */
+  /** Set on a `discontinued` fact. */
   discontinuedReason?: string;
   fields: Record<string, string | number | string[]>;
   provenance: Provenance;
@@ -76,8 +73,6 @@ export interface NarrativeNote {
   createdAt: string;
 }
 
-// `missing-data` (DD7, spec 14 §5): the nightly transcript sweep files these when a user-mentioned
-// entity had no same-day ledger event — "Did I miss logging X yesterday?". med-lexicon hits are critical.
 export type CuriosityKind = 'follow-up' | 'medication-reminder' | 'lab-correlation' | 'information-gap' | 'insight' | 'missing-data';
 
 export interface CuriosityItem {
@@ -91,12 +86,6 @@ export interface CuriosityItem {
   dueAt?: string;
 }
 
-/**
- * Input for a NEW ledger fact captured during a turn. The store assigns id/version/
- * createdAt; the caller supplies the semantic content + provenance. Cross-entity link
- * ids (`replaces`/`corrects`) are the TARGET fact ids the caller resolved. `text` is the
- * human-readable narrative log line — omit it to log the entity name.
- */
 export interface LedgerFactInput {
   entity: string;
   type: FactType;
@@ -111,7 +100,7 @@ export interface LedgerFactInput {
   text?: string;
 }
 
-/** Input for a narrative-only note (CHAT-06) — the lossless lane, no structured fact. */
+/** Input for a narrative-only note: the lossless lane, no structured fact. */
 export interface NarrativeNoteInput {
   text: string;
   language?: string;
@@ -119,10 +108,6 @@ export interface NarrativeNoteInput {
   date?: string;
 }
 
-/**
- * Input for a metric reading (DIAB-02). Recorded as a `metric`-type ledger fact whose
- * `fields` always carry a `date` (F19) plus a narrative note.
- */
 export interface MetricPointInput {
   entity: string;
   fields: Record<string, string | number | string[]>;
@@ -133,7 +118,7 @@ export interface MetricPointInput {
   safetyRelevant?: boolean;
 }
 
-/** Input for a mistaken-entity correction (DAD-10): retract `wrong`, record `corrected`. */
+/** Input for a mistaken-entity correction: retract `wrong`, record `corrected`. */
 export interface LedgerCorrectionInput {
   wrong: { entity: string; type: FactType };
   corrected: LedgerFactInput;
@@ -141,34 +126,20 @@ export interface LedgerCorrectionInput {
   note: string;
 }
 
-interface CaptureEventBase {
-  profileId: string;
-  source: string;
-}
-
-/**
- * A normalized inbound capture event, discriminated by `kind`. Each payload is an
- * INPUT shape (not a stored record) — the pipeline resolves ids/anchors when it writes.
- */
 export type CaptureEvent =
-  | (CaptureEventBase & { kind: 'ledger-fact'; payload: LedgerFactInput })
-  | (CaptureEventBase & { kind: 'narrative-note'; payload: NarrativeNoteInput })
-  | (CaptureEventBase & { kind: 'metric-point'; payload: MetricPointInput })
-  | (CaptureEventBase & { kind: 'curiosity-item'; payload: Omit<CuriosityItem, 'id' | 'profileId' | 'createdAt'> })
-  | (CaptureEventBase & { kind: 'ledger-correction'; payload: LedgerCorrectionInput });
+  | { kind: 'ledger-fact'; payload: LedgerFactInput }
+  | { kind: 'narrative-note'; payload: NarrativeNoteInput }
+  | { kind: 'metric-point'; payload: MetricPointInput }
+  | { kind: 'curiosity-item'; payload: Omit<CuriosityItem, 'id' | 'profileId' | 'createdAt'> }
+  | { kind: 'ledger-correction'; payload: LedgerCorrectionInput };
 
 export type PendingOp =
-  | { kind: 'write'; entity: string; type: FactType; fields: Record<string, string | number | string[]>; provenance: Provenance; safetyRelevant?: boolean; episodeId?: string; language?: string; verbatim?: string; visibility?: string; resume?: boolean; /** Cross-entity links (E1.2): carried through confirm so a confirmed write stamps the reverse link. */ replaces?: string; corrects?: string; /** Hash of the current fact at proposal time (CH): verified at confirm to reject stale-token clobbers. */ baselineCurHash?: string }
+  | { kind: 'write'; entity: string; type: FactType; fields: Record<string, string | number | string[]>; provenance: Provenance; safetyRelevant?: boolean; episodeId?: string; language?: string; verbatim?: string; visibility?: string; resume?: boolean; /** Carried through confirm so a confirmed write stamps the reverse link. */ replaces?: string; corrects?: string; /** Verified at confirm to reject stale-token clobbers. */ baselineCurHash?: string }
   | { kind: 'retract'; entity: string; type: FactType; provenance: Provenance; baselineCurHash: string }
   | { kind: 'dispute'; entity: string; type: FactType; versionA: number; versionB: number; originalId: string }
   | { kind: 'discontinue'; entity: string; type: FactType; provenance: Provenance; reason?: string; replacedBy?: string; baselineCurHash: string }
   | { kind: 'restart'; entity: string; type: FactType; provenance: Provenance; fields: Record<string, string | number | string[]>; restartOf: string; baselineCurHash: string };
 
-/**
- * Result of a lifecycle mutation (discontinue / restart / pause). `noop` is an
- * idempotent no-change outcome (e.g. discontinue with no active version), so the
- * tool layer can report it without a null-fact sentinel.
- */
 export type LedgerMutationResult =
   | { kind: 'applied'; fact: LedgerFact }
   | { kind: 'needs-confirmation'; fact: LedgerFact; token: ConfirmationToken }
@@ -182,9 +153,9 @@ export interface StoredToken {
 }
 
 export type RecordFactResult =
-  | { kind: 'applied'; fact: LedgerFact; /** CT (SB-2): set when a correction's companion retract needs user confirmation — the tool layer must relay it (DAD-10). */ pendingRetract?: ConfirmationToken }
+  | { kind: 'applied'; fact: LedgerFact; /** Set when a correction's companion retract needs user confirmation; the tool layer must relay it. */ pendingRetract?: ConfirmationToken }
   | { kind: 'needs-confirmation'; token: ConfirmationToken; current: LedgerFact; proposed: LedgerFact; /** CT: relayed correction-retract token (may accompany a pending corrected arm too). */ pendingRetract?: ConfirmationToken }
-  | { kind: 'disputed'; versions: [LedgerFact, LedgerFact]; disputeToken: ConfirmationToken; /** CT: relayed correction-retract token. */ pendingRetract?: ConfirmationToken };
+  | { kind: 'disputed'; versions: [LedgerFact, LedgerFact]; disputeToken: ConfirmationToken; /** CT: relayed correction-retract token. */ pendingRetract?: ConfirmationToken; /** An existing dispute offered again with a fresh token; nothing was written. */ reopened?: true };
 
 export type RetractResult =
   | { kind: 'applied' | 'needs-confirmation'; fact: LedgerFact; token?: ConfirmationToken }

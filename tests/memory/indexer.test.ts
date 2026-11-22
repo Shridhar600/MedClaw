@@ -1,11 +1,10 @@
-// tests/memory/indexer.test.ts
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { MemoryIndexer } from '../../src/memory/indexer';
 import { SqliteStore } from '../../src/memory/sqlite-store';
 import type { LLMProvider } from '../../src/providers/types';
 import { SqliteKeywordIndex } from '../../src/indexstore';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('MemoryIndexer', () => {
   let tmpDir: string;
@@ -14,7 +13,7 @@ describe('MemoryIndexer', () => {
   let workspaceDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-indexer-'));
+    tmpDir = makeTestTemp('redacted-indexer-');
     workspaceDir = tmpDir;
     store = new SqliteStore(path.join(tmpDir, 'test.db'));
     mockProvider = {
@@ -28,7 +27,7 @@ describe('MemoryIndexer', () => {
     fs.rmSync(tmpDir, { recursive: true });
   });
 
-  it('indexAll() stores chunks in SQLite', async () => {
+  it('indexAll stores chunks in SQLite', async () => {
     fs.writeFileSync(path.join(workspaceDir, 'test.md'), '# Test\n\nSome content here.');
     const indexer = new MemoryIndexer(store, mockProvider, workspaceDir);
     await indexer.indexAll();

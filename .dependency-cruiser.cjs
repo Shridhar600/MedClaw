@@ -3,11 +3,10 @@ module.exports = {
   forbidden: [
     /* 1. No circular dependencies (specs/16 §1)
      *
-     * Legacy modules (agent, channels, cli, config, gateway, media, memory,
-     * onboarding, providers, runtime, scheduler, tools, workspace) are
-     * grandfathered and excluded from this check. The v1 codebase has a
-     * pre-existing cycle (cli/service-onboarding ↔ cli/setup-wizard) which
-     * will be resolved at the v2 cutover.
+     * `src/cli/` is ENFORCED (not grandfathered): S1-T3 extracted
+     * `cli/setup-config.ts`, which removed the last known cycle
+     * (cli/service-onboarding <-> cli/setup-wizard). The remaining legacy
+     * modules stay grandfathered until their own cutover.
      */
     {
       name: 'no-circular',
@@ -19,7 +18,6 @@ module.exports = {
         pathNot: [
           '^src/agent/',
           '^src/channels/',
-          '^src/cli/',
           '^src/config/',
           '^src/gateway/',
           '^src/media/',
@@ -32,6 +30,16 @@ module.exports = {
           '^src/workspace/',
         ],
       },
+      to: { circular: true },
+    },
+    /* 1b. cli must stay acyclic — the cycle that used to live here is gone. */
+    {
+      name: 'no-circular-cli',
+      severity: 'error',
+      comment:
+        'src/cli/ must be acyclic. setup-config.ts exists so the wizard and the ' +
+        'service entry never import each other again.',
+      from: { path: '^src/cli/' },
       to: { circular: true },
     },
 
@@ -77,7 +85,7 @@ module.exports = {
         'their own directory, and external packages. This rule blocks ' +
         'imports from legacy (v1) modules.',
       from: {
-        path: '^src/(memcore|profiles|recall|context2|capture|subagents|indexstore|security)/',
+        path: '^src/(memcore|profiles|recall|context2|capture|indexstore|security)/',
       },
       to: {
         path: '^src/(agent|channels|cli|config|gateway|media|memory|onboarding|providers|runtime|scheduler|tools|workspace)/',

@@ -1,6 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { AgentLoop } from '../../src/agent/agent-loop';
 import { LLMSemaphore, HeartbeatQueueFullError } from '../../src/tools/semaphore';
@@ -8,12 +7,14 @@ import { SessionManager } from '../../src/gateway/session';
 import { Gateway } from '../../src/gateway/gateway';
 import { ToolRegistry } from '../../src/tools/registry';
 import type { LLMProvider, LLMResponse } from '../../src/providers/types';
-import type { AppConfig } from '../../src/config/types';
+import type { EffectiveConfig } from '../../src/config/types';
 import { HeartbeatStore } from '../../src/scheduler/store';
 import { HeartbeatScheduler } from '../../src/scheduler/runtime';
-import { ProfileRegistry } from '../../src/profiles/registry';
-import type { ProfileId } from '../../src/profiles/types';
 import { attachGatewayTestRuntime } from '../helpers/gateway-test-runtime';
+import {} from '../helpers/test-config';
+import { bindOwnerFixture } from '../helpers/owner-authority-fixture';
+import { fixtureOwner, ownerSelection } from '../helpers/test-config';
+import { makeTestTemp } from '../helpers/test-temp';
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -39,15 +40,23 @@ describe('LLM semaphore wiring', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-sem-wiring-'));
+    tmpDir = makeTestTemp('redacted-sem-wiring-');
   });
 
   afterEach(() => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  function makeConfig(overrides?: Partial<AppConfig>): AppConfig {
+  async function boundGateway(config: EffectiveConfig): Promise<Gateway> {
+    const owner = fixtureOwner(tmpDir);
+    const bound = await bindOwnerFixture(owner.ownerRecord, owner.ownerId, 'chat-1');
+    return new Gateway(config, bound.gatewayDeps);
+  }
+
+  function makeConfig(overrides?: Partial<EffectiveConfig>): EffectiveConfig {
     return {
+    schemaVersion: 2,
+    ...ownerSelection(fixtureOwner(tmpDir)),
       providers: {
         main: { type: 'ollama', model: 'qwen3.5:9b', baseUrl: 'http://localhost:11434/v1' },
         medical: { type: 'ollama', model: 'qwen3.5:9b', baseUrl: 'http://localhost:11434/v1' },
@@ -56,23 +65,21 @@ describe('LLM semaphore wiring', () => {
       channels: { telegram: { enabled: false, botToken: '' } },
       tools: { allow: ['*'], deny: [] },
       memory: {
-        workspace: path.join(tmpDir, 'workspace'),
+        workspace: fixtureOwner(tmpDir).workspace,
         search: { hybridWeights: { vector: 0.7, keyword: 0.3 } },
         bootstrapMaxChars: 20000,
       },
       sessions: {
-        softResetAfterMinutes: 240,
-        hardResetAfterMinutes: 1440,
-        compaction: { enabled: true, triggerAtTokenPercent: 80, memoryFlush: true, keepRecentTurns: 10 },
+        compaction: { enabled: true, memoryFlush: true, keepRecentTurns: 10 },
       },
       heartbeat: {
         enabled: true,
         timezone: 'Asia/Kolkata',
-        storePath: path.join(tmpDir, 'heartbeats', 'jobs.json'),
+        storePath: fixtureOwner(tmpDir).storePath,
         recovery: { enabled: false, windowMinutes: 60 },
         retry: { maxRetries: 3, backoffMinutes: 5 },
         rateLimit: { maxGlobalTriggersPerMinute: 10, maxPerChatTriggersPerMinute: 3 },
-        audit: { path: path.join(tmpDir, 'heartbeats', 'audit.jsonl') },
+        audit: { path: fixtureOwner(tmpDir).auditLogPath },
         policy: {
           quietHours: { enabled: false, start: '22:00', end: '07:00' },
           skipIfChatActiveWithinMinutes: 60,
@@ -82,7 +89,7 @@ describe('LLM semaphore wiring', () => {
           },
         },
       },
-      agent: { maxIterations: 15, disclaimerEnabled: true },
+      agent: { maxIterations: 15 },
       ...overrides,
     };
   }
@@ -107,18 +114,14 @@ describe('LLM semaphore wiring', () => {
 
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
     const semaphore = new LLMSemaphore();
-    const loop = new AgentLoop(recordingProvider, registry, [], { maxIterations: 15, disclaimerEnabled: false }, semaphore);
+    const loop = new AgentLoop(recordingProvider, registry, [], { maxIterations: 15 }, semaphore);
 
-    // Start a heartbeat blocker to occupy the running slot so subsequent
-    // calls must queue.
     const hbBlocker = loop.run('hb1-blocker', [], { chatId: 'c1', origin: 'heartbeat' });
     await firstChatStarted.promise;
 
-    // Queue a second heartbeat while drain is paused.
     const hb2 = loop.run('hb2', [], { chatId: 'c1', origin: 'heartbeat' });
     await Promise.resolve();
 
-    // Then queue a user job — should win by priority.
     const user = loop.run('user-input', [], { chatId: 'c1', origin: 'user' });
 
     firstChatDone.resolve();
@@ -126,7 +129,6 @@ describe('LLM semaphore wiring', () => {
     await user;
     await hb2;
 
-    // 3 chats called: hb1-blocker, then user-input (priority), then hb2
     expect(chatOrder).toEqual(['hb1-blocker', 'user-input', 'hb2']);
   });
 
@@ -149,7 +151,7 @@ describe('LLM semaphore wiring', () => {
 
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
     const semaphore = new LLMSemaphore();
-    const loop = new AgentLoop(blockingProvider, registry, [], { maxIterations: 15, disclaimerEnabled: false }, semaphore);
+    const loop = new AgentLoop(blockingProvider, registry, [], { maxIterations: 15 }, semaphore);
 
     const blocker = loop.run('blocker', [], { chatId: 'c1', origin: 'heartbeat' });
     await firstChatEntered.promise;
@@ -161,9 +163,9 @@ describe('LLM semaphore wiring', () => {
     await Promise.resolve();
 
     const config = makeConfig();
-    const gateway = new Gateway(config);
+    const gateway = await boundGateway(config);
     const send = jest.fn().mockResolvedValue(undefined);
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
 
     const runtime = attachGatewayTestRuntime(gateway, config, {
       semaphore,
@@ -171,14 +173,6 @@ describe('LLM semaphore wiring', () => {
       sessions,
     });
     (gateway as any).channel = { send };
-    // RR2-B1 setup migration: pair the job's chat to the attached runtime's profile so the
-    // queue-overflow assertions keep their original meaning under the destination guard.
-    const baseDir = path.join(tmpDir, 'profiles-base');
-    fs.mkdirSync(baseDir, { recursive: true });
-    const pairingRegistry = new ProfileRegistry(baseDir);
-    pairingRegistry.getOrCreateDefaultProfile();
-    pairingRegistry.pairChatToProfile('chat-1', 'default' as ProfileId);
-    (gateway as any).profileRegistry = pairingRegistry;
 
     const scheduler = new HeartbeatScheduler(
       new HeartbeatStore(path.join(tmpDir, 'heartbeats', 'jobs.json')),
@@ -217,10 +211,6 @@ describe('LLM semaphore wiring', () => {
       const refreshed = await scheduler.getStore().get(job.id);
       expect(refreshed?.deliveryState).toBe('retry-wait');
 
-      // T1 strengthening: nextRetryAt must survive (markRun must not clobber
-      // retry state). handleScheduledJob (invoked-by-scheduler) calls
-      // scheduler.recordFailure, which schedules a wakeup — assert both the
-      // persisted retry state and the in-memory wakeup timer.
       expect(refreshed?.nextRetryAt).toBeTruthy();
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -246,8 +236,8 @@ describe('LLM semaphore wiring', () => {
 
   it('queue-full recordFailure storage failure does not escape handleScheduledJob', async () => {
     const config = makeConfig();
-    const gateway = new Gateway(config);
-    const sessions = new SessionManager(240, 1440, path.join(tmpDir, 'sessions'));
+    const gateway = await boundGateway(config);
+    const sessions = new SessionManager(path.join(tmpDir, 'sessions'));
 
     const runtime = attachGatewayTestRuntime(gateway, config, {
       sessions,
@@ -257,15 +247,6 @@ describe('LLM semaphore wiring', () => {
       },
     });
     (gateway as any).channel = { send: jest.fn().mockResolvedValue(undefined) };
-    // RR2-B1 setup migration: pair the job's chat to the attached runtime's profile.
-    {
-      const baseDir = path.join(tmpDir, 'profiles-base');
-      fs.mkdirSync(baseDir, { recursive: true });
-      const pairingRegistry = new ProfileRegistry(baseDir);
-      pairingRegistry.getOrCreateDefaultProfile();
-      pairingRegistry.pairChatToProfile('chat-1', 'default' as ProfileId);
-      (gateway as any).profileRegistry = pairingRegistry;
-    }
 
     const job = {
       id: 'job-rf',
@@ -301,7 +282,7 @@ describe('LLM semaphore wiring', () => {
   it('no semaphore passed: behavior unchanged (AgentLoop without 5th arg still works)', async () => {
     const provider = makeProvider([{ type: 'text', text: 'no-sem-ok' }]);
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
-    const loop = new AgentLoop(provider, registry, [], { maxIterations: 15, disclaimerEnabled: false });
+    const loop = new AgentLoop(provider, registry, [], { maxIterations: 15 });
 
     const result = await loop.run('hello', [], { chatId: 'c1', origin: 'user' });
     expect(result.text).toBe('no-sem-ok');

@@ -1,20 +1,17 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { createMemoryTools } from '../../src/tools/memory-tools';
 import { MemoryEngine } from '../../src/memory/memory-engine';
 import type { Tool } from '../../src/tools/types';
+import { makeTestTemp } from '../helpers/test-temp';
 
-// Task 12.6 (G1): memory_write must refuse writes to every invariant-bearing managed path,
-// directing the agent to the owning tool. `memory/**` (narrative) and core files stay
-// writable (no regression). SAFETY.md removal is an OVERWRITE-drop check, not append.
-describe('memory_write managed-path guard (G1 / CONTRA-03)', () => {
+describe('memory_write managed-path guard', () => {
   let tmpDir: string;
   let engine: MemoryEngine;
   let write: Tool;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-wguard-'));
+    tmpDir = makeTestTemp('redacted-wguard-');
     engine = new MemoryEngine(tmpDir);
     write = createMemoryTools(engine).find(t => t.name === 'memory_write')!;
   });
@@ -41,13 +38,12 @@ describe('memory_write managed-path guard (G1 / CONTRA-03)', () => {
     expect(r.content[0].text).toMatch(/curated|budget|MEMORY/i);
   });
 
-  it('rejects a SAFETY.md overwrite that DROPS a base allergy entry (CONTRA-03)', async () => {
+  it('rejects a SAFETY.md overwrite that DROPS a base allergy entry', async () => {
     await engine.writeFile('SAFETY.md', '# Safety\n## Allergies\n- penicillin — anaphylaxis\n## Medications\n- warfarin — 5mg\n');
     const dropped = '# Safety\n## Medications\n- warfarin — 5mg\n'; // penicillin removed
     const r = await write.execute({ path: 'SAFETY.md', content: dropped, mode: 'overwrite' });
     reject(r);
     expect(r.content[0].text).toMatch(/confirm|ledger_update|removal/i);
-    // The destructive overwrite did NOT land.
     expect(await engine.readFile('SAFETY.md')).toContain('penicillin');
   });
 
@@ -71,14 +67,16 @@ describe('memory_write managed-path guard (G1 / CONTRA-03)', () => {
     reject(await write.execute({ path: 'scratch/n1.md', content: 'x', mode: 'overwrite' }));
   });
 
-  it('still allows narrative appends under memory/ (no P0 regression)', async () => {
+  it('still allows narrative appends under memory/ ', async () => {
     const r = await write.execute({ path: 'memory/2026-08-12.md', content: '- 10:00 — felt tired\n', mode: 'append' });
     ok(r);
     expect(await engine.readFile('memory/2026-08-12.md')).toContain('felt tired');
   });
 
-  it('still allows writes to core files (SOUL.md, USER.md) — no regression', async () => {
-    ok(await write.execute({ path: 'SOUL.md', content: '# Soul\nbe kind', mode: 'overwrite' }));
+  it('keeps the SOUL.md safety doctrine: append only; other core files stay writable', async () => {
+    reject(await write.execute({ path: 'SOUL.md', content: '# Soul\nbe kind', mode: 'overwrite' }));
+    reject(await write.execute({ path: './soul.md', content: '# Soul\nbe kind' }));
+    ok(await write.execute({ path: 'SOUL.md', content: '\n- prefers short answers\n', mode: 'append' }));
     ok(await write.execute({ path: 'USER.md', content: '# User\nArjun', mode: 'overwrite' }));
   });
 
@@ -87,10 +85,7 @@ describe('memory_write managed-path guard (G1 / CONTRA-03)', () => {
     reject(await write.execute({ path: 'ledger\\symptoms.md', content: 'x', mode: 'overwrite' }));
   });
 
-  // W-C/D fix pass (PT / SB-1): a raw path whose `..` segments RESOLVE INTO a managed
-  // lane must be classified by its normalized target — never slip through on the
-  // un-normalized prefix. Residual `..` above the root is refused outright.
-  describe('hostile paths — .. segment resolution (PT)', () => {
+  describe('hostile paths — .. segment resolution', () => {
     it.each([
       ['memory/../ledger/medications.md', /ledger_record|ledger_update|ledger/i],
       ['x/../ledger/allergies.md', /ledger_record|ledger_update|ledger/i],

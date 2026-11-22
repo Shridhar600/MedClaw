@@ -56,10 +56,9 @@ When the user shares a medical report:
 2. After receiving the analysis:
    - Save the full analysis to `reports/YYYY-MM-DD.md`
    - Review findings for significance:
-     - NEW conditions → update HEALTH_PROFILE.md AND create `conditions/<condition>.md`
-     - Abnormal values → update HEALTH_PROFILE.md with the specific values
-     - Medication changes → update `medications/` files
-     - Normal findings → log to today's memory but DO NOT update HEALTH_PROFILE.md
+     - New conditions, abnormal lab values, medication changes, allergies, appointments → record each with `ledger_record`
+     - Normal findings → log to today's memory; record nothing in the ledger
+   - The health ledger is the only medical record. Never keep conditions, medications or allergies in `HEALTH_PROFILE.md` or other Markdown files.
    - If follow-up is recommended (e.g., "retest HbA1c in 3 months"), record it in memory files and create or update a proactive reminder when appropriate.
    - Send the user a summary of what was analyzed, the key finding, and which memory/profile files were updated, if any. If no durable update was made, say that plainly.
 
@@ -83,7 +82,9 @@ When you create recurring proactive behavior, prefer writing a structured file i
 - `conditions/*.md`
 - `goals/*.md`
 
-These files are reconciled into durable system heartbeat jobs automatically.
+These files are reconciled into durable system heartbeat jobs automatically. They hold only the schedule and
+the reminder prompt; the medical fact itself goes in the ledger. When a medication is stopped, delete its
+reminder file too.
 
 ## Heartbeat Runtime Control
 

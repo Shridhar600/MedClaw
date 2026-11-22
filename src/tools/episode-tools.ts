@@ -1,7 +1,3 @@
-// src/tools/episode-tools.ts
-//
-// episode_manage (Task 12.4) — CRUD over EpisodeStore (create/update/link/close/get/list
-// with pagination). Episodes group related facts + narrative into a health arc.
 
 import type { Tool, ToolResult } from './types';
 import type { EpisodeStore, Episode, EpisodeStatus } from '../memcore';
@@ -13,14 +9,6 @@ const EPISODE_STATUSES: EpisodeStatus[] = ['open', 'resolving', 'resolved', 'reo
 export interface EpisodeToolsDeps {
   store: EpisodeStore;
   profileId: string;
-  /**
-   * RR-STRUCT R-S3 (C-46 generalization): `episode_manage` used to write DIRECTLY to
-   * `EpisodeStore` — one file per episode id, read-then-write — with no serialization against a
-   * concurrent mutation of the SAME episode (a genuine lost-update race). Routing create/update/
-   * link/close through the single-writer coordinator closes that window. Optional + falls back to
-   * the direct (pre-R-S3) call when absent, so existing single-caller test construction is
-   * unaffected — a missing coordinator degrades atomicity, never availability (resilience law).
-   */
   queue?: QueuePort;
 }
 
@@ -36,11 +24,6 @@ function isPathContainmentError(error: unknown): boolean {
     || (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'ERR_PATH_CONTAINMENT');
 }
 
-/**
- * SB-1: the episode lane persists caller-controlled text (title/note/regions/factIds) to a 0600
- * health file — it carries the SAME credential-rejection bar as every other write path
- * (memory_write, ledger_record, safety_note, capture). Returns a rejection or null.
- */
 function scanEpisodeInputs(...fields: (string | string[] | undefined)[]): ToolResult | null {
   const text = fields.flatMap(f => (f === undefined ? [] : Array.isArray(f) ? f : [f])).join('\n');
   const cred = contentContainsCredentials(text);
@@ -59,9 +42,6 @@ function renderEpisode(e: Episode): string {
 }
 
 export function createEpisodeTools(deps: EpisodeToolsDeps): Tool[] {
-  // Serialize every mutating action against the SAME per-profile single-writer used by every
-  // other memory-domain writer (RR-STRUCT R-S3). Without an injected queue, run inline — the
-  // exact pre-R-S3 behavior (fine for a single caller; loses atomicity under real concurrency).
   const mutate = <T>(label: string, run: () => Promise<T>): Promise<T> =>
     deps.queue ? deps.queue.enqueue('turn', { label, scope: 'episode', run }) : run();
 

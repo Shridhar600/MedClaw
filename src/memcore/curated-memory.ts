@@ -1,19 +1,3 @@
-// src/memcore/curated-memory.ts
-//
-// MEMORY.md — the curated narrative memory with a hard character budget (specs/07 §7;
-// plan Task 6). Category budgets are independent: Health 60% / Life 20% / Agent notes 20%
-// of the injected `budgetChars`. Writes are FAIL-LOUD: an over-budget append throws
-// `BudgetExceededError{section, gauge, currentEntries}` and writes nothing — the engine
-// NEVER auto-evicts across categories and NEVER evicts a health entry to fit a non-health
-// one (CHAT-02/CHAT-05). The model merges in-turn via `replace()` after the tool relays
-// `currentEntries` (D6). "Clinical merged last" ordering is a P3 L1-manual instruction —
-// P1 asserts only engine properties (D6/F11).
-//
-// The gauge line is auto-maintained in each section heading:
-//   ## Health <!-- 1320/1320 chars used (100%) -->
-//
-// Corrupt-file reads degrade to empty sections + sanitized warn, preserving any salvageable
-// raw bytes in a <!-- PARSE-ERROR --> quarantine note (D2/F24). Never crashes.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -31,12 +15,6 @@ export type MemorySection = 'health' | 'life' | 'agent';
 export interface CuratedMemoryOptions {
   /** Total MEMORY.md budget in characters; split across the three sections by {@link budgetRatios}. */
   budgetChars: number;
-  /**
-   * Per-section share of `budgetChars` (E1.4 — sourced from `config.memory.budgetRatios`). Any
-   * missing or non-positive entry falls back to the 60/20/20 default. Changing the shares only
-   * resizes the per-section budgets — the no-cross-category + health-never-evicted invariants stay
-   * code-enforced (CHAT-02/05).
-   */
   budgetRatios?: Partial<Record<MemorySection, number>>;
 }
 
@@ -92,16 +70,12 @@ export class CuratedMemory {
     return Math.floor(this.opts.budgetChars * this.sectionShare(section));
   }
 
-  /** The H1 budget-line ratio summary, rendered from the effective shares (e.g. "health 60% / …"). */
+  /** The budget-line ratio summary for the title heading, rendered from the effective shares (e.g. "health 60% / …"). */
   private ratioSummary(): string {
-    // Short section keys (health/life/agent) — matches the historic H1 label, not SECTION_DISPLAY.
+    // Short section keys (health/life/agent), not SECTION_DISPLAY.
     return SECTION_ORDER.map(s => `${s} ${Math.round(this.sectionShare(s) * 100)}%`).join(' / ');
   }
 
-  /**
-   * Append an entry to a section's budget. Fails loudly (nothing written) when the section
-   * would exceed its own budget. Returns the section's entry texts after the write.
-   */
   async write(section: MemorySection, text: string): Promise<string[]> {
     const { items } = this.load();
     this.ensureSkeleton(items);
@@ -114,10 +88,6 @@ export class CuratedMemory {
     return this.entriesOf(sec);
   }
 
-  /**
-   * Replace a section's entries wholesale with the given set (the D6 in-turn merge path).
-   * Also fail-loud when the merged set still exceeds the budget.
-   */
   async replace(section: MemorySection, entries: string[]): Promise<string[]> {
     const { items } = this.load();
     this.ensureSkeleton(items);
@@ -149,12 +119,6 @@ export class CuratedMemory {
     }
   }
 
-  /**
-   * Read a bounded representation for prompt assembly. The source is consumed line-by-line so a
-   * hand-edited or damaged MEMORY.md cannot be slurped into the turn. Repeated owned headings are
-   * merged into the same category before its share is applied, so duplicate sections cannot bypass
-   * the health/life/agent budget.
-   */
   async readForContext(
     maxChars: number,
     budgetRatios?: Partial<Record<MemorySection, number>>,
@@ -266,8 +230,6 @@ export class CuratedMemory {
     return { content, status: 'present', truncated };
   }
 
-  // ---- internals ---------------------------------------------------------
-
   private assertFits(section: MemorySection, newLines: string[], currentLines: string[]): void {
     const budget = this.sectionBudget(section);
     if (this.sectionSize(newLines) <= budget) return;
@@ -339,11 +301,6 @@ export class CuratedMemory {
     return text;
   }
 
-  /**
-   * Load the current file, degrading on corrupt read (D2/F24): sanitized warn + fresh
-   * skeleton, preserving any salvageable raw bytes in a PARSE-ERROR quarantine note.
-   * Never crashes.
-   */
   private load(): { items: ParsedItem[] } {
     const fp = this.filePath();
     let raw: string;
@@ -353,8 +310,6 @@ export class CuratedMemory {
       const nodeErr = err as NodeJS.ErrnoException;
       if (nodeErr.code === 'ENOENT') return { items: this.freshItems() };
       console.warn(`[curated-memory] degraded read: ${summarizeErrorForLog(err)}`);
-      // Do not turn an unreadable existing MEMORY.md into a fresh skeleton. The
-      // caller must retry after the source file becomes readable.
       throw err;
     }
     if (raw.includes('\uFFFD')) {
@@ -382,8 +337,6 @@ export class CuratedMemory {
   private quarantinedItems(salvaged: string | null): ParsedItem[] {
     const items = this.freshItems();
     if (salvaged) {
-      // Salvaged bytes → 0600 side file; only a constant pointer inlines into the
-      // always-injected MEMORY.md (no injection surface, no date leak).
       items.push({ kind: 'quarantine', lines: [quarantineToSideFile(this.filePath(), salvaged)] });
     }
     return items;
@@ -409,8 +362,6 @@ export class CuratedMemory {
         const owned = this.memorySectionForHeading(parsed.heading);
         const existing = owned ? this.sectionItem(items, owned) : undefined;
         if (existing && existing.kind === 'section') {
-          // The blank line before this duplicate heading belongs to the structural separator,
-          // not to the merged category body. Remove it before continuing the same section.
           existing.lines = this.trimOuterBlank(existing.lines);
           current = existing;
         } else {
@@ -427,8 +378,6 @@ export class CuratedMemory {
       current.lines.push(line);
       i += 1;
     }
-    // Blank lines between blocks are structural separators (assemble re-adds them), not
-    // section content — drop them so entries()/gauges stay clean and round-trips stable.
     for (const item of items) {
       if (item.kind !== 'quarantine') item.lines = this.trimOuterBlank(item.lines);
     }

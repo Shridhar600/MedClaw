@@ -21,7 +21,7 @@ function ledgerFact(over: Partial<LedgerFact> = {}): LedgerFact {
   };
 }
 
-describe('ledgerFactToRecord (v2-M-2 mapping: LedgerFact -> FactRecord)', () => {
+describe('ledgerFactToRecord (v2- mapping: LedgerFact -> FactRecord)', () => {
   it('maps provenance.source -> authority and provenance.confidence -> confidence', () => {
     const r = ledgerFactToRecord(ledgerFact());
     expect(r.authority).toBe('doctor');

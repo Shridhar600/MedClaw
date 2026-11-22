@@ -1,7 +1,5 @@
 import { isRemoteEmbeddingBaseUrl } from '../../src/indexstore';
 
-// P2 A3.1b (v2-BL-2 = B1): the recall latency budget (p50≤300/p95≤800) assumes LOCAL embeddings.
-// A remote embeddings base URL earns a boot config warning. This is the pure locality check.
 describe('isRemoteEmbeddingBaseUrl', () => {
   it('treats localhost / loopback as local', () => {
     expect(isRemoteEmbeddingBaseUrl('http://localhost:11434/v1')).toBe(false);

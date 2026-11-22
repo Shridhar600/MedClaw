@@ -42,10 +42,8 @@ function renderHealthSection(answers: OnboardingAnswers): string {
     `- Name: ${valueOrNone(answers.name)}`,
     `- Age: ${valueOrNone(answers.age)}`,
     `- Timezone: ${valueOrNone(answers.timezone)}`,
-    `- Active conditions: ${valueOrNone(answers.conditions)}`,
-    `- Current medications: ${valueOrNone(answers.medications)}`,
-    `- Known allergies: ${valueOrNone(answers.allergies)}`,
     `- Goals: ${valueOrNone(answers.goals)}`,
+    '- Conditions, medications and allergies are kept in the health ledger.',
   ].join('\n');
 }
 

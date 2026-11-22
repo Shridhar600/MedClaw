@@ -3,13 +3,6 @@ import { systemClock } from '../ports';
 import { assertSafetyInjected } from './safety-invariant';
 import { InvariantViolationError } from '../shared/errors';
 
-// The v2 ContextAssembler. Builds the spec-14 §1 injection map (system-message rows 1–9) fresh
-// EVERY turn (D9): SAFETY is re-read each assemble so a mid-session safety-relevant mutation reaches
-// the running prompt without a restart. History (row 10) stays SessionManager-owned and is NOT
-// rendered here (v2-M-5). context2 is ports-only — it never imports legacy modules (providers,
-// memory, agent), so `assemble` returns the system-message BODY as a plain string; the caller wraps
-// it into a provider `Message[]`.
-
 export type AssemblerMode = 'chat' | 'heartbeat' | 'dream' | 'subagent';
 
 export type ContextReadStatus = 'present' | 'absent' | 'unreadable' | 'provider-unavailable';
@@ -40,11 +33,6 @@ export interface SafetyReader {
   read(): Promise<string | null>;
 }
 
-/**
- * The slice of a RecallEngine `RecallReport` the assembler consumes (structural — no cross-v2
- * import). Recalled hits carry their `id` so the assembler can render them with a citable tag for
- * the B7 `<used>` feedback loop (H-3).
- */
 export interface AssemblerRecall {
   /** Stage-1 active-ledger one-liners (all active health facts). */
   ledger: string;
@@ -77,7 +65,7 @@ export interface ContextSection {
   budget: number;
   /** Content as PLACED in the prompt (post-truncation for truncatable sections). */
   content: string;
-  /** SAFETY: emitted in full regardless of budget (PLAT-05). */
+  /** SAFETY: emitted in full regardless of budget. */
   nonTruncatable?: boolean;
   /** Typed degradation status for an optional source. */
   status?: ContextReadStatus;
@@ -114,11 +102,6 @@ export interface AssemblerDeps {
 
 const SEPARATOR = '\n\n---\n\n';
 
-// Skeleton files above the cache boundary, in stable order, per mode (spec 06 §2 / amendment C5a):
-//   chat      — full L2 skeleton. HEALTH_PROFILE.md kept as its own section (parity — not folded).
-//   heartbeat — L1-lite persona + the HEARTBEAT.md checklist only; no full MEMORY / USER / profile.
-//   dream     — NO persona/user (consolidation turn over the user's own memory).
-//   subagent  — none (PHI-minimal; task + tool docs are the runner's job, not the assembler — KNEE-05).
 const SOUL = { key: 'SOUL.md', title: 'SOUL' };
 const HEALTH_PROFILE = { key: 'HEALTH_PROFILE.md', title: 'HEALTH PROFILE' };
 const USER = { key: 'USER.md', title: 'USER' };
@@ -132,10 +115,6 @@ const SKELETON_BY_MODE: Record<AssemblerMode, { key: string; title: string }[]> 
   subagent: [],
 };
 
-// Which volatile recall sections each mode renders (runtime is always emitted).
-//   chat      — full recall (active ledger + hits + CHECK).
-//   heartbeat — Stage-1 active-ledger one-liners only (KNEE-02); no user-message recall/CHECK.
-//   dream/subagent — none.
 const VOLATILE_BY_MODE: Record<AssemblerMode, { ledger: boolean; hits: boolean; check: boolean }> = {
   chat: { ledger: true, hits: true, check: true },
   heartbeat: { ledger: true, hits: false, check: false },
@@ -151,12 +130,6 @@ function estimateTokens(s: string): number {
   return Math.ceil(s.length / 4);
 }
 
-/**
- * Structural cache-boundary guard (C1.3 / H-2): the cacheStable partition must be contiguous at the
- * front — once a volatile section appears, no later section may be cacheStable. A violation is an
- * assembler bug (it would poison prefix caching), so it throws. This checks ORDERING only; it never
- * regexes file bytes (a user's own MEMORY.md date must never abort the turn).
- */
 export function assertCacheDiscipline(sections: ContextSection[]): void {
   let seenVolatile = false;
   for (const s of sections) {
@@ -195,24 +168,17 @@ export class ContextAssembler {
     mode: AssemblerMode,
     recall: AssemblerRecall | null,
   ): Promise<ContextReport> {
-    // The reader/safety ports are already profile-scoped by the Gateway (one assembler per profile);
-    // profileId is retained in the signature for the injection-map contract (v2-H-4).
     void profileId;
 
     const raw: RawSection[] = [];
     const degraded: ContextDegraded[] = [];
     const vol = VOLATILE_BY_MODE[mode];
 
-    // 1. SAFETY first, in full, non-truncatable, above the boundary (KNEE-07 SAFETY-first mechanism).
-    //    Re-read every turn (D9). Empty / whitespace-only => skipped (PLAT-04). Dream and subagent
-    //    turns are PHI-minimal: they must not even read SAFETY (spec 03 §3 / PLAT-21).
     const safetyContent = mode === 'chat' || mode === 'heartbeat' ? await this.readSafety() : null;
     if (safetyContent && safetyContent.trim() !== '') {
       raw.push({ key: 'SAFETY.md', title: 'SAFETY', layer: 1, cacheStable: true, content: safetyContent, nonTruncatable: true });
     }
 
-    // 2. Build volatile sections before reading optional stable prose. Their complete framed size
-    //    is reserved so a large MEMORY.md cannot consume the ledger/recall allocation.
     const volatile = this.volatileSections(mode, recall, vol);
     const reservedVolatile = this.reserveVolatile(volatile);
 
@@ -244,15 +210,11 @@ export class ContextAssembler {
       }
     }
 
-    // 4. Volatile recall sections are below the boundary. Today's/yesterday's blanket daily-log dump
-    //    is RETIRED in favor of RECALL (parity
-    //    decision, recorded — active facts still injected via SAFETY + Stage-1 ledger; recent turns
-    //    live in the SessionManager-owned history row).
     raw.push(...volatile);
 
     const { sections, content, truncated } = this.compose(raw, reservedVolatile);
 
-    // Cache discipline + SAFETY non-omission, per turn (D9 / PLAT-04/05). medical-safety > resilience.
+    // Cache discipline and SAFETY non-omission, checked every turn. Safety outranks resilience.
     assertCacheDiscipline(sections);
     assertSafetyInjected(content, safetyContent);
 
@@ -272,13 +234,9 @@ export class ContextAssembler {
     };
   }
 
-  // ---- mode-specific section sets (C2 narrows these) --------------------------------------
-
   private skeletonFor(mode: AssemblerMode): { key: string; title: string }[] {
     return SKELETON_BY_MODE[mode];
   }
-
-  // ---- rendering helpers -----------------------------------------------------------------
 
   private runtimeLine(hitsShown: boolean): string {
     const day = this.clock.now().toISOString().slice(0, 10);
@@ -346,11 +304,8 @@ export class ContextAssembler {
     };
   }
 
+  // A read error THROWS on purpose: shipping a prompt with no SAFETY is worse than failing the turn.
   private async readSafety(): Promise<string | null> {
-    // NO swallow (H-1): the SafetyReader returns null only for a genuinely absent/empty SAFETY
-    // (PLAT-04). A read error (EACCES/EISDIR/I/O) THROWS and must propagate — it aborts the turn to
-    // the caller's safe fallback rather than silently shipping a prompt with no safety constitution
-    // (medical-safety > resilience). This is the ONE place resilience does not apply.
     return this.deps.safety.read();
   }
 
@@ -438,9 +393,6 @@ export class ContextAssembler {
       }
     }
 
-    // Runtime line (volatile) — the ONLY place a clock/date value is composed in (H-2). Marked
-    // non-truncatable (L-1): the day date grounds health advice and must never be evicted by
-    // budget pressure (it is tiny). Still below the cache boundary (cacheStable:false).
     sections.push({
       key: 'runtime',
       title: 'RUNTIME',
@@ -458,8 +410,6 @@ export class ContextAssembler {
       const header = `## ${section.title}\n\n`;
       return sum + header.length + section.content.length;
     }, 0);
-    // One separator per volatile section is conservative: the first one separates it from the
-    // stable prefix and every later one separates it from its predecessor.
     return framed + sections.length * SEPARATOR.length;
   }
 

@@ -62,11 +62,6 @@ function nearestExistingPath(candidate: string): string {
   }
 }
 
-/**
- * Resolve one or more untrusted path components strictly inside an existing trusted base.
- * Existing path segments are lstat-checked so a pre-existing symlink cannot redirect a PHI path.
- * Missing final components are allowed when their nearest existing parent remains contained.
- */
 export function resolveContainedPath(baseDir: string, ...components: string[]): string {
   if (components.length === 0) throw new PathContainmentError('invalid-component');
   for (const component of components) validateComponent(component);
@@ -109,4 +104,61 @@ export function resolveContainedPath(baseDir: string, ...components: string[]): 
     throw new PathContainmentError('outside-base');
   }
   return candidate;
+}
+
+export interface ContainedDirectory {
+  absolutePath: string;
+  exists: boolean;
+}
+
+/** Read-only validation of a directory chain beneath explicit, existing owner authority. */
+export function inspectContainedDirectory(baseDir: string | undefined, directory: string): ContainedDirectory {
+  if (!baseDir || !path.isAbsolute(baseDir) || !path.isAbsolute(directory)) {
+    throw new PathContainmentError('unavailable');
+  }
+  const base = path.resolve(baseDir);
+  const absolutePath = path.resolve(directory);
+  if (!isStrictDescendant(base, absolutePath)) throw new PathContainmentError('outside-base');
+  const baseStat = fs.lstatSync(base);
+  if (baseStat.isSymbolicLink()) throw new PathContainmentError('symlink');
+  if (!baseStat.isDirectory()) throw new PathContainmentError('invalid-component');
+  const components = path.relative(base, absolutePath).split(path.sep);
+  let current = base;
+  let exists = true;
+  for (const component of components) {
+    validateComponent(component);
+    current = path.join(current, component);
+    try {
+      const stat = fs.lstatSync(current);
+      if (stat.isSymbolicLink()) throw new PathContainmentError('symlink');
+      if (!stat.isDirectory()) throw new PathContainmentError('invalid-component');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      exists = false;
+      break;
+    }
+  }
+  // Reuse canonical containment, including validation of the remaining missing components.
+  resolveContainedPath(base, ...components);
+  return { absolutePath, exists };
+}
+
+/** Create only validated descendants; never repair or chmod an alias or the trusted base. */
+export function createContainedDirectory(baseDir: string | undefined, directory: string): string {
+  const checked = inspectContainedDirectory(baseDir, directory);
+  const base = path.resolve(baseDir!);
+  let current = base;
+  for (const component of path.relative(base, checked.absolutePath).split(path.sep)) {
+    current = path.join(current, component);
+    const componentState = inspectContainedDirectory(base, current);
+    if (!componentState.exists) {
+      try { fs.mkdirSync(current, { mode: 0o700 }); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+      inspectContainedDirectory(base, current);
+      fs.chmodSync(current, 0o700);
+    }
+  }
+  inspectContainedDirectory(base, checked.absolutePath);
+  fs.chmodSync(checked.absolutePath, 0o700);
+  return checked.absolutePath;
 }

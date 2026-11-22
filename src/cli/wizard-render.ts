@@ -59,8 +59,6 @@ export function renderCompletionDivider(io: CliIO): void {
 }
 
 export function renderWizardBanner(io: CliIO): void {
-  // const breadcrumb = colorize(io, COLORS.dim, 'medclaw onboard');
-
   const wordmark = [
     '╔╦╗╔═╗╔╦╗╔═╗╦  ╔═╗╦ ╦  Setup Wizard v1.0.0',
     '║║║║╣  ║║║  ║  ╠═╣║║║',
@@ -70,14 +68,12 @@ export function renderWizardBanner(io: CliIO): void {
   const divider = '─────────────────────────────────────────────';
   const subtitle = '● ● ●  MedClaw — Personal AI Health Assistant';
 
-  // writeLine(io, breadcrumb);
   writeLine(io);
   writeLine(io, colorize(io, COLORS.dim, subtitle));
   writeLine(io, colorize(io, COLORS.dim, divider));
   for (const line of wordmark) {
     writeLine(io, colorize(io, COLORS.cyan, line));
   }
-  // writeLine(io);
 }
 
 export function maskSecret(value: string | undefined): string {

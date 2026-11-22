@@ -1,15 +1,15 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { PathContainmentError, resolveContainedPath } from '../../src/security';
+import { makeTestTemp } from '../helpers/test-temp';
 
 describe('resolveContainedPath', () => {
   let root: string;
   let outside: string;
 
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-safe-path-'));
-    outside = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-safe-path-outside-'));
+    root = makeTestTemp('redacted-safe-path-');
+    outside = makeTestTemp('redacted-safe-path-outside-');
   });
 
   afterEach(() => {

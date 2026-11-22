@@ -1,13 +1,6 @@
 import { RecallEngine, DEFAULT_RECALL_CONFIG } from '../../src/recall';
 import type { FactRecord, ChunkWithScore } from '../../src/ports';
-import { FakeFactMirror, FakeVectorIndex, FakeKeywordIndex, FakeEmbedding, FakeChunkStats, fixedClock } from './fakes';
-
-// P2 Wave B / Task B3.3 — recall latency bench. Embeddings are MOCKED (instant), so this measures
-// the engine's OWN per-turn compute (hybrid merge + scoreChunk + suppression matching + render)
-// against a large index + many ledger entity heads — a regression guard against an accidental
-// O(n²) blow-up. The B1 p95≤800ms gate WITH LOCAL EMBEDDINGS (PLAT-18) is an integration concern
-// needing a live Ollama (deferred with the instrumentation program); P0 already proved 52ms raw KNN
-// over 5K chunks. This bench keeps the pure path far under the 800ms budget.
+import { FakeFactMirror, currentFactsOf, FakeVectorIndex, FakeKeywordIndex, FakeEmbedding, FakeChunkStats, fixedClock } from './fakes';
 
 const P95_BUDGET_MS = 800;
 
@@ -42,11 +35,13 @@ function percentile(sorted: number[], p: number): number {
 
 describe('recall latency bench', () => {
   it('per-turn recall stays well under the p95 budget over a 5K index + 300 heads', async () => {
+    const factMirror = new FakeFactMirror(manyHeads(300));
     const engine = new RecallEngine({
+      factMirror,
+      currentFacts: currentFactsOf(factMirror),
       embedding: new FakeEmbedding({ vector: [0.1, 0.2, 0.3] }),
       vectorIndex: new FakeVectorIndex(bigChunks(5000)),
       keywordIndex: new FakeKeywordIndex(bigChunks(5000)),
-      factMirror: new FakeFactMirror(manyHeads(300)),
       chunkStats: new FakeChunkStats(),
       clock: fixedClock('2026-10-01T00:00:00.000Z'),
       config: DEFAULT_RECALL_CONFIG,

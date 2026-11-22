@@ -3,7 +3,6 @@ import type { LLMProvider, LLMResponse } from '../../src/providers/types';
 import { ToolRegistry } from '../../src/tools/registry';
 import type { Tool } from '../../src/tools/types';
 
-// Mock provider that replays a sequence of responses
 function makeProvider(responses: LLMResponse[]): LLMProvider {
   let idx = 0;
   return {
@@ -26,7 +25,7 @@ describe('AgentLoop', () => {
   it('returns text response directly when no tool call needed', async () => {
     const provider = makeProvider([{ type: 'text', text: 'Hello Arjun!' }]);
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
-    const loop = new AgentLoop(provider, registry, [], { maxIterations: 15, disclaimerEnabled: false });
+    const loop = new AgentLoop(provider, registry, [], { maxIterations: 15 });
 
     const result = await loop.run('Hi there');
     expect(result.text).toBe('Hello Arjun!');
@@ -39,7 +38,7 @@ describe('AgentLoop', () => {
     ]);
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
     registry.register(pingTool);
-    const loop = new AgentLoop(provider, registry, [], { maxIterations: 15, disclaimerEnabled: false });
+    const loop = new AgentLoop(provider, registry, [], { maxIterations: 15 });
 
     const result = await loop.run('Ping the system');
     expect(result.text).toContain('pong');
@@ -52,7 +51,7 @@ describe('AgentLoop', () => {
     ]);
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
     registry.register(pingTool);
-    const loop = new AgentLoop(provider, registry, [], { maxIterations: 15, disclaimerEnabled: false });
+    const loop = new AgentLoop(provider, registry, [], { maxIterations: 15 });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const result = await (loop.run('Ping the system') as any);
@@ -74,7 +73,7 @@ describe('AgentLoop', () => {
       ]);
       const registry = new ToolRegistry({ allow: ['*'], deny: [] });
       registry.register(pingTool);
-      const loop = new AgentLoop(provider, registry, [], { maxIterations: 15, disclaimerEnabled: false });
+      const loop = new AgentLoop(provider, registry, [], { maxIterations: 15 });
 
       await loop.run('check my glucose');
 
@@ -94,7 +93,7 @@ describe('AgentLoop', () => {
       provider,
       registry,
       async () => ({ messages: [], healthContextTouched: true }),
-      { maxIterations: 15, disclaimerEnabled: true },
+      { maxIterations: 15 },
     );
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -113,7 +112,7 @@ describe('AgentLoop', () => {
       provider,
       registry,
       async () => ({ messages: [], healthContextTouched: true } as never),
-      { maxIterations: 15, disclaimerEnabled: false },
+      { maxIterations: 15 },
     );
 
     const result = await loop.run('Tell me about lisinopril.');
@@ -125,7 +124,7 @@ describe('AgentLoop', () => {
   it('does not mark clearly non-health responses as medical', async () => {
     const provider = makeProvider([{ type: 'text', text: 'Here is a short haiku about mountains.' }]);
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
-    const loop = new AgentLoop(provider, registry, [], { maxIterations: 15, disclaimerEnabled: true });
+    const loop = new AgentLoop(provider, registry, [], { maxIterations: 15 });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const result = await (loop.run('Write a haiku about mountains.') as any);
@@ -134,11 +133,10 @@ describe('AgentLoop', () => {
   });
 
   it('stops after maxIterations to prevent infinite loop', async () => {
-    // Provider always returns a tool call
     const provider = makeProvider(Array(20).fill({ type: 'tool_call', toolCalls: [{ id: 'c1', name: 'ping', arguments: {} }] }));
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
     registry.register(pingTool);
-    const loop = new AgentLoop(provider, registry, [], { maxIterations: 3, disclaimerEnabled: false });
+    const loop = new AgentLoop(provider, registry, [], { maxIterations: 3 });
 
     const result = await loop.run('Loop forever');
     expect(result.text).toContain('maximum');
@@ -154,7 +152,7 @@ describe('AgentLoop', () => {
     const registry = new ToolRegistry({ allow: ['*'], deny: [] });
     registry.register(pingTool);
     const executeSpy = jest.spyOn(registry, 'execute');
-    const loop = new AgentLoop(provider, registry, [], { maxIterations: 15, disclaimerEnabled: false });
+    const loop = new AgentLoop(provider, registry, [], { maxIterations: 15 });
 
     await loop.run('Ping with context', [], { chatId: 'chat-context-1' });
     await loop.run('Ping again', [], { chatId: 'chat-context-1' });

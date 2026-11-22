@@ -1,22 +1,13 @@
-// tests/memcore/curated-memory.test.ts
-//
-// CuratedMemory — MEMORY.md budget engine (plan Task 6). Acceptance: CHAT-02 (60/20/20,
-// fail-loud, no cross-category eviction), CHAT-05 (non-health never evicts health),
-// CHAT-03 engine half (health bytes untouched on overflow, currentEntries surfaced).
-// Merge-ordering is a P3 L1-manual model instruction (D6/F11) — NOT asserted here.
-//
-// Imports the store DIRECTLY (not via the memcore barrel) — the orchestrator owns the
-// barrel consolidation pass after Wave B.
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { CuratedMemory } from '../../src/memcore/curated-memory';
 import { BudgetExceededError } from '../../src/shared/errors';
+import { makeTestTemp } from '../helpers/test-temp';
 
 let tmpDir: string;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-curated-memory-'));
+  tmpDir = makeTestTemp('redacted-curated-memory-');
 });
 
 afterEach(() => {
@@ -71,7 +62,7 @@ describe('CuratedMemory.write', () => {
     expect(await readHealthSection()).toBe(healthBefore); // health never touched
   });
 
-  it('throws BudgetExceededError with the CHAT-02 message when a category is full', async () => {
+  it('throws BudgetExceededError with the message when a category is full', async () => {
     const cm = new CuratedMemory(tmpDir, { budgetChars: 2200 }); // health 1320
     await cm.write('health', 'x'.repeat(1317)); // fills health to exactly 1320
 
@@ -80,7 +71,7 @@ describe('CuratedMemory.write', () => {
     );
   });
 
-  it('throws BudgetExceededError carrying section, gauge, and currentEntries; file untouched (CHAT-03 engine half)', async () => {
+  it('throws BudgetExceededError carrying section, gauge, and currentEntries; file untouched', async () => {
     const cm = new CuratedMemory(tmpDir, { budgetChars: 2200 });
     await cm.write('health', 'metformin 850mg daily');
     const before = await fs.promises.readFile(memoryFile(), 'utf-8');
@@ -94,24 +85,22 @@ describe('CuratedMemory.write', () => {
     expect(be.currentEntries).toEqual(['metformin 850mg daily']);
     expect(be.currentEntries).toContain('metformin 850mg daily');
 
-    // Health bytes untouched on overflow — nothing partial was written.
     const after = await fs.promises.readFile(memoryFile(), 'utf-8');
     expect(after).toBe(before);
   });
 
-  it('never evicts a health entry to fit a non-health one (CHAT-05)', async () => {
+  it('never evicts a health entry to fit a non-health one', async () => {
     const cm = new CuratedMemory(tmpDir, { budgetChars: 2200 });
     const healthBefore = ['take metformin with food', 'allergic to penicillin'];
     for (const e of healthBefore) await cm.write('health', e);
 
-    // Life budget is small (440) — overfill it.
     await expect(cm.write('life', 'y'.repeat(1000))).rejects.toThrow(BudgetExceededError);
 
     const healthAfter = await readHealthSection();
     for (const e of healthBefore) expect(healthAfter).toContain(`- ${e}`);
   });
 
-  it('a successful life write leaves full-health bytes untouched (no cross-category eviction, CHAT-02)', async () => {
+  it('a successful life write leaves full-health bytes untouched (no cross-category eviction)', async () => {
     const cm = new CuratedMemory(tmpDir, { budgetChars: 2200 });
     const healthLines = ['metformin 850mg', 'penicillin allergy', 'diabetes type 2'];
     for (const e of healthLines) await cm.write('health', e);
@@ -210,7 +199,6 @@ describe('CuratedMemory corrupt-file degradation', () => {
       expect(md).toContain('PARSE-ERROR'); // constant pointer present
       expect(md).not.toContain('broken bytes'); // raw bytes NOT inline — side-filed
       expect(warnSpy).toHaveBeenCalled();
-      // corrupt bytes preserved in a sidecar
       const sidecar = fs.readdirSync(tmpDir).find(n => n.includes('MEMORY.md.quarantine'));
       expect(sidecar).toBeDefined();
       expect(fs.readFileSync(path.join(tmpDir, sidecar!), 'utf-8')).toContain('broken bytes');

@@ -1,17 +1,15 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { SqliteFactMirror } from '../../src/indexstore';
 import { runFactMirrorContract } from '../ports/fact-mirror.contract';
 import type { FactRecord } from '../../src/ports';
+import { makeTestTemp } from '../helpers/test-temp';
 
 const tmpDirs: string[] = [];
 
-// Each mirror gets its own isolated temp search.db (its own better-sqlite3 connection —
-// the mirror layer co-owns search.db with the vec/keyword adapters, D6). NEVER ~/.redacted.
 runFactMirrorContract(() => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-factmirror-'));
+  const dir = makeTestTemp('redacted-factmirror-');
   tmpDirs.push(dir);
   return new SqliteFactMirror({ dbPath: path.join(dir, 'search.db') });
 });
@@ -44,12 +42,12 @@ function record(over: Partial<FactRecord> = {}): FactRecord {
 }
 
 function makeDirectMirror(): SqliteFactMirror {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redacted-factmirror-rr5-'));
+  const dir = makeTestTemp('redacted-factmirror-');
   tmpDirs.push(dir);
   return new SqliteFactMirror({ dbPath: path.join(dir, 'search.db') });
 }
 
-describe('SqliteFactMirror RR-5 projection correctness', () => {
+describe('SqliteFactMirror projection correctness', () => {
   it('keeps same-named medication and allergy facts as separate active heads', async () => {
     const mirror = makeDirectMirror();
     await mirror.upsert([

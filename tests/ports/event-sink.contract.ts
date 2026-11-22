@@ -1,6 +1,3 @@
-// Shared EventSink contract (P2 Task A3). The append-only event store feeding Stage-3
-// entity-correlation lag queries (DIAB-07 is P5; the sink is populated in P2 on metric/fact
-// writes). NOT a test file itself; invoked from an adapter's own *.test.ts.
 
 import type { EventSink, EventRecord } from '../../src/ports';
 
@@ -25,7 +22,7 @@ function ev(id: string, over: Partial<EventRecord> = {}): EventRecord {
 }
 
 export function runEventSinkContract(makeSink: MakeEventSink): void {
-  describe('EventSink contract (P2 A3)', () => {
+  describe('EventSink contract', () => {
     let sink: ContractEventSink;
 
     beforeEach(() => {

@@ -8,13 +8,6 @@ interface HybridWeights {
   keyword: number;
 }
 
-/**
- * Min-max normalizes raw BM25 scores (unbounded, from FTS5 rank) to [0, 1].
- * FTS5 rank values are negative; stronger matches are typically more negative.
- * After Math.abs(), stronger matches become larger positive numbers.
- * So we apply (score - min) / (max - min) to map stronger keyword matches closer to 1.0.
- * Returns 0.5 when all scores are equal (no variation).
- */
 function normalizeBm25Scores(results: SearchResult[]): SearchResult[] {
   if (results.length === 0) return results;
   const scores = results.map(r => r.score);
